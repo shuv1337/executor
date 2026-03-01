@@ -7,11 +7,9 @@ import type {
   RuntimeToolCallCredentialContext,
   RuntimeToolCallRequest,
 } from "@executor-v2/sdk";
-import * as Context from "effect/Context";
 import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
 import * as Either from "effect/Either";
-import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 
 export class CredentialResolverError extends Data.TaggedError(
@@ -26,21 +24,9 @@ export type ResolvedToolCredentials = {
   headers: Readonly<Record<string, string>>;
 };
 
-export type CredentialResolverShape = {
-  resolveForToolCall: (
-    input: RuntimeToolCallRequest,
-  ) => Effect.Effect<ResolvedToolCredentials, CredentialResolverError>;
-};
-
-export class CredentialResolver extends Context.Tag(
-  "@executor-v2/domain/CredentialResolver",
-)<CredentialResolver, CredentialResolverShape>() {}
-
-export const makeCredentialResolver = (
-  resolveForToolCall: CredentialResolverShape["resolveForToolCall"],
-): CredentialResolverShape => ({
-  resolveForToolCall,
-});
+export type ResolveToolCredentials = (
+  input: RuntimeToolCallRequest,
+) => Effect.Effect<ResolvedToolCredentials, CredentialResolverError>;
 
 const emptyResolvedToolCredentials: ResolvedToolCredentials = {
   headers: {},
@@ -271,9 +257,9 @@ export const buildCredentialHeaders = (
   };
 };
 
-export const CredentialResolverNoneLive = Layer.succeed(
-  CredentialResolver,
-  CredentialResolver.of(
-    makeCredentialResolver(() => Effect.succeed(emptyResolvedToolCredentials)),
-  ),
-);
+export const makeCredentialResolver = (
+  resolveForToolCall: ResolveToolCredentials,
+): ResolveToolCredentials => resolveForToolCall;
+
+export const resolveNoCredentials: ResolveToolCredentials = () =>
+  Effect.succeed(emptyResolvedToolCredentials);

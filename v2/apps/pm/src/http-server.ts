@@ -1,70 +1,92 @@
-import {
-  HttpRouter,
-  HttpServer,
-  HttpServerRequest,
-  HttpServerResponse,
-} from "@effect/platform";
-import { BunHttpServer, BunHttpServerRequest } from "@effect/platform-bun";
-import {
-  ControlPlaneService,
-  controlPlaneOpenApiSpec,
-  makeControlPlaneWebHandler,
-} from "@executor-v2/control-plane";
-import { LocalStateStoreService } from "@executor-v2/persistence-local";
-import * as Effect from "effect/Effect";
-import * as Layer from "effect/Layer";
+import { controlPlaneOpenApiSpec } from "@executor-v2/control-plane";
 
-import { PmActorLive } from "./actor";
-import { PmConfig } from "./config";
-import { PmMcpHandler } from "./mcp-handler";
-import { handleToolCallHttp } from "./tool-call-handler";
+export type StartPmHttpServerOptions = {
+  port: number;
+  handleMcp: (request: Request) => Promise<Response>;
+  handleToolCall: (request: Request) => Promise<Response>;
+  handleControlPlane: (request: Request) => Promise<Response>;
+};
 
-const fromWebHandler = (handler: (request: Request) => Promise<Response>) =>
-  Effect.gen(function* () {
-    const request = yield* HttpServerRequest.HttpServerRequest;
-    const response = yield* Effect.promise(() =>
-      handler(BunHttpServerRequest.toRequest(request))
-    );
+export type PmHttpServer = {
+  stop: () => void;
+};
 
-    return HttpServerResponse.raw(response);
+const methodNotAllowed = (allowed: string): Response =>
+  Response.json(
+    {
+      ok: false,
+      error: `Method not allowed. Expected ${allowed}`,
+    },
+    { status: 405 },
+  );
+
+const notFound = (): Response =>
+  Response.json(
+    {
+      ok: false,
+      error: "Not found",
+    },
+    { status: 404 },
+  );
+
+const isControlPlaneMethod = (method: string): boolean =>
+  method === "GET" ||
+  method === "POST" ||
+  method === "PUT" ||
+  method === "PATCH" ||
+  method === "DELETE" ||
+  method === "OPTIONS";
+
+export const startPmHttpServer = (options: StartPmHttpServerOptions): PmHttpServer => {
+  const server = Bun.serve({
+    port: options.port,
+    hostname: "127.0.0.1",
+    fetch: async (request) => {
+      const { pathname } = new URL(request.url);
+
+      if (pathname === "/healthz") {
+        return Response.json({ ok: true, service: "pm" });
+      }
+
+      if (pathname === "/v1/mcp") {
+        if (
+          request.method !== "GET" &&
+          request.method !== "POST" &&
+          request.method !== "DELETE"
+        ) {
+          return methodNotAllowed("GET, POST, DELETE");
+        }
+
+        return options.handleMcp(request);
+      }
+
+      if (pathname === "/v1/runtime/tool-call") {
+        if (request.method !== "POST") {
+          return methodNotAllowed("POST");
+        }
+
+        return options.handleToolCall(request);
+      }
+
+      if (pathname === "/v1/openapi.json") {
+        if (request.method !== "GET") {
+          return methodNotAllowed("GET");
+        }
+
+        return Response.json(controlPlaneOpenApiSpec);
+      }
+
+      if (pathname.startsWith("/v1/") && isControlPlaneMethod(request.method)) {
+        return options.handleControlPlane(request);
+      }
+
+      return notFound();
+    },
   });
 
-export const startPmHttpServer = Effect.fn("@executor-v2/app-pm/http.start")(function* () {
-  const { port } = yield* PmConfig;
-  const { handleMcp } = yield* PmMcpHandler;
-  const controlPlaneService = yield* ControlPlaneService;
-  const localStateStore = yield* LocalStateStoreService;
-  const controlPlaneWebHandler = yield* Effect.sync(() =>
-    makeControlPlaneWebHandler(
-      Layer.succeed(ControlPlaneService, controlPlaneService),
-      PmActorLive(localStateStore),
-    ),
-  );
-
-  yield* Effect.addFinalizer(() =>
-    Effect.promise(() => controlPlaneWebHandler.dispose()),
-  );
-
-  const httpLive = HttpRouter.empty.pipe(
-    HttpRouter.get("/healthz", HttpServerResponse.json({ ok: true, service: "pm" })),
-    HttpRouter.get("/v1/mcp", fromWebHandler(handleMcp)),
-    HttpRouter.post("/v1/mcp", fromWebHandler(handleMcp)),
-    HttpRouter.del("/v1/mcp", fromWebHandler(handleMcp)),
-    HttpRouter.post("/v1/runtime/tool-call", handleToolCallHttp),
-    HttpRouter.get("/v1/workspaces/:workspaceId/sources", fromWebHandler(controlPlaneWebHandler.handler)),
-    HttpRouter.post("/v1/workspaces/:workspaceId/sources", fromWebHandler(controlPlaneWebHandler.handler)),
-    HttpRouter.del(
-      "/v1/workspaces/:workspaceId/sources/:sourceId",
-      fromWebHandler(controlPlaneWebHandler.handler),
-    ),
-    HttpRouter.get(
-      "/v1/openapi.json",
-      HttpServerResponse.unsafeJson(controlPlaneOpenApiSpec),
-    ),
-    HttpServer.serve(),
-    HttpServer.withLogAddress,
-    Layer.provide(BunHttpServer.layer({ port })),
-  );
-
-  return yield* Layer.launch(httpLive);
-});
+  return {
+    stop: () => {
+      server.stop(true);
+    },
+  };
+};

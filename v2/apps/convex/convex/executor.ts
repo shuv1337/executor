@@ -1,21 +1,11 @@
-import {
-  RunExecutionService,
-  RunExecutionServiceLive,
-} from "@executor-v2/domain";
+import { createRunExecutor } from "@executor-v2/engine";
 import type { ExecuteRunInput, ExecuteRunResult } from "@executor-v2/sdk";
 import * as Effect from "effect/Effect";
-import * as Layer from "effect/Layer";
 
-import { ConvexRuntimeExecutionPortLive } from "./runtime_execution_port";
+import { executeRuntimeRunInConvex } from "./runtime_execution_port";
 
-const ConvexRunExecutionLive = RunExecutionServiceLive().pipe(
-  Layer.provide(ConvexRuntimeExecutionPortLive),
-);
+const runExecutor = createRunExecutor(executeRuntimeRunInConvex);
 
 export const executeRunImpl = (
   input: ExecuteRunInput,
-): Effect.Effect<ExecuteRunResult> =>
-  Effect.gen(function* () {
-    const runExecutionService = yield* RunExecutionService;
-    return yield* runExecutionService.executeRun(input);
-  }).pipe(Effect.provide(ConvexRunExecutionLive));
+): Effect.Effect<ExecuteRunResult> => runExecutor.executeRun(input);

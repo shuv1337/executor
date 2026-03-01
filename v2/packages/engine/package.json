@@ -13,6 +13,7 @@
   "dependencies": {
     "@executor-v2/persistence-ports": "workspace:*",
     "@executor-v2/schema": "workspace:*",
+    "@executor-v2/sdk": "workspace:*",
     "effect": "catalog:"
   },
   "devDependencies": {

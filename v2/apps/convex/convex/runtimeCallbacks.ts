@@ -1,18 +1,15 @@
 import {
-  RuntimeToolInvokerUnimplementedLive,
-  ToolInvocationService,
-  ToolInvocationServiceLive,
-  type CredentialResolver,
-} from "@executor-v2/domain";
+  createRuntimeToolCallHandler,
+  createUnimplementedRuntimeToolInvoker,
+} from "@executor-v2/engine";
 import type { RuntimeToolCallResult } from "@executor-v2/sdk";
 import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
-import * as Layer from "effect/Layer";
 import * as ParseResult from "effect/ParseResult";
 import * as Schema from "effect/Schema";
 
 import { httpAction, type ActionCtx } from "./_generated/server";
-import { ConvexCredentialResolverLive } from "./credential_resolver";
+import { createConvexResolveToolCredentials } from "./credential_resolver";
 
 class RuntimeToolCallBadRequestError extends Data.TaggedError(
   "RuntimeToolCallBadRequestError",
@@ -62,14 +59,12 @@ const handleToolCallHttpEffect = (
   ctx: ActionCtx,
   request: Request,
 ): Effect.Effect<Response, never> => {
-  const toolInvocationLive: Layer.Layer<ToolInvocationService, never, CredentialResolver> =
-    ToolInvocationServiceLive.pipe(
-      Layer.provide(RuntimeToolInvokerUnimplementedLive("convex")),
-    );
-
-  const toolInvocationWithResolverLive = toolInvocationLive.pipe(
-    Layer.provide(ConvexCredentialResolverLive(ctx)),
-  );
+  const resolveCredentials = createConvexResolveToolCredentials(ctx);
+  const invokeRuntimeTool = createUnimplementedRuntimeToolInvoker("convex");
+  const handleToolCall = createRuntimeToolCallHandler({
+    resolveCredentials,
+    invokeRuntimeTool,
+  });
 
   return Effect.gen(function* () {
     const body = yield* Effect.tryPromise({
@@ -91,12 +86,9 @@ const handleToolCallHttpEffect = (
       ),
     );
 
-    const toolInvocationService = yield* ToolInvocationService;
-    const result = yield* toolInvocationService.invokeRuntimeToolCall(input);
-
+    const result = yield* handleToolCall(input);
     return Response.json(result, { status: 200 });
   }).pipe(
-    Effect.provide(toolInvocationWithResolverLive),
     Effect.catchTag("RuntimeToolCallBadRequestError", (error) =>
       Effect.succeed(badRequest(formatBadRequestMessage(error))),
     ),

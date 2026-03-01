@@ -1,40 +1,22 @@
-import { RunExecutionService } from "@executor-v2/domain";
+import {
+  type ExecuteRunInput,
+  type ExecuteRunResult,
+  createExecutorRunClient,
+} from "@executor-v2/sdk";
 import { handleMcpHttpRequest } from "@executor-v2/mcp-gateway";
-import { createExecutorRunClient } from "@executor-v2/sdk";
-import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
-import * as Layer from "effect/Layer";
-import * as Runtime from "effect/Runtime";
 
-export type PmMcpHandlerService = {
-  handleMcp: (request: Request) => Promise<Response>;
-};
+export const createPmMcpHandler = (
+  executeRun: (input: ExecuteRunInput) => Effect.Effect<ExecuteRunResult>,
+): ((request: Request) => Promise<Response>) => {
+  const runClient = createExecutorRunClient((input) =>
+    Effect.runPromise(executeRun(input)),
+  );
 
-export class PmMcpHandler extends Context.Tag("@executor-v2/app-pm/PmMcpHandler")<
-  PmMcpHandler,
-  PmMcpHandlerService
->() {}
-
-export const PmMcpHandlerLive = Layer.effect(
-  PmMcpHandler,
-  Effect.gen(function* () {
-    const runExecutionService = yield* RunExecutionService;
-    const runtime = yield* Effect.runtime<never>();
-    const runPromise = Runtime.runPromise(runtime);
-
-    const runClient = createExecutorRunClient((input) =>
-      runPromise(runExecutionService.executeRun(input)),
-    );
-
-    const handleMcp = (request: Request): Promise<Response> =>
-      handleMcpHttpRequest(request, {
-        serverName: "executor-v2-pm",
-        serverVersion: "0.0.0",
-        runClient,
-      });
-
-    return PmMcpHandler.of({
-      handleMcp,
+  return (request: Request) =>
+    handleMcpHttpRequest(request, {
+      serverName: "executor-v2-pm",
+      serverVersion: "0.0.0",
+      runClient,
     });
-  }),
-);
+};

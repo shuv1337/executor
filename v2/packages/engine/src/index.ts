@@ -42,3 +42,40 @@ export {
   type ToolProviderKind,
   type ToolProviderRegistry,
 } from "./tool-providers";
+
+export {
+  RuntimeExecutionPortError,
+  type ExecuteRuntimeRun,
+} from "./runtime-execution-port";
+
+export {
+  createRunExecutor,
+  executeRun,
+  type ExecuteRunOptions,
+} from "./run-execution-service";
+
+export {
+  buildCredentialHeaders,
+  CredentialResolverError,
+  extractCredentialResolutionContext,
+  makeCredentialResolver,
+  resolveNoCredentials,
+  selectCredentialBinding,
+  selectOAuthAccessToken,
+  sourceIdFromSourceKey,
+  type ResolveToolCredentials,
+  type ResolvedToolCredentials,
+} from "./credential-resolver";
+
+export {
+  RuntimeToolInvokerError,
+  createUnimplementedRuntimeToolInvoker,
+  type InvokeRuntimeToolCall,
+  type RuntimeToolInvokerInput,
+} from "./runtime-tool-invoker";
+
+export {
+  ToolInvocationServiceError,
+  createRuntimeToolCallHandler,
+  invokeRuntimeToolCall,
+} from "./tool-invocation-service";

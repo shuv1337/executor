@@ -1,13 +1,13 @@
 import {
   buildCredentialHeaders,
-  CredentialResolver,
   CredentialResolverError,
   extractCredentialResolutionContext,
   makeCredentialResolver,
   selectCredentialBinding,
   selectOAuthAccessToken,
   sourceIdFromSourceKey,
-} from "@executor-v2/domain";
+  type ResolveToolCredentials,
+} from "@executor-v2/engine";
 import {
   OAuthTokenSchema,
   SourceCredentialBindingSchema,
@@ -16,7 +16,6 @@ import {
 } from "@executor-v2/schema";
 import { v } from "convex/values";
 import * as Effect from "effect/Effect";
-import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 
 import { api } from "./_generated/api";
@@ -115,61 +114,56 @@ const runQueryEffect = <T>(
       ),
   });
 
-export const ConvexCredentialResolverLive = (
+export const createConvexResolveToolCredentials = (
   ctx: ActionCtx,
-): Layer.Layer<CredentialResolver> =>
-  Layer.succeed(
-    CredentialResolver,
-    CredentialResolver.of(
-      makeCredentialResolver((input) =>
-        Effect.gen(function* () {
-          const context = extractCredentialResolutionContext(input);
-          if (context === null) {
-            return {
-              headers: {},
-            };
-          }
+): ResolveToolCredentials =>
+  makeCredentialResolver((input) =>
+    Effect.gen(function* () {
+      const context = extractCredentialResolutionContext(input);
+      if (context === null) {
+        return {
+          headers: {},
+        };
+      }
 
-          const bindings = yield* runQueryEffect(
-            "list_credential_bindings",
-            () =>
-              ctx.runQuery(api.credential_resolver.listCredentialBindingsForSource, {
-                workspaceId: context.workspaceId,
-                sourceKey: context.sourceKey,
-                organizationId: context.organizationId ?? undefined,
-                accountId: context.accountId ?? undefined,
-              }),
-          );
+      const bindings = yield* runQueryEffect(
+        "list_credential_bindings",
+        () =>
+          ctx.runQuery(api.credential_resolver.listCredentialBindingsForSource, {
+            workspaceId: context.workspaceId,
+            sourceKey: context.sourceKey,
+            organizationId: context.organizationId ?? undefined,
+            accountId: context.accountId ?? undefined,
+          }),
+      );
 
-          const binding = selectCredentialBinding(bindings, context);
-          if (binding === null) {
-            return {
-              headers: {},
-            };
-          }
+      const binding = selectCredentialBinding(bindings, context);
+      if (binding === null) {
+        return {
+          headers: {},
+        };
+      }
 
-          const sourceId = sourceIdFromSourceKey(context.sourceKey);
+      const sourceId = sourceIdFromSourceKey(context.sourceKey);
 
-          const oauthAccessToken =
-            binding.provider === "oauth2" && sourceId
-              ? yield* runQueryEffect("list_oauth_tokens", () =>
-                  ctx
-                    .runQuery(api.credential_resolver.listOAuthTokensForSource, {
-                      workspaceId: context.workspaceId,
-                      sourceId,
-                    })
-                    .then((tokens) =>
-                      selectOAuthAccessToken(tokens, context, sourceId),
-                    ),
-                )
-              : null;
+      const oauthAccessToken =
+        binding.provider === "oauth2" && sourceId
+          ? yield* runQueryEffect("list_oauth_tokens", () =>
+              ctx
+                .runQuery(api.credential_resolver.listOAuthTokensForSource, {
+                  workspaceId: context.workspaceId,
+                  sourceId,
+                })
+                .then((tokens) =>
+                  selectOAuthAccessToken(tokens, context, sourceId),
+                ),
+            )
+          : null;
 
-          return {
-            headers: buildCredentialHeaders(binding, {
-              oauthAccessToken,
-            }),
-          };
+      return {
+        headers: buildCredentialHeaders(binding, {
+          oauthAccessToken,
         }),
-      ),
-    ),
+      };
+    }),
   );
