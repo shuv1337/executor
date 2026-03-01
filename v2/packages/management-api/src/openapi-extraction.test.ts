@@ -1,7 +1,13 @@
 import { describe, expect, it } from "@effect/vitest";
+import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
 
 import { extractOpenApiManifest } from "./openapi-extraction";
+
+class CloudflareSpecTestError extends Data.TaggedError("CloudflareSpecTestError")<{
+  stage: "fetch" | "parse";
+  message: string;
+}> {}
 
 describe("extractOpenApiManifest invocation metadata", () => {
   it.effect("extracts parameter and request body metadata", () =>
@@ -142,5 +148,37 @@ describe("extractOpenApiManifest invocation metadata", () => {
         "#/components/schemas/User": userSchemaJson,
       });
     }),
+  );
+
+  it.effect("extracts a complex Cloudflare OpenAPI schema", () =>
+    Effect.gen(function* () {
+      const response = yield* Effect.tryPromise({
+        try: () =>
+          fetch("https://raw.githubusercontent.com/cloudflare/api-schemas/main/openapi.json"),
+        catch: (cause) =>
+          new CloudflareSpecTestError({
+            stage: "fetch",
+            message: `failed to fetch Cloudflare OpenAPI spec: ${cause instanceof Error ? cause.message : String(cause)}`,
+          }),
+      });
+
+      expect(response.ok).toBe(true);
+
+      const openApiSpec = yield* Effect.tryPromise({
+        try: () => response.json(),
+        catch: (cause) =>
+          new CloudflareSpecTestError({
+            stage: "parse",
+            message: `failed to parse Cloudflare OpenAPI spec JSON: ${cause instanceof Error ? cause.message : String(cause)}`,
+          }),
+      });
+
+      const manifest = yield* extractOpenApiManifest("cloudflare", openApiSpec);
+
+      expect(manifest.tools.length).toBeGreaterThan(1000);
+      expect(manifest.tools.some((tool) => tool.typing !== undefined)).toBe(true);
+      expect(Object.keys(manifest.refHintTable ?? {}).length).toBeGreaterThan(0);
+    }),
+    30_000,
   );
 });
