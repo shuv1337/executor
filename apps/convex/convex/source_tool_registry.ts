@@ -268,21 +268,15 @@ const mergeHeaders = (...sets: ReadonlyArray<Record<string, string>>): Record<st
 const resolveSourceCredentialHeadersForInvocation = async (
   ctx: ActionCtx,
   source: Source,
-  accountId: string | null,
+  accountId: string,
 ): Promise<Record<string, string>> => {
   try {
-    const accountInput = accountId
-      ? {
-          accountId,
-        }
-      : {};
-
     const resolved = (await ctx.runAction(
       runtimeInternal.control_plane.credentials.resolveSourceCredentialHeaders,
       {
         workspaceId: source.workspaceId,
         sourceId: source.id,
-        ...accountInput,
+        accountId,
       },
     )) as { headers?: unknown };
 
@@ -306,7 +300,7 @@ const resolveSourceCredentialHeadersForInvocation = async (
 const resolveSourceHeadersForInvocation = async (
   ctx: ActionCtx,
   source: Source,
-  accountId: string | null,
+  accountId: string,
 ): Promise<Record<string, string>> => {
   const config = parseSourceConfig(source);
 
@@ -1047,7 +1041,7 @@ const invokeToolWithRegistry = (
   source: Source,
   artifactTool: ArtifactToolRow,
   args: Record<string, unknown>,
-  accountId: string | null,
+  accountId: string,
 ): Effect.Effect<{ output: unknown; isError: boolean }, RuntimeAdapterError> =>
   Effect.gen(function* () {
     const openApiProvider = makeOpenApiToolProvider();
@@ -1583,21 +1577,21 @@ const describeSource = (row: {
 }): string => `${row.sourceKind.toUpperCase()} source: ${row.sourceName}`;
 
 export type ConvexSourceToolRegistryOptions = {
+  accountId: string;
   requireToolApprovals?: boolean;
   approvalRetryAfterMs?: number;
-  accountId?: string | null;
 };
 
 export const createConvexSourceToolRegistry = (
   ctx: ActionCtx,
   workspaceId: string,
-  options: ConvexSourceToolRegistryOptions = {},
+  options: ConvexSourceToolRegistryOptions,
 ): ToolRegistry => {
   const requireApprovals = options.requireToolApprovals ?? requireToolApprovalsByDefault;
-  const accountId =
-    typeof options.accountId === "string" && options.accountId.trim().length > 0
-      ? options.accountId.trim()
-      : null;
+  const accountId = options.accountId.trim();
+  if (accountId.length === 0) {
+    throw new Error("Tool registry accountId is required");
+  }
   const approvalRetryAfterMs =
     typeof options.approvalRetryAfterMs === "number" &&
     Number.isFinite(options.approvalRetryAfterMs) &&

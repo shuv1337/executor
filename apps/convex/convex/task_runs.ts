@@ -14,7 +14,7 @@ export const startTaskRun = internalMutation({
   args: {
     workspaceId: v.string(),
     runId: v.string(),
-    accountId: v.optional(v.union(v.string(), v.null())),
+    accountId: v.string(),
     sessionId: v.optional(v.string()),
     runtimeId: v.optional(v.string()),
     codeHash: v.optional(v.string()),
@@ -29,13 +29,18 @@ export const startTaskRun = internalMutation({
       if (existing.workspaceId !== args.workspaceId) {
         throw new Error(`Task run workspace mismatch: ${args.runId}`);
       }
+
+      if (existing.accountId !== args.accountId) {
+        throw new Error(`Task run account mismatch: ${args.runId}`);
+      }
+
       return;
     }
 
     const taskRun = {
       id: args.runId,
       workspaceId: args.workspaceId,
-      accountId: args.accountId ?? null,
+      accountId: args.accountId,
       sessionId: args.sessionId ?? "session_runtime",
       runtimeId: args.runtimeId ?? "runtime",
       codeHash: args.codeHash ?? "runtime",
@@ -83,7 +88,7 @@ export const getTaskRunContext = internalQuery({
   args: {
     runId: v.string(),
   },
-  handler: async (ctx, args): Promise<{ workspaceId: string; accountId: string | null } | null> => {
+  handler: async (ctx, args): Promise<{ workspaceId: string; accountId: string } | null> => {
     const existing = await ctx.db
       .query("taskRuns")
       .withIndex("by_domainId", (q) => q.eq("id", args.runId))
@@ -95,7 +100,7 @@ export const getTaskRunContext = internalQuery({
 
     return {
       workspaceId: existing.workspaceId,
-      accountId: typeof existing.accountId === "string" ? existing.accountId : null,
+      accountId: existing.accountId,
     };
   },
 });

@@ -21,7 +21,6 @@ const providers: AuthConfig["providers"] = clientId
         type: "customJwt",
         issuer: `https://api.workos.com/user_management/${clientId}`,
         algorithm: "RS256",
-        applicationID: clientId,
         jwks: `https://api.workos.com/sso/jwks/${clientId}`,
       },
     ]

@@ -9,19 +9,15 @@ const trim = (value: string | undefined): string | undefined => {
   return candidate && candidate.length > 0 ? candidate : undefined;
 };
 
-const publicControlPlaneBaseUrl =
-  trim(process.env.NEXT_PUBLIC_CONTROL_PLANE_BASE_URL)
-  ?? trim(process.env.CONTROL_PLANE_SERVER_BASE_URL)
-  ?? trim(process.env.CONTROL_PLANE_UPSTREAM_URL)
-  ?? trim(process.env.NEXT_PUBLIC_CONVEX_URL)
-  ?? trim(process.env.CONVEX_URL)
-  ?? "";
+const publicControlPlaneBaseUrl = trim(process.env.NEXT_PUBLIC_CONTROL_PLANE_BASE_URL);
 
 const nextConfig: NextConfig = {
   outputFileTracingRoot: resolve(appDir, "../.."),
-  env: {
-    NEXT_PUBLIC_CONTROL_PLANE_BASE_URL: publicControlPlaneBaseUrl,
-  },
+  env: publicControlPlaneBaseUrl
+    ? {
+        NEXT_PUBLIC_CONTROL_PLANE_BASE_URL: publicControlPlaneBaseUrl,
+      }
+    : {},
 };
 
 export default nextConfig;

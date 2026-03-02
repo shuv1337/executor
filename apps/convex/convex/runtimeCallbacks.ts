@@ -88,7 +88,7 @@ const decodeToolCallRequest = (request: Request): Effect.Effect<RuntimeToolCallR
 const resolveWorkspaceIdForToolCall = (
   ctx: ActionCtx,
   input: RuntimeToolCallRequest,
-): Effect.Effect<{ workspaceId: string; accountId: string | null }, RuntimeToolCallBadRequestError> =>
+): Effect.Effect<{ workspaceId: string; accountId: string }, RuntimeToolCallBadRequestError> =>
   Effect.gen(function* () {
     const runContext = yield* Effect.tryPromise({
       try: () =>
@@ -103,12 +103,17 @@ const resolveWorkspaceIdForToolCall = (
     });
 
     if (runContext && runContext.workspaceId.trim().length > 0) {
+      const accountId = runContext.accountId.trim();
+      if (accountId.length === 0) {
+        return yield* new RuntimeToolCallBadRequestError({
+          message: "Runtime callback run is missing account identity",
+          details: `runId=${input.runId}`,
+        });
+      }
+
       return {
         workspaceId: runContext.workspaceId.trim(),
-        accountId:
-          typeof runContext.accountId === "string" && runContext.accountId.trim().length > 0
-            ? runContext.accountId.trim()
-            : null,
+        accountId,
       };
     }
 

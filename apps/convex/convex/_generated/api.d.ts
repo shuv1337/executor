@@ -26,6 +26,7 @@ import type * as control_plane_workspaces from "../control_plane/workspaces.js";
 import type * as credential_crypto from "../credential_crypto.js";
 import type * as executor from "../executor.js";
 import type * as http from "../http.js";
+import type * as http_security from "../http_security.js";
 import type * as mcp from "../mcp.js";
 import type * as mcp_auth from "../mcp_auth.js";
 import type * as run_executor from "../run_executor.js";
@@ -61,6 +62,7 @@ declare const fullApi: ApiFromModules<{
   credential_crypto: typeof credential_crypto;
   executor: typeof executor;
   http: typeof http;
+  http_security: typeof http_security;
   mcp: typeof mcp;
   mcp_auth: typeof mcp_auth;
   run_executor: typeof run_executor;

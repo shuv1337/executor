@@ -294,7 +294,7 @@ export const ConvexControlPlaneActorLive = (ctx: ActionCtx) =>
 
         const principal = yield* resolveAuthenticatedPrincipal(ctx);
 
-        const organizationMemberships = yield* runQueryEffect(
+        let organizationMemberships = yield* runQueryEffect(
           "organizationMembership.list",
           () =>
             ctx.runQuery(internal.control_plane.actor.listOrganizationMembershipsForActor, {
@@ -302,16 +302,46 @@ export const ConvexControlPlaneActorLive = (ctx: ActionCtx) =>
             }),
         );
 
-        const organizationIds = organizationMemberships.map(
+        let organizationIds = organizationMemberships.map(
           (membership) => membership.organizationId,
         );
 
-        const workspaces = yield* runQueryEffect("workspace.list", () =>
+        let workspaces = yield* runQueryEffect("workspace.list", () =>
           ctx.runQuery(internal.control_plane.actor.listWorkspacesForActor, {
             accountId: principal.accountId,
             organizationIds,
           }),
         );
+
+        if (organizationMemberships.length === 0) {
+          const workspaceId = workspaces[0]?.id ?? `ws_${principal.accountId}`;
+
+          yield* runQueryEffect("workspace.ensureDefault", () =>
+            ctx.runMutation(internal.control_plane.actor.ensureWorkspaceForActor, {
+              workspaceId,
+              accountId: principal.accountId,
+            }),
+          );
+
+          organizationMemberships = yield* runQueryEffect(
+            "organizationMembership.list",
+            () =>
+              ctx.runQuery(internal.control_plane.actor.listOrganizationMembershipsForActor, {
+                accountId: principal.accountId,
+              }),
+          );
+
+          organizationIds = organizationMemberships.map(
+            (membership) => membership.organizationId,
+          );
+
+          workspaces = yield* runQueryEffect("workspace.list", () =>
+            ctx.runQuery(internal.control_plane.actor.listWorkspacesForActor, {
+              accountId: principal.accountId,
+              organizationIds,
+            }),
+          );
+        }
 
         const workspaceMemberships = workspaces.flatMap((workspace) =>
           deriveWorkspaceMembershipsForPrincipal({

@@ -7,7 +7,7 @@ import { AccountIdSchema, TaskRunIdSchema, WorkspaceIdSchema } from "../ids";
 export const TaskRunSchema = Schema.Struct({
   id: TaskRunIdSchema,
   workspaceId: WorkspaceIdSchema,
-  accountId: Schema.NullOr(AccountIdSchema),
+  accountId: AccountIdSchema,
   sessionId: Schema.String,
   runtimeId: Schema.String,
   codeHash: Schema.String,

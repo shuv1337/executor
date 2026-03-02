@@ -19,18 +19,10 @@ import {
 } from "./mcp_auth";
 import { createConvexSourceToolRegistry } from "./source_tool_registry";
 
-const readConfiguredWorkspaceId = (value: string | undefined): string => {
-  const normalized = value?.trim();
-  return normalized && normalized.length > 0 ? normalized : "ws_local";
-};
-
 const readWorkspaceIdFromRequest = (request: Request): string | null => {
   const value = new URL(request.url).searchParams.get("workspaceId")?.trim();
   return value && value.length > 0 ? value : null;
 };
-
-const readRequestedWorkspaceId = (request: Request, fallbackWorkspaceId: string): string =>
-  readWorkspaceIdFromRequest(request) ?? fallbackWorkspaceId;
 
 const readToolExposureModeFromRequest = (
   request: Request,
@@ -96,7 +88,6 @@ const hasWorkspaceAccess = async (
   }
 };
 
-const fallbackWorkspaceId = readConfiguredWorkspaceId(process.env.CONVEX_WORKSPACE_ID);
 const defaultToolExposureMode =
   parseExecuteToolExposureMode(process.env.CONVEX_TOOL_EXPOSURE_MODE) ??
   defaultExecuteToolExposureMode;
@@ -104,45 +95,41 @@ const runtimeInternal = internal as any;
 
 export const mcpHandler = httpAction(async (ctx, request) => {
   const mcpAuthConfig = getMcpAuthConfig();
-  const requestWorkspaceId = readWorkspaceIdFromRequest(request);
-  const workspaceId = readRequestedWorkspaceId(request, fallbackWorkspaceId);
-  let accountId: string | null = null;
+  const workspaceId = readWorkspaceIdFromRequest(request);
 
   if (!mcpAuthConfig.enabled) {
-    if (mcpAuthConfig.required) {
-      return Response.json(
-        {
-          error: "MCP OAuth must be configured for cloud deployments",
-        },
-        { status: 503 },
-      );
-    }
-  } else {
-    const auth = await verifyMcpToken(request, mcpAuthConfig);
-    if (!auth) {
-      return unauthorizedMcpResponse(request, "No valid bearer token provided.");
-    }
+    return Response.json(
+      {
+        error: "MCP OAuth must be configured",
+      },
+      { status: 503 },
+    );
+  }
 
-    accountId = auth.subject;
+  const auth = await verifyMcpToken(request, mcpAuthConfig);
+  if (!auth) {
+    return unauthorizedMcpResponse(request, "No valid bearer token provided.");
+  }
 
-    if (!requestWorkspaceId) {
-      return Response.json(
-        {
-          error: "workspaceId query parameter is required when MCP OAuth is enabled",
-        },
-        { status: 400 },
-      );
-    }
+  if (!workspaceId) {
+    return Response.json(
+      {
+        error: "workspaceId query parameter is required",
+      },
+      { status: 400 },
+    );
+  }
 
-    const authorized = await hasWorkspaceAccess(ctx, requestWorkspaceId, auth.subject);
-    if (!authorized) {
-      return Response.json(
-        {
-          error: "Workspace authorization failed",
-        },
-        { status: 403 },
-      );
-    }
+  const accountId = auth.subject;
+
+  const authorized = await hasWorkspaceAccess(ctx, workspaceId, accountId);
+  if (!authorized) {
+    return Response.json(
+      {
+        error: "Workspace authorization failed",
+      },
+      { status: 403 },
+    );
   }
 
   const toolRegistry = createConvexSourceToolRegistry(ctx, workspaceId, {

@@ -1410,6 +1410,7 @@ describe("Convex executor and control-plane", () => {
         t.mutation(runtimeInternal.task_runs.startTaskRun, {
           workspaceId: "ws_1",
           runId: "run_approval_1",
+          accountId: "acct_1",
         }),
       );
 

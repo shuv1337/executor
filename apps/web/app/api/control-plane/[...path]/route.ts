@@ -57,7 +57,27 @@ const buildUpstreamHeaders = (
     }
   }
 
+  headers.set("accept-encoding", "identity");
+
   return headers;
+};
+
+const responseHeadersToStrip = [
+  "content-encoding",
+  "content-length",
+  "transfer-encoding",
+  "connection",
+  "keep-alive",
+] as const;
+
+const sanitizeUpstreamResponseHeaders = (headers: Headers): Headers => {
+  const sanitized = new Headers(headers);
+
+  for (const name of responseHeadersToStrip) {
+    sanitized.delete(name);
+  }
+
+  return sanitized;
 };
 
 const resolveUpstreamUrl = (
@@ -118,7 +138,7 @@ const handle = async (request: NextRequest, context: RouteContext): Promise<Resp
   return new Response(upstreamResponse.body, {
     status: upstreamResponse.status,
     statusText: upstreamResponse.statusText,
-    headers: upstreamResponse.headers,
+    headers: sanitizeUpstreamResponseHeaders(upstreamResponse.headers),
   });
 };
 
