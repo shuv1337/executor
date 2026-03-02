@@ -2,11 +2,12 @@ import { Schema } from "effect";
 
 import { TimestampMsSchema } from "../common";
 import { TaskRunStatusSchema } from "../enums";
-import { TaskRunIdSchema, WorkspaceIdSchema } from "../ids";
+import { AccountIdSchema, TaskRunIdSchema, WorkspaceIdSchema } from "../ids";
 
 export const TaskRunSchema = Schema.Struct({
   id: TaskRunIdSchema,
   workspaceId: WorkspaceIdSchema,
+  accountId: Schema.NullOr(AccountIdSchema),
   sessionId: Schema.String,
   runtimeId: Schema.String,
   codeHash: Schema.String,

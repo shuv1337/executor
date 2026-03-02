@@ -1192,11 +1192,9 @@ const ingestGraphqlSource = (
       headers: Record<string, string>;
     }>(
       () =>
-        ctx.runAction(runtimeInternal.control_plane.credentials.resolveSourceCredentialHeadersForIngest, {
+        ctx.runAction(runtimeInternal.control_plane.credentials.resolveSourceCredentialHeaders, {
           workspaceId: source.workspaceId,
           sourceId: source.id,
-          sourceName: source.name,
-          sourceEndpoint: source.endpoint,
         }),
       "Failed to resolve source credentials for GraphQL ingest",
     );
@@ -1349,11 +1347,9 @@ const ingestMcpSource = (
       headers: Record<string, string>;
     }>(
       () =>
-        ctx.runAction(runtimeInternal.control_plane.credentials.resolveSourceCredentialHeadersForIngest, {
+        ctx.runAction(runtimeInternal.control_plane.credentials.resolveSourceCredentialHeaders, {
           workspaceId: source.workspaceId,
           sourceId: source.id,
-          sourceName: source.name,
-          sourceEndpoint: source.endpoint,
         }),
       "Failed to resolve source credentials for MCP ingest",
     );

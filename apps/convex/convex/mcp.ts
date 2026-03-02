@@ -106,6 +106,7 @@ export const mcpHandler = httpAction(async (ctx, request) => {
   const mcpAuthConfig = getMcpAuthConfig();
   const requestWorkspaceId = readWorkspaceIdFromRequest(request);
   const workspaceId = readRequestedWorkspaceId(request, fallbackWorkspaceId);
+  let accountId: string | null = null;
 
   if (!mcpAuthConfig.enabled) {
     if (mcpAuthConfig.required) {
@@ -121,6 +122,8 @@ export const mcpHandler = httpAction(async (ctx, request) => {
     if (!auth) {
       return unauthorizedMcpResponse(request, "No valid bearer token provided.");
     }
+
+    accountId = auth.subject;
 
     if (!requestWorkspaceId) {
       return Response.json(
@@ -142,7 +145,9 @@ export const mcpHandler = httpAction(async (ctx, request) => {
     }
   }
 
-  const toolRegistry = createConvexSourceToolRegistry(ctx, workspaceId);
+  const toolRegistry = createConvexSourceToolRegistry(ctx, workspaceId, {
+    accountId,
+  });
   const toolExposureMode = readToolExposureModeFromRequest(
     request,
     defaultToolExposureMode,
@@ -158,6 +163,7 @@ export const mcpHandler = httpAction(async (ctx, request) => {
     await ctx.runMutation(runtimeInternal.task_runs.startTaskRun, {
       workspaceId,
       runId,
+      accountId,
       sessionId: "session_mcp",
       runtimeId: "runtime_local_inproc",
       codeHash: `code_length_${input.code.length}`,

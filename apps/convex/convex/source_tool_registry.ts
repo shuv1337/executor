@@ -268,15 +268,21 @@ const mergeHeaders = (...sets: ReadonlyArray<Record<string, string>>): Record<st
 const resolveSourceCredentialHeadersForInvocation = async (
   ctx: ActionCtx,
   source: Source,
+  accountId: string | null,
 ): Promise<Record<string, string>> => {
   try {
+    const accountInput = accountId
+      ? {
+          accountId,
+        }
+      : {};
+
     const resolved = (await ctx.runAction(
-      runtimeInternal.control_plane.credentials.resolveSourceCredentialHeadersForIngest,
+      runtimeInternal.control_plane.credentials.resolveSourceCredentialHeaders,
       {
         workspaceId: source.workspaceId,
         sourceId: source.id,
-        sourceName: source.name,
-        sourceEndpoint: source.endpoint,
+        ...accountInput,
       },
     )) as { headers?: unknown };
 
@@ -300,13 +306,14 @@ const resolveSourceCredentialHeadersForInvocation = async (
 const resolveSourceHeadersForInvocation = async (
   ctx: ActionCtx,
   source: Source,
+  accountId: string | null,
 ): Promise<Record<string, string>> => {
   const config = parseSourceConfig(source);
 
   return mergeHeaders(
     collectConfiguredHeadersFromSourceConfig(config),
     collectAuthHeadersFromSourceConfig(config),
-    await resolveSourceCredentialHeadersForInvocation(ctx, source),
+    await resolveSourceCredentialHeadersForInvocation(ctx, source, accountId),
   );
 };
 
@@ -1040,6 +1047,7 @@ const invokeToolWithRegistry = (
   source: Source,
   artifactTool: ArtifactToolRow,
   args: Record<string, unknown>,
+  accountId: string | null,
 ): Effect.Effect<{ output: unknown; isError: boolean }, RuntimeAdapterError> =>
   Effect.gen(function* () {
     const openApiProvider = makeOpenApiToolProvider();
@@ -1076,7 +1084,11 @@ const invokeToolWithRegistry = (
               operationName = payload.fieldName;
             }
 
-            const sourceHeaders = await resolveSourceHeadersForInvocation(ctx, input.source);
+            const sourceHeaders = await resolveSourceHeadersForInvocation(
+              ctx,
+              input.source,
+              accountId,
+            );
 
             const response = await fetch(payload.endpoint, {
               method: "POST",
@@ -1127,7 +1139,11 @@ const invokeToolWithRegistry = (
 
             const payload = decodeMcpInvocationPayload(input.tool.providerPayload);
             const invokeArgs = normalizeInvokeInput(input.args);
-            const sourceHeaders = await resolveSourceHeadersForInvocation(ctx, input.source);
+            const sourceHeaders = await resolveSourceHeadersForInvocation(
+              ctx,
+              input.source,
+              accountId,
+            );
 
             if (payload.transport !== "streamable-http") {
               throw new Error(
@@ -1569,6 +1585,7 @@ const describeSource = (row: {
 export type ConvexSourceToolRegistryOptions = {
   requireToolApprovals?: boolean;
   approvalRetryAfterMs?: number;
+  accountId?: string | null;
 };
 
 export const createConvexSourceToolRegistry = (
@@ -1577,6 +1594,10 @@ export const createConvexSourceToolRegistry = (
   options: ConvexSourceToolRegistryOptions = {},
 ): ToolRegistry => {
   const requireApprovals = options.requireToolApprovals ?? requireToolApprovalsByDefault;
+  const accountId =
+    typeof options.accountId === "string" && options.accountId.trim().length > 0
+      ? options.accountId.trim()
+      : null;
   const approvalRetryAfterMs =
     typeof options.approvalRetryAfterMs === "number" &&
     Number.isFinite(options.approvalRetryAfterMs) &&
@@ -1643,7 +1664,13 @@ export const createConvexSourceToolRegistry = (
           } satisfies RuntimeToolCallResult;
         }
 
-        const invocation = yield* invokeToolWithRegistry(ctx, source, artifactTool, args);
+        const invocation = yield* invokeToolWithRegistry(
+          ctx,
+          source,
+          artifactTool,
+          args,
+          accountId,
+        );
         if (invocation.isError) {
           return {
             ok: false,

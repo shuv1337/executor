@@ -14,6 +14,7 @@ export const startTaskRun = internalMutation({
   args: {
     workspaceId: v.string(),
     runId: v.string(),
+    accountId: v.optional(v.union(v.string(), v.null())),
     sessionId: v.optional(v.string()),
     runtimeId: v.optional(v.string()),
     codeHash: v.optional(v.string()),
@@ -34,6 +35,7 @@ export const startTaskRun = internalMutation({
     const taskRun = {
       id: args.runId,
       workspaceId: args.workspaceId,
+      accountId: args.accountId ?? null,
       sessionId: args.sessionId ?? "session_runtime",
       runtimeId: args.runtimeId ?? "runtime",
       codeHash: args.codeHash ?? "runtime",
@@ -77,16 +79,23 @@ export const finishTaskRun = internalMutation({
   },
 });
 
-export const getTaskRunWorkspaceId = internalQuery({
+export const getTaskRunContext = internalQuery({
   args: {
     runId: v.string(),
   },
-  handler: async (ctx, args): Promise<string | null> => {
+  handler: async (ctx, args): Promise<{ workspaceId: string; accountId: string | null } | null> => {
     const existing = await ctx.db
       .query("taskRuns")
       .withIndex("by_domainId", (q) => q.eq("id", args.runId))
       .unique();
 
-    return existing?.workspaceId ?? null;
+    if (!existing) {
+      return null;
+    }
+
+    return {
+      workspaceId: existing.workspaceId,
+      accountId: typeof existing.accountId === "string" ? existing.accountId : null,
+    };
   },
 });

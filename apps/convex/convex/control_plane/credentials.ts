@@ -112,54 +112,13 @@ const canAccessSourceCredentialBinding = (
 const toOAuthToken = (document: Record<string, unknown>): OAuthToken =>
   decodeOAuthToken(stripConvexSystemFields(document));
 
-const sourceSlug = (value: string): string =>
-  value
-    .toLowerCase()
-    .replaceAll(/[^a-z0-9]+/g, "_")
-    .replaceAll(/^_+|_+$/g, "");
-
-const parseHostname = (endpoint: string): string | null => {
-  try {
-    const hostname = new URL(endpoint).hostname.trim().toLowerCase();
-    return hostname.length > 0 ? hostname : null;
-  } catch {
+const sourceKeyFromSourceId = (sourceId: string): string | null => {
+  const trimmed = sourceId.trim();
+  if (trimmed.length === 0) {
     return null;
   }
-};
 
-const sourceKeyCandidatesForIngest = (input: {
-  sourceId: string;
-  sourceName: string;
-  sourceEndpoint: string;
-}): Array<string> => {
-  const values = new Set<string>();
-
-  const addCandidate = (value: string | null): void => {
-    if (!value) {
-      return;
-    }
-
-    const trimmed = value.trim();
-    if (trimmed.length > 0) {
-      values.add(trimmed);
-    }
-  };
-
-  addCandidate(`source:${input.sourceId}`);
-  addCandidate(input.sourceId);
-  addCandidate(input.sourceName.toLowerCase());
-  addCandidate(sourceSlug(input.sourceName));
-
-  const hostname = parseHostname(input.sourceEndpoint);
-  addCandidate(hostname);
-  if (hostname) {
-    const hostnameWithoutApi = hostname.replace(/^api\./, "");
-    addCandidate(hostnameWithoutApi);
-    const firstLabel = hostnameWithoutApi.split(".")[0] ?? null;
-    addCandidate(firstLabel);
-  }
-
-  return [...values];
+  return `source:${trimmed}`;
 };
 
 const bindingScopeScore = (
@@ -167,8 +126,17 @@ const bindingScopeScore = (
   input: {
     workspaceId: string;
     organizationId: string;
+    accountId: string | null;
   },
 ): number => {
+  if (binding.scopeType === "account") {
+    if (!input.accountId || binding.accountId !== input.accountId) {
+      return -1;
+    }
+
+    return binding.organizationId === input.organizationId ? 30 : -1;
+  }
+
   if (binding.scopeType === "workspace") {
     return binding.workspaceId === input.workspaceId ? 20 : -1;
   }
@@ -180,30 +148,23 @@ const bindingScopeScore = (
   return -1;
 };
 
-const selectBestIngestBinding = (
-  candidates: ReadonlyArray<{
-    binding: SourceCredentialBinding;
-    sourceKeyRank: number;
-  }>,
+const selectBestSourceBinding = (
+  bindings: ReadonlyArray<SourceCredentialBinding>,
   input: {
     workspaceId: string;
     organizationId: string;
+    accountId: string | null;
   },
 ): SourceCredentialBinding | null => {
-  const ranked = candidates
-    .map((candidate) => ({
-      binding: candidate.binding,
-      scopeScore: bindingScopeScore(candidate.binding, input),
-      sourceKeyRank: candidate.sourceKeyRank,
+  const ranked = bindings
+    .map((binding) => ({
+      binding,
+      scopeScore: bindingScopeScore(binding, input),
     }))
     .filter((candidate) => candidate.scopeScore >= 0)
     .sort((left, right) => {
       if (left.scopeScore !== right.scopeScore) {
         return right.scopeScore - left.scopeScore;
-      }
-
-      if (left.sourceKeyRank !== right.sourceKeyRank) {
-        return right.sourceKeyRank - left.sourceKeyRank;
       }
 
       if (left.binding.updatedAt !== right.binding.updatedAt) {
@@ -235,65 +196,41 @@ const resolveSecretRefForHeaders = async (
   return await decryptSecretValue(binding.secretRef);
 };
 
-const resolveIngestSelection = async (
+const resolveSourceSelection = async (
   ctx: QueryCtx,
   args: {
     workspaceId: string;
     sourceId: string;
-    sourceName: string;
-    sourceEndpoint: string;
+    accountId: string | null;
   },
 ): Promise<{
   binding: SourceCredentialBinding | null;
   oauthAccessToken: string | null;
 }> => {
   const organizationId = await resolveWorkspaceOrganizationId(ctx, args.workspaceId);
-  const sourceKeys = sourceKeyCandidatesForIngest({
-    sourceId: args.sourceId,
-    sourceName: args.sourceName,
-    sourceEndpoint: args.sourceEndpoint,
-  });
-
-  const candidateRows = await Promise.all(
-    sourceKeys.map((sourceKey) =>
-      ctx.db
-        .query("sourceCredentialBindings")
-        .withIndex("by_sourceKey", (q) => q.eq("sourceKey", sourceKey))
-        .collect()
-        .then((rows) =>
-          rows.map((row) => ({
-            binding: toSourceCredentialBinding(row),
-            sourceKey,
-          })),
-        ),
-    ),
-  );
-
-  const flattened = candidateRows.flat();
-  const dedupedById = new Map<string, { binding: SourceCredentialBinding; sourceKey: string }>();
-  for (const candidate of flattened) {
-    if (!dedupedById.has(candidate.binding.id)) {
-      dedupedById.set(candidate.binding.id, candidate);
-    }
+  const sourceKey = sourceKeyFromSourceId(args.sourceId);
+  if (!sourceKey) {
+    return {
+      binding: null,
+      oauthAccessToken: null,
+    };
   }
 
-  const sourceKeyRankByKey = new Map<string, number>();
-  sourceKeys.forEach((sourceKey, index) => {
-    sourceKeyRankByKey.set(sourceKey, sourceKeys.length - index);
-  });
+  const rows = await ctx.db
+    .query("sourceCredentialBindings")
+    .withIndex("by_sourceKey", (q) => q.eq("sourceKey", sourceKey))
+    .collect();
 
-  const binding = selectBestIngestBinding(
-    [...dedupedById.values()].map((candidate) => ({
-      binding: candidate.binding,
-      sourceKeyRank: sourceKeyRankByKey.get(candidate.sourceKey) ?? 0,
-    })),
+  const binding = selectBestSourceBinding(
+    rows.map((row) => toSourceCredentialBinding(row)),
     {
       workspaceId: args.workspaceId,
       organizationId,
+      accountId: args.accountId,
     },
   );
 
-  if (!binding || !canAccessSourceCredentialBinding(binding, { workspaceId: args.workspaceId, organizationId })) {
+  if (!binding) {
     return {
       binding: null,
       oauthAccessToken: null,
@@ -311,8 +248,8 @@ const resolveIngestSelection = async (
     ? selectOAuthAccessToken(oauthTokens, {
       workspaceId: args.workspaceId,
       organizationId,
-      accountId: null,
-      sourceKey: binding.sourceKey,
+      accountId: args.accountId,
+      sourceKey,
     }, args.sourceId)
     : null;
 
@@ -333,30 +270,36 @@ const withDecryptedSecret = async (
   };
 };
 
-export const resolveSourceCredentialSelectionForIngest = internalQuery({
+export const resolveSourceCredentialSelection = internalQuery({
   args: {
     workspaceId: v.string(),
     sourceId: v.string(),
-    sourceName: v.string(),
-    sourceEndpoint: v.string(),
+    accountId: v.optional(v.union(v.string(), v.null())),
   },
-  handler: async (ctx, args) => resolveIngestSelection(ctx, args),
+  handler: async (ctx, args) => resolveSourceSelection(ctx, {
+    workspaceId: args.workspaceId,
+    sourceId: args.sourceId,
+    accountId: args.accountId ?? null,
+  }),
 });
 
-export const resolveSourceCredentialHeadersForIngest = internalAction({
+export const resolveSourceCredentialHeaders = internalAction({
   args: {
     workspaceId: v.string(),
     sourceId: v.string(),
-    sourceName: v.string(),
-    sourceEndpoint: v.string(),
+    accountId: v.optional(v.union(v.string(), v.null())),
   },
   handler: async (ctx, args): Promise<{
     headers: Record<string, string>;
   }> => {
     const selected = await ctx.runQuery(
-      runtimeInternal.control_plane.credentials.resolveSourceCredentialSelectionForIngest,
-      args,
-    )
+      runtimeInternal.control_plane.credentials.resolveSourceCredentialSelection,
+      {
+        workspaceId: args.workspaceId,
+        sourceId: args.sourceId,
+        accountId: args.accountId ?? null,
+      },
+    );
 
     if (!selected.binding) {
       return {

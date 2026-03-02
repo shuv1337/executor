@@ -88,11 +88,11 @@ const decodeToolCallRequest = (request: Request): Effect.Effect<RuntimeToolCallR
 const resolveWorkspaceIdForToolCall = (
   ctx: ActionCtx,
   input: RuntimeToolCallRequest,
-): Effect.Effect<string, RuntimeToolCallBadRequestError> =>
+): Effect.Effect<{ workspaceId: string; accountId: string | null }, RuntimeToolCallBadRequestError> =>
   Effect.gen(function* () {
-    const runWorkspaceId = yield* Effect.tryPromise({
+    const runContext = yield* Effect.tryPromise({
       try: () =>
-        ctx.runQuery(internal.task_runs.getTaskRunWorkspaceId, {
+        ctx.runQuery(internal.task_runs.getTaskRunContext, {
           runId: input.runId,
         }),
       catch: (cause) =>
@@ -102,8 +102,14 @@ const resolveWorkspaceIdForToolCall = (
         }),
     });
 
-    if (typeof runWorkspaceId === "string" && runWorkspaceId.trim().length > 0) {
-      return runWorkspaceId.trim();
+    if (runContext && runContext.workspaceId.trim().length > 0) {
+      return {
+        workspaceId: runContext.workspaceId.trim(),
+        accountId:
+          typeof runContext.accountId === "string" && runContext.accountId.trim().length > 0
+            ? runContext.accountId.trim()
+            : null,
+      };
     }
 
     return yield* new RuntimeToolCallBadRequestError({
@@ -126,9 +132,11 @@ const handleToolCallHttpEffect = (
     }
 
     const input = yield* decodeToolCallRequest(request);
-    const workspaceId = yield* resolveWorkspaceIdForToolCall(ctx, input);
+    const runContext = yield* resolveWorkspaceIdForToolCall(ctx, input);
 
-    const toolRegistry = createConvexSourceToolRegistry(ctx, workspaceId);
+    const toolRegistry = createConvexSourceToolRegistry(ctx, runContext.workspaceId, {
+      accountId: runContext.accountId,
+    });
 
     const result = yield* invokeRuntimeToolCallResult(toolRegistry, input).pipe(
       Effect.catchTag("RuntimeAdapterError", (error) =>
