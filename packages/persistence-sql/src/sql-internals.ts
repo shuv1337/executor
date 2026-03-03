@@ -1,4 +1,6 @@
 import { PGlite } from "@electric-sql/pglite";
+import { neon, neonConfig } from "@neondatabase/serverless";
+import { drizzle as drizzleNeonHttp } from "drizzle-orm/neon-http";
 import { drizzle as drizzlePGlite } from "drizzle-orm/pglite";
 import { migrate as migratePGlite } from "drizzle-orm/pglite/migrator";
 import { drizzle as drizzlePostgres } from "drizzle-orm/postgres-js";
@@ -27,7 +29,7 @@ import {
   workspacesTable,
 } from "./schema";
 
-export type SqlBackend = "pglite" | "postgres";
+export type SqlBackend = "pglite" | "postgres" | "postgres-neon-http";
 type CreateSqlRuntimeOptions = {
   databaseUrl?: string;
   localDataDir: string;
@@ -54,17 +56,27 @@ const drizzleSchema = {
 
 const createPGliteDb = (client: PGlite) => drizzlePGlite(client, { schema: drizzleSchema });
 const createPostgresDb = (client: postgres.Sql) => drizzlePostgres(client, { schema: drizzleSchema });
+const createNeonHttpDb = (client: ReturnType<typeof neon>) =>
+  drizzleNeonHttp(client, { schema: drizzleSchema });
 
 type PGliteDb = ReturnType<typeof createPGliteDb>;
 type PostgresDb = ReturnType<typeof createPostgresDb>;
+type NeonHttpDb = ReturnType<typeof createNeonHttpDb>;
 
-export type DrizzleDb = PGliteDb | PostgresDb;
+export type DrizzleDb = PGliteDb | PostgresDb | NeonHttpDb;
 export type DrizzleTables = typeof drizzleSchema;
 
 type SqlRuntime = {
   backend: SqlBackend;
   db: DrizzleDb;
   close: () => Promise<void>;
+  migrationDatabaseUrl?: string;
+  migrationApplicationName?: string;
+};
+
+const trim = (value: string | undefined): string | undefined => {
+  const candidate = value?.trim();
+  return candidate && candidate.length > 0 ? candidate : undefined;
 };
 
 const resolvePostgresMaxConnections = (): number => {
@@ -98,6 +110,30 @@ const sanitizePostgresUrl = (value: string): string => {
   } catch {
     return value;
   }
+};
+
+const isPlanetScalePostgresHost = (databaseUrl: string): boolean => {
+  try {
+    return new URL(databaseUrl).hostname.endsWith(".pg.psdb.cloud");
+  } catch {
+    return false;
+  }
+};
+
+const shouldUseNeonHttpDriver = (databaseUrl: string): boolean => {
+  const configured = trim(process.env.CONTROL_PLANE_POSTGRES_DRIVER)?.toLowerCase();
+
+  if (configured === "postgres-js") {
+    return false;
+  }
+
+  if (configured === "neon-http") {
+    return true;
+  }
+
+  return process.env.VERCEL === "1"
+    && process.env.NODE_ENV === "production"
+    && isPlanetScalePostgresHost(databaseUrl);
 };
 
 const createPGliteRuntime = async (localDataDir: string): Promise<SqlRuntime> => {
@@ -134,6 +170,27 @@ const createPostgresRuntime = async (
     close: async () => {
       await client.end({ timeout: 5 });
     },
+  };
+};
+
+const createNeonHttpRuntime = async (
+  databaseUrl: string,
+  applicationName: string | undefined,
+): Promise<SqlRuntime> => {
+  const sanitizedDatabaseUrl = sanitizePostgresUrl(databaseUrl);
+
+  if (isPlanetScalePostgresHost(sanitizedDatabaseUrl)) {
+    neonConfig.fetchEndpoint = (host: string) => `https://${host}/sql`;
+  }
+
+  const db = createNeonHttpDb(neon(sanitizedDatabaseUrl));
+
+  return {
+    backend: "postgres-neon-http",
+    db,
+    close: async () => {},
+    migrationDatabaseUrl: sanitizedDatabaseUrl,
+    migrationApplicationName: applicationName,
   };
 };
 
@@ -175,6 +232,10 @@ export const createSqlRuntime = async (
     databaseUrl
     && (databaseUrl.startsWith("postgres://") || databaseUrl.startsWith("postgresql://"))
   ) {
+    if (shouldUseNeonHttpDriver(databaseUrl)) {
+      return createNeonHttpRuntime(databaseUrl, options.postgresApplicationName?.trim());
+    }
+
     return createPostgresRuntime(databaseUrl, options.postgresApplicationName?.trim());
   }
 
@@ -186,6 +247,28 @@ export const runMigrations = async (runtime: SqlRuntime): Promise<void> => {
 
   if (runtime.backend === "pglite") {
     await migratePGlite(runtime.db as PGliteDb, { migrationsFolder });
+    return;
+  }
+
+  if (runtime.backend === "postgres-neon-http") {
+    if (!runtime.migrationDatabaseUrl) {
+      throw new Error("Missing migration database URL for neon-http runtime");
+    }
+
+    const migrationClient = postgres(runtime.migrationDatabaseUrl, {
+      prepare: false,
+      max: 1,
+      ...(runtime.migrationApplicationName
+        ? { connection: { application_name: runtime.migrationApplicationName } }
+        : {}),
+    });
+
+    try {
+      await migratePostgres(createPostgresDb(migrationClient), { migrationsFolder });
+    } finally {
+      await migrationClient.end({ timeout: 5 });
+    }
+
     return;
   }
 

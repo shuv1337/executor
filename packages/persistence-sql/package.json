@@ -14,6 +14,7 @@
   },
   "dependencies": {
     "@electric-sql/pglite": "^0.3.10",
+    "@neondatabase/serverless": "^1.0.1",
     "@executor-v2/persistence-ports": "workspace:*",
     "@executor-v2/schema": "workspace:*",
     "drizzle-orm": "^0.44.7",
