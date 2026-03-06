@@ -1,5 +1,6 @@
 import { HttpApiBuilder, HttpServerRequest } from "@effect/platform";
 import * as Effect from "effect/Effect";
+import type { OrganizationId, WorkspaceId } from "#schema";
 
 import {
   Actor,
@@ -43,39 +44,36 @@ const resolveActor = Effect.gen(function* () {
   return yield* actorResolver.resolveActor({ headers: request.headers });
 });
 
-const resolveWorkspaceActor = (workspaceId: string) =>
+const resolveWorkspaceActor = (workspaceId: WorkspaceId) =>
   Effect.gen(function* () {
     const actorResolver = yield* ControlPlaneActorResolver;
     const request = yield* HttpServerRequest.HttpServerRequest;
 
-    return yield* actorResolver.resolveWorkspaceActor({
-      workspaceId: workspaceId as never,
-      headers: request.headers,
-    });
+    return yield* actorResolver.resolveWorkspaceActor({ workspaceId, headers: request.headers });
   });
 
-const requireReadWorkspace = (workspaceId: string) =>
+const requireReadWorkspace = (workspaceId: WorkspaceId) =>
   requirePermission({
     permission: "workspace:read",
-    workspaceId: workspaceId as never,
+    workspaceId,
   });
 
-const requireManageWorkspace = (workspaceId: string) =>
+const requireManageWorkspace = (workspaceId: WorkspaceId) =>
   requirePermission({
     permission: "workspace:manage",
-    workspaceId: workspaceId as never,
+    workspaceId,
   });
 
-const requireOrganizationWorkspaceRead = (organizationId: string) =>
+const requireOrganizationWorkspaceRead = (organizationId: OrganizationId) =>
   requirePermission({
     permission: "workspace:read",
-    organizationId: organizationId as never,
+    organizationId,
   });
 
-const requireOrganizationWorkspaceManage = (organizationId: string) =>
+const requireOrganizationWorkspaceManage = (organizationId: OrganizationId) =>
   requirePermission({
     permission: "workspace:manage",
-    organizationId: organizationId as never,
+    organizationId,
   });
 
 export const ControlPlaneWorkspacesLive = HttpApiBuilder.group(

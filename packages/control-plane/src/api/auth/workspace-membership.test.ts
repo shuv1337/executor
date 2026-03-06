@@ -1,15 +1,25 @@
 import { describe, expect, it } from "@effect/vitest";
+import {
+  AccountIdSchema,
+  OrganizationIdSchema,
+  OrganizationMemberIdSchema,
+  WorkspaceIdSchema,
+} from "#schema";
 
 import { deriveWorkspaceMembershipsForPrincipal } from "./workspace-membership";
 
 describe("workspace membership derivation", () => {
   it("prefers highest active role in matching organization", () => {
+    const principalAccountId = AccountIdSchema.make("acc_1");
+    const workspaceId = WorkspaceIdSchema.make("ws_1");
+    const organizationId = OrganizationIdSchema.make("org_1");
+
     const memberships = deriveWorkspaceMembershipsForPrincipal({
-      principalAccountId: "acc_1" as never,
-      workspaceId: "ws_1" as never,
+      principalAccountId,
+      workspaceId,
       workspace: {
-        id: "ws_1" as never,
-        organizationId: "org_1" as never,
+        id: workspaceId,
+        organizationId,
         name: "Main",
         createdByAccountId: null,
         createdAt: 1,
@@ -17,9 +27,9 @@ describe("workspace membership derivation", () => {
       },
       organizationMemberships: [
         {
-          id: "mem_1" as never,
-          organizationId: "org_1" as never,
-          accountId: "acc_1" as never,
+          id: OrganizationMemberIdSchema.make("mem_1"),
+          organizationId,
+          accountId: principalAccountId,
           role: "viewer",
           status: "active",
           billable: true,
@@ -29,9 +39,9 @@ describe("workspace membership derivation", () => {
           updatedAt: 1,
         },
         {
-          id: "mem_2" as never,
-          organizationId: "org_1" as never,
-          accountId: "acc_1" as never,
+          id: OrganizationMemberIdSchema.make("mem_2"),
+          organizationId,
+          accountId: principalAccountId,
           role: "admin",
           status: "active",
           billable: true,

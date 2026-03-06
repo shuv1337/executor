@@ -1,5 +1,6 @@
 import { HttpApiBuilder, HttpServerRequest } from "@effect/platform";
 import * as Effect from "effect/Effect";
+import type { OrganizationId } from "#schema";
 
 import {
   Actor,
@@ -43,16 +44,16 @@ const resolveActor = Effect.gen(function* () {
   return yield* actorResolver.resolveActor({ headers: request.headers });
 });
 
-const requireReadMemberships = (organizationId: string) =>
+const requireReadMemberships = (organizationId: OrganizationId) =>
   requirePermission({
     permission: "memberships:read",
-    organizationId: organizationId as never,
+    organizationId,
   });
 
-const requireWriteMemberships = (organizationId: string) =>
+const requireWriteMemberships = (organizationId: OrganizationId) =>
   requirePermission({
     permission: "memberships:write",
-    organizationId: organizationId as never,
+    organizationId,
   });
 
 export const ControlPlaneMembershipsLive = HttpApiBuilder.group(

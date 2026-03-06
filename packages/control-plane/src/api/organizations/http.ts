@@ -1,5 +1,6 @@
 import { HttpApiBuilder, HttpServerRequest } from "@effect/platform";
 import * as Effect from "effect/Effect";
+import type { OrganizationId } from "#schema";
 
 import {
   Actor,
@@ -47,10 +48,10 @@ const requireReadOrganizations = requirePermission({
   permission: "organizations:read",
 });
 
-const requireManageOrganizations = (organizationId: string) =>
+const requireManageOrganizations = (organizationId: OrganizationId) =>
   requirePermission({
     permission: "organizations:manage",
-    organizationId: organizationId as never,
+    organizationId,
   });
 
 export const ControlPlaneOrganizationsLive = HttpApiBuilder.group(

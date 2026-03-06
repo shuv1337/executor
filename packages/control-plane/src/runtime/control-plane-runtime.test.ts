@@ -1,7 +1,7 @@
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 
-import type { AccountId } from "#schema";
+import { WorkspaceIdSchema, type AccountId } from "#schema";
 
 import { makeSqlControlPlaneRuntime } from "./index";
 import { withControlPlaneClient } from "./test-http-client";
@@ -312,7 +312,7 @@ describe("control-plane-runtime", () => {
       expect(deleteOrg.removed).toBe(true);
 
       const deletedWorkspaceLookup = yield* Effect.either(
-        runtime.service.getWorkspace(workspace.id as never),
+        runtime.service.getWorkspace(WorkspaceIdSchema.make(workspace.id)),
       );
       expect(deletedWorkspaceLookup._tag).toBe("Left");
 

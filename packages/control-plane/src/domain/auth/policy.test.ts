@@ -1,4 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
+import { AccountIdSchema, WorkspaceIdSchema } from "#schema";
 import * as Effect from "effect/Effect";
 
 import { Actor, makeAllowAllActor } from "./actor";
@@ -7,8 +8,11 @@ import { requirePermission, withPolicy } from "./policy";
 describe("control-plane-domain policy", () => {
   it.effect("runs protected effect when permission is granted", () =>
     Effect.gen(function* () {
+      const accountId = AccountIdSchema.make("acc_1");
+      const workspaceId = WorkspaceIdSchema.make("ws_1");
+
       const principal = {
-        accountId: "acc_1" as never,
+        accountId,
         provider: "local" as const,
         subject: "local:acc_1",
         email: null,
@@ -18,7 +22,7 @@ describe("control-plane-domain policy", () => {
       const result = yield* withPolicy(
         requirePermission({
           permission: "workspace:read",
-          workspaceId: "ws_1" as never,
+          workspaceId,
         }),
       )(Effect.succeed("ok")).pipe(
         Effect.provideService(Actor, makeAllowAllActor(principal)),

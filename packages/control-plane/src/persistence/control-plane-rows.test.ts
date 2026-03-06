@@ -1,4 +1,12 @@
 import { describe, expect, it } from "@effect/vitest";
+import {
+  AccountIdSchema,
+  OrganizationIdSchema,
+  OrganizationMemberIdSchema,
+  PolicyIdSchema,
+  SourceIdSchema,
+  WorkspaceIdSchema,
+} from "#schema";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 
@@ -20,29 +28,32 @@ describe("control-plane-persistence-drizzle", () => {
     Effect.gen(function* () {
       const persistence = yield* makePersistence;
       const now = Date.now();
+      const organizationId = OrganizationIdSchema.make("org_1");
+      const accountId = AccountIdSchema.make("acc_1");
+      const workspaceId = WorkspaceIdSchema.make("ws_1");
 
       yield* persistence.rows.organizations.insert({
-        id: "org_1" as never,
+        id: organizationId,
         slug: "acme",
         name: "Acme",
         status: "active",
-        createdByAccountId: "acc_1" as never,
+        createdByAccountId: accountId,
         createdAt: now,
         updatedAt: now,
       });
 
       yield* persistence.rows.workspaces.insert({
-        id: "ws_1" as never,
-        organizationId: "org_1" as never,
+        id: workspaceId,
+        organizationId,
         name: "Main",
-        createdByAccountId: "acc_1" as never,
+        createdByAccountId: accountId,
         createdAt: now,
         updatedAt: now,
       });
 
       yield* persistence.rows.sources.insert({
-        id: "src_1" as never,
-        workspaceId: "ws_1" as never,
+        id: SourceIdSchema.make("src_1"),
+        workspaceId,
         name: "Github",
         kind: "openapi",
         endpoint: "https://api.github.com/openapi.json",
@@ -56,8 +67,8 @@ describe("control-plane-persistence-drizzle", () => {
       });
 
       yield* persistence.rows.policies.insert({
-        id: "pol_1" as never,
-        workspaceId: "ws_1" as never,
+        id: PolicyIdSchema.make("pol_1"),
+        workspaceId,
         targetAccountId: null,
         clientId: null,
         resourceType: "tool_path",
@@ -72,14 +83,14 @@ describe("control-plane-persistence-drizzle", () => {
         updatedAt: now,
       });
 
-      const workspace = yield* persistence.rows.workspaces.getById("ws_1" as never);
+      const workspace = yield* persistence.rows.workspaces.getById(workspaceId);
       expect(Option.isSome(workspace)).toBe(true);
 
-      const sources = yield* persistence.rows.sources.listByWorkspaceId("ws_1" as never);
+      const sources = yield* persistence.rows.sources.listByWorkspaceId(workspaceId);
       expect(sources).toHaveLength(1);
       expect(sources[0]?.name).toBe("Github");
 
-      const policies = yield* persistence.rows.policies.listByWorkspaceId("ws_1" as never);
+      const policies = yield* persistence.rows.policies.listByWorkspaceId(workspaceId);
       expect(policies).toHaveLength(1);
       expect(policies[0]?.resourcePattern).toBe("source.github.*");
     }),
@@ -89,11 +100,13 @@ describe("control-plane-persistence-drizzle", () => {
     Effect.gen(function* () {
       const persistence = yield* makePersistence;
       const now = Date.now();
+      const organizationId = OrganizationIdSchema.make("org_1");
+      const accountId = AccountIdSchema.make("acc_1");
 
       yield* persistence.rows.organizationMemberships.upsert({
-        id: "mem_1" as never,
-        organizationId: "org_1" as never,
-        accountId: "acc_1" as never,
+        id: OrganizationMemberIdSchema.make("mem_1"),
+        organizationId,
+        accountId,
         role: "viewer",
         status: "active",
         billable: true,
@@ -104,9 +117,9 @@ describe("control-plane-persistence-drizzle", () => {
       });
 
       yield* persistence.rows.organizationMemberships.upsert({
-        id: "mem_2" as never,
-        organizationId: "org_1" as never,
-        accountId: "acc_1" as never,
+        id: OrganizationMemberIdSchema.make("mem_2"),
+        organizationId,
+        accountId,
         role: "admin",
         status: "active",
         billable: true,
@@ -117,8 +130,8 @@ describe("control-plane-persistence-drizzle", () => {
       });
 
       const membership = yield* persistence.rows.organizationMemberships.getByOrganizationAndAccount(
-        "org_1" as never,
-        "acc_1" as never,
+        organizationId,
+        accountId,
       );
 
       expect(Option.isSome(membership)).toBe(true);

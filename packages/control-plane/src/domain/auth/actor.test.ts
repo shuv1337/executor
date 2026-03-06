@@ -1,4 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
+import { AccountIdSchema, WorkspaceIdSchema } from "#schema";
 import * as Effect from "effect/Effect";
 
 import {
@@ -10,9 +11,12 @@ import {
 describe("control-plane-domain actor", () => {
   it.effect("allows workspace permissions from active membership", () =>
     Effect.gen(function* () {
+      const accountId = AccountIdSchema.make("acc_1");
+      const workspaceId = WorkspaceIdSchema.make("ws_1");
+
       const actor = yield* makeActor({
         principal: {
-          accountId: "acc_1" as never,
+          accountId,
           provider: "local",
           subject: "local:acc_1",
           email: null,
@@ -20,8 +24,8 @@ describe("control-plane-domain actor", () => {
         },
         workspaceMemberships: [
           {
-            accountId: "acc_1" as never,
-            workspaceId: "ws_1" as never,
+            accountId,
+            workspaceId,
             role: "editor",
             status: "active",
             grantedAt: 1,
@@ -33,16 +37,19 @@ describe("control-plane-domain actor", () => {
 
       yield* actor.requirePermission({
         permission: "sources:write",
-        workspaceId: "ws_1" as never,
+        workspaceId,
       });
     }),
   );
 
   it.effect("denies permission when role is insufficient", () =>
     Effect.gen(function* () {
+      const accountId = AccountIdSchema.make("acc_1");
+      const workspaceId = WorkspaceIdSchema.make("ws_1");
+
       const actor = yield* makeActor({
         principal: {
-          accountId: "acc_1" as never,
+          accountId,
           provider: "local",
           subject: "local:acc_1",
           email: null,
@@ -50,8 +57,8 @@ describe("control-plane-domain actor", () => {
         },
         workspaceMemberships: [
           {
-            accountId: "acc_1" as never,
-            workspaceId: "ws_1" as never,
+            accountId,
+            workspaceId,
             role: "viewer",
             status: "active",
             grantedAt: 1,
@@ -64,7 +71,7 @@ describe("control-plane-domain actor", () => {
       const denied = yield* Effect.either(
         actor.requirePermission({
           permission: "sources:write",
-          workspaceId: "ws_1" as never,
+          workspaceId,
         }),
       );
 

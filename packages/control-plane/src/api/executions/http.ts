@@ -1,5 +1,6 @@
 import { HttpApiBuilder, HttpServerRequest } from "@effect/platform";
 import * as Effect from "effect/Effect";
+import type { WorkspaceId } from "#schema";
 
 import {
   Actor,
@@ -37,21 +38,18 @@ const toUnauthorizedError = (
     details: "Authentication required",
   });
 
-const resolveWorkspaceActor = (workspaceId: string) =>
+const resolveWorkspaceActor = (workspaceId: WorkspaceId) =>
   Effect.gen(function* () {
     const actorResolver = yield* ControlPlaneActorResolver;
     const request = yield* HttpServerRequest.HttpServerRequest;
 
-    return yield* actorResolver.resolveWorkspaceActor({
-      workspaceId: workspaceId as never,
-      headers: request.headers,
-    });
+    return yield* actorResolver.resolveWorkspaceActor({ workspaceId, headers: request.headers });
   });
 
-const requireExecuteWorkspace = (workspaceId: string) =>
+const requireExecuteWorkspace = (workspaceId: WorkspaceId) =>
   requirePermission({
     permission: "workspace:read",
-    workspaceId: workspaceId as never,
+    workspaceId,
   });
 
 export const ControlPlaneExecutionsLive = HttpApiBuilder.group(
