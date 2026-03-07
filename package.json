@@ -19,6 +19,7 @@
     "zod": "^4.3.6"
   },
   "scripts": {
+    "executor": "./apps/executor/bin/executor",
     "typecheck": "bun run --filter='*' typecheck",
     "knip": "knip"
   },

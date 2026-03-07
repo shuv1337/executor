@@ -16,6 +16,7 @@
 
 # Executor
 .executor-v2/
+.executor-v3/
 
 # Cloudflare Workers local state
 **/.wrangler/

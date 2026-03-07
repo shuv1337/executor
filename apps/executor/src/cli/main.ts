@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 
-import { Command, Options } from "@effect/cli";
+import { Args, Command, Options } from "@effect/cli";
 import {
   NodeFileSystem,
   NodePath,
@@ -10,18 +10,24 @@ import {
 } from "@effect/platform-node";
 import {
   ExecutionIdSchema,
+  RuntimeExecutionResolverService,
   createControlPlaneClient,
+  createSqlControlPlaneRuntime,
   type ControlPlaneClient,
   type ExecutionEnvelope,
   type ExecutionInteraction,
+  type SqlControlPlaneRuntime,
 } from "@executor-v3/control-plane";
+import type { ToolCatalog } from "@executor-v3/codemode-core";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as Option from "effect/Option";
+import * as Cause from "effect/Cause";
 
 import {
   DEFAULT_SERVER_BASE_URL,
   DEFAULT_SERVER_HOST,
+  DEFAULT_LOCAL_DATA_DIR,
   DEFAULT_SERVER_PORT,
   SERVER_POLL_INTERVAL_MS,
   SERVER_START_TIMEOUT_MS,
@@ -96,13 +102,228 @@ const readCode = (input: {
       }
     }
 
-    return yield* Effect.fail(new Error("Provide --code, --file, or pipe code over stdin."));
+    return yield* Effect.fail(
+      new Error("Provide code as a positional argument, use --file, or pipe code over stdin."),
+    );
   });
 
 const getBootstrapClient = (baseUrl: string = DEFAULT_SERVER_BASE_URL) =>
   createControlPlaneClient({ baseUrl });
 
 const decodeExecutionId = Schema.decodeUnknown(ExecutionIdSchema);
+const CLI_NAME = "executor";
+const CLI_VERSION = "0.1.0";
+const CLI_ENTRYPOINT = process.argv[1];
+const HELP_TOKENS = ["--help", "-h", "help"] as const;
+
+const isHelpToken = (value: string | undefined): boolean =>
+  value !== undefined && HELP_TOKENS.includes(value as (typeof HELP_TOKENS)[number]);
+
+const normalizeCliArgs = (rawArgs: readonly string[]): string[] => {
+  return rawArgs[0] === "run"
+    ? ["call", ...rawArgs.slice(1)]
+    : [...rawArgs];
+};
+
+const getCliArgs = (): string[] => normalizeCliArgs(process.argv.slice(2));
+
+const toEffectCliArgv = (args: readonly string[]): string[] => [
+  process.execPath || CLI_NAME,
+  CLI_NAME,
+  ...args,
+];
+
+const buildWorkflowText = (namespaces: readonly string[] = []): string =>
+  [
+    "Execute TypeScript in sandbox; call tools via discovery workflow.",
+    ...(namespaces.length > 0
+      ? [
+          "Available namespaces:",
+          ...namespaces.map((namespace) => `- ${namespace}`),
+        ]
+      : []),
+    "Workflow:",
+    '1) const matches = await tools.discover({ query: "<intent>", limit: 12 });',
+    "2) const details = await tools.describe.tool({ path, includeSchemas: true });",
+    "3) Call selected tools.<path>(input).",
+    '4) To connect a new MCP source, call tools.executor.sources.add({ endpoint, name, namespace }).',
+    "5) If execution pauses for interaction, resume it with `executor resume --execution-id ...`.",
+    "Do not use fetch; use tools.* only.",
+  ].join("\n");
+
+const DEFAULT_RUN_WORKFLOW = buildWorkflowText();
+
+const indentBlock = (value: string, prefix: string = "  "): string =>
+  value
+    .split("\n")
+    .map((line) => (line.length > 0 ? `${prefix}${line}` : ""))
+    .join("\n");
+
+const formatCauseMessage = (cause: Cause.Cause<unknown>): string => {
+  const failure = Option.getOrUndefined(Cause.failureOption(cause));
+  if (failure instanceof Error && failure.message.length > 0) {
+    return failure.message;
+  }
+  if (typeof failure === "string" && failure.length > 0) {
+    return failure;
+  }
+
+  const defect = Option.getOrUndefined(Cause.dieOption(cause));
+  if (defect instanceof Error && defect.message.length > 0) {
+    return defect.message;
+  }
+  if (typeof defect === "string" && defect.length > 0) {
+    return defect;
+  }
+
+  return Cause.pretty(cause).split("\n").find((line) => line.trim().length > 0) ?? "unknown error";
+};
+
+const formatCatalogUnavailableMessage = (cause: Cause.Cause<unknown>): string => {
+  const message = formatCauseMessage(cause);
+  return message === "Error: An error has occurred"
+    ? "Current workspace catalog unavailable."
+    : `Current workspace catalog unavailable: ${message}`;
+};
+
+const closeSqlRuntime = (runtime: SqlControlPlaneRuntime) =>
+  Effect.tryPromise({
+    try: () => runtime.close(),
+    catch: toError,
+  }).pipe(Effect.catchAll(() => Effect.void));
+
+const buildRunWorkflowText = (
+  catalog?: ToolCatalog,
+): Effect.Effect<string, Error, never> => {
+  if (!catalog) {
+    return Effect.succeed(DEFAULT_RUN_WORKFLOW);
+  }
+
+  return catalog.listNamespaces({ limit: 200 }).pipe(
+    Effect.map((namespaces) =>
+      buildWorkflowText(
+        namespaces.length > 0
+          ? namespaces.map((namespace) => namespace.displayName ?? namespace.namespace)
+          : ["none discovered yet"],
+      )
+    ),
+    Effect.mapError(toError),
+  );
+};
+
+const loadRunWorkflowText = (): Effect.Effect<string, Error, never> =>
+  Effect.acquireUseRelease(
+    createSqlControlPlaneRuntime({
+      localDataDir: DEFAULT_LOCAL_DATA_DIR,
+    }).pipe(Effect.mapError(toError)),
+    (runtime) =>
+      Effect.gen(function* () {
+        const environment = yield* Effect.gen(function* () {
+          const resolveExecutionEnvironment = yield* RuntimeExecutionResolverService;
+          return yield* resolveExecutionEnvironment({
+            workspaceId: runtime.localInstallation.workspaceId,
+            accountId: runtime.localInstallation.accountId,
+            executionId: ExecutionIdSchema.make("exec_help"),
+          });
+        }).pipe(
+          Effect.provide(runtime.runtimeLayer),
+          Effect.mapError(toError),
+        );
+
+        return yield* buildRunWorkflowText(environment.catalog);
+      }),
+    closeSqlRuntime,
+  ).pipe(
+    Effect.catchAllCause((cause) =>
+      Effect.succeed(
+        [
+          DEFAULT_RUN_WORKFLOW,
+          "",
+          formatCatalogUnavailableMessage(cause),
+        ].join("\n"),
+      )
+    ),
+  );
+
+const printRootHelp = (workflow: string) =>
+  Effect.sync(() => {
+    console.log([
+      `${CLI_NAME} ${CLI_VERSION}`,
+      "",
+      "USAGE",
+      "",
+      "  executor call [code] [--file text] [--stdin] [--base-url text]",
+      "  executor resume --execution-id text [--base-url text]",
+      "",
+      "CALL WORKFLOW",
+      "",
+      indentBlock(workflow),
+      "",
+      "COMMANDS",
+      "",
+      "  call",
+      "    Execute code against the local executor server.",
+      "  resume",
+      "    Resume a paused execution.",
+      "",
+      "TIP",
+      "",
+      "  Run `executor call --help` for more examples.",
+    ].join("\n"));
+  });
+
+const printCallHelp = (workflow: string) =>
+  Effect.sync(() => {
+    console.log([
+      "executor call",
+      "",
+      "USAGE",
+      "",
+      "  executor call [code] [--file text] [--stdin] [--base-url text]",
+      "",
+      "DESCRIPTION",
+      "",
+      "  Execute code against the local executor server.",
+      "",
+      "WORKFLOW",
+      "",
+      indentBlock(workflow),
+      "",
+      "OPTIONS",
+      "",
+      "  [code]",
+      "    Inline code to execute.",
+      "  --file text",
+      "    Read code from a file.",
+      "  --stdin",
+      "    Read code from stdin.",
+      "  --base-url text",
+      "    Override the executor server base URL.",
+      "",
+      "EXAMPLES",
+      "",
+      '  executor call \'const matches = await tools.discover({ query: "github issues", limit: 5 }); return matches;\'',
+      '  executor call \'const matches = await tools.discover({ query: "repo details", limit: 1 }); const path = matches.bestPath; return await tools.describe.tool({ path, includeSchemas: true });\'',
+      '  executor call \'return await tools.executor.sources.add({ endpoint: "https://example.com/mcp", name: "Example", namespace: "example" });\'',
+      "  cat script.ts | executor call --stdin",
+      "  executor call --file script.ts",
+      "  executor resume --execution-id exec_123",
+    ].join("\n"));
+  });
+
+const helpOverride = (): Effect.Effect<void, Error, never> | null => {
+  const args = getCliArgs();
+
+  if (args.length === 0 || (args.length === 1 && isHelpToken(args[0]))) {
+    return loadRunWorkflowText().pipe(Effect.flatMap(printRootHelp));
+  }
+
+  if (args[0] === "call" && args.length === 2 && isHelpToken(args[1])) {
+    return loadRunWorkflowText().pipe(Effect.flatMap(printCallHelp));
+  }
+
+  return null;
+};
 
 const getLocalAuthedClient = (baseUrl: string = DEFAULT_SERVER_BASE_URL) =>
   Effect.gen(function* () {
@@ -128,12 +349,11 @@ const isServerReachable = (baseUrl: string) =>
 
 const startServerInBackground = (port: number) =>
   Effect.sync(() => {
-    const script = process.argv[1];
-    if (!script) {
+    if (!CLI_ENTRYPOINT) {
       throw new Error("Cannot determine current executor entrypoint.");
     }
 
-    const child = spawn(process.execPath, [script, "__local-server", "--port", String(port)], {
+    const child = spawn(process.execPath, [CLI_ENTRYPOINT, "__local-server", "--port", String(port)], {
       detached: true,
       stdio: "ignore",
     });
@@ -401,10 +621,13 @@ const serverCommand = Command.make("server").pipe(
   Command.withDescription("Local server commands"),
 );
 
-const runCommand = Command.make(
-  "run",
+const callCommand = Command.make(
+  "call",
   {
-    code: Options.text("code").pipe(Options.optional),
+    code: Args.text({ name: "code" }).pipe(
+      Args.withDescription("Inline code to execute."),
+      Args.optional,
+    ),
     file: Options.text("file").pipe(Options.optional),
     stdin: Options.boolean("stdin").pipe(Options.withDefault(false)),
     baseUrl: Options.text("base-url").pipe(Options.withDefault(DEFAULT_SERVER_BASE_URL)),
@@ -530,22 +753,24 @@ const devCommand = Command.make("dev").pipe(
 );
 
 const root = Command.make("executor").pipe(
-  Command.withSubcommands([serverCommand, runCommand, resumeCommand, devCommand] as const),
+  Command.withSubcommands([serverCommand, callCommand, resumeCommand, devCommand] as const),
   Command.withDescription("Executor local CLI"),
 );
 
 const runCli = Command.run(root, {
-  name: "executor",
-  version: "0.1.0",
+  name: CLI_NAME,
+  version: CLI_VERSION,
+  executable: CLI_NAME,
 });
 
 const hiddenServer = (): Effect.Effect<void, Error, never> | null => {
-  if (process.argv[2] !== "__local-server") {
+  const args = getCliArgs();
+  if (args[0] !== "__local-server") {
     return null;
   }
 
-  const portFlagIndex = process.argv.findIndex((arg) => arg === "--port");
-  const port = portFlagIndex >= 0 ? Number(process.argv[portFlagIndex + 1]) : DEFAULT_SERVER_PORT;
+  const portFlagIndex = args.findIndex((arg) => arg === "--port");
+  const port = portFlagIndex >= 0 ? Number(args[portFlagIndex + 1]) : DEFAULT_SERVER_PORT;
 
   return runLocalExecutorServer({
     host: DEFAULT_SERVER_HOST,
@@ -554,7 +779,8 @@ const hiddenServer = (): Effect.Effect<void, Error, never> | null => {
 };
 
 const program = (hiddenServer()
-  ?? runCli(process.argv).pipe(Effect.mapError(toError)))
+  ?? helpOverride()
+  ?? runCli(toEffectCliArgv(getCliArgs())).pipe(Effect.mapError(toError)))
   .pipe(Effect.provide(NodeFileSystem.layer))
   .pipe(Effect.provide(NodePath.layer));
 
