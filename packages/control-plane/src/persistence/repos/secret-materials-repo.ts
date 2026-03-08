@@ -4,7 +4,7 @@ import {
 } from "#schema";
 import * as Option from "effect/Option";
 import { Schema } from "effect";
-import { eq, desc } from "drizzle-orm";
+import { eq, desc, or, and } from "drizzle-orm";
 
 import type { DrizzleClient } from "../client";
 import type { DrizzleTables } from "../schema";
@@ -89,5 +89,67 @@ export const createSecretMaterialsRepo = (
         .returning();
 
       return deleted.length > 0;
+    }),
+
+  /**
+   * For each secret, find the sources that reference it via credentials.
+   * Returns a map of secretId -> Array<{ sourceId, sourceName }>.
+   */
+  listLinkedSources: () =>
+    client.use("rows.secret_materials.list_linked_sources", async (db) => {
+      // Find all credentials that reference any postgres-stored secret
+      // and join through bindings to sources.
+      const rows = await db
+        .select({
+          tokenHandle: tables.credentialsTable.tokenHandle,
+          tokenProviderId: tables.credentialsTable.tokenProviderId,
+          refreshTokenHandle: tables.credentialsTable.refreshTokenHandle,
+          refreshTokenProviderId: tables.credentialsTable.refreshTokenProviderId,
+          sourceId: tables.sourceCredentialBindingsTable.sourceId,
+          sourceName: tables.sourcesTable.name,
+        })
+        .from(tables.credentialsTable)
+        .innerJoin(
+          tables.sourceCredentialBindingsTable,
+          eq(tables.credentialsTable.id, tables.sourceCredentialBindingsTable.credentialId),
+        )
+        .innerJoin(
+          tables.sourcesTable,
+          and(
+            eq(tables.sourceCredentialBindingsTable.workspaceId, tables.sourcesTable.workspaceId),
+            eq(tables.sourceCredentialBindingsTable.sourceId, tables.sourcesTable.sourceId),
+          ),
+        )
+        .where(
+          or(
+            eq(tables.credentialsTable.tokenProviderId, "postgres"),
+            eq(tables.credentialsTable.refreshTokenProviderId, "postgres"),
+          ),
+        );
+
+      const result = new Map<string, Array<{ sourceId: string; sourceName: string }>>();
+
+      for (const row of rows) {
+        const addLink = (secretId: string) => {
+          let links = result.get(secretId);
+          if (!links) {
+            links = [];
+            result.set(secretId, links);
+          }
+          // Avoid duplicate entries
+          if (!links.some((l) => l.sourceId === row.sourceId)) {
+            links.push({ sourceId: row.sourceId, sourceName: row.sourceName });
+          }
+        };
+
+        if (row.tokenProviderId === "postgres") {
+          addLink(row.tokenHandle);
+        }
+        if (row.refreshTokenProviderId === "postgres" && row.refreshTokenHandle) {
+          addLink(row.refreshTokenHandle);
+        }
+      }
+
+      return result;
     }),
 });

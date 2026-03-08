@@ -90,13 +90,20 @@ export const ControlPlaneLocalLive = HttpApiBuilder.group(
           const rows = yield* store.secretMaterials.listAll().pipe(
             Effect.mapError(() => storageError("Failed listing secrets.")),
           );
-          return rows;
+          const linkedSourcesMap = yield* store.secretMaterials.listLinkedSources().pipe(
+            Effect.mapError(() => storageError("Failed loading linked sources.")),
+          );
+          return rows.map((row) => ({
+            ...row,
+            linkedSources: linkedSourcesMap.get(row.id) ?? [],
+          }));
         }),
       )
       .handle("createSecret", ({ payload }) =>
         Effect.gen(function* () {
           const name = payload.name.trim();
           const value = payload.value;
+          const purpose = payload.purpose ?? "auth_material";
 
           if (name.length === 0) {
             return yield* Effect.fail(
@@ -115,7 +122,7 @@ export const ControlPlaneLocalLive = HttpApiBuilder.group(
           yield* store.secretMaterials.upsert({
             id,
             name,
-            purpose: "auth_material",
+            purpose,
             value,
             createdAt: now,
             updatedAt: now,
@@ -127,7 +134,7 @@ export const ControlPlaneLocalLive = HttpApiBuilder.group(
             id,
             name,
             providerId: POSTGRES_SECRET_PROVIDER_ID,
-            purpose: "auth_material",
+            purpose,
             createdAt: now,
             updatedAt: now,
           } satisfies CreateSecretResult;

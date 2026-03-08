@@ -1,5 +1,5 @@
 import { HttpApiEndpoint, HttpApiGroup, HttpApiSchema } from "@effect/platform";
-import { LocalInstallationSchema } from "#schema";
+import { LocalInstallationSchema, SecretMaterialPurposeSchema } from "#schema";
 import * as Schema from "effect/Schema";
 
 import {
@@ -25,12 +25,20 @@ export type InstanceConfig = typeof InstanceConfigSchema.Type;
 
 // -- Secrets CRUD schemas ---------------------------------------------------
 
+export const SecretLinkedSourceSchema = Schema.Struct({
+  sourceId: Schema.String,
+  sourceName: Schema.String,
+});
+
+export type SecretLinkedSource = typeof SecretLinkedSourceSchema.Type;
+
 export const SecretListItemSchema = Schema.Struct({
   id: Schema.String,
   name: Schema.NullOr(Schema.String),
   purpose: Schema.String,
   createdAt: Schema.Number,
   updatedAt: Schema.Number,
+  linkedSources: Schema.Array(SecretLinkedSourceSchema),
 });
 
 export type SecretListItem = typeof SecretListItemSchema.Type;
@@ -38,6 +46,7 @@ export type SecretListItem = typeof SecretListItemSchema.Type;
 export const CreateSecretPayloadSchema = Schema.Struct({
   name: Schema.String,
   value: Schema.String,
+  purpose: Schema.optional(SecretMaterialPurposeSchema),
 });
 
 export type CreateSecretPayload = typeof CreateSecretPayloadSchema.Type;

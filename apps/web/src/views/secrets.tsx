@@ -1,4 +1,5 @@
 import { useState, type ReactNode } from "react";
+import { Link } from "@tanstack/react-router";
 import {
   type SecretListItem,
   type Loadable,
@@ -247,6 +248,22 @@ function SecretRow(props: {
                 {createdDate}
               </span>
             </div>
+            {secret.linkedSources.length > 0 && (
+              <div className="flex items-center gap-1.5 mt-1 flex-wrap">
+                <span className="text-[10px] text-muted-foreground/50">Used by</span>
+                {secret.linkedSources.map((ls) => (
+                  <Link
+                    key={ls.sourceId}
+                    to="/sources/$sourceId"
+                    params={{ sourceId: ls.sourceId }}
+                    search={{ tab: "model" }}
+                    className="inline-flex items-center gap-1 rounded-md bg-accent/60 px-1.5 py-0.5 text-[10px] font-medium text-foreground/70 transition-colors hover:bg-accent hover:text-foreground"
+                  >
+                    {ls.sourceName}
+                  </Link>
+                ))}
+              </div>
+            )}
           </div>
         </div>
         <div className="flex items-center gap-1.5 shrink-0">
