@@ -2,16 +2,22 @@ import { describe, expect, it } from "@effect/vitest";
 import { assertTrue } from "@effect/vitest/utils";
 import {
   AccountIdSchema,
+  CredentialIdSchema,
   OrganizationIdSchema,
   OrganizationMemberIdSchema,
   PolicyIdSchema,
+  SecretMaterialIdSchema,
+  SourceAuthSessionIdSchema,
   SourceIdSchema,
   WorkspaceIdSchema,
 } from "#schema";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 
-import { createSqlControlPlanePersistence } from "./index";
+import {
+  createSqlControlPlanePersistence,
+  type SqlControlPlanePersistence,
+} from "./index";
 
 const makePersistence = Effect.acquireRelease(
   createSqlControlPlanePersistence({
@@ -23,6 +29,119 @@ const makePersistence = Effect.acquireRelease(
       catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
     }).pipe(Effect.orDie),
 );
+
+const seedWorkspaceCredentialState = (input: {
+  persistence: SqlControlPlanePersistence;
+  accountId: ReturnType<typeof AccountIdSchema.make>;
+  organizationId: ReturnType<typeof OrganizationIdSchema.make>;
+  workspaceId: ReturnType<typeof WorkspaceIdSchema.make>;
+  sourceId: ReturnType<typeof SourceIdSchema.make>;
+}) =>
+  Effect.gen(function* () {
+    const now = Date.now();
+    const credentialId = CredentialIdSchema.make(`cred_${input.workspaceId}`);
+    const tokenId = SecretMaterialIdSchema.make(`sec_${input.workspaceId}_token`);
+    const refreshId = SecretMaterialIdSchema.make(`sec_${input.workspaceId}_refresh`);
+
+    yield* input.persistence.rows.organizations.insert({
+      id: input.organizationId,
+      slug: `org-${input.organizationId}`,
+      name: `Org ${input.organizationId}`,
+      status: "active",
+      createdByAccountId: input.accountId,
+      createdAt: now,
+      updatedAt: now,
+    });
+    yield* input.persistence.rows.workspaces.insert({
+      id: input.workspaceId,
+      organizationId: input.organizationId,
+      name: `Workspace ${input.workspaceId}`,
+      createdByAccountId: input.accountId,
+      createdAt: now,
+      updatedAt: now,
+    });
+    yield* input.persistence.rows.sources.insert({
+      id: input.sourceId,
+      workspaceId: input.workspaceId,
+      name: "Github",
+      kind: "openapi",
+      endpoint: "https://api.github.com",
+      status: "connected",
+      enabled: true,
+      namespace: "github",
+      transport: null,
+      queryParamsJson: null,
+      headersJson: null,
+      specUrl: "https://api.github.com/openapi.json",
+      defaultHeadersJson: null,
+      sourceHash: null,
+      sourceDocumentText: null,
+      lastError: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    yield* input.persistence.rows.secretMaterials.upsert({
+      id: tokenId,
+      purpose: "oauth_access_token",
+      value: "token",
+      createdAt: now,
+      updatedAt: now,
+    });
+    yield* input.persistence.rows.secretMaterials.upsert({
+      id: refreshId,
+      purpose: "oauth_refresh_token",
+      value: "refresh",
+      createdAt: now,
+      updatedAt: now,
+    });
+    yield* input.persistence.rows.credentials.upsert({
+      id: credentialId,
+      workspaceId: input.workspaceId,
+      authKind: "oauth2",
+      authHeaderName: "Authorization",
+      authPrefix: "Bearer ",
+      tokenProviderId: "postgres",
+      tokenHandle: tokenId,
+      refreshTokenProviderId: "postgres",
+      refreshTokenHandle: refreshId,
+      createdAt: now,
+      updatedAt: now,
+    });
+    yield* input.persistence.rows.sourceCredentialBindings.upsert({
+      id: `src_cred_bind_${input.workspaceId}`,
+      workspaceId: input.workspaceId,
+      sourceId: input.sourceId,
+      credentialId,
+      createdAt: now,
+      updatedAt: now,
+    });
+    yield* input.persistence.rows.sourceAuthSessions.upsert({
+      id: SourceAuthSessionIdSchema.make(`src_auth_${input.workspaceId}`),
+      workspaceId: input.workspaceId,
+      sourceId: input.sourceId,
+      executionId: null,
+      interactionId: null,
+      strategy: "oauth2_authorization_code",
+      status: "pending",
+      endpoint: "https://api.github.com",
+      state: `state_${input.workspaceId}`,
+      redirectUri: "http://127.0.0.1/callback",
+      scope: null,
+      resourceMetadataUrl: null,
+      authorizationServerUrl: null,
+      resourceMetadataJson: null,
+      authorizationServerMetadataJson: null,
+      clientInformationJson: null,
+      codeVerifier: "verifier",
+      authorizationUrl: "https://example.com/auth",
+      errorText: null,
+      completedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    return { tokenId, refreshId };
+  });
 
 describe("control-plane-persistence-drizzle", () => {
   it.scoped("creates and reads organization/workspace/source/policy rows", () =>
@@ -148,4 +267,57 @@ describe("control-plane-persistence-drizzle", () => {
     }),
   );
 
+  it.scoped("deleting a workspace removes source credentials, sessions, and postgres secrets", () =>
+    Effect.gen(function* () {
+      const persistence = yield* makePersistence;
+      const accountId = AccountIdSchema.make("acc_ws_cleanup");
+      const organizationId = OrganizationIdSchema.make("org_ws_cleanup");
+      const workspaceId = WorkspaceIdSchema.make("ws_cleanup");
+      const sourceId = SourceIdSchema.make("src_ws_cleanup");
+
+      const { tokenId, refreshId } = yield* seedWorkspaceCredentialState({
+        persistence,
+        accountId,
+        organizationId,
+        workspaceId,
+        sourceId,
+      });
+
+      const removed = yield* persistence.rows.workspaces.removeById(workspaceId);
+      expect(removed).toBe(true);
+      expect(Option.isNone(yield* persistence.rows.workspaces.getById(workspaceId))).toBe(true);
+      expect(yield* persistence.rows.credentials.listByWorkspaceId(workspaceId)).toHaveLength(0);
+      expect(yield* persistence.rows.sourceCredentialBindings.listByWorkspaceId(workspaceId)).toHaveLength(0);
+      expect(yield* persistence.rows.sourceAuthSessions.listByWorkspaceId(workspaceId)).toHaveLength(0);
+      expect(Option.isNone(yield* persistence.rows.secretMaterials.getById(tokenId))).toBe(true);
+      expect(Option.isNone(yield* persistence.rows.secretMaterials.getById(refreshId))).toBe(true);
+    }),
+  );
+
+  it.scoped("deleting an organization removes workspace credential state and postgres secrets", () =>
+    Effect.gen(function* () {
+      const persistence = yield* makePersistence;
+      const accountId = AccountIdSchema.make("acc_org_cleanup");
+      const organizationId = OrganizationIdSchema.make("org_cleanup");
+      const workspaceId = WorkspaceIdSchema.make("ws_org_cleanup");
+      const sourceId = SourceIdSchema.make("src_org_cleanup");
+
+      const { tokenId, refreshId } = yield* seedWorkspaceCredentialState({
+        persistence,
+        accountId,
+        organizationId,
+        workspaceId,
+        sourceId,
+      });
+
+      const removed = yield* persistence.rows.organizations.removeTreeById(organizationId);
+      expect(removed).toBe(true);
+      expect(Option.isNone(yield* persistence.rows.workspaces.getById(workspaceId))).toBe(true);
+      expect(yield* persistence.rows.credentials.listByWorkspaceId(workspaceId)).toHaveLength(0);
+      expect(yield* persistence.rows.sourceCredentialBindings.listByWorkspaceId(workspaceId)).toHaveLength(0);
+      expect(yield* persistence.rows.sourceAuthSessions.listByWorkspaceId(workspaceId)).toHaveLength(0);
+      expect(Option.isNone(yield* persistence.rows.secretMaterials.getById(tokenId))).toBe(true);
+      expect(Option.isNone(yield* persistence.rows.secretMaterials.getById(refreshId))).toBe(true);
+    }),
+  );
 });

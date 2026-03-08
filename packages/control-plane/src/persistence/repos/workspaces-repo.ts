@@ -5,7 +5,7 @@ import { asc, eq, inArray } from "drizzle-orm";
 
 import type { DrizzleClient } from "../client";
 import type { DrizzleTables } from "../schema";
-import { firstOption } from "./shared";
+import { firstOption, postgresSecretHandlesFromCredentials } from "./shared";
 
 const decodeWorkspace = Schema.decodeUnknownSync(WorkspaceSchema);
 
@@ -70,6 +70,16 @@ export const createWorkspacesRepo = (
         .from(tables.executionsTable)
         .where(eq(tables.executionsTable.workspaceId, workspaceId));
       const executionIds = executionRows.map((execution) => execution.id);
+      const credentials = await tx
+        .select({
+          tokenProviderId: tables.credentialsTable.tokenProviderId,
+          tokenHandle: tables.credentialsTable.tokenHandle,
+          refreshTokenProviderId: tables.credentialsTable.refreshTokenProviderId,
+          refreshTokenHandle: tables.credentialsTable.refreshTokenHandle,
+        })
+        .from(tables.credentialsTable)
+        .where(eq(tables.credentialsTable.workspaceId, workspaceId));
+      const postgresSecretHandles = postgresSecretHandlesFromCredentials(credentials);
 
       if (executionIds.length > 0) {
         await tx
@@ -80,6 +90,10 @@ export const createWorkspacesRepo = (
       await tx
         .delete(tables.executionsTable)
         .where(eq(tables.executionsTable.workspaceId, workspaceId));
+
+      await tx
+        .delete(tables.sourceAuthSessionsTable)
+        .where(eq(tables.sourceAuthSessionsTable.workspaceId, workspaceId));
 
       await tx
         .delete(tables.sourceCredentialBindingsTable)
@@ -100,6 +114,12 @@ export const createWorkspacesRepo = (
       await tx
         .delete(tables.localInstallationsTable)
         .where(eq(tables.localInstallationsTable.workspaceId, workspaceId));
+
+      if (postgresSecretHandles.length > 0) {
+        await tx
+          .delete(tables.secretMaterialsTable)
+          .where(inArray(tables.secretMaterialsTable.id, postgresSecretHandles));
+      }
 
       const deleted = await tx
         .delete(tables.workspacesTable)

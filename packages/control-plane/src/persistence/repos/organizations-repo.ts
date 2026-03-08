@@ -10,7 +10,11 @@ import { asc, eq, inArray } from "drizzle-orm";
 
 import type { DrizzleClient } from "../client";
 import type { DrizzleTables } from "../schema";
-import { firstOption, withoutCreatedAt } from "./shared";
+import {
+  firstOption,
+  postgresSecretHandlesFromCredentials,
+  withoutCreatedAt,
+} from "./shared";
 
 const decodeOrganization = Schema.decodeUnknownSync(OrganizationSchema);
 const decodeOrganizationMembership = Schema.decodeUnknownSync(
@@ -132,8 +136,18 @@ export const createOrganizationsRepo = (
           .select({ id: tables.executionsTable.id })
           .from(tables.executionsTable)
           .where(inArray(tables.executionsTable.workspaceId, workspaceIds));
+        const credentials = await tx
+          .select({
+            tokenProviderId: tables.credentialsTable.tokenProviderId,
+            tokenHandle: tables.credentialsTable.tokenHandle,
+            refreshTokenProviderId: tables.credentialsTable.refreshTokenProviderId,
+            refreshTokenHandle: tables.credentialsTable.refreshTokenHandle,
+          })
+          .from(tables.credentialsTable)
+          .where(inArray(tables.credentialsTable.workspaceId, workspaceIds));
 
         const executionIds = executionRows.map((execution) => execution.id);
+        const postgresSecretHandles = postgresSecretHandlesFromCredentials(credentials);
 
         if (executionIds.length > 0) {
           await tx
@@ -146,6 +160,10 @@ export const createOrganizationsRepo = (
         await tx
           .delete(tables.executionsTable)
           .where(inArray(tables.executionsTable.workspaceId, workspaceIds));
+
+        await tx
+          .delete(tables.sourceAuthSessionsTable)
+          .where(inArray(tables.sourceAuthSessionsTable.workspaceId, workspaceIds));
 
         await tx
           .delete(tables.sourceCredentialBindingsTable)
@@ -166,6 +184,12 @@ export const createOrganizationsRepo = (
         await tx
           .delete(tables.workspacesTable)
           .where(inArray(tables.workspacesTable.id, workspaceIds));
+
+        if (postgresSecretHandles.length > 0) {
+          await tx
+            .delete(tables.secretMaterialsTable)
+            .where(inArray(tables.secretMaterialsTable.id, postgresSecretHandles));
+        }
       }
 
       await tx

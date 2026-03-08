@@ -33,6 +33,10 @@ export type StoreSecretMaterial = (input: {
   value: string;
 }) => Effect.Effect<SecretRef, Error, never>;
 
+export type DeleteSecretMaterial = (
+  ref: SecretRef,
+) => Effect.Effect<boolean, Error, never>;
+
 type SecretMaterialProviderRuntime = {
   rows: SqlControlPlaneRows;
   env: NodeJS.ProcessEnv;
@@ -51,6 +55,10 @@ type SecretMaterialProvider = {
     value: string;
     runtime: SecretMaterialProviderRuntime;
   }) => Effect.Effect<SecretRef, Error, never>;
+  remove?: (input: {
+    ref: SecretRef;
+    runtime: SecretMaterialProviderRuntime;
+  }) => Effect.Effect<boolean, Error, never>;
 };
 
 type SecretMaterialProviderRegistry = ReadonlyMap<string, SecretMaterialProvider>;
@@ -192,6 +200,8 @@ const createParamsSecretMaterialProvider = (): SecretMaterialProvider => ({
 
     return Effect.succeed(value);
   },
+
+  remove: () => Effect.succeed(false),
 });
 
 const createEnvSecretMaterialProvider = (): SecretMaterialProvider => ({
@@ -211,6 +221,8 @@ const createEnvSecretMaterialProvider = (): SecretMaterialProvider => ({
 
     return Effect.succeed(value);
   },
+
+  remove: () => Effect.succeed(false),
 });
 
 const createPostgresSecretMaterialProvider = (): SecretMaterialProvider => ({
@@ -241,6 +253,12 @@ const createPostgresSecretMaterialProvider = (): SecretMaterialProvider => ({
         providerId: POSTGRES_SECRET_PROVIDER_ID,
         handle: id,
       } satisfies SecretRef;
+    }),
+
+  remove: ({ ref, runtime }) =>
+    Effect.gen(function* () {
+      const materialId = SecretMaterialIdSchema.make(ref.handle);
+      return yield* runtime.rows.secretMaterials.removeById(materialId);
     }),
 });
 
@@ -304,6 +322,27 @@ const keychainStoreWithSecurityCli = (): SecretMaterialProvider => ({
       } satisfies SecretRef),
     );
   },
+
+  remove: ({ ref, runtime }) => {
+    const id = parseKeychainHandle(ref.handle);
+    if (id === null) {
+      return Effect.fail(new Error(`Invalid keychain secret handle: ${ref.handle}`));
+    }
+
+    return runCommand({
+      command: "security",
+      args: [
+        "delete-generic-password",
+        "-a",
+        id,
+        "-s",
+        runtime.keychainServiceName,
+      ],
+      operation: "keychain.delete",
+    }).pipe(
+      Effect.map((result) => result.exitCode === 0),
+    );
+  },
 });
 
 const keychainStoreWithSecretTool = (): SecretMaterialProvider => ({
@@ -365,6 +404,27 @@ const keychainStoreWithSecretTool = (): SecretMaterialProvider => ({
       } satisfies SecretRef),
     );
   },
+
+  remove: ({ ref, runtime }) => {
+    const id = parseKeychainHandle(ref.handle);
+    if (id === null) {
+      return Effect.fail(new Error(`Invalid keychain secret handle: ${ref.handle}`));
+    }
+
+    return runCommand({
+      command: "secret-tool",
+      args: [
+        "clear",
+        "service",
+        runtime.keychainServiceName,
+        "account",
+        id,
+      ],
+      operation: "keychain.delete",
+    }).pipe(
+      Effect.map((result) => result.exitCode === 0),
+    );
+  },
 });
 
 const createKeychainSecretMaterialProvider = (): SecretMaterialProvider => {
@@ -382,6 +442,7 @@ const createKeychainSecretMaterialProvider = (): SecretMaterialProvider => {
   return {
     resolve: () => unsupported("keychain.get"),
     store: () => unsupported("keychain.put"),
+    remove: () => Effect.succeed(false),
   } satisfies SecretMaterialProvider;
 };
 
@@ -465,6 +526,32 @@ export const createDefaultSecretMaterialStorer = (input: {
       return yield* provider.store({
         purpose,
         value,
+        runtime,
+      });
+    });
+};
+
+export const createDefaultSecretMaterialDeleter = (input: {
+  rows: SqlControlPlaneRows;
+  dangerouslyAllowEnvSecrets?: boolean;
+  keychainServiceName?: string;
+}): DeleteSecretMaterial => {
+  const providers = createSecretMaterialProviderRegistry();
+  const runtime = createSecretMaterialProviderRuntime(input);
+
+  return (ref) =>
+    Effect.gen(function* () {
+      const provider = yield* getSecretMaterialProvider({
+        providers,
+        providerId: ref.providerId,
+      });
+
+      if (!provider.remove) {
+        return false;
+      }
+
+      return yield* provider.remove({
+        ref,
         runtime,
       });
     });

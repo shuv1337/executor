@@ -14,9 +14,6 @@ import * as Option from "effect/Option";
 
 import {
   createSourceFromPayload,
-  projectSourceFromStorage,
-  projectSourcesFromStorage,
-  splitSourceForStorage,
   updateSourceFromPayload,
 } from "./source-definitions";
 import {
@@ -31,7 +28,8 @@ import { syncSourceToolArtifacts } from "./tool-artifacts";
 import {
   loadSourceById,
   loadSourcesInWorkspace,
-  removeCredentialBindingForSource,
+  persistSource,
+  removeSourceById,
 } from "./source-store";
 
 const sourceOps = {
@@ -74,25 +72,18 @@ const syncArtifactsForSource = (input: {
                 lastError: error.message,
               },
               now: Date.now(),
-            }).pipe(
-              Effect.mapError((cause) =>
-                input.operation.badRequest(
-                  "Failed indexing source tools",
-                  cause instanceof Error ? cause.message : String(cause),
+          }).pipe(
+            Effect.mapError((cause) =>
+              input.operation.badRequest(
+                "Failed indexing source tools",
+                cause instanceof Error ? cause.message : String(cause),
                 ),
               ),
             );
 
-            const { sourceRecord } = splitSourceForStorage({
-              source: erroredSource,
-            });
-            const { sourceDocumentText: _sourceDocumentText, ...sourcePatch } = sourceRecord;
             yield* mapPersistenceError(
               input.operation.child("source_error"),
-              input.store.sources.update(input.source.workspaceId, input.source.id, {
-                ...sourcePatch,
-                updatedAt: erroredSource.updatedAt,
-              }),
+              persistSource(input.store, erroredSource),
             );
           }
 
@@ -136,24 +127,10 @@ export const createSource = (input: {
         ),
       );
 
-      const { sourceRecord, credential, credentialBinding } = splitSourceForStorage({
-        source,
-      });
-
       yield* mapPersistenceError(
-        sourceOps.create.child("source"),
-        store.sources.insert(sourceRecord),
+        sourceOps.create.child("persist"),
+        persistSource(store, source),
       );
-      if (credential !== null && credentialBinding !== null) {
-        yield* mapPersistenceError(
-          sourceOps.create.child("credential"),
-          store.credentials.upsert(credential),
-        );
-        yield* mapPersistenceError(
-          sourceOps.create.child("binding"),
-          store.sourceCredentialBindings.upsert(credentialBinding),
-        );
-      }
 
       return yield* syncArtifactsForSource({
         store,
@@ -191,26 +168,6 @@ export const updateSource = (input: {
 }) =>
   Effect.flatMap(ControlPlaneStore, (store) =>
     Effect.gen(function* () {
-      const existing = yield* sourceOps.update.child("existing").mapStorage(
-        store.sources.getByWorkspaceAndId(input.workspaceId, input.sourceId),
-      );
-
-      if (Option.isNone(existing)) {
-        return yield* Effect.fail(
-          sourceOps.update.notFound(
-            "Source not found",
-            `workspaceId=${input.workspaceId} sourceId=${input.sourceId}`,
-          ),
-        );
-      }
-
-      const existingBinding = yield* sourceOps.update.child("binding").mapStorage(
-        store.sourceCredentialBindings.getByWorkspaceAndSourceId(
-          input.workspaceId,
-          input.sourceId,
-        ),
-      );
-
       const existingSource = yield* loadSourceById(store, {
         workspaceId: input.workspaceId,
         sourceId: input.sourceId,
@@ -241,56 +198,10 @@ export const updateSource = (input: {
         ),
       );
 
-      const { sourceRecord, credential, credentialBinding } = splitSourceForStorage({
-        source: updatedSource,
-        existingCredentialId: Option.isSome(existingBinding)
-          ? existingBinding.value.credentialId
-          : null,
-        existingBindingId: Option.isSome(existingBinding)
-          ? existingBinding.value.id
-          : null,
-      });
-      const { sourceDocumentText: _sourceDocumentText, ...sourcePatch } = sourceRecord;
-
-      const stored = yield* mapPersistenceError(
-        sourceOps.update.child("source"),
-        store.sources.update(input.workspaceId, input.sourceId, {
-          ...sourcePatch,
-          updatedAt: updatedSource.updatedAt,
-        }),
+      yield* mapPersistenceError(
+        sourceOps.update.child("persist"),
+        persistSource(store, updatedSource),
       );
-
-      if (Option.isNone(stored)) {
-        return yield* Effect.fail(
-          sourceOps.update.notFound(
-            "Source not found",
-            `workspaceId=${input.workspaceId} sourceId=${input.sourceId}`,
-          ),
-        );
-      }
-
-      if (credential === null || credentialBinding === null) {
-        if (Option.isSome(existingBinding)) {
-          yield* sourceOps.update.child("binding.remove").mapStorage(
-            store.sourceCredentialBindings.removeByWorkspaceAndSourceId(
-              input.workspaceId,
-              input.sourceId,
-            ),
-          );
-          yield* sourceOps.update.child("credential.remove").mapStorage(
-            store.credentials.removeById(existingBinding.value.credentialId),
-          );
-        }
-      } else {
-        yield* mapPersistenceError(
-          sourceOps.update.child("credential"),
-          store.credentials.upsert(credential),
-        );
-        yield* mapPersistenceError(
-          sourceOps.update.child("binding"),
-          store.sourceCredentialBindings.upsert(credentialBinding),
-        );
-      }
 
       return yield* syncArtifactsForSource({
         store,
@@ -305,23 +216,15 @@ export const removeSource = (input: {
 }) =>
   Effect.flatMap(ControlPlaneStore, (store) =>
     Effect.gen(function* () {
-      yield* sourceOps.remove.child("credential.remove").mapStorage(
-        removeCredentialBindingForSource(store, {
-          workspaceId: input.workspaceId,
-          sourceId: input.sourceId,
-        }),
-      );
-
-      yield* sourceOps.remove.child("artifacts").mapStorage(
-        store.toolArtifacts.removeByWorkspaceAndSourceId(input.workspaceId, input.sourceId),
-      );
-
       yield* sourceOps.remove.child("artifacts").mapStorage(
         store.toolArtifacts.removeByWorkspaceAndSourceId(input.workspaceId, input.sourceId),
       );
 
       const removed = yield* sourceOps.remove.mapStorage(
-        store.sources.removeByWorkspaceAndId(input.workspaceId, input.sourceId),
+        removeSourceById(store, {
+          workspaceId: input.workspaceId,
+          sourceId: input.sourceId,
+        }),
       );
 
       return { removed };

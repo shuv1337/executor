@@ -118,4 +118,22 @@ export const createSourceAuthSessionsRepo = (
           },
         });
     }),
+
+  removeByWorkspaceAndSourceId: (
+    workspaceId: SourceAuthSession["workspaceId"],
+    sourceId: SourceAuthSession["sourceId"],
+  ) =>
+    client.use("rows.source_auth_sessions.remove_by_workspace_and_source_id", async (db) => {
+      const deleted = await db
+        .delete(tables.sourceAuthSessionsTable)
+        .where(
+          and(
+            eq(tables.sourceAuthSessionsTable.workspaceId, workspaceId),
+            eq(tables.sourceAuthSessionsTable.sourceId, sourceId),
+          ),
+        )
+        .returning();
+
+      return deleted.length > 0;
+    }),
 });

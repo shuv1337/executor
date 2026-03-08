@@ -1,5 +1,6 @@
 import type {
   Credential,
+  SecretRef,
   Source,
   WorkspaceId,
 } from "#schema";
@@ -12,6 +13,46 @@ import {
   projectSourcesFromStorage,
   splitSourceForStorage,
 } from "./source-definitions";
+import { createDefaultSecretMaterialDeleter } from "./secret-material-providers";
+
+const credentialSecretRefs = (credential: Credential): ReadonlyArray<SecretRef> => [
+  {
+    providerId: credential.tokenProviderId,
+    handle: credential.tokenHandle,
+  },
+  ...(credential.refreshTokenProviderId !== null && credential.refreshTokenHandle !== null
+    ? [{
+        providerId: credential.refreshTokenProviderId,
+        handle: credential.refreshTokenHandle,
+      } satisfies SecretRef]
+    : []),
+];
+
+const secretRefKey = (ref: SecretRef): string => `${ref.providerId}:${ref.handle}`;
+
+const cleanupCredentialSecretRefs = (rows: SqlControlPlaneRows, input: {
+  previous: Credential | null;
+  next: Credential | null;
+}) =>
+  Effect.gen(function* () {
+    if (input.previous === null) {
+      return;
+    }
+
+    const deleteSecretMaterial = createDefaultSecretMaterialDeleter({ rows });
+    const nextRefKeys = new Set(
+      (input.next === null ? [] : credentialSecretRefs(input.next)).map(secretRefKey),
+    );
+    const refsToDelete = credentialSecretRefs(input.previous).filter(
+      (ref) => !nextRefKeys.has(secretRefKey(ref)),
+    );
+
+    yield* Effect.forEach(
+      refsToDelete,
+      (ref) => Effect.either(deleteSecretMaterial(ref)),
+      { discard: true },
+    );
+  });
 
 export const loadSourcesInWorkspace = (
   rows: SqlControlPlaneRows,
@@ -75,12 +116,36 @@ export const removeCredentialBindingForSource = (rows: SqlControlPlaneRows, inpu
       return false;
     }
 
+    const existingCredential = yield* rows.credentials.getById(existingBinding.value.credentialId);
+
     yield* rows.sourceCredentialBindings.removeByWorkspaceAndSourceId(
       input.workspaceId,
       input.sourceId,
     );
-    yield* rows.credentials.removeById(existingBinding.value.credentialId);
+
+    if (Option.isSome(existingCredential)) {
+      yield* rows.credentials.removeById(existingBinding.value.credentialId);
+    }
+
+    yield* cleanupCredentialSecretRefs(rows, {
+      previous: Option.isSome(existingCredential) ? existingCredential.value : null,
+      next: null,
+    });
+
     return true;
+  });
+
+export const removeSourceById = (rows: SqlControlPlaneRows, input: {
+  workspaceId: WorkspaceId;
+  sourceId: Source["id"];
+}) =>
+  Effect.gen(function* () {
+    yield* rows.sourceAuthSessions.removeByWorkspaceAndSourceId(
+      input.workspaceId,
+      input.sourceId,
+    );
+    yield* removeCredentialBindingForSource(rows, input);
+    return yield* rows.sources.removeByWorkspaceAndId(input.workspaceId, input.sourceId);
   });
 
 export const persistSource = (rows: SqlControlPlaneRows, source: Source) =>
@@ -90,6 +155,9 @@ export const persistSource = (rows: SqlControlPlaneRows, source: Source) =>
       source.workspaceId,
       source.id,
     );
+    const existingCredential = Option.isSome(existingBinding)
+      ? yield* rows.credentials.getById(existingBinding.value.credentialId)
+      : Option.none<Credential>();
     const existingCredentialId = Option.isSome(existingBinding)
       ? existingBinding.value.credentialId
       : null;
@@ -121,12 +189,20 @@ export const persistSource = (rows: SqlControlPlaneRows, source: Source) =>
           source.workspaceId,
           source.id,
         );
-        yield* rows.credentials.removeById(existingBinding.value.credentialId);
+
+        if (Option.isSome(existingCredential)) {
+          yield* rows.credentials.removeById(existingBinding.value.credentialId);
+        }
       }
     } else {
       yield* rows.credentials.upsert(credential);
       yield* rows.sourceCredentialBindings.upsert(credentialBinding);
     }
+
+    yield* cleanupCredentialSecretRefs(rows, {
+      previous: Option.isSome(existingCredential) ? existingCredential.value : null,
+      next: credential,
+    });
 
     return source;
   });

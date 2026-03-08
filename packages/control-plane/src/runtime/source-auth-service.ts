@@ -461,7 +461,7 @@ export type ExecutorAddSourceInput =
       auth?: ExecutorOpenApiSourceAuthInput | null;
     };
 
-const shouldPromptForOpenApiCredentialSetup = (input: {
+export const shouldPromptForOpenApiCredentialSetup = (input: {
   existing?: Source;
   auth?: ExecutorOpenApiSourceAuthInput | null;
 }): boolean => {
@@ -469,7 +469,7 @@ const shouldPromptForOpenApiCredentialSetup = (input: {
     return false;
   }
 
-  return !(input.existing?.kind === "openapi" && input.existing.auth.kind === "bearer");
+  return !(input.existing?.kind === "openapi" && input.existing.auth.kind !== "none");
 };
 
 const materializeExecutorOpenApiAuth = (input: {
