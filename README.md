@@ -8,7 +8,6 @@ It gives an agent a TypeScript runtime, a discoverable tool catalog, and a singl
 
 Join the Discord community: https://discord.gg/eF29HBHwM6
 
-
 At runtime, `executor` behaves like one local product:
 
 - a CLI for starting the runtime and executing code
@@ -22,7 +21,6 @@ The current codebase lives in `apps/` and `packages/`. Older experiments stay in
 
 - The npm package name `executor` is used with attribution to [Crystian](https://www.linkedin.com/in/crystian/).
 - The `codemode` concept in this project is inspired by Cloudflare's [Code Mode announcement](https://blog.cloudflare.com/code-mode/).
-
 
 ## Why this exists
 
@@ -116,12 +114,22 @@ For each source you can:
 
 ## Quick start
 
-If you are working from this repository, the easiest path is:
+If you want to use this a package distribution, install it via npm:
+
+```bash
+npm install -g executor
+executor up
+```
+
+Then either tell your agent to use the CLI or to open the web UI and copy the MCP CLI install command.
+
+Then you can run the CLI as `executor`.
+
+If you are working from this repository locally, the easiest path is:
 
 ```bash
 bun install
-bun run executor doctor --json
-bun run executor up
+bun dev
 ```
 
 That starts the local runtime. The default base URL is:
@@ -205,7 +213,8 @@ return await tools.executor.sources.add({
 return await tools.executor.sources.add({
   kind: "openapi",
   endpoint: "https://api.github.com",
-  specUrl: "https://raw.githubusercontent.com/github/rest-api-description/main/descriptions/api.github.com/api.github.com.json",
+  specUrl:
+    "https://raw.githubusercontent.com/github/rest-api-description/main/descriptions/api.github.com/api.github.com.json",
   name: "GitHub",
   namespace: "github",
 });
