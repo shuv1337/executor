@@ -155,7 +155,7 @@ export const buildDistributionPackage = async (
   const pgliteDataPath = join(pgliteDistDir, "pglite.data");
   const pgliteWasmPath = join(pgliteDistDir, "pglite.wasm");
   const webDistDir = join(repoRoot, "apps/web/dist");
-  const readmePath = join(repoRoot, "apps/executor/README.md");
+  const readmePath = join(repoRoot, "README.md");
   const packageName = options.packageName ?? defaults.name;
   const packageVersion = options.packageVersion ?? defaults.version;
   await rm(packageDir, { recursive: true, force: true });
