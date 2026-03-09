@@ -3,20 +3,25 @@ import type * as Registry from "@effect-atom/atom/Registry";
 import { RegistryContext, RegistryProvider, useAtomValue } from "@effect-atom/atom-react";
 import { createControlPlaneClient } from "@executor-v3/control-plane/client";
 import type {
-  ConnectMcpSourcePayload,
-  ConnectMcpSourceResult,
+  CompleteSourceOAuthResult,
+  ConnectSourcePayload,
+  ConnectSourceResult,
   ControlPlaneClient,
   CreateSecretPayload,
   CreateSecretResult,
   CreateSourcePayload,
   DeleteSecretResult,
+  DiscoverSourcePayload,
   InstanceConfig,
   LocalInstallation,
   SecretListItem,
   Source,
+  SourceDiscoveryResult,
   SourceInspection,
   SourceInspectionDiscoverResult,
   SourceInspectionToolDetail,
+  StartSourceOAuthPayload,
+  StartSourceOAuthResult,
   UpdateSecretPayload,
   UpdateSecretResult,
   UpdateSourcePayload,
@@ -87,9 +92,25 @@ type MutationExecutionContext = {
   invalidateQueries: (target?: InvalidationTarget) => void;
 };
 
-type MutationOptions<TInput, TOutput> = {
-  optimisticUpdate?: (context: MutationExecutionContext, payload: TInput) => void | (() => void);
-  onSuccess?: (context: MutationExecutionContext, payload: TInput, data: TOutput) => void;
+type OptimisticMutationResult<T> =
+  | void
+  | (() => void)
+  | {
+      rollback?: () => void;
+      value?: T;
+    };
+
+type MutationOptions<TInput, TOutput, TOptimistic = never> = {
+  optimisticUpdate?: (
+    context: MutationExecutionContext,
+    payload: TInput,
+  ) => OptimisticMutationResult<TOptimistic>;
+  onSuccess?: (
+    context: MutationExecutionContext,
+    payload: TInput,
+    data: TOutput,
+    optimisticValue: TOptimistic | undefined,
+  ) => void;
 };
 
 type InternalNode<A> = {
@@ -146,6 +167,37 @@ const causeMessage = (cause: Cause.Cause<unknown>): Error =>
 const toError = (cause: unknown): Error =>
   cause instanceof Error ? cause : new Error(String(cause));
 
+const shouldLogExecutorDevErrors = (): boolean => {
+  if (typeof window === "undefined") {
+    return false;
+  }
+
+  const hostname = window.location.hostname;
+  return hostname === "localhost" || hostname === "127.0.0.1";
+};
+
+const describeExecutorDevError = (cause: unknown): Record<string, unknown> => {
+  if (cause instanceof Error) {
+    return {
+      name: cause.name,
+      message: cause.message,
+      stack: cause.stack,
+    };
+  }
+
+  return {
+    message: String(cause),
+  };
+};
+
+const logExecutorDevError = (label: string, details: Record<string, unknown>): void => {
+  if (!shouldLogExecutorDevErrors()) {
+    return;
+  }
+
+  console.error(`[executor react] ${label}`, details);
+};
+
 const runControlPlane = <A>(input: {
   accountId?: string;
   execute: (client: ControlPlaneClient) => Effect.Effect<A, unknown, never>;
@@ -157,7 +209,15 @@ const runControlPlane = <A>(input: {
       baseUrl: apiBaseUrl,
       ...(accountId !== undefined ? { accountId } : {}),
     }).pipe(Effect.flatMap(input.execute)),
-  );
+  ).catch((cause) => {
+    logExecutorDevError("control-plane request failed", {
+      baseUrl: apiBaseUrl,
+      accountId,
+      error: describeExecutorDevError(cause),
+      cause,
+    });
+    throw cause;
+  });
 };
 
 const controlPlaneRequest = <A>(input: {
@@ -576,13 +636,13 @@ const applyUpdatePayloadToSource = (source: Source, payload: UpdateSourcePayload
   updatedAt: Date.now(),
 });
 
-const useSourceMutation = <TInput, TOutput>(
+const useSourceMutation = <TInput, TOutput, TOptimistic = never>(
   execute: (input: {
     workspaceId: Source["workspaceId"];
     accountId: string;
     payload: TInput;
   }) => Promise<TOutput>,
-  options?: MutationOptions<TInput, TOutput>,
+  options?: MutationOptions<TInput, TOutput, TOptimistic>,
 ) => {
   const workspace = useWorkspaceRequestContext();
   const { registry, invalidateQueries } = useExecutorQueryContext();
@@ -612,7 +672,13 @@ const useSourceMutation = <TInput, TOutput>(
       error: null,
     }));
 
-    const rollback = options?.optimisticUpdate?.(executionContext, payload);
+    const optimistic = options?.optimisticUpdate?.(executionContext, payload);
+    const rollback = typeof optimistic === "function"
+      ? optimistic
+      : optimistic?.rollback;
+    const optimisticValue = typeof optimistic === "function"
+      ? undefined
+      : optimistic?.value;
 
     try {
       const data = await execute({
@@ -620,11 +686,18 @@ const useSourceMutation = <TInput, TOutput>(
         accountId: workspace.accountId,
         payload,
       });
-      options?.onSuccess?.(executionContext, payload, data);
+      options?.onSuccess?.(executionContext, payload, data, optimisticValue);
       setState({ status: "success", data, error: null });
       return data;
     } catch (cause) {
       rollback?.();
+      logExecutorDevError("source mutation failed", {
+        workspaceId: workspace.workspaceId,
+        accountId: workspace.accountId,
+        payload,
+        error: describeExecutorDevError(cause),
+        cause,
+      });
       const error = cause instanceof Error ? cause : new Error(String(cause));
       setState({ status: "error", data: null, error });
       throw error;
@@ -895,7 +968,7 @@ export const usePrefetchToolDetail = () => {
 };
 
 export const useCreateSource = () =>
-  useSourceMutation<CreateSourcePayload, Source>(
+  useSourceMutation<CreateSourcePayload, Source, Source>(
     React.useCallback(
       ({ workspaceId, accountId, payload }) =>
         runControlPlane({
@@ -922,15 +995,21 @@ export const useCreateSource = () =>
           payload,
         });
         setCachedAtomValue(context.registry, listAtom, [optimisticSource, ...previousList]);
-        return () => {
-          setCachedAtomValue(context.registry, listAtom, previousList);
+        return {
+          value: optimisticSource,
+          rollback: () => {
+            setCachedAtomValue(context.registry, listAtom, previousList);
+          },
         };
       },
-      onSuccess: (context, _payload, source) => {
+      onSuccess: (context, _payload, source, optimisticSource) => {
         const listAtom = sourcesAtom(encodeSourcesKey(true, context.workspaceId, context.accountId));
         const currentList = getCachedAtomValue(context.registry, listAtom);
         if (currentList !== undefined) {
-          setCachedAtomValue(context.registry, listAtom, upsertSourceInList(currentList, source));
+          const withoutOptimistic = optimisticSource
+            ? currentList.filter((candidate) => candidate.id !== optimisticSource.id)
+            : currentList;
+          setCachedAtomValue(context.registry, listAtom, upsertSourceInList(withoutOptimistic, source));
         }
 
         setCachedAtomValue(
@@ -1003,13 +1082,13 @@ export const useUpdateSource = () =>
     },
   );
 
-export const useConnectMcpSource = () =>
-  useSourceMutation<ConnectMcpSourcePayload, ConnectMcpSourceResult>(
+export const useStartSourceOAuth = () =>
+  useSourceMutation<StartSourceOAuthPayload, StartSourceOAuthResult>(
     React.useCallback(
       ({ workspaceId, accountId, payload }) =>
         runControlPlane({
           accountId,
-          execute: (client) => client.sources.connectMcp({
+          execute: (client) => client.oauth.startSourceAuth({
             path: {
               workspaceId,
             },
@@ -1018,27 +1097,6 @@ export const useConnectMcpSource = () =>
         }),
       [],
     ),
-    {
-      onSuccess: (context, _payload, result) => {
-        const listAtom = sourcesAtom(encodeSourcesKey(true, context.workspaceId, context.accountId));
-        const currentList = getCachedAtomValue(context.registry, listAtom);
-        if (currentList !== undefined) {
-          setCachedAtomValue(context.registry, listAtom, upsertSourceInList(currentList, result.source));
-        }
-
-        setCachedAtomValue(
-          context.registry,
-          sourceAtom(encodeSourceKey(true, context.workspaceId, context.accountId, result.source.id)),
-          result.source,
-        );
-
-        context.invalidateQueries({
-          workspaceId: context.workspaceId,
-          accountId: context.accountId,
-          sourceId: result.source.id,
-        });
-      },
-    },
   );
 
 export const useRemoveSource = () =>
@@ -1079,20 +1137,76 @@ export const useRemoveSource = () =>
     },
   );
 
+export const useDiscoverSource = () =>
+  useSourceMutation<DiscoverSourcePayload, SourceDiscoveryResult>(
+    React.useCallback(
+      ({ accountId, payload }) =>
+        runControlPlane({
+          accountId,
+          execute: (client) => client.sources.discover({
+            payload,
+          }),
+        }),
+      [],
+    ),
+  );
+
+export const useConnectSource = () =>
+  useSourceMutation<ConnectSourcePayload, ConnectSourceResult, Source>(
+    React.useCallback(
+      ({ workspaceId, accountId, payload }) =>
+        runControlPlane({
+          accountId,
+          execute: (client) => client.sources.connect({
+            path: {
+              workspaceId,
+            },
+            payload,
+          } as any),
+        }),
+      [],
+    ),
+    {
+      onSuccess: (context, _payload, result) => {
+        const listAtom = sourcesAtom(encodeSourcesKey(true, context.workspaceId, context.accountId));
+        const currentList = getCachedAtomValue(context.registry, listAtom);
+        if (currentList !== undefined) {
+          setCachedAtomValue(context.registry, listAtom, upsertSourceInList(currentList, result.source));
+        }
+
+        setCachedAtomValue(
+          context.registry,
+          sourceAtom(encodeSourceKey(true, context.workspaceId, context.accountId, result.source.id)),
+          result.source,
+        );
+        context.invalidateQueries({
+          workspaceId: context.workspaceId,
+          accountId: context.accountId,
+        });
+      },
+    },
+  );
+
 export type {
-  ConnectMcpSourcePayload,
-  ConnectMcpSourceResult,
+  CompleteSourceOAuthResult,
+  ConnectSourcePayload,
+  ConnectSourceResult,
   CreateSecretPayload,
   CreateSecretResult,
   CreateSourcePayload,
   DeleteSecretResult,
+  DiscoverSourcePayload,
   InstanceConfig,
   LocalInstallation,
+
   SecretListItem,
   Source,
+  SourceDiscoveryResult,
   SourceInspection,
   SourceInspectionDiscoverResult,
   SourceInspectionToolDetail,
+  StartSourceOAuthPayload,
+  StartSourceOAuthResult,
   UpdateSecretPayload,
   UpdateSecretResult,
   UpdateSourcePayload,
