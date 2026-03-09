@@ -216,8 +216,9 @@ const defaultConnectForm = (discovery?: SourceDiscoveryResult): ConnectFormState
 
 const connectFormFromTemplate = (template: SourceTemplate): ConnectFormState => ({
   ...defaultConnectForm(),
-  kind: template.kind === "internal" ? "openapi" : template.kind,
+  kind: template.kind,
   endpoint: template.endpoint,
+  specUrl: "specUrl" in template ? template.specUrl : "",
   name: template.name,
   namespace: namespaceFromUrl(template.endpoint),
   transport: template.kind === "mcp" ? "auto" : "",

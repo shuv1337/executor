@@ -1,12 +1,22 @@
 import type { Source } from "@executor-v3/react";
 
-export type SourceTemplate = {
+type SourceTemplateBase = {
   id: string;
   name: string;
   summary: string;
-  kind: Source["kind"];
   endpoint: string;
 };
+
+export type OpenApiSourceTemplate = SourceTemplateBase & {
+  kind: "openapi";
+  specUrl: string;
+};
+
+export type NonOpenApiSourceTemplate = SourceTemplateBase & {
+  kind: Exclude<Source["kind"], "openapi" | "internal">;
+};
+
+export type SourceTemplate = OpenApiSourceTemplate | NonOpenApiSourceTemplate;
 
 export const sourceTemplates: ReadonlyArray<SourceTemplate> = [
   {
@@ -29,6 +39,7 @@ export const sourceTemplates: ReadonlyArray<SourceTemplate> = [
     summary: "Repos, issues, pull requests, actions, and org settings.",
     kind: "openapi",
     endpoint: "https://api.github.com",
+    specUrl: "https://raw.githubusercontent.com/github/rest-api-description/main/descriptions/api.github.com/api.github.com.yaml",
   },
   {
     id: "github-graphql",
@@ -50,6 +61,7 @@ export const sourceTemplates: ReadonlyArray<SourceTemplate> = [
     summary: "Models, files, responses, and fine-tuning.",
     kind: "openapi",
     endpoint: "https://api.openai.com/v1",
+    specUrl: "https://app.stainless.com/api/spec/documented/openai/openapi.documented.yml",
   },
   {
     id: "vercel-api",
@@ -57,6 +69,7 @@ export const sourceTemplates: ReadonlyArray<SourceTemplate> = [
     summary: "Deployments, projects, domains, and environments.",
     kind: "openapi",
     endpoint: "https://api.vercel.com",
+    specUrl: "https://openapi.vercel.sh",
   },
   {
     id: "stripe-api",
@@ -64,6 +77,7 @@ export const sourceTemplates: ReadonlyArray<SourceTemplate> = [
     summary: "Payments, billing, subscriptions, and invoices.",
     kind: "openapi",
     endpoint: "https://api.stripe.com",
+    specUrl: "https://raw.githubusercontent.com/stripe/openapi/master/openapi/spec3.json",
   },
   {
     id: "linear-graphql",

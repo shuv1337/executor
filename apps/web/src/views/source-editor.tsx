@@ -260,7 +260,7 @@ const defaultFormState = (template?: SourceTemplate): SourceFormState => ({
   transport: template?.kind === "mcp" ? "auto" : "",
   queryParamsText: "",
   headersText: "",
-  specUrl: "",
+  specUrl: template && "specUrl" in template ? template.specUrl : "",
   defaultHeadersText: "",
   authKind: "none",
   authHeaderName: "Authorization",
