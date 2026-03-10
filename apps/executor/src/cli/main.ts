@@ -412,13 +412,38 @@ const isServerReachable = (baseUrl: string) =>
     Effect.catchAll(() => Effect.succeed(false)),
   );
 
-const getDefaultServerOptions = (port: number = DEFAULT_SERVER_PORT) => {
+const getServerBindOptions = (
+  baseUrl: string = DEFAULT_SERVER_BASE_URL,
+  hostOverride?: string,
+): {
+  host: string;
+  port: number;
+} => {
+  const url = new URL(baseUrl);
+  const port = Number(url.port || DEFAULT_SERVER_PORT);
+
+  return {
+    host: hostOverride && hostOverride.trim().length > 0
+      ? hostOverride.trim()
+      : url.hostname || DEFAULT_SERVER_HOST,
+    port: Number.isInteger(port) && port > 0 ? port : DEFAULT_SERVER_PORT,
+  };
+};
+
+const getDefaultServerOptions = (
+  input: {
+    baseUrl?: string;
+    host?: string;
+    port?: number;
+  } = {},
+) => {
   const assetsDir = resolveRuntimeWebAssetsDir();
   const migrationsFolder = resolveRuntimeMigrationsDir();
 
   return {
-    host: DEFAULT_SERVER_HOST,
-    port,
+    baseUrl: input.baseUrl,
+    host: input.host ?? DEFAULT_SERVER_HOST,
+    port: input.port ?? DEFAULT_SERVER_PORT,
     localDataDir: DEFAULT_LOCAL_DATA_DIR,
     migrationsFolder: migrationsFolder ?? undefined,
     pidFile: DEFAULT_SERVER_PID_FILE,
@@ -426,10 +451,18 @@ const getDefaultServerOptions = (port: number = DEFAULT_SERVER_PORT) => {
   };
 };
 
-const startServerInBackground = (port: number) =>
+const startServerInBackground = (input: { baseUrl: string; host: string; port: number }) =>
   Effect.tryPromise({
     try: async () => {
-      const command = resolveSelfCommand(["__local-server", "--port", String(port)]);
+      const command = resolveSelfCommand([
+        "__local-server",
+        "--port",
+        String(input.port),
+        "--host",
+        input.host,
+        "--base-url",
+        input.baseUrl,
+      ]);
       await mkdir(dirname(DEFAULT_SERVER_LOG_FILE), { recursive: true });
       const logHandle = await open(DEFAULT_SERVER_LOG_FILE, "a");
 
@@ -686,16 +719,21 @@ const stopServer = (baseUrl: string) =>
     return true;
   });
 
-const ensureServer = (baseUrl: string = DEFAULT_SERVER_BASE_URL) =>
+const ensureServer = (
+  baseUrl: string = DEFAULT_SERVER_BASE_URL,
+  hostOverride?: string,
+) =>
   Effect.gen(function* () {
     const reachable = yield* isServerReachable(baseUrl);
     if (reachable) {
       return;
     }
 
-    const url = new URL(baseUrl);
-    const port = Number(url.port || DEFAULT_SERVER_PORT);
-    yield* startServerInBackground(port);
+    const bindOptions = getServerBindOptions(baseUrl, hostOverride);
+    yield* startServerInBackground({
+      ...bindOptions,
+      baseUrl,
+    });
 
     yield* waitForReachability(baseUrl, true);
   });
@@ -1115,9 +1153,16 @@ const driveExecution = (input: {
 const serverStartCommand = Command.make(
   "start",
   {
+    baseUrl: Options.text("base-url").pipe(Options.optional),
+    host: Options.text("host").pipe(Options.withDefault(DEFAULT_SERVER_HOST)),
     port: Options.integer("port").pipe(Options.withDefault(DEFAULT_SERVER_PORT)),
   },
-  ({ port }) => runLocalExecutorServer(getDefaultServerOptions(port)),
+  ({ baseUrl, host, port }) =>
+    runLocalExecutorServer(getDefaultServerOptions({
+      baseUrl: Option.getOrUndefined(baseUrl),
+      host,
+      port,
+    })),
 ).pipe(Command.withDescription("Start the local executor server"));
 
 const serverCommand = Command.make("server").pipe(
@@ -1129,9 +1174,10 @@ const upCommand = Command.make(
   "up",
   {
     baseUrl: Options.text("base-url").pipe(Options.withDefault(DEFAULT_SERVER_BASE_URL)),
+    host: Options.text("host").pipe(Options.optional),
   },
-  ({ baseUrl }) =>
-    ensureServer(baseUrl).pipe(
+  ({ baseUrl, host }) =>
+    ensureServer(baseUrl, Option.getOrUndefined(host)).pipe(
       Effect.zipRight(getServerStatus(baseUrl)),
       Effect.flatMap((status) => printText(renderStatus(status))),
     ),
@@ -1408,12 +1454,18 @@ const hiddenServer = (): Effect.Effect<void, Error, never> | null => {
   }
 
   const portFlagIndex = args.findIndex((arg) => arg === "--port");
+  const hostFlagIndex = args.findIndex((arg) => arg === "--host");
+  const baseUrlFlagIndex = args.findIndex((arg) => arg === "--base-url");
   const port = portFlagIndex >= 0 ? Number(args[portFlagIndex + 1]) : DEFAULT_SERVER_PORT;
+  const host = hostFlagIndex >= 0 ? args[hostFlagIndex + 1] : DEFAULT_SERVER_HOST;
+  const baseUrl = baseUrlFlagIndex >= 0 ? args[baseUrlFlagIndex + 1] : undefined;
 
   return runLocalExecutorServer({
-    ...getDefaultServerOptions(
-      Number.isInteger(port) && port > 0 ? port : DEFAULT_SERVER_PORT,
-    ),
+    ...getDefaultServerOptions({
+      baseUrl: baseUrl && baseUrl.trim().length > 0 ? baseUrl : undefined,
+      host: host && host.trim().length > 0 ? host : DEFAULT_SERVER_HOST,
+      port: Number.isInteger(port) && port > 0 ? port : DEFAULT_SERVER_PORT,
+    }),
   });
 };
 

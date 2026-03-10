@@ -181,6 +181,10 @@ const executeInDeno = (
       let stderrBuffer = "";
       let worker: ReturnType<typeof spawnDenoWorkerProcess> | null =
         null;
+      let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+      let timeoutStartedAt: number | null = null;
+      let remainingTimeoutMs = timeoutMs;
+      let pendingToolCalls = 0;
 
       const finish = (executeResult: ExecuteResult) => {
         if (settled) {
@@ -188,7 +192,11 @@ const executeInDeno = (
         }
 
         settled = true;
-        clearTimeout(timeout);
+        if (timeoutHandle !== null) {
+          clearTimeout(timeoutHandle);
+          timeoutHandle = null;
+          timeoutStartedAt = null;
+        }
         worker?.dispose();
         resume(Effect.succeed(executeResult));
       };
@@ -204,11 +212,55 @@ const executeInDeno = (
         });
       };
 
-      const timeout = setTimeout(() => {
-        fail(
-          `Deno subprocess execution timed out after ${timeoutMs}ms`,
+      const armTimeout = () => {
+        if (settled || pendingToolCalls > 0 || timeoutHandle !== null) {
+          return;
+        }
+
+        if (remainingTimeoutMs <= 0) {
+          fail(
+            `Deno subprocess execution timed out after ${timeoutMs}ms`,
+          );
+          return;
+        }
+
+        timeoutStartedAt = Date.now();
+        timeoutHandle = setTimeout(() => {
+          timeoutHandle = null;
+          timeoutStartedAt = null;
+          remainingTimeoutMs = 0;
+          fail(
+            `Deno subprocess execution timed out after ${timeoutMs}ms`,
+          );
+        }, remainingTimeoutMs);
+      };
+
+      const pauseTimeout = () => {
+        pendingToolCalls += 1;
+
+        if (pendingToolCalls !== 1 || timeoutHandle === null || timeoutStartedAt === null) {
+          return;
+        }
+
+        clearTimeout(timeoutHandle);
+        timeoutHandle = null;
+        remainingTimeoutMs = Math.max(
+          0,
+          remainingTimeoutMs - (Date.now() - timeoutStartedAt),
         );
-      }, timeoutMs);
+        timeoutStartedAt = null;
+      };
+
+      const resumeTimeout = () => {
+        if (pendingToolCalls === 0) {
+          return;
+        }
+
+        pendingToolCalls -= 1;
+        if (pendingToolCalls === 0) {
+          armTimeout();
+        }
+      };
 
       const handleStdoutLine = (rawLine: string) => {
         const line = rawLine.trim();
@@ -240,6 +292,7 @@ const executeInDeno = (
             return;
           }
 
+          pauseTimeout();
           const currentWorker = worker;
 
           Effect.runPromise(
@@ -265,6 +318,7 @@ const executeInDeno = (
                     ok: true,
                     value,
                   });
+                  resumeTimeout();
                 },
                 onFailure: (error) => {
                   writeMessage(currentWorker.stdin, {
@@ -273,10 +327,12 @@ const executeInDeno = (
                     ok: false,
                     error: error.message,
                   });
+                  resumeTimeout();
                 },
               },
             ),
           ).catch((cause) => {
+            resumeTimeout();
             fail(
               `Failed handling worker tool_call: ${String(cause)}`,
             );
@@ -328,6 +384,7 @@ const executeInDeno = (
         return;
       }
 
+      armTimeout();
       writeMessage(worker.stdin, {
         type: "start",
         code,

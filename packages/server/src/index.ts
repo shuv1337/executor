@@ -67,6 +67,7 @@ export type LocalExecutorServer = {
 export type StartLocalExecutorServerOptions = {
   readonly port?: number;
   readonly host?: string;
+  readonly baseUrl?: string;
   readonly localDataDir?: string;
   readonly migrationsFolder?: string;
   readonly pidFile?: string;
@@ -484,7 +485,7 @@ export const createLocalExecutorServer = (
     }
 
     const resolvedAddress = address as AddressInfo;
-    const baseUrl = `http://${host}:${resolvedAddress.port}`;
+    const baseUrl = options.baseUrl ?? `http://${host}:${resolvedAddress.port}`;
     requestHandler.setBaseUrl(baseUrl);
 
     return {

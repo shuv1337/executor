@@ -187,6 +187,67 @@ skipUnlessDeno("runtime-deno-subprocess", () => {
     }),
   );
 
+  it.effect("does not count host tool waits against timeout", () =>
+    Effect.gen(function* () {
+      const delayedTools = {
+        "slow.echo": {
+          description: "Return a message after a host-side delay",
+          inputSchema: messageInputSchema,
+          execute: async ({ message }: { message: string }) => {
+            await new Promise((resolve) => setTimeout(resolve, 200));
+            return { message };
+          },
+        },
+      };
+
+      const executor = makeDenoSubprocessExecutor({
+        timeoutMs: 100,
+      });
+      const toolInvoker = makeToolInvokerFromTools({ tools: delayedTools });
+
+      const output = yield* executor.execute(
+        'return await tools.slow.echo({ message: "hello" });',
+        toolInvoker,
+      );
+
+      expect(output.result).toEqual({ message: "hello" });
+      expect(output.error).toBeUndefined();
+    }),
+  );
+
+  it.effect("still enforces timeout across active sandbox time", () =>
+    Effect.gen(function* () {
+      const delayedTools = {
+        "slow.echo": {
+          description: "Return a message after a host-side delay",
+          inputSchema: messageInputSchema,
+          execute: async ({ message }: { message: string }) => {
+            await new Promise((resolve) => setTimeout(resolve, 200));
+            return { message };
+          },
+        },
+      };
+
+      const executor = makeDenoSubprocessExecutor({
+        timeoutMs: 250,
+      });
+      const toolInvoker = makeToolInvokerFromTools({ tools: delayedTools });
+
+      const output = yield* executor.execute(
+        [
+          'await new Promise((resolve) => setTimeout(resolve, 150));',
+          'await tools.slow.echo({ message: "hello" });',
+          'await new Promise((resolve) => setTimeout(resolve, 150));',
+          'return 1;',
+        ].join("\n"),
+        toolInvoker,
+      );
+
+      expect(output.result).toBeNull();
+      expect(output.error).toContain("timed out");
+    }),
+  );
+
   it.effect("network access is denied by default", () =>
     Effect.gen(function* () {
       const executor = makeDenoSubprocessExecutor();
