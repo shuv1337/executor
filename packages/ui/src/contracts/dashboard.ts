@@ -35,6 +35,8 @@ export interface AccountDetail {
 export interface Inventory {
   readonly apps: readonly App[];
   readonly accounts: readonly AccountSummary[];
+  /** Hosts may supply caller-specific execution bindings instead of app-owned bindings. */
+  readonly appAccountSelections?: Readonly<Record<string, readonly SelectedAccounts[]>>;
 }
 /** Any Effect Atom source, including a live stream or a one-shot HTTP query. */
 export type Query<A, E> = Atom.Atom<AsyncResult.AsyncResult<A, E>>;

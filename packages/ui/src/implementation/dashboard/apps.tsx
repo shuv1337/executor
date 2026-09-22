@@ -109,8 +109,21 @@ function AppsList({
         <div className="app-cards grid grid-cols-3 [grid-auto-rows:1fr] gap-4 max-[1100px]:grid-cols-2 max-[600px]:grid-cols-1">
           {pending}
           {apps.map((app) => {
-            const ids = selectedIds(app);
-            const issues = accountSelectionIssues(app, data.accounts);
+            const selections = data.appAccountSelections?.[app.id];
+            const contexts =
+              selections === undefined
+                ? [app]
+                : selections.map((accounts) => ({ ...app, accounts }));
+            const complete = contexts.filter(
+              (context) => accountSelectionIssues(context, data.accounts).length === 0,
+            );
+            const issues =
+              complete.length > 0
+                ? []
+                : (contexts.length > 0 ? contexts : [app]).flatMap((context) =>
+                    accountSelectionIssues(context, data.accounts),
+                  );
+            const ids = [...new Set(complete.flatMap(selectedIds))];
             const selected = data.accounts.filter((account) => ids.includes(account.id));
             const needsSignIn = selected.some((account) => accountNeedsSignIn(account));
             const unavailable = selected.some((account) => account.signIn?.state === "unavailable");

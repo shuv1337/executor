@@ -147,7 +147,17 @@ const inventory = Atom.family((key: ListKey) =>
         providerName: provider.definition.name,
         providerUrl: providerDisplayUrl(provider.definition),
       }));
-      return { apps, accounts, pendingApp: key.group !== "private" && data.pendingApp };
+      const appAccountSelections = Object.fromEntries(
+        data.apps.flatMap(({ app, accountSelections }) =>
+          accountSelections === undefined ? [] : [[app.id, accountSelections]],
+        ),
+      );
+      return {
+        apps,
+        accounts,
+        appAccountSelections,
+        pendingApp: key.group !== "private" && data.pendingApp,
+      };
     }),
   ),
 );

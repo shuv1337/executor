@@ -131,6 +131,11 @@ layer(HostedLive, { excludeTestServices: true })("Executor API-key account", (it
                 page.getByRole("status", { name: "Installing app", exact: true }).count(),
               ),
             ).toBe(0);
+            expect(
+              yield* browser.use("The installed app recognizes its personal account", (page) =>
+                page.getByRole("link", { name: "Open Executor", exact: true }).innerText(),
+              ),
+            ).not.toContain("Needs account");
             yield* browser.checkpoint("The installed app replaces the skeleton");
           }),
         );
@@ -179,6 +184,72 @@ layer(HostedLive, { excludeTestServices: true })("Executor API-key account", (it
         expect(admin.id).not.toBe(own.id);
         expect(admin.accounts.service).not.toBe(account);
         expect(adminInventory.accounts.some((item) => item.id === account)).toBe(false);
+        const directory = (actor: Session) =>
+          Effect.gen(function* () {
+            return yield* body(
+              Schema.Struct({
+                apps: Schema.Array(
+                  Schema.Struct({
+                    app: App,
+                    accountSelections: Schema.Array(Schema.Record(Schema.String, Schema.String)),
+                  }),
+                ),
+              }),
+              yield* api.request(actor, "GET", `${prefix}/resources`),
+            );
+          });
+        const ownDirectory = yield* directory(actors.owner);
+        const adminDirectory = yield* directory(actors.admin);
+        expect(
+          ownDirectory.apps.find((entry) => entry.app.id === app.id)?.accountSelections,
+        ).toEqual([{ service: account }]);
+        expect(
+          adminDirectory.apps.find((entry) => entry.app.id === app.id)?.accountSelections,
+        ).toEqual([{ service: admin.accounts.service }]);
+        yield* browser.use("The app list shows the caller's selected account", (page) =>
+          page.goto(`/org/${actors.organization.slug}/apps`),
+        );
+        yield* browser.use("The card names the personal account", (page) =>
+          page
+            .getByRole("link", { name: "Open Executor", exact: true })
+            .getByText("My Executor key", { exact: true })
+            .waitFor(),
+        );
+        yield* browser.use("Open the same app's overview", (page) =>
+          page.getByRole("link", { name: "Open Executor", exact: true }).click(),
+        );
+        yield* browser.use("Overview agrees that one account is selected", (page) =>
+          page.getByText("1 account", { exact: true }).waitFor(),
+        );
+        const disabled = yield* body(
+          Profile,
+          yield* api.request(actors.owner, "PATCH", `${path}/profiles/${own.id}/enabled`, {
+            expectedRevision: own.revision,
+            enabled: false,
+          }),
+        );
+        yield* browser.use("Return to Apps with the only personal profile disabled", (page) =>
+          page.goto(`/org/${actors.organization.slug}/apps`),
+        );
+        yield* browser.use("Disabled profiles do not claim a usable account", (page) =>
+          page
+            .getByRole("link", { name: "Open Executor", exact: true })
+            .getByText("Needs account", { exact: true })
+            .waitFor(),
+        );
+        expect(
+          (yield* api.request(actors.owner, "PATCH", `${path}/profiles/${own.id}/enabled`, {
+            expectedRevision: disabled.revision,
+            enabled: true,
+          })).status,
+        ).toBe(200);
+        yield* browser.use("The account becomes usable again without reloading", (page) =>
+          page
+            .getByRole("link", { name: "Open Executor", exact: true })
+            .getByText("My Executor key", { exact: true })
+            .waitFor(),
+        );
+
         const call = (actor: Session, profile: string) =>
           api.request(actor, "POST", `${path}/tools/call`, {
             profile,

@@ -49,25 +49,56 @@ export const resourceDirectory = (view: "available" | "managed" = "available") =
     const { owner } = yield* CurrentOrganization;
     const policy = yield* CurrentAuthorization;
     const apps = yield* executor.apps.list({ owner, ids: permittedAppIds(policy) });
-    const selected = new Set(
-      apps.flatMap((app) =>
-        Object.values(app.accounts).flatMap((value) =>
-          typeof value === "string" ? [value] : value,
-        ),
-      ),
-    );
-    const accounts = (yield* executor.accounts.list({ owner })).filter(
-      (account) => policy.tools.kind === "all" || selected.has(account.id),
-    );
     const appEntries = yield* Effect.forEach(apps, (app) =>
       applicationAccess(app.id, actor).pipe(
         Effect.flatMap((access) =>
           (view === "managed" ? access.canManage : access.canUse)
-            ? safeAppMetadata(app, actor).pipe(Effect.map((app) => [{ app, access }]))
+            ? Effect.gen(function* () {
+                const safe = yield* safeAppMetadata(app, actor);
+                const profiles = access.canUse
+                  ? yield* executor.apps.profiles.list({ app: app.id, owner, subject: actor.user })
+                  : [];
+                const configured = profiles
+                  .filter(
+                    (profile) =>
+                      profile.enabled &&
+                      profile.status !== "removing" &&
+                      profile.status !== "removed",
+                  )
+                  .map((profile) => ({
+                    ...app,
+                    accounts: { ...app.accounts, ...profile.accounts },
+                  }));
+                if (
+                  access.canUse &&
+                  Object.keys(app.requirements.accounts).every((slot) =>
+                    Object.hasOwn(app.accounts, slot),
+                  )
+                )
+                  configured.unshift(app);
+                const accountSelections = yield* Effect.forEach(configured, (configured) =>
+                  safeAppMetadata(configured, actor).pipe(Effect.map((app) => app.accounts)),
+                );
+                return [{ app: safe, access, ...(access.canUse ? { accountSelections } : {}) }];
+              })
             : Effect.succeed([]),
         ),
         Effect.catchTag("OrganizationForbidden", () => Effect.succeed([])),
       ),
+    );
+    const selected = new Set(
+      appEntries
+        .flat()
+        .flatMap(({ app, accountSelections }) =>
+          [app.accounts, ...(accountSelections ?? [])].flatMap((selection) =>
+            Object.values(selection).flatMap((value) =>
+              typeof value === "string" ? [value] : value,
+            ),
+          ),
+        ),
+    );
+    const accounts = (yield* executor.accounts.list({ owner })).filter(
+      (account) => policy.tools.kind === "all" || selected.has(account.id),
     );
     const providers = new Map<ProviderId, Provider>();
     const accountEntries = yield* Effect.forEach(accounts, (account) =>

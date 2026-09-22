@@ -3,6 +3,8 @@ import { RequiredAction } from "./authorization.ts";
 /** Hosted sharing policy stays separate from SDK tenant ownership and saved bindings. */
 import {
   App,
+  SelectedAccounts,
+  ProfileErrors,
   Account,
   Provider,
   AppId,
@@ -113,7 +115,14 @@ const errors = [
 /** Normal lists show use grants; management mode is explicit and never grants execution. */
 export const ResourceDirectory = Schema.Struct({
   pendingApp: Schema.Boolean,
-  apps: Schema.Array(Schema.Struct({ app: App, access: AppAccess })),
+  apps: Schema.Array(
+    Schema.Struct({
+      app: App,
+      access: AppAccess,
+      /** Usable caller-specific bindings for display; never changes the shared app. */
+      accountSelections: Schema.optional(Schema.Array(SelectedAccounts)),
+    }),
+  ),
   accounts: Schema.Array(
     Schema.Struct({ account: Account, access: AccountAccess, provider: Provider }),
   ),
@@ -125,7 +134,7 @@ export const HostedResourceAccess = HttpApiGroup.make("resourceAccess")
       params: organization,
       query: { view: Schema.optional(Schema.Literals(["available", "managed"])) },
       success: ResourceDirectory,
-      error: errors,
+      error: [...errors, ...ProfileErrors],
     }).annotate(RequiredAction, "read"),
   )
   .add(
