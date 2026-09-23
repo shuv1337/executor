@@ -278,22 +278,27 @@ export const makeOAuthProtocol = (options: OAuthOptions) => {
       Effect.gen(function* () {
         const method = yield* clientMethod(server, configured);
         const advertised = method === "client_secret_basic_raw" ? "client_secret_basic" : method;
-        const registered = yield* request(async (settings) =>
-          oauth.processDynamicClientRegistrationResponse(
-            await oauth.dynamicClientRegistrationRequest(
-              metadata(server),
-              {
-                client_name: options.clientName,
-                redirect_uris: [redirectUri],
-                token_endpoint_auth_method: advertised,
-                grant_types: ["authorization_code", "refresh_token"],
-                response_types: ["code"],
-                ...(scopes.length === 0 ? {} : { scope: scopes.join(" ") }),
-              },
-              settings,
-            ),
-          ),
-        );
+        const registered = yield* request(async (settings) => {
+          const response = await oauth.dynamicClientRegistrationRequest(
+            metadata(server),
+            {
+              client_name: options.clientName,
+              redirect_uris: [redirectUri],
+              token_endpoint_auth_method: advertised,
+              grant_types: ["authorization_code", "refresh_token"],
+              response_types: ["code"],
+              ...(scopes.length === 0 ? {} : { scope: scopes.join(" ") }),
+            },
+            settings,
+          );
+          // Zoho and Jotform return 200 instead of RFC 7591's 201. Keep the library's
+          // complete response validation, normalizing only this successful status.
+          return oauth.processDynamicClientRegistrationResponse(
+            response.status === 200
+              ? new Response(response.body, { status: 201, headers: response.headers })
+              : response,
+          );
+        });
         if (
           registered.token_endpoint_auth_method !== undefined &&
           registered.token_endpoint_auth_method !== advertised

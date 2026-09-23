@@ -13,6 +13,8 @@ import {
 export const oauthSetupIssuer = Effect.gen(function* () {
   const address = yield* Deferred.make<string>();
   let registration = true;
+  let registrationStatus = 201;
+  let malformedRegistration = false;
   let expiresAt = 0;
   let discoveryFails = false;
   let scopes = ["read"];
@@ -81,13 +83,13 @@ export const oauthSetupIssuer = Effect.gen(function* () {
         lastRegistration = { scope: input.scope ?? "", method: input.token_endpoint_auth_method };
         return yield* HttpServerResponse.json(
           {
-            client_id: `synthetic-client-${registrations}`,
+            ...(malformedRegistration ? {} : { client_id: `synthetic-client-${registrations}` }),
             client_secret: "synthetic-client-secret",
             client_secret_expires_at: expiresAt,
             token_endpoint_auth_method: input.token_endpoint_auth_method,
             redirect_uris: input.redirect_uris,
           },
-          { status: 201 },
+          { status: registrationStatus },
         );
       }),
     ),
@@ -105,6 +107,8 @@ export const oauthSetupIssuer = Effect.gen(function* () {
     origin,
     configure: (input: {
       readonly registration?: boolean;
+      readonly registrationStatus?: number;
+      readonly malformedRegistration?: boolean;
       readonly expiresAt?: number;
       readonly discoveryFails?: boolean;
       readonly scopes?: readonly string[];
@@ -112,6 +116,9 @@ export const oauthSetupIssuer = Effect.gen(function* () {
     }) =>
       Effect.sync(() => {
         if (input.registration !== undefined) registration = input.registration;
+        if (input.registrationStatus !== undefined) registrationStatus = input.registrationStatus;
+        if (input.malformedRegistration !== undefined)
+          malformedRegistration = input.malformedRegistration;
         if (input.expiresAt !== undefined) expiresAt = input.expiresAt;
         if (input.discoveryFails !== undefined) discoveryFails = input.discoveryFails;
         if (input.scopes !== undefined) scopes = [...input.scopes];

@@ -528,6 +528,15 @@ export const scenarios = {
       local: na("Exercises shared OAuth through the hosted API."),
     },
   },
+  oauthRegistrationCompatibility: {
+    file: "oauth-registration-compatibility.spec.ts",
+    title: "OAuth registration accepts HTTP 200 clients and rejects malformed or error responses",
+    targets: {
+      "self-host": scheduled,
+      cloud: na("Uses a scoped loopback issuer."),
+      local: na("Hosted account connection API."),
+    },
+  },
   oauthClientSetup: {
     file: "oauth-client-setup.spec.ts",
     title:
