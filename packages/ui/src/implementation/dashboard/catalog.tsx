@@ -188,7 +188,7 @@ export function CatalogPage<E, P>({
                     <strong>{name}</strong>
                     <span>
                       {row.kind === "publication"
-                        ? row.publication.description || "Public app"
+                        ? row.publication.description || "Published app"
                         : row.entry.domain}
                     </span>
                   </div>

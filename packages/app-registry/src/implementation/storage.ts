@@ -74,11 +74,16 @@ export const makeRegistryStorage = Effect.gen(function* () {
     ),
     scopeOwner: (scope: string) => run(scopeOwner(scope)),
     get: (name: string) => run(get(name)),
-    list: (name?: string) =>
+    list: (name?: string, access?: { readonly owner: OwnerId; readonly apps?: readonly AppId[] }) =>
       run(
         db
           .findMany("publications", {
-            where: (b) => (name === undefined ? true : b("name", "=", name)),
+            where: (b) =>
+              b.and(
+                name === undefined ? true : b("name", "=", name),
+                access === undefined ? true : b("owner", "=", access.owner),
+                access?.apps === undefined ? true : b("app", "in", access.apps),
+              ),
             orderBy: ["name", "asc"],
           })
           .pipe(

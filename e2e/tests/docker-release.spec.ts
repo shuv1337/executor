@@ -249,7 +249,10 @@ export default defineApp({ accounts: { service }, database }, async ({ accounts 
               },
               {
                 path: "package.json",
-                content: JSON.stringify({ dependencies: { "is-number": "7.0.0" } }),
+                content: JSON.stringify({
+                  name: `@${parsed[0].slug}/release-app`,
+                  dependencies: { "is-number": "7.0.0" },
+                }),
               },
               {
                 path: "ui/index.html",
@@ -357,6 +360,22 @@ visit("/app/data/hosted.pglite");process.stdout.write(hash.digest("hex"));`,
           );
         let nativeBackup: string | undefined;
         let beforeRestartTrace: string | undefined;
+        const publicationName = `@${parsed[0].slug}/release-app`;
+        let publicationCommit: string | undefined;
+        if (initialImage === image) {
+          const response = yield* request(`${prefix}/apps/${app.id}/workspace`, undefined, cookie);
+          const workspace = yield* Schema.decodeUnknownEffect(
+            Schema.Struct({ revision: Schema.Struct({ commit: Schema.String }) }),
+          )(yield* driver("Read publication revision", () => response.json()));
+          publicationCommit = workspace.revision.commit;
+          expect(
+            (yield* request(
+              `${prefix}/apps/${app.id}/publication`,
+              { commit: publicationCommit },
+              cookie,
+            )).status,
+          ).toBe(200);
+        }
         for (const restart of [false, true]) {
           if (restart) {
             yield* run(
@@ -409,6 +428,29 @@ visit("/app/data/hosted.pglite");process.stdout.write(hash.digest("hex"));`,
                 yield* legacyDigest(),
                 "migration preserves the complete native database backup",
               ).toBe(nativeBackup);
+          }
+          if (restart || initialImage === image) {
+            const authoring = yield* request(
+              `${prefix}/apps/${app.id}/authoring`,
+              undefined,
+              cookie,
+            );
+            expect(
+              yield* driver("Publishing survives startup", () => authoring.json()),
+            ).toMatchObject({ canPublish: true, publicationAudience: "organization" });
+          }
+          if (publicationCommit !== undefined) {
+            const query = `name=${encodeURIComponent(publicationName)}&commit=${publicationCommit}`;
+            const published = yield* request(
+              `${prefix}/app-publications/source?${query}`,
+              undefined,
+              cookie,
+            );
+            expect(published.status).toBe(200);
+            expect(
+              yield* driver("Publication survives restart", () => published.json()),
+            ).toMatchObject({ publication: { name: publicationName, commit: publicationCommit } });
+            expect((yield* request(`/api/registry/source?${query}`)).status).toBe(404);
           }
           if (mode === "explicit") {
             // Exercise the packaged Git HTTP backend, including its pack subprocesses.

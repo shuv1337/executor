@@ -86,6 +86,8 @@ export class RegistryError extends Schema.TaggedError<RegistryError>()(
 /** Public reads require a selected commit; a changed listing never silently selects newer code. */
 export interface Registry {
   readonly origin: string;
+  /** Authenticated registries use their product-owned source route for copy provenance. */
+  readonly sourcePath?: string;
   readonly list: (
     name?: string,
   ) => Effect.Effect<ReadonlyArray<typeof Publication.Type>, RegistryError>;

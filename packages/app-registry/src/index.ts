@@ -30,12 +30,24 @@ export const storedRegistry = (
   storage: RegistryStorage,
   sources: AppSourceStorage,
   origin: string,
+  access?: {
+    readonly owner: OwnerId;
+    readonly apps?: readonly AppId[];
+    readonly sourcePath?: string;
+  },
 ): Registry => ({
   origin,
-  list: storage.list,
+  ...(access?.sourcePath === undefined ? {} : { sourcePath: access.sourcePath }),
+  list: (name) => storage.list(name, access),
   snapshot: (name, commit) =>
     Effect.gen(function* () {
       const row = yield* storage.get(name);
+      if (
+        access !== undefined &&
+        (row.owner !== access.owner ||
+          (access.apps !== undefined && !access.apps.includes(row.app)))
+      )
+        return yield* new RegistryError({ reason: "not-found" });
       if (row.publication.commit !== commit) return yield* new RegistryError({ reason: "changed" });
       const files = yield* sources
         .read(row.source)
@@ -153,7 +165,7 @@ export const resolvePublication = (
       files: snapshot.files,
       origin: {
         reference: new URL(
-          `/api/registry/source?name=${encodeURIComponent(input.package)}&commit=${encodeURIComponent(input.commit)}`,
+          `${registry.sourcePath ?? "/api/registry/source"}?name=${encodeURIComponent(input.package)}&commit=${encodeURIComponent(input.commit)}`,
           registry.origin,
         ).href,
         name: input.package,

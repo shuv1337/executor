@@ -1,7 +1,7 @@
 import { hostedAppCapabilities } from "@executor-js/hosted-server/app-management";
 import { executorSelfHostApiDocument } from "../contracts/api.ts";
 import { AppManagementHost } from "@executor-js/app-management";
-import { remoteRegistry } from "@executor-js/app-registry";
+import { createAppRegistry, makeRegistryStorage, storedRegistry } from "@executor-js/app-registry";
 import { gitSourceStorage } from "@executor-js/app-source";
 import type { RepositoryBackend } from "@executor-js/app-source";
 /** Self-host SDK uses the same PGlite connection as Better Auth. */
@@ -62,11 +62,7 @@ export const selfHostExecutorServices = <E, R>(
       const storage = yield* makeExecutorStorage({ provider: "postgresql" });
       const ready = yield* Deferred.make<Executor>();
       const { runtime, workflows, blobs, repositories } = yield* acquire(Deferred.await(ready));
-      const registry = remoteRegistry(
-        yield* Config.String("EXECUTOR_REGISTRY_URL").pipe(
-          Config.withDefault("https://v2.executor.sh"),
-        ),
-      );
+      const registryStorage = yield* makeRegistryStorage;
       const sources = gitSourceStorage(repositories);
       const executor = yield* postgresExecutor(
         key,
@@ -119,9 +115,15 @@ export const selfHostExecutorServices = <E, R>(
             executor,
             sources,
             repositories,
-            registry,
+            registry: (identity) =>
+              storedRegistry(registryStorage, sources, origin, {
+                owner: identity.owner,
+                sourcePath: `/api/organizations/${encodeURIComponent(identity.scope)}/app-publications/source`,
+                ...(identity.appIds === undefined ? {} : { apps: identity.appIds }),
+              }),
+            publicationAudience: "organization",
             blobs,
-            publisher: undefined,
+            publisher: createAppRegistry({ storage: registryStorage, executor, sources }),
             access: yield* hostedAppCapabilities,
           }),
         ),
