@@ -69,7 +69,7 @@ export const provision = (id: string, services: ProvisioningServices) =>
         const members =
           yield* sql`select "user".name from member join "user" on "user".id = member."userId"
         where member."organizationId" = ${job.organization_id} and member."userId" = ${job.user_id}
-        and member.role in ('owner', 'admin') and (${services.requireVerifiedEmail} = false or "user"."emailVerified" = true)`;
+        and member.role in ('owner', 'admin', 'member') and (${services.requireVerifiedEmail} = false or "user"."emailVerified" = true)`;
         if (members.length > 0) {
           const member = yield* Schema.decodeUnknownEffect(Schema.Struct({ name: Schema.String }))(
             members[0],

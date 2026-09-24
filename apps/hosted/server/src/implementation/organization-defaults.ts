@@ -177,7 +177,7 @@ export const organizationDefaults = (
               const eligible =
                 yield* sql`select member.id from member join "user" on "user".id = member."userId"
                 where member."organizationId" = ${organization} and member."userId" = ${user.userId}
-                and member.role in ('owner', 'admin') and (${requireVerifiedEmail} = false or "user"."emailVerified" = true)
+                and member.role in ('owner', 'admin', 'member') and (${requireVerifiedEmail} = false or "user"."emailVerified" = true)
                 for share of member, "user"`.pipe(Effect.mapError(() => new StorageError()));
               if (eligible.length === 0) return;
               const token =
