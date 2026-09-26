@@ -125,7 +125,9 @@ test(
                   manage: caller.canWrite,
                   edit: caller.canWrite,
                 }),
-              registry,
+              registry: () => registry,
+              publicRegistry: registry,
+              publicationAudience: "public",
               blobs,
               publisher: createAppRegistry({ storage: packageStorage, executor, sources }),
             }),
@@ -192,6 +194,7 @@ test(
                 gitPath: "/git/fixture/example.git",
                 canEdit: true,
                 canPublish: true,
+                publicationAudience: "public",
               });
             }),
           );

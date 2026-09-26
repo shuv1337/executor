@@ -52,6 +52,7 @@ const authoringFields = {
   namespace: Schema.NullOr(Schema.String),
   gitPath: Schema.String,
   canEdit: Schema.Boolean,
+  publicationAudience: Schema.Literals(["public", "organization"]),
 };
 /** Permissions and clone location for controls that do not need a source snapshot. */
 export const AppAuthoringMetadata = Schema.Struct({
@@ -89,6 +90,7 @@ import {
 } from "@executor-js/sdk/core";
 import {
   Publication,
+  PublicationSnapshot,
   PackageName,
   PublicationReference,
 } from "@executor-js/app-registry/contracts";
@@ -212,7 +214,7 @@ export const appManagementApi = <I extends HttpApiMiddleware.AnyId, S>(
           error: appOperationErrors,
         }).annotate(
           OpenApi.Description,
-          "Make an independent copy with fresh Git history. Owned apps copy running source; unfinished apps copy working source. Public packages copy the reviewed published commit. Running and public copies deploy automatically. Accounts and app data are not copied.",
+          "Make an independent copy with fresh Git history. Owned apps copy running source; unfinished apps copy working source. Published packages copy the reviewed commit permitted by this registry. Running and published copies deploy automatically. Accounts and app data are not copied.",
         ),
         HttpApiEndpoint.get("git", "/apps/:app/git", {
           params: app,
@@ -229,7 +231,7 @@ export const appManagementApi = <I extends HttpApiMiddleware.AnyId, S>(
           error: appOperationErrors,
         }).annotate(
           OpenApi.Description,
-          "Publish this Git commit as the current public app listing. package.json supplies a scoped name and optional description. Installs own their source copies; existing copies do not update. Git history, accounts, and app data stay private.",
+          "Publish this Git commit to this server's registry. Self-host publications are organization-only; Cloud publications are public. package.json supplies a scoped name and optional description. Existing copies do not update. Git history, accounts, and app data stay private.",
         ),
         HttpApiEndpoint.get("history", "/apps/:app/history", {
           params: app,
@@ -243,13 +245,22 @@ export const appManagementApi = <I extends HttpApiMiddleware.AnyId, S>(
           error: appOperationErrors,
         }).annotate(
           OpenApi.Description,
-          "Discover public app listings and their selected Git commits.",
+          "Discover permitted published apps and their selected Git commits.",
         ),
         HttpApiEndpoint.get("published", "/app-publications/published", {
           params: tenant,
           success: Schema.Array(Publication),
           error: appOperationErrors,
-        }).annotate(OpenApi.Description, "List this publishing account's public apps."),
+        }).annotate(OpenApi.Description, "List this publishing account's published apps."),
+        HttpApiEndpoint.get("publicationSource", "/app-publications/source", {
+          params: tenant,
+          query: { name: PackageName, commit: SourceCommit },
+          success: PublicationSnapshot,
+          error: appOperationErrors,
+        }).annotate(
+          OpenApi.Description,
+          "Read the selected published source permitted by this registry and organization.",
+        ),
         HttpApiEndpoint.post("unpublish", "/app-publications/unpublish", {
           params: tenant,
           payload: Schema.Struct({ package: PackageName }),
@@ -257,7 +268,7 @@ export const appManagementApi = <I extends HttpApiMiddleware.AnyId, S>(
           error: appOperationErrors,
         }).annotate(
           OpenApi.Description,
-          "Remove a public listing. Existing installed copies remain independent and usable.",
+          "Remove a registry listing. Existing installed copies remain independent and usable.",
         ),
       )
       .prefix(prefix)

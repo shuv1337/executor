@@ -75,8 +75,8 @@ test("lifecycle jobs commit with auth changes, survive retry, and respect curren
           (yield* sql`select id from hosted_provisioning where kind = 'user'`).length,
           2,
         );
-        // A removed or downgraded member's queued job cannot mint an account.
-        yield* sql`update member set role = 'member' where id = 'owner'`;
+        // A removed member's queued job cannot mint an account.
+        yield* sql`delete from member where id = 'owner'`;
         const [job] = yield* sql<{
           id: string;
         }>`select id from hosted_provisioning where kind = 'member' and user_id = 'owner' order by id limit 1`;
@@ -97,6 +97,39 @@ test("lifecycle jobs commit with auth changes, survive retry, and respect curren
           (yield* sql`select id from hosted_provisioning where organization_id = 'team'`).length,
           0,
         );
+      }),
+    ).pipe(Effect.provide(pgliteLayer())),
+  ));
+
+test("member lifecycle setup retains the member role and completes once", () =>
+  Effect.runPromise(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { sql, user, team, member } = yield* fixture;
+        yield* user("teammate", false);
+        yield* team("team");
+        yield* member("teammate", "member");
+        const [job] = yield* sql<{ id: string }>`select id from hosted_provisioning
+          where kind = 'member' and user_id = 'teammate'`;
+        assert.ok(job);
+        const provisioned: string[] = [];
+        const defaults = OrganizationDefaults.of((_organization, user) =>
+          Effect.sync(() => {
+            if (user !== undefined) provisioned.push(user.userId);
+          }),
+        );
+        yield* provision(job.id, selfHostProvisioningServices).pipe(
+          Effect.provideService(OrganizationDefaults, defaults),
+        );
+        assert.deepEqual(provisioned, ["teammate"]);
+        assert.equal(
+          (yield* sql`select role from member where id = 'teammate'`)[0]?.role,
+          "member",
+        );
+        yield* provision(job.id, selfHostProvisioningServices).pipe(
+          Effect.provideService(OrganizationDefaults, defaults),
+        );
+        assert.deepEqual(provisioned, ["teammate"], "completed jobs are not replayed");
       }),
     ).pipe(Effect.provide(pgliteLayer())),
   ));

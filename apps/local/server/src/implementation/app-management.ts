@@ -94,7 +94,15 @@ export const localAppManagement = (
       Layer.provide(access),
       HttpRouter.provideRequest(gitAccess),
       HttpRouter.provideRequest(
-        Layer.succeed(AppManagementHost, Effect.succeed({ ...resources, publisher: undefined })),
+        Layer.succeed(
+          AppManagementHost,
+          Effect.succeed({
+            ...resources,
+            registry: () => resources.registry,
+            publicationAudience: "public",
+            publisher: undefined,
+          }),
+        ),
       ),
     );
   });

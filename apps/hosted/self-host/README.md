@@ -86,6 +86,26 @@ input set to `build`. Publishing requires an explicit release dispatch.
 Both native architectures must pass the Docker release scenarios before the
 workflow updates a channel tag. See the [release check](../../../e2e/README.md#targets-and-shared-behavior).
 
+## Team app registry
+
+This source build includes an organization-only registry in the same database as
+your apps. Owners and administrators can open an app's **Publish** dialog to share
+its saved Git revision. Set `package.json`'s name to `@organization-slug/app-name`
+first; the dialog shows the required handle when a name needs repair.
+
+Signed-in organization members can discover publications in **Add app** and read
+their selected source. Creating an independent copy requires app-management
+permission. Other organizations and anonymous visitors cannot list or download
+these publications. The public `/api/registry/*` routes are not enabled on self-host.
+
+Publishing shares only the selected files, not connected accounts, app data or
+Git history. Later edits remain private until republished. Unpublishing removes
+discovery and source access; already installed copies remain independent.
+
+Registry tables are created additively on first startup and retained across
+restarts. There is no publishing environment-variable switch. Self-host uses its
+own registry rather than `EXECUTOR_REGISTRY_URL`; Cloud retains its public registry.
+
 ## Railway
 
 Create an image service from `ghcr.io/usefulsoftwareco/executor-selfhost:beta`,

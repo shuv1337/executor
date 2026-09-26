@@ -55,7 +55,11 @@ export class AppManagementHost extends Context.Service<
         | undefined;
       readonly sources: AppSourceStorage;
       readonly repositories: RepositoryBackend;
-      readonly registry: Registry;
+      /** The product selects the readable registry for this verified caller. */
+      readonly registry: (identity: Context.Service.Shape<typeof AppIdentity>) => Registry;
+      /** Only hosts with anonymous source sharing supply this capability. */
+      readonly publicRegistry?: Registry;
+      readonly publicationAudience: "public" | "organization";
       readonly blobs: BlobStorage;
       readonly publisher: ReturnType<typeof createAppRegistry> | undefined;
     },
@@ -132,6 +136,7 @@ const authoring = (id: AppId) =>
         namespace: identity.namespace,
         gitPath: `/git/${encodeURIComponent(identity.scope)}/${app.slug}.git`,
         canEdit,
+        publicationAudience: host.publicationAudience,
         canPublish: canEdit && host.publisher !== undefined && identity.namespace !== null,
       },
     };
@@ -238,7 +243,7 @@ export const appManagementHandlers = <I extends HttpApiMiddleware.AnyId, S, Id e
           const from =
             "app" in payload.from
               ? (yield* ownedSource(host, identity, payload.from.app)).app.id
-              : yield* resolvePublication(host.registry, payload.from);
+              : yield* resolvePublication(host.registry(identity), payload.from);
           return yield* host.executor.apps
             .copy({
               owner: identity.owner,
@@ -283,7 +288,17 @@ export const appManagementHandlers = <I extends HttpApiMiddleware.AnyId, S, Id e
       )
       .handle("catalog", ({ query }) =>
         Effect.gen(function* () {
-          return yield* (yield* Effect.flatten(AppManagementHost)).registry.list(query.name);
+          const identity = yield* AppIdentity;
+          return yield* (yield* Effect.flatten(AppManagementHost))
+            .registry(identity)
+            .list(query.name);
+        }),
+      )
+      .handle("publicationSource", ({ query }) =>
+        Effect.gen(function* () {
+          const identity = yield* AppIdentity;
+          const host = yield* Effect.flatten(AppManagementHost);
+          return yield* host.registry(identity).snapshot(query.name, query.commit);
         }),
       )
       .handle("published", () =>
@@ -328,6 +343,11 @@ export const registryRoutes = (() => {
     ),
   );
   const publicRegistry = Effect.flatten(AppManagementHost).pipe(
+    Effect.flatMap((host) =>
+      host.publicRegistry === undefined
+        ? Effect.fail(new RegistryError({ reason: "forbidden" }))
+        : Effect.succeed(host.publicRegistry),
+    ),
     Effect.mapError(() => new RegistryError({ reason: "storage" })),
   );
   return HttpApiBuilder.layer(api).pipe(
@@ -335,11 +355,11 @@ export const registryRoutes = (() => {
       HttpApiBuilder.group(api, "registry", (h) =>
         h
           .handle("list", ({ query }) =>
-            Effect.flatMap(publicRegistry, (host) => host.registry.list(query.name)),
+            Effect.flatMap(publicRegistry, (registry) => registry.list(query.name)),
           )
           .handle("snapshot", ({ query }) =>
-            Effect.flatMap(publicRegistry, (host) =>
-              host.registry.snapshot(query.name, query.commit),
+            Effect.flatMap(publicRegistry, (registry) =>
+              registry.snapshot(query.name, query.commit),
             ),
           ),
       ),

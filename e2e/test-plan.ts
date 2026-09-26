@@ -30,6 +30,15 @@ const cloudOnboarding = {
 
 /** Scenario names and applicability used by both test declarations and test selection. */
 export const scenarios = {
+  teamRegistry: {
+    file: "team-registry.spec.ts",
+    title: "Team registry publishes, isolates, copies and unpublishes organization-only source",
+    targets: {
+      "self-host": scheduled,
+      cloud: na("Cloud uses the public registry instead of organization-only publications."),
+      local: na("Local does not publish apps."),
+    },
+  },
   cloudImpersonation: {
     file: "cloud-impersonation.spec.ts",
     title: "Platform admin impersonation uses the shared widget and restores the original session",

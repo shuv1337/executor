@@ -39,13 +39,13 @@ function publicationRepair(issue: PublicationIssue) {
     case "unscoped-name":
       return {
         title: "Add your publishing handle",
-        detail: "This package has a name, but public names also need your organization’s handle.",
+        detail: "Published names need your organization’s handle.",
         rename: true,
       };
     case "invalid-name":
       return {
-        title: "Use a valid public name",
-        detail: "Public names use @handle/app-name with lowercase letters, numbers, and hyphens.",
+        title: "Use a valid package name",
+        detail: "Package names use @handle/app-name with lowercase letters, numbers, and hyphens.",
         rename: true,
       };
     case "forbidden-scope":
@@ -56,8 +56,8 @@ function publicationRepair(issue: PublicationIssue) {
       };
     case "name-taken":
       return {
-        title: "Choose a different public name",
-        detail: "Another app already uses this public name. This copy needs its own name.",
+        title: "Choose a different package name",
+        detail: "Another app already uses this package name. This copy needs its own name.",
         rename: true,
       };
     case "invalid-json":
@@ -92,7 +92,7 @@ function publicationRepair(issue: PublicationIssue) {
       return {
         title: "Reduce the package size",
         detail:
-          "Public apps can contain up to 512 files and 4 MB of source. Ask your agent to remove files the app does not need.",
+          "Published apps can contain up to 512 files and 4 MB of source. Ask your agent to remove files the app does not need.",
         rename: false,
       };
   }
@@ -138,7 +138,12 @@ export function PublishApp<E>({
     >
       {(metadata) =>
         metadata.canPublish ? (
-          <PublishAction app={app} atoms={atoms} Failure={Failure} />
+          <PublishAction
+            app={app}
+            atoms={atoms}
+            Failure={Failure}
+            audience={metadata.publicationAudience}
+          />
         ) : (
           <Button variant="outline" disabledReason="Publishing is not available on this server.">
             Publish
@@ -154,8 +159,10 @@ function PublishAction<E>({
   app,
   atoms,
   Failure,
+  audience,
 }: AppManagementProps<E> & {
   readonly app: App;
+  readonly audience: "public" | "organization";
 }) {
   const [open, setOpen] = useState(false);
   const publishing = useAtomValue(atoms.publish(app.id));
@@ -178,7 +185,9 @@ function PublishAction<E>({
                 Publish {app.name}
               </DialogTitle>
               <DialogDescription className="mt-2 leading-6">
-                Share your app so anyone can find it and make their own copy.
+                {audience === "organization"
+                  ? "Share this app with your organization."
+                  : "Share your app so anyone can find it and make their own copy."}
               </DialogDescription>
             </div>
             <QueryView
@@ -253,12 +262,14 @@ function PublishDialog<E>({
             <div className="mt-5 space-y-3 text-[13px] leading-5">
               <p className="flex items-start gap-3">
                 <HugeiconsIcon
-                  icon={Globe02Icon}
+                  icon={source.publicationAudience === "organization" ? LockKeyIcon : Globe02Icon}
                   size={17}
                   className="mt-0.5 shrink-0"
                   aria-hidden
                 />
-                Your latest saved app files will be public.
+                {source.publicationAudience === "organization"
+                  ? "Only signed-in members of your organization can access these files."
+                  : "Your latest saved app files will be public."}
               </p>
               <p className="flex items-start gap-3 text-muted-foreground">
                 <HugeiconsIcon
@@ -354,7 +365,7 @@ function PublicationActions<E>({
               {completed === "unpublished"
                 ? "It no longer appears in discovery. Existing copies keep working."
                 : completed === "published"
-                  ? "People can find it in Add app and make their own copy."
+                  ? "Find it in Add app to make an independent copy."
                   : "Your latest saved changes are already published."}
             </p>
           </div>
@@ -362,19 +373,25 @@ function PublicationActions<E>({
       )}
       {publishedCommit !== undefined && !current && completed === null && (
         <p className="border-t px-7 py-4 text-sm leading-6 text-muted-foreground max-[740px]:px-5">
-          Publish your latest saved changes as the new public version. Existing copies stay as they
-          are.
+          Publish your latest saved changes as the new version. Existing copies stay as they are.
         </p>
       )}
       {publishedCommit !== undefined && completed !== "unpublished" && (
         <div className="px-7 pb-5 max-[740px]:px-5">
           <a
-            href={registryPublicationPath(name)}
+            href={
+              source.publicationAudience === "organization"
+                ? `/org/${encodeURIComponent(source.namespace ?? "")}/apps/add`
+                : registryPublicationPath(name)
+            }
             target="_blank"
             rel="noopener noreferrer"
             className="inline-flex min-h-9 items-center gap-2 text-sm font-medium underline underline-offset-4 hover:text-muted-foreground"
           >
-            View published app <span aria-hidden>↗</span>
+            {source.publicationAudience === "organization"
+              ? "Browse team apps"
+              : "View published app"}{" "}
+            <span aria-hidden>↗</span>
           </a>
         </div>
       )}

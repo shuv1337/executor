@@ -44,13 +44,13 @@ layer(HostedLive, { excludeTestServices: true })("Publishing dialog", (it) => {
           { reason: "unscoped-name", name: "axiom", title: "Add your publishing handle" },
           { reason: "missing-name", name: null, title: "Add a package name" },
           { reason: "invalid-json", name: null, title: "Fix package.json" },
-          { reason: "invalid-name", name: "@bad/Invalid Name", title: "Use a valid public name" },
+          { reason: "invalid-name", name: "@bad/Invalid Name", title: "Use a valid package name" },
           {
             reason: "forbidden-scope",
             name: "@original/axiom",
             title: "Use your own publishing handle",
           },
-          { reason: "name-taken", name: suggestedName, title: "Choose a different public name" },
+          { reason: "name-taken", name: suggestedName, title: "Choose a different package name" },
         ] as const) {
           yield* Effect.scoped(
             Effect.gen(function* () {
@@ -73,7 +73,8 @@ layer(HostedLive, { excludeTestServices: true })("Publishing dialog", (it) => {
               );
               const sourceHold = yield* holdQuery(
                 [actors.organization.id, actors.organization.slug].map(
-                  (organization) => `/api/organizations/${organization}/apps/${app.id}/workspace`,
+                  (organization) =>
+                    `/api/organizations/${organization}/apps/${app.id}/workspace/display`,
                 ),
                 "continue",
                 { allRequests: true },

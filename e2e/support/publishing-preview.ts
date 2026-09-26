@@ -3,7 +3,7 @@ import { Effect, Schema } from "effect";
 import type { Route } from "playwright";
 import { Browser } from "./browser.ts";
 
-/** Self-host does not publish; replace only that capability on real workspace reads for UI checks. */
+/** Replace readiness on real workspace reads to cover each repair state in the shared dialog. */
 export const publishingPreview = (
   app: string,
   publication: unknown,
@@ -11,7 +11,7 @@ export const publishingPreview = (
 ) =>
   Effect.gen(function* () {
     const browser = yield* Browser;
-    const workspace = (url: URL) => url.pathname.endsWith(`/apps/${app}/workspace`);
+    const workspace = (url: URL) => url.pathname.endsWith(`/apps/${app}/workspace/display`);
     const authoring = (url: URL) => url.pathname.endsWith(`/apps/${app}/authoring`);
     const listings = (url: URL) => url.pathname.endsWith("/app-publications/published");
     const source = (route: Route) =>

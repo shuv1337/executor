@@ -83,7 +83,8 @@ export const hostedAppAccess = Layer.effect(
               endpoint.identifier === "sourceDisplay" ||
               endpoint.identifier === "sourceDisplayFile" ||
               endpoint.identifier === "history" ||
-              endpoint.identifier === "published"
+              endpoint.identifier === "published" ||
+              endpoint.identifier === "publicationSource"
             ? "read"
             : "manage",
       ).pipe(

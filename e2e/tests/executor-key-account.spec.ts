@@ -42,7 +42,7 @@ layer(HostedLive, { excludeTestServices: true })("Executor API-key account", (it
           browser = yield* Browser;
         const prefix = `/api/organizations/${actors.organization.id}`;
         const selectedAccounts: string[] = [];
-        for (const actor of [actors.owner, actors.admin]) {
+        for (const actor of [actors.owner, actors.admin, actors.member]) {
           const inventory = yield* api.request(actor, "GET", `${prefix}/inventory`).pipe(
             Effect.flatMap((response) => body(Inventory, response)),
             Effect.repeat({
@@ -96,6 +96,10 @@ layer(HostedLive, { excludeTestServices: true })("Executor API-key account", (it
               yield* api.request(actor, "GET", `${prefix}/resources?view=${view}`),
             );
             const entry = directory.apps.find((entry) => entry.app.id === app.id);
+            if (actor === actors.member && view === "managed") {
+              expect(entry).toBeUndefined();
+              continue;
+            }
             expect(entry?.app.accounts).toBeUndefined();
             expect(entry?.profiles.map((item) => item.id)).toEqual([profile.id]);
             expect(entry?.profiles[0]?.accounts.service).toBe(account.id);
@@ -319,6 +323,31 @@ layer(HostedLive, { excludeTestServices: true })("Executor API-key account", (it
           role: "admin",
         });
         expect((yield* call(actors.admin, own.id)).status).toBe(403);
+        const memberInventory = yield* read(actors.member).pipe(
+          Effect.repeat({
+            schedule: Schedule.spaced("250 millis"),
+            until: (inventory) => inventory.accounts.some((item) => item.method === "apiKey"),
+          }),
+          Effect.timeout("30 seconds"),
+        );
+        const member = yield* profile(actors.member);
+        expect(member.accounts.service).not.toBe(account);
+        expect(member.accounts.service).not.toBe(admin.accounts.service);
+        expect(memberInventory.accounts.map((item) => item.id)).toEqual([member.accounts.service]);
+        const memberCall = yield* call(actors.member, member.id);
+        expect(memberCall.status, JSON.stringify(memberCall.body)).toBe(200);
+        expect(yield* body(Identity, memberCall)).toEqual({
+          organization: actors.organization.id,
+          role: "member",
+        });
+        expect((yield* call(actors.member, own.id)).status).toBe(403);
+        expect((yield* call(actors.owner, member.id)).status).toBe(403);
+        expect(
+          (yield* api.request(actors.member, "GET", `${prefix}/accounts/${account}`)).status,
+        ).toBe(403);
+        expect(
+          (yield* api.request(actors.member, "PATCH", `${path}/name`, { name: "Executor" })).status,
+        ).toBe(403);
         const connection = yield* body(
           Schema.Struct({ id: Schema.String }),
           yield* api.request(actors.owner, "POST", `${path}/connections`, {

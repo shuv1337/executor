@@ -4,6 +4,7 @@ import { test } from "node:test";
 import { Effect, FileSystem, Layer, Redacted } from "effect";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { pgliteLayer } from "fumadb-effect/pglite";
+import { SqlClient } from "effect/unstable/sql";
 import {
   OwnerId,
   SourceFiles,
@@ -51,6 +52,16 @@ test(
           const storage = yield* makeExecutorStorage({ provider: "postgresql" });
           yield* storage.migrate;
           const catalog = yield* makeRegistryStorage;
+          const sql = yield* SqlClient.SqlClient;
+          assert.equal(
+            yield* sql
+              .withTransaction(catalog.migrate.pipe(Effect.andThen(Effect.fail("rollback"))))
+              .pipe(Effect.flip),
+            "rollback",
+          );
+          assert.deepEqual(yield* sql`select to_regclass('executor_public_apps') as name`, [
+            { name: null },
+          ]);
           yield* catalog.migrate;
           const sources = gitSourceStorage(nativeRepositories(`${directory}/repositories`));
           const executor = yield* createExecutor({
@@ -119,6 +130,30 @@ test(
           assert.equal(publication.name, "@fixture/example");
           assert.equal(publication.commit, first.revision.commit);
           assert.deepEqual(yield* registry.list(), [publication]);
+          // A repeated startup preserves published rows; scoped readers cannot discover other owners.
+          yield* catalog.migrate;
+          const team = storedRegistry(catalog, sources, registry.origin, { owner });
+          assert.deepEqual(yield* team.list(), [publication]);
+          assert.deepEqual(
+            (yield* team.snapshot(publication.name, publication.commit)).files,
+            source,
+          );
+          for (const access of [
+            { owner: recipient },
+            { owner, apps: [] },
+            { owner, apps: [app.id] },
+          ]) {
+            const scoped = storedRegistry(catalog, sources, registry.origin, access);
+            const permitted = access.owner === owner && access.apps?.includes(app.id);
+            assert.deepEqual(yield* scoped.list(), permitted ? [publication] : []);
+            assert.deepEqual(yield* scoped.list(publication.name), permitted ? [publication] : []);
+            if (!permitted)
+              assert.equal(
+                (yield* scoped.snapshot(publication.name, publication.commit).pipe(Effect.flip))
+                  .reason,
+                "not-found",
+              );
+          }
           assert.deepEqual(
             yield* publisher.publish({
               owner,
