@@ -25,6 +25,7 @@ export class StartupFailed extends Schema.TaggedError<StartupFailed>()("StartupF
     "storage",
     "runtime",
     "sdk",
+    "data-steps",
     "composition",
     "listen",
     "browser",
@@ -61,4 +62,11 @@ export const serveCommand = Command.make("serve").pipe(
 /** Pair with an existing server without opening local storage. */
 export const pairCommand = Command.make("pair").pipe(
   Command.withDescription("Print a new connection link for the running server"),
+);
+
+/** Replace the saved local API key. A running server uses the new key after it restarts. */
+export const rotateKeyCommand = Command.make("rotate-key").pipe(
+  Command.withDescription(
+    "Replace the saved local API key. Restart Executor to use it, then update clients that used the old key",
+  ),
 );

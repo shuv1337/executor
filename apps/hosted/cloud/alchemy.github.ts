@@ -46,7 +46,6 @@ const productionVariables = [
   "AXIOM_ORG_ID",
   "BETTER_AUTH_URL",
   "CLOUDFLARE_ZONE_ID",
-  "CLOUD_DATABASE_CONNECTION_LIMIT",
   "CLOUD_PLACEMENT_REGION",
   "EXECUTOR_APP_UI_BASE_URL",
   "OAUTH_PROXY_PRODUCTION_URL",
@@ -77,7 +76,6 @@ const requiredStatusChecks = [
   "checks / e2e-local",
   "checks / e2e-self-host",
   "checks / e2e-cloud",
-  "deployed-cloud / test",
 ] as const;
 
 export default Alchemy.Stack(
@@ -96,6 +94,9 @@ export default Alchemy.Stack(
     );
     const publicBranch = yield* Config.NonEmptyString("PUBLIC_EXPORT_BRANCH").pipe(
       Config.withDefault("v2"),
+    );
+    const runnerMode = yield* Config.Literals(["blacksmith", "desktop"], "CI_RUNNER_MODE").pipe(
+      Config.withDefault("blacksmith" as const),
     );
     const enforcement = yield* Config.Literals(
       ["evaluate", "active", "disabled"],
@@ -150,11 +151,13 @@ export default Alchemy.Stack(
             // Request timing provisions a private native trace export destination.
             "Workers Observability Write",
             "Workers R2 Storage Write",
+            // Workers connect to Postgres directly. Deleting the retired Hyperdrive
+            // configurations still needs this; drop it once no stage has one.
             "Hyperdrive Write",
             "Account Settings Read",
             // The shared state store keeps its bearer token in the account Secrets Store.
             "Secrets Store Write",
-            // Hyperdrive's PlanetScale CA certificate is an account-level certificate upload.
+            // The retired Hyperdrive CA upload is retained, not managed; drop with Hyperdrive Write.
             "Account: SSL and Certificates Write",
           ],
           resources: { [`com.cloudflare.api.account.${accountId}`]: "*" },
@@ -183,6 +186,15 @@ export default Alchemy.Stack(
       ...target,
       name: "CLOUDFLARE_ACCOUNT_ID",
       value: accountId,
+    }).pipe(retain());
+
+    // Secretless PR and main checks can run on the trusted desktop runner when requested.
+    // Deployment, staging and release workflows intentionally keep their own Blacksmith
+    // capacity because they hold credentials or require an OS-specific runner matrix.
+    yield* GitHub.Variable("CiRunnerMode", {
+      ...target,
+      name: "CI_RUNNER_MODE",
+      value: runnerMode,
     }).pipe(retain());
 
     /**

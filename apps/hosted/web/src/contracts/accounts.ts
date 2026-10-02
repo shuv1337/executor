@@ -1,12 +1,16 @@
+import { hydrated } from "@executor-js/ui/contracts/http";
+import { revalidated } from "@executor-js/ui/contracts/refresh";
 import { refreshProfiles } from "./profiles.ts";
-import { refreshResourceDirectory } from "./resource-access.ts";
+import { acknowledgeResourceAccount, resourceDirectoryAtom } from "./resource-access.ts";
 import { protectedQuery } from "./protected-query.ts";
 /** Account queries remain independent across organizations, including OAuth returns. */
-import type { Account, AccountId } from "@executor-js/sdk";
+import type { Account, AccountFieldsInput, AccountId, AppId, ProviderId } from "@executor-js/sdk";
 import type { OrganizationReference } from "@executor-js/hosted-server/organization";
 import { Data, Effect, Option } from "effect";
 import { AsyncResult, Atom } from "effect/unstable/reactivity";
 import { acknowledge, upsert, invalidate } from "@executor-js/ui/contracts/mutations";
+import type { AccountToName } from "@executor-js/ui/dashboard/name-account";
+import type { AccountMetadataUpdate } from "@executor-js/ui/dashboard/account-description";
 import { HostedClient } from "./api.ts";
 import { inventoryAtom } from "./organization.ts";
 import { connectionAtom, toolsAtom } from "./apps.ts";
@@ -16,8 +20,8 @@ class AccountKey extends Data.Class<{
   readonly account: AccountId;
 }> {}
 const accountQuery = Atom.family((key: AccountKey) =>
-  HostedClient.query("accounts", "get", { params: key }).pipe(
-    Atom.refreshOnWindowFocus,
+  HostedClient.query("accounts", "get", hydrated({ params: key })).pipe(
+    revalidated,
     protectedQuery,
   ),
 );
@@ -25,20 +29,50 @@ export const accountAtom = (key: {
   readonly organization: OrganizationReference;
   readonly account: AccountId;
 }) => accountQuery(new AccountKey(key));
-const renameAccount = Atom.family((key: AccountKey) =>
-  HostedClient.runtime.fn((label: string, get) =>
-    Effect.flatMap(HostedClient, (client) =>
-      client.accounts.rename({ params: key, payload: { label } }),
-    ).pipe(
+const updateAccount = Atom.family((key: AccountKey) =>
+  HostedClient.runtime.fn((payload: AccountMetadataUpdate, get) =>
+    Effect.flatMap(HostedClient, (client) => client.accounts.update({ params: key, payload })).pipe(
       Effect.tap((saved) => Effect.sync(() => acknowledgeAccount(get, key.organization, saved))),
     ),
   ),
 );
-/** A different account cannot supersede this account's rename request. */
-export const renameAccountAtom = (key: {
+const checkAccount = Atom.family((key: AccountKey) =>
+  HostedClient.runtime.fn((_: void, get) =>
+    Effect.flatMap(HostedClient, (client) => client.accounts.check({ params: key })).pipe(
+      Effect.tap((health) =>
+        Effect.sync(() => {
+          acknowledge(get, accountAtom(key), (data) => ({ ...data, health }));
+          // The account list reads the resource directory; reload it for the recorded results.
+          get.refresh(resourceDirectoryAtom(key.organization));
+          get.refresh(resourceDirectoryAtom(key.organization, "managed"));
+          acknowledge(get, inventoryAtom(key.organization), (data) => ({
+            ...data,
+            accounts: data.accounts.map((current) =>
+              current.id === key.account ? { ...current, health } : current,
+            ),
+          }));
+        }),
+      ),
+    ),
+  ),
+);
+/** Run the checks of the apps this member can use; the account query shows the results. */
+export const checkAccountAtom = (key: {
   organization: OrganizationReference;
   account: AccountId;
-}) => renameAccount(new AccountKey(key));
+}) => checkAccount(new AccountKey(key));
+/**
+ * A new account waiting to be named. The organization layout shows the prompt, so page refreshes
+ * after saving, and the OAuth return navigation, cannot dismiss it.
+ */
+export const accountToNameAtom = Atom.make<
+  (AccountToName & { readonly organization: OrganizationReference }) | undefined
+>(undefined).pipe(Atom.keepAlive);
+/** A different account cannot supersede this account's name or description update. */
+export const updateAccountAtom = (key: {
+  organization: OrganizationReference;
+  account: AccountId;
+}) => updateAccount(new AccountKey(key));
 /** Resolves once the dialog's connection is loaded, so it opens without a skeleton. */
 export const reconnectAccountAtom = HostedClient.runtime.fn(
   (key: { readonly organization: OrganizationReference; readonly account: AccountId }, get) =>
@@ -50,13 +84,21 @@ export const reconnectAccountAtom = HostedClient.runtime.fn(
       );
     }),
 );
+/** A fresh read of which apps select an account, taken after a selection change commits. */
+export const accountUsageAtom = Atom.family((organization: OrganizationReference) =>
+  HostedClient.runtime.fn((account: AccountId) =>
+    Effect.flatMap(HostedClient, (client) =>
+      client.accounts.get({ params: { organization, account } }),
+    ),
+  ),
+);
 const disconnectAccount = Atom.family((key: AccountKey) =>
   HostedClient.runtime.fn((_: void, get) =>
     Effect.flatMap(HostedClient, (client) => client.accounts.disconnect({ params: key })).pipe(
       Effect.tap(() =>
         Effect.sync(() => {
-          refreshResourceDirectory(get, key.organization);
           refreshCredentialDependents(get, key.organization, key.account);
+          acknowledgeResourceAccount(get, key.organization, key.account, undefined);
           acknowledge(get, inventoryAtom(key.organization), (data) => ({
             ...data,
             accounts: data.accounts.filter((account) => account.id !== key.account),
@@ -80,7 +122,7 @@ export function acknowledgeAccount(
   saved: Account,
   credentialsChanged = false,
 ) {
-  refreshResourceDirectory(get, organization);
+  acknowledgeResourceAccount(get, organization, saved.id, saved);
   acknowledge(get, accountAtom({ organization, account: saved.id }), (data) => ({
     ...data,
     account: saved,
@@ -117,3 +159,23 @@ function refreshCredentialDependents(
       }
     }
 }
+
+/**
+ * Check unsaved credentials with an app's check. A newer check replaces an older one still
+ * running, which is what a form checking its latest input wants.
+ */
+export const checkCredentialsAtom = HostedClient.runtime.fn(
+  (input: {
+    readonly organization: OrganizationReference;
+    readonly app: AppId;
+    readonly provider: ProviderId;
+    readonly method: string;
+    readonly fields: typeof AccountFieldsInput.Type;
+  }) =>
+    Effect.flatMap(HostedClient, (client) =>
+      client.accounts.checkCredentials({
+        params: { organization: input.organization, app: input.app },
+        payload: { provider: input.provider, method: input.method, fields: input.fields },
+      }),
+    ),
+);

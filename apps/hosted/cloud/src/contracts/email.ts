@@ -38,5 +38,5 @@ export interface UnsubscribeLinks {
   readonly oneClick: Redacted.Redacted<string>;
 }
 
-/** Migrations and MCP authentication cannot send email; accidental delivery fails closed. */
+/** Migrations cannot send email; accidental delivery fails closed. */
 export const unavailableAuthEmail: SendAuthEmail = () => Effect.fail(new EmailDeliveryFailed());

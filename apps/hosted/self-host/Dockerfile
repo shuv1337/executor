@@ -1,8 +1,9 @@
-FROM oven/bun:1.3.11 AS build
+FROM node:24.18.0-bookworm-slim AS build
+COPY --from=oven/bun:1.4.2 /usr/local/bin/bun /usr/local/bin/bun
 ARG EXECUTOR_BUILD_VERSION
-RUN test -n "$EXECUTOR_BUILD_VERSION"
+RUN test -n "$EXECUTOR_BUILD_VERSION" || { echo "EXECUTOR_BUILD_VERSION is required. Pass --build-arg EXECUTOR_BUILD_VERSION=<version>, or set it in the environment for docker compose build." >&2; exit 1; }
 ENV EXECUTOR_BUILD_VERSION=$EXECUTOR_BUILD_VERSION EXECUTOR_ENVIRONMENT=self-host
-RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates python3 make g++ && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 COPY package.json bun.lock ./
 COPY patches ./patches
@@ -12,7 +13,7 @@ COPY apps ./apps
 COPY playground ./playground
 COPY e2e/viewer/package.json ./e2e/viewer/package.json
 RUN bun install --frozen-lockfile --filter @executor-js/hosted-self-host --filter @executor-js/hosted-self-host-web --filter @executor-js/telemetry --filter apps --filter @executor-js/app-live-inbox
-RUN bun run --cwd packages/telemetry build:motel --workerd
+RUN bun run --cwd packages/telemetry build:motel
 RUN bun run --cwd apps/hosted/self-host/web build
 RUN bun run --cwd packages/apps build
 RUN bun run --cwd apps/hosted/self-host package:runtime
@@ -29,7 +30,10 @@ RUN sh /package-system.sh
 
 FROM gcr.io/distroless/cc-debian12:latest
 ARG EXECUTOR_BUILD_VERSION
-ENV EXECUTOR_BUILD_VERSION=$EXECUTOR_BUILD_VERSION
+# Release builds pass the PostHog ingestion key and host; without both the image sends no analytics.
+ARG EXECUTOR_POSTHOG_KEY=""
+ARG EXECUTOR_POSTHOG_HOST=""
+ENV EXECUTOR_BUILD_VERSION=$EXECUTOR_BUILD_VERSION EXECUTOR_POSTHOG_KEY=$EXECUTOR_POSTHOG_KEY EXECUTOR_POSTHOG_HOST=$EXECUTOR_POSTHOG_HOST
 COPY --from=system /runtime/ /
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt NODE_ENV=production EXECUTOR_ENVIRONMENT=self-host HOST=0.0.0.0 PORT=4400 EXECUTOR_DATA_DIR=/app/data EXECUTOR_MOTEL_DATA_DIR=/app/motel-data
 WORKDIR /app

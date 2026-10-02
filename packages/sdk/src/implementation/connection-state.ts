@@ -58,25 +58,27 @@ export const lockConnection = (
     }
   });
 
-/** Check inside the committing transaction so cancellation and expiry win over late callbacks. */
+/** A parsed connection row. */
+export type ConnectionRow = Effect.Success<ReturnType<typeof readConnection>>;
+/** Reject a completed, cancelled or expired request. */
+export const requireOpen = (input: typeof GetAccountConnection.Type, row: ConnectionRow) =>
+  row.state.status === "pending"
+    ? Effect.succeed(row)
+    : Effect.fail(new AccountConnectionClosed(input));
+/** Read and check outside a transaction; transactions check the row returned by `lockConnection`. */
 export const openConnection = (db: Query, input: typeof GetAccountConnection.Type) =>
+  Effect.flatMap(readConnection(db, input), (row) => requireOpen(input, row));
+/**
+ * Commit with the account write, never as a later, independently failing update. `claimed` is the
+ * row `lockConnection` returned in this transaction. Writers claim the row first, so it is current.
+ */
+export const finishConnection = (db: Query, claimed: ConnectionRow, account: Account) =>
   Effect.gen(function* () {
-    const row = yield* readConnection(db, input);
-    if (row.state.status !== "pending") return yield* new AccountConnectionClosed(input);
-    return row;
-  });
-/** Commit with the account write, never as a later, independently failing update. */
-export const finishConnection = (
-  db: Query,
-  connection: typeof GetAccountConnection.Type,
-  account: Account,
-) =>
-  Effect.gen(function* () {
-    const row = yield* readConnection(db, connection);
-    if (row.target !== null) yield* applyConnectionTarget(db, row.target, row.provider, account);
+    if (claimed.target !== null)
+      yield* applyConnectionTarget(db, claimed.target, claimed.provider, account);
     yield* query(() =>
       db.updateMany("accountConnections", {
-        where: (b) => b("id", "=", connection.connection),
+        where: (b) => b("id", "=", claimed.id),
         set: {
           state: Schema.encodeSync(Schema.toCodecJson(AccountConnectionState))({
             status: "completed",

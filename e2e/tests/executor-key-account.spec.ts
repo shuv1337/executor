@@ -1,15 +1,14 @@
 /** Default management keys are ordinary personal accounts bound to one profile per user. */
-import { saveAndDeploy } from "../support/app-authoring.ts";
 import { holdTeamInstallation, InstallationDirectory } from "../support/team-installation.ts";
 import { expect, layer } from "@effect/vitest";
-import { Effect, Layer, Redacted, Schema, Schedule } from "effect";
+import { Effect, Schema, Schedule } from "effect";
 import { scenarios } from "../test-plan.ts";
 import { Actors } from "../support/actors.ts";
 import { Api, body, type Session } from "../support/api.ts";
 import { Browser } from "../support/browser.ts";
 import { HostedLive, withHostedCase } from "../support/case.ts";
-import { McpClient } from "../support/mcp-client.ts";
-import { McpOAuth } from "../support/mcp-oauth.ts";
+import { openThroughBrowser } from "../support/in-app-navigation.ts";
+import { advanceToReconciliation, installBrowserClock } from "../support/query-transition.ts";
 const App = Schema.Struct({
   id: Schema.String,
   name: Schema.String,
@@ -27,9 +26,6 @@ const Profile = Schema.Struct({
   id: Schema.String,
   revision: Schema.Number,
   accounts: Schema.Struct({ service: Schema.String }),
-});
-const Source = Schema.Struct({
-  files: Schema.Array(Schema.Struct({ path: Schema.String, content: Schema.String })),
 });
 const Identity = Schema.Struct({ organization: Schema.String, role: Schema.String });
 layer(HostedLive, { excludeTestServices: true })("Executor API-key account", (it) => {
@@ -74,7 +70,7 @@ layer(HostedLive, { excludeTestServices: true })("Executor API-key account", (it
             page.goto(`/org/${actors.organization.slug}/apps/${app.id}?view=accounts`),
           );
           yield* browser.use("The Accounts tab shows this user's managed account", (page) =>
-            page.getByRole("link", { name: account.label, exact: true }).waitFor(),
+            page.getByRole("radio", { name: account.label, exact: true, checked: true }).waitFor(),
           );
           yield* browser.use("Return to the app list", (page) =>
             page.getByRole("link", { name: "Back to apps", exact: true }).click(),
@@ -137,10 +133,22 @@ layer(HostedLive, { excludeTestServices: true })("Executor API-key account", (it
                     .getByRole("button", { name: `Remove ${account.label}`, exact: true })
                     .click(),
               );
+              // No other app uses the managed key, so the page offers to delete it; keep it.
+              yield* browser.use("Keep the managed account when offered its deletion", (page) =>
+                page
+                  .getByRole("dialog", { name: "Delete unused account?" })
+                  .getByRole("button", { name: "Keep account", exact: true })
+                  .click(),
+              );
+              yield* browser.use("The deletion offer closes", (page) =>
+                page
+                  .getByRole("dialog", { name: "Delete unused account?" })
+                  .waitFor({ state: "hidden" }),
+              );
               yield* browser.use("Wait for the confirmed removal", (page) =>
                 page
-                  .getByRole("link", { name: account.label, exact: true })
-                  .waitFor({ state: "hidden" }),
+                  .getByRole("radio", { name: account.label, exact: true, checked: false })
+                  .waitFor(),
               );
               yield* browser.use("Return to the list after changing the profile", (page) =>
                 page.getByRole("link", { name: "Back to apps", exact: true }).click(),
@@ -158,15 +166,106 @@ layer(HostedLive, { excludeTestServices: true })("Executor API-key account", (it
       }),
     ),
   );
-  it.effect(scenarios.executorKeyAccount.title, (context) =>
+  it.effect(scenarios.executorInstallationLoading.title, (context) =>
     withHostedCase(
       context,
       Effect.gen(function* () {
         const api = yield* Api,
           actors = yield* Actors,
-          browser = yield* Browser,
-          oauth = yield* McpOAuth,
-          mcp = yield* McpClient;
+          browser = yield* Browser;
+        const prefix = `/api/organizations/${actors.organization.id}`;
+        const read = (actor: Session) =>
+          api.request(actor, "GET", `${prefix}/inventory`).pipe(
+            Effect.tap((response) => Effect.sync(() => expect(response.status).toBe(200))),
+            Effect.flatMap((response) => body(Inventory, response)),
+          );
+        // Setup runs without an inventory request. Reads only observe committed progress.
+        yield* read(actors.owner).pipe(
+          Effect.repeat({
+            schedule: Schedule.spaced("250 millis"),
+            until: (inventory) =>
+              inventory.apps.some((app) => app.name === "Executor") &&
+              inventory.accounts.some((account) => account.method === "apiKey"),
+          }),
+          Effect.timeout("90 seconds"),
+        );
+        yield* browser.login(actors.owner);
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const directory = yield* body(
+              InstallationDirectory,
+              yield* api.request(actors.owner, "GET", `${prefix}/resources`),
+            );
+            expect(directory.pendingApp).toBe(false);
+            const held = yield* holdTeamInstallation(
+              [actors.organization.id, actors.organization.slug].map(
+                (reference) => `/api/organizations/${reference}/resources`,
+              ),
+              directory,
+            );
+            yield* installBrowserClock;
+            // A document load renders the directory on the server, beyond the browser hold.
+            yield* openThroughBrowser(
+              "Open Apps during team installation",
+              `/org/${actors.organization.slug}/apps`,
+            );
+            yield* held.requested;
+            yield* browser.use("Missing app has one skeleton while the workflow runs", (page) =>
+              page.getByRole("status", { name: "Installing app", exact: true }).waitFor(),
+            );
+            expect(
+              yield* browser.use("The pending app is not a navigable optimistic card", (page) =>
+                page.getByRole("link", { name: "Open Executor", exact: true }).count(),
+              ),
+            ).toBe(0);
+            yield* browser.use("Team controls stay available", (page) =>
+              page.getByRole("link", { name: "Add app", exact: true }).waitFor(),
+            );
+            yield* browser.checkpoint("One app skeleton while team installation runs");
+            yield* held.stop;
+            yield* browser.use("Stopped installation does not leave an endless skeleton", (page) =>
+              page.getByRole("heading", { name: "No apps available", exact: true }).waitFor(),
+            );
+            expect(
+              yield* browser.use("No provisioning skeleton after failure", (page) =>
+                page.getByRole("status", { name: "Installing app", exact: true }).count(),
+              ),
+            ).toBe(0);
+            yield* held.resume;
+            // A settled directory learns about the retry at its next idle reconciliation.
+            yield* advanceToReconciliation;
+            yield* browser.use("Retried installation shows the skeleton again", (page) =>
+              page.getByRole("status", { name: "Installing app", exact: true }).waitFor(),
+            );
+            yield* browser.use("Search is usable during installation", (page) =>
+              page.getByRole("textbox", { name: "Search apps…" }).fill("Executor"),
+            );
+            yield* held.release;
+            yield* browser.use("The real app arrives without a reload", (page) =>
+              page.getByRole("link", { name: "Open Executor", exact: true }).waitFor(),
+            );
+            expect(
+              yield* browser.use("Search survives background completion", (page) =>
+                page.getByRole("textbox", { name: "Search apps…" }).inputValue(),
+              ),
+            ).toBe("Executor");
+            expect(
+              yield* browser.use("Completed installation has no skeleton", (page) =>
+                page.getByRole("status", { name: "Installing app", exact: true }).count(),
+              ),
+            ).toBe(0);
+            yield* browser.checkpoint("The installed app replaces the skeleton");
+          }),
+        );
+      }),
+    ),
+  );
+  it.effect(scenarios.executorKeyAccount.title, (context) =>
+    withHostedCase(
+      context,
+      Effect.gen(function* () {
+        const api = yield* Api,
+          actors = yield* Actors;
         const prefix = `/api/organizations/${actors.organization.id}`;
         const read = (actor: Session) =>
           api.request(actor, "GET", `${prefix}/inventory`).pipe(
@@ -196,69 +295,6 @@ layer(HostedLive, { excludeTestServices: true })("Executor API-key account", (it
         const initial = reads[0],
           app = initial?.apps.find((app) => app.name === "Executor");
         if (!initial || !app) return yield* Effect.die("Default Executor app missing");
-        yield* browser.login(actors.owner);
-        yield* Effect.scoped(
-          Effect.gen(function* () {
-            const directory = yield* body(
-              InstallationDirectory,
-              yield* api.request(actors.owner, "GET", `${prefix}/resources`),
-            );
-            expect(directory.pendingApp).toBe(false);
-            const held = yield* holdTeamInstallation(
-              [actors.organization.id, actors.organization.slug].map(
-                (reference) => `/api/organizations/${reference}/resources`,
-              ),
-              directory,
-            );
-            yield* browser.use("Open Apps during team installation", (page) =>
-              page.goto(`/org/${actors.organization.slug}/apps`),
-            );
-            yield* held.requested;
-            yield* browser.use("Missing app has one skeleton while the workflow runs", (page) =>
-              page.getByRole("status", { name: "Installing app", exact: true }).waitFor(),
-            );
-            expect(
-              yield* browser.use("The pending app is not a navigable optimistic card", (page) =>
-                page.getByRole("link", { name: "Open Executor", exact: true }).count(),
-              ),
-            ).toBe(0);
-            yield* browser.use("Team controls stay available", (page) =>
-              page.getByRole("link", { name: "Add app", exact: true }).waitFor(),
-            );
-            yield* browser.checkpoint("One app skeleton while team installation runs");
-            yield* held.stop;
-            yield* browser.use("Stopped installation does not leave an endless skeleton", (page) =>
-              page.getByRole("heading", { name: "No apps available", exact: true }).waitFor(),
-            );
-            expect(
-              yield* browser.use("No provisioning skeleton after failure", (page) =>
-                page.getByRole("status", { name: "Installing app", exact: true }).count(),
-              ),
-            ).toBe(0);
-            yield* held.resume;
-            yield* browser.use("Retried installation shows the skeleton again", (page) =>
-              page.getByRole("status", { name: "Installing app", exact: true }).waitFor(),
-            );
-            yield* browser.use("Search is usable during installation", (page) =>
-              page.getByRole("textbox", { name: "Search apps…" }).fill("Executor"),
-            );
-            yield* held.release;
-            yield* browser.use("The real app arrives without a reload", (page) =>
-              page.getByRole("link", { name: "Open Executor", exact: true }).waitFor(),
-            );
-            expect(
-              yield* browser.use("Search survives background completion", (page) =>
-                page.getByRole("textbox", { name: "Search apps…" }).inputValue(),
-              ),
-            ).toBe("Executor");
-            expect(
-              yield* browser.use("Completed installation has no skeleton", (page) =>
-                page.getByRole("status", { name: "Installing app", exact: true }).count(),
-              ),
-            ).toBe(0);
-            yield* browser.checkpoint("The installed app replaces the skeleton");
-          }),
-        );
         expect(app.accounts).toBeUndefined();
         const path = `${prefix}/apps/${app.id}`;
         const profile = (actor: Session) =>
@@ -299,30 +335,35 @@ layer(HostedLive, { excludeTestServices: true })("Executor API-key account", (it
           );
         }
         expect((yield* profile(actors.owner)).id).toBe(own.id);
-        const adminInventory = yield* read(actors.admin),
-          admin = yield* profile(actors.admin);
+        const [adminInventory, admin] = yield* Effect.all(
+          [read(actors.admin), profile(actors.admin)],
+          { concurrency: 2 },
+        );
         expect(admin.id).not.toBe(own.id);
         expect(admin.accounts.service).not.toBe(account);
         expect(adminInventory.accounts.some((item) => item.id === account)).toBe(false);
         const call = (actor: Session, profile: string) =>
           api.request(actor, "POST", `${path}/tools/call`, {
             profile,
-            tool: "queries.context_get",
+            tool: "context.get",
+            kind: "query",
             input: {},
           });
-        const ownerCall = yield* call(actors.owner, own.id);
+        const [ownerCall, adminCall, deniedCall] = yield* Effect.all(
+          [call(actors.owner, own.id), call(actors.admin, admin.id), call(actors.admin, own.id)],
+          { concurrency: 3 },
+        );
         expect(ownerCall.status, JSON.stringify(ownerCall.body)).toBe(200);
         expect(yield* body(Identity, ownerCall)).toEqual({
           organization: actors.organization.id,
           role: "owner",
         });
-        const adminCall = yield* call(actors.admin, admin.id);
         expect(adminCall.status).toBe(200);
         expect(yield* body(Identity, adminCall)).toEqual({
           organization: actors.organization.id,
           role: "admin",
         });
-        expect((yield* call(actors.admin, own.id)).status).toBe(403);
+        expect(deniedCall.status).toBe(403);
         const memberInventory = yield* read(actors.member).pipe(
           Effect.repeat({
             schedule: Schedule.spaced("250 millis"),
@@ -380,78 +421,13 @@ layer(HostedLive, { excludeTestServices: true })("Executor API-key account", (it
         expect(
           (yield* api.request(actors.owner, "DELETE", `${prefix}/accounts/${manual.id}`)).status,
         ).toBe(200);
-        const original = yield* body(
-          Source,
-          yield* api.request(actors.owner, "GET", `${path}/source`),
-        );
-        yield* Effect.addFinalizer(() =>
-          Effect.gen(function* () {
-            yield* saveAndDeploy(actors.owner, path, {
-              files: original.files,
-            });
-          }).pipe(Effect.orDie),
-        );
-        const modified = original.files.map((file) =>
-          file.path === "index.ts"
-            ? { ...file, content: file.content + "\n// User customization\n" }
-            : file,
-        );
-        const edited = yield* body(
-          Schema.Struct({ app: App }),
-          yield* saveAndDeploy(actors.owner, path, {
-            files: modified,
-          }),
-        );
-        expect(
-          (yield* read(actors.owner)).apps.find((item) => item.id === app.id)?.activeDeployment,
-        ).toBe(edited.app.activeDeployment);
-        expect(
-          (yield* body(
-            Source,
-            yield* api.request(actors.owner, "GET", `${path}/source`),
-          )).files.toSorted((a, b) => a.path.localeCompare(b.path)),
-        ).toEqual(modified.toSorted((a, b) => a.path.localeCompare(b.path)));
-        yield* browser.login(actors.owner);
-        yield* browser.use("Open the user's Executor profile", (page) =>
-          page.goto(
-            `/org/${actors.organization.slug}/apps/${app.id}?view=accounts&profile=${own.id}`,
-          ),
-        );
-        yield* browser.use("The managed account is selected in the picker", (page) =>
-          page.getByText("My Executor key", { exact: true }).waitFor(),
-        );
-        yield* browser.checkpoint("Executor uses a personal profile of the common app");
-        const grant = yield* oauth.authorize;
-        yield* Effect.addFinalizer(() => oauth.revoke(grant).pipe(Effect.orDie));
-        const client = yield* mcp.connect(
-          Redacted.make(Redacted.value(grant.tokens).access_token),
-          "executor-key-profile",
-        );
-        const called = yield* client.use(
-          "Run the default app through its personal MCP target",
-          (client, signal) =>
-            client.callTool(
-              {
-                name: "execute",
-                arguments: {
-                  code: `return await tools[${JSON.stringify(app.slug)}].profiles[${JSON.stringify(own.id)}].queries.context_get({});`,
-                },
-              },
-              undefined,
-              { signal },
-            ),
-        );
-        const result = yield* Schema.decodeUnknownEffect(
-          Schema.Struct({
-            status: Schema.Literal("completed"),
-            execution: Schema.Struct({ ok: Schema.Literal(true), value: Identity }),
-          }),
-        )(called.structuredContent);
-        expect(result.execution.value).toEqual({
+        const restored = yield* call(actors.owner, own.id);
+        expect(restored.status).toBe(200);
+        expect(yield* body(Identity, restored)).toEqual({
           organization: actors.organization.id,
           role: "owner",
         });
-      }).pipe(Effect.provide(Layer.mergeAll(McpOAuth.layer, McpClient.layer))),
+      }),
     ),
   );
 });

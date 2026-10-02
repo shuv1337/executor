@@ -1,10 +1,15 @@
-/** Browser failures must reach both OTLP and Sentry after real response decoding. */
+/** Browser failures must reach both OTLP and Sentry after real response decoding, naming their page. */
 import { expect, layer } from "@effect/vitest";
-import { Effect, FileSystem, Schedule, Schema } from "effect";
+import { Effect, Schedule, Schema } from "effect";
 import { scenarios } from "../test-plan.ts";
 import {
+  awaitSentry,
   injectDashboardResponse,
-  corruptDashboardEntry,
+  incompleteDashboardDocument,
+  docsCopyFailure,
+  docsPageActionsChunk,
+  failDocsCopy,
+  throwers,
 } from "../support/browser-observability.ts";
 import { Actors } from "../support/actors.ts";
 import { Browser } from "../support/browser.ts";
@@ -19,18 +24,6 @@ const Failure = Schema.fromJsonString(
     page_id: Schema.String,
   }),
 );
-const Envelope = Schema.fromJsonString(Schema.Struct({ envelope: Schema.String }));
-const Event = Schema.fromJsonString(
-  Schema.Struct({
-    tags: Schema.optional(Schema.Record(Schema.String, Schema.Json)),
-    contexts: Schema.optional(
-      Schema.Struct({ trace: Schema.optional(Schema.Struct({ trace_id: Schema.String })) }),
-    ),
-    exception: Schema.optional(
-      Schema.Struct({ values: Schema.Array(Schema.Struct({ value: Schema.String })) }),
-    ),
-  }),
-);
 layer(HostedLive, { excludeTestServices: true })("Browser observability", (it) => {
   it.effect(scenarios.browserObservability.title, (context) =>
     withHostedCase(
@@ -40,33 +33,8 @@ layer(HostedLive, { excludeTestServices: true })("Browser observability", (it) =
           actors = yield* Actors,
           telemetry = yield* Telemetry;
         const evidence = yield* Evidence,
-          target = yield* Target,
-          fs = yield* FileSystem.FileSystem;
+          target = yield* Target;
         expect(target.metadata.mode).toBe("managed");
-        const events = fs.readFileString(`${target.directory}/sentry.ndjson`).pipe(
-          Effect.map((text) =>
-            text
-              .trim()
-              .split("\n")
-              .filter(Boolean)
-              .flatMap((line) =>
-                Schema.decodeUnknownSync(Envelope)(line)
-                  .envelope.split("\n")
-                  .slice(2)
-                  .filter(Boolean)
-                  .map((value) => Schema.decodeUnknownSync(Event)(value)),
-              ),
-          ),
-        );
-        const sentry = (predicate: (event: typeof Event.Type) => boolean) =>
-          events.pipe(
-            Effect.map((events) => events.filter(predicate)),
-            Effect.repeat({
-              schedule: Schedule.spaced("200 millis"),
-              until: (events) => events.length > 0,
-            }),
-            Effect.timeout("15 seconds"),
-          );
         yield* browser.login(actors.owner);
         yield* browser.use("Observe only safe operation failure metadata", (page) =>
           page.addInitScript(() => {
@@ -79,6 +47,7 @@ layer(HostedLive, { excludeTestServices: true })("Browser observability", (it) =
             });
           }),
         );
+        const pageIds: Array<string> = [];
         for (const [name, body, status, kind] of [
           ["schema", '{"privateFixture":"do-not-export"}', 200, "BrowserDecodeFailed"],
           ["json", "{", 200, "BrowserDecodeFailed"],
@@ -112,59 +81,66 @@ layer(HostedLive, { excludeTestServices: true })("Browser observability", (it) =
             ),
           ).toBe(true);
           expect(JSON.stringify(trace)).not.toContain("do-not-export");
-          const reported = yield* sentry(
+          // The browser's API spans name the page that reported the failure.
+          const browserSpans = trace.data.filter(({ span }) =>
+            ["ui.api", "ui.api.transport"].includes(span.operationName),
+          );
+          expect(browserSpans.length).toBeGreaterThan(0);
+          expect(browserSpans.map(({ span }) => span.tags["executor.page.id"])).toEqual(
+            browserSpans.map(() => failure.page_id),
+          );
+          pageIds.push(failure.page_id);
+          const reported = yield* awaitSentry(
             (event) => event.contexts?.trace?.trace_id === failure.trace_id,
           );
           expect(reported).toHaveLength(1);
           expect(JSON.stringify(reported)).not.toContain("do-not-export");
           yield* evidence.json(`${name}-failure.json`, { failure, trace, reported });
         }
+        // Each failure came from a fresh document, and each document has its own page id.
+        expect(new Set(pageIds).size).toBe(pageIds.length);
         yield* browser.use("Leave the decoded failure document", (page) =>
           page.goto("about:blank"),
         );
-        yield* browser.use("Fail the dashboard entry module", (page) =>
-          page.route("**/src/main.tsx", (route) => route.abort("failed")),
+        let blockedEntryRequests = 0;
+        yield* browser.use("Fail the built dashboard entry module", (page) =>
+          page.route("**/assets/main-*.js", (route) => {
+            blockedEntryRequests++;
+            return route.abort("failed");
+          }),
         );
         yield* browser.use("Open the dashboard with a missing entry module", (page) =>
           page.goto(`/org/${actors.organization.slug}/apps`),
         );
-        const moduleFailure = yield* sentry(
+        const moduleFailure = yield* awaitSentry(
           (event) =>
             event.exception?.values.some((value) =>
               value.value.includes("Failed to fetch dynamically imported module"),
             ) === true,
         );
         yield* evidence.json("entry-module-failure.json", moduleFailure);
+        expect(blockedEntryRequests).toBeGreaterThan(0);
         yield* browser.use("Restore the dashboard entry module", (page) =>
-          page.unroute("**/src/main.tsx"),
+          page.unroute("**/assets/main-*.js"),
         );
-        yield* corruptDashboardEntry(actors.organization.slug);
-        const boot = yield* sentry(
+        yield* incompleteDashboardDocument(actors.organization.slug);
+        const boot = yield* awaitSentry(
           (event) =>
-            event.exception?.values.some((value) => value.value === "Invalid entry document") ===
-            true,
+            event.exception?.values.some(
+              (value) => value.value === "Dashboard document is incomplete",
+            ) === true,
         );
         yield* evidence.json("boot-failure.json", boot);
         yield* browser.use("Open documentation", (page) => page.goto("/docs/"));
         yield* browser.use("Confirm documentation is rendered", (page) =>
           page.getByRole("heading", { level: 1 }).waitFor(),
         );
-        yield* browser.use("Raise a synthetic documentation failure", (page) =>
-          page.evaluate(() => {
-            window.dispatchEvent(
-              new ErrorEvent("error", {
-                error: new Error("SyntheticDocsFailure"),
-                message: "SyntheticDocsFailure",
-              }),
-            );
-          }),
-        );
-        const docs = yield* sentry(
-          (event) =>
-            event.tags?.surface === "docs" &&
-            event.exception?.values.some((value) => value.value === "SyntheticDocsFailure") ===
-              true,
-        );
+        // A real failure raised by the documentation's own code, captured automatically.
+        yield* failDocsCopy;
+        const docs = yield* awaitSentry(docsCopyFailure("/docs/"));
+        expect(docs[0] === undefined ? [] : throwers(docs[0])).toEqual([
+          expect.stringMatching(docsPageActionsChunk),
+        ]);
         yield* evidence.json("docs-failure.json", docs);
       }),
     ),

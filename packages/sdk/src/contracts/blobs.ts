@@ -17,12 +17,14 @@ export type BlobKey = typeof BlobKey.Type;
 
 /** Missing objects are ordinary results; storage failures must not look like absence. */
 export class BlobStoreError extends Schema.TaggedError<BlobStoreError>()("BlobStoreError", {
-  operation: Schema.Literals(["get", "put", "remove"]),
+  operation: Schema.Literals(["get", "exists", "put", "remove"]),
 }) {}
 
 /** Each successful put publishes the complete object. Remove is idempotent. No public URLs or authorization live here. */
 export interface BlobStorage {
   readonly get: (key: BlobKey) => Effect.Effect<Option.Option<Uint8Array>, BlobStoreError>;
+  /** Whether a complete object is stored, without reading its bytes. */
+  readonly exists: (key: BlobKey) => Effect.Effect<boolean, BlobStoreError>;
   readonly put: (key: BlobKey, body: Uint8Array) => Effect.Effect<void, BlobStoreError>;
   readonly remove: (key: BlobKey) => Effect.Effect<void, BlobStoreError>;
 }

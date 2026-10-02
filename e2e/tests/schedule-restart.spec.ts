@@ -6,16 +6,17 @@ import { Target } from "../support/platform.ts";
 import { TestLive, withCase } from "../support/case.ts";
 import { serverControl } from "../support/server-control.ts";
 import { scenarios } from "../test-plan.ts";
+import { appsManifest } from "../support/apps-release.ts";
 
 const Runs = Schema.Array(
   Schema.Struct({ id: Schema.String, name: Schema.String, status: Schema.String }),
 );
 class Pending extends Schema.TaggedError<Pending>()("Pending", {}) {}
-const source = `import { defineApp, mutation, interval, object } from "apps";
+const source = `import { defineApp, mutation, interval, object, router } from "apps";
 import { always } from "apps/operations/approval";
 const tick = mutation({ input: object({}) }, async () => ({ done: true }));
 const review = mutation({ input: object({}), approval: always() }, async () => ({ done: true }));
-export default defineApp({ accounts: {} }, async () => ({  mutations: { tick, review }, schedules: { tick: interval({ minutes: 1 }, tick, {}), review: interval({ minutes: 1 }, review, {}) } }));`;
+export default defineApp({ accounts: {} }, async () => ({  tools: router({ tick, review }), schedules: { tick: interval({ minutes: 1 }, tick, {}), review: interval({ minutes: 1 }, review, {}) } }));`;
 layer(TestLive, { excludeTestServices: true })("Schedule persistence", (it) => {
   it.effect(scenarios.scheduleRestart.title, (context) =>
     withCase(
@@ -31,7 +32,7 @@ layer(TestLive, { excludeTestServices: true })("Schedule persistence", (it) => {
           {
             owner: "local",
             name: "Restart fixture",
-            files: [{ path: "index.ts", content: source }],
+            files: [{ path: "index.ts", content: source }, appsManifest],
           },
           headers,
         );
@@ -78,9 +79,9 @@ layer(TestLive, { excludeTestServices: true })("Schedule persistence", (it) => {
           );
         yield* configure("tick", true);
         yield* serverControl("stop");
-        // Deliberate downtime outlasts the schedule's whole interval, so its one due tick is
-        // missed entirely. Intervals are floored at one minute, so this wait is a real minute.
-        yield* Effect.sleep("100 seconds");
+        // Advance the stopped product's wall clock across a full interval. Persistence and
+        // scheduler recovery still run through the real process and public HTTP boundary.
+        yield* serverControl("clock/advance", 200, { milliseconds: 100_000 });
         yield* serverControl("start");
         yield* waitFor("tick", "succeeded");
         yield* configure("tick", false);

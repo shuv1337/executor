@@ -1,7 +1,7 @@
 /** Header-only OAuth discovery for resources that advertise auth on GET or MCP initialization. */
 import { Effect } from "effect";
 import { FetchHttpClient, HttpBody, HttpClient } from "effect/unstable/http";
-import { bearerResourceMetadata } from "./oauth-challenge.ts";
+import { bearerChallenge } from "./oauth-challenge.ts";
 
 /**
  * Probe an already policy-checked endpoint with the host's checked HTTP client.
@@ -18,11 +18,16 @@ export const probeOAuthChallenge = (endpoint: string | URL, client: HttpClient.H
         .pipe(
           Effect.map((response) => ({
             status: response.status,
-            resourceMetadata: bearerResourceMetadata(response.headers["www-authenticate"]),
+            ...bearerChallenge(response.headers["www-authenticate"]),
           })),
         ),
     );
-    if (get.resourceMetadata !== undefined || ![401, 403, 405].includes(get.status)) return get;
+    if (
+      get.resourceMetadata !== undefined ||
+      get.scopes !== undefined ||
+      ![401, 403, 405].includes(get.status)
+    )
+      return get;
     return yield* Effect.scoped(
       Effect.gen(function* () {
         const response = yield* HttpClient.withScope(client).post(endpoint, {
@@ -51,7 +56,7 @@ export const probeOAuthChallenge = (endpoint: string | URL, client: HttpClient.H
         }
         return {
           status: response.status,
-          resourceMetadata: bearerResourceMetadata(response.headers["www-authenticate"]),
+          ...bearerChallenge(response.headers["www-authenticate"]),
         };
       }),
     );

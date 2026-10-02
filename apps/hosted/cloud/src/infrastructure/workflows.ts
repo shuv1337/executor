@@ -4,7 +4,7 @@ import { cloudSentry, reportCloudFailure } from "../implementation/error-reporti
 import { cloudAnalytics, recordBackgroundUsage } from "../implementation/product-analytics.ts";
 import * as Cloudflare from "alchemy/Cloudflare";
 import type { Workflow } from "@cloudflare/workers-types";
-import { Cause, Clock, Effect, Exit, Schema, Option, Result } from "effect";
+import { Cause, Clock, Effect, Exit, Schema, Result } from "effect";
 import { HostedExecutor } from "@executor-js/hosted-server";
 import {
   WorkflowHost,
@@ -13,25 +13,17 @@ import {
   type WorkflowRuntime,
   type WorkflowDriver,
   WorkflowFailure,
+  decodeWorkflowFailure,
+  workflowFailureMessage,
 } from "@executor-js/sdk/core";
 import { cloudExecutor } from "./executor.ts";
-import { AppDataSupervisor } from "./app-data.ts";
+import { appDataSupervisors } from "./app-data.ts";
+import { readNativeWorkflowStatus } from "../implementation/workflow-status.ts";
+import { providerFailureCode } from "../implementation/provider-failure.ts";
 
 const failure = () => new WorkflowFailure({ reason: "engine", retryable: true });
-const encode = (error: WorkflowFailure) =>
-  `ExecutorWorkflowFailure(${error.reason},${error.retryable})`;
-const recover = (error: unknown): WorkflowFailure => {
-  const match =
-    error instanceof Error
-      ? /ExecutorWorkflowFailure\(([a-z_]+),(true|false)\)/.exec(error.message)
-      : null;
-  if (match !== null) {
-    const reason = Schema.decodeUnknownOption(WorkflowFailure.fields.reason)(match[1]);
-    if (Option.isSome(reason))
-      return new WorkflowFailure({ reason: reason.value, retryable: match[2] === "true" });
-  }
-  return failure();
-};
+const encode = workflowFailureMessage;
+const recover = decodeWorkflowFailure;
 const safe = <A, R>(effect: Effect.Effect<A, unknown, R>): Effect.Effect<A, WorkflowFailure, R> =>
   effect.pipe(
     Effect.catchCause((cause) =>
@@ -98,7 +90,7 @@ export class AppWorkflows extends Cloudflare.Workflow<AppWorkflows>()(
   "AppWorkflows",
   Effect.gen(function* () {
     const executor = yield* cloudExecutor(
-      yield* AppDataSupervisor,
+      yield* appDataSupervisors,
       yield* cloudArtifactsTokensLive,
     );
     const analytics = yield* cloudAnalytics;
@@ -146,10 +138,26 @@ export const cloudWorkflows: Effect.Effect<WorkflowRuntime, never, Cloudflare.Wo
     ).pipe(Effect.mapError(failure));
     const status: WorkflowRuntime["status"] = (run) =>
       binding.pipe(
-        Effect.flatMap((binding) => native(async () => (await binding.get(run)).status())),
+        Effect.flatMap((binding) =>
+          readNativeWorkflowStatus(async () => (await binding.get(run)).status()).pipe(
+            Effect.tapError((error) =>
+              Effect.annotateCurrentSpan({
+                "executor.workflow.failure.phase": "native_status",
+                "executor.workflow.failure.code": providerFailureCode(error),
+              }),
+            ),
+          ),
+        ),
         Effect.flatMap((value) =>
           Schema.decodeUnknownEffect(WorkflowBackendState)(
             value.status === "unknown" ? { status: "missing" } : value,
+          ).pipe(
+            Effect.tapError(() =>
+              Effect.annotateCurrentSpan({
+                "executor.workflow.failure.phase": "decode_status",
+                "executor.workflow.backend.status": value.status,
+              }),
+            ),
           ),
         ),
         Effect.catchCause((cause) => {
@@ -158,6 +166,13 @@ export const cloudWorkflows: Effect.Effect<WorkflowRuntime, never, Cloudflare.Wo
             return Effect.succeed({ status: "missing" } as const);
           return Cause.hasInterrupts(cause) ? Effect.interrupt : Effect.fail(recover(error));
         }),
+        Effect.tapError((error) =>
+          Effect.annotateCurrentSpan({
+            "executor.workflow.failure.reason": error.reason,
+            "executor.workflow.failure.retryable": error.retryable,
+          }),
+        ),
+        Effect.withSpan("workflow.backend.status", { attributes: { "executor.run.id": run } }),
       );
     return {
       status,

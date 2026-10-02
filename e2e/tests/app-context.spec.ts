@@ -1,13 +1,14 @@
 import { createProfile } from "../support/profiles.ts";
 /** Real hosted HTTP checks for separately declared handlers and their invocation-owned context. */
 import { expect, layer } from "@effect/vitest";
-import { Effect, Schema } from "effect";
+import { Clock, Effect, Schema } from "effect";
 import { randomUUID } from "node:crypto";
 import { scenarios } from "../test-plan.ts";
 import { Api, body } from "../support/api.ts";
 import { Actors } from "../support/actors.ts";
 import { HostedLive, withHostedCase } from "../support/case.ts";
 import { App, Resource } from "../support/contracts.ts";
+import { appsManifest } from "../support/apps-release.ts";
 
 const files = [
   {
@@ -70,13 +71,14 @@ export const messages = {
   },
   {
     path: "index.ts",
-    content: `import { defineApp } from "apps";
+    content: `import { defineApp, router } from "apps";
 import { requirements } from "./context.ts";
 import { list, save, broken, invalid, guarded, forbidden, messages } from "./handlers.ts";
 export default defineApp(requirements, {
-  queries: { list, forbidden }, mutations: { save, broken, invalid, guarded }, webhooks: { messages }
+  tools: router({ list, forbidden, save, broken, invalid, guarded }),
 });`,
   },
+  appsManifest,
 ];
 
 const Rows = Schema.Array(Schema.Struct({ body: Schema.String, source: Schema.String }));
@@ -95,17 +97,52 @@ layer(HostedLive, { excludeTestServices: true })("App handler context", (it) => 
           actors = yield* Actors;
         const prefix = `/api/organizations/${actors.organization.id}`;
         const name = `Context ${randomUUID().slice(0, 8)}`;
-        const created: { app?: string; account?: string; subscription?: string } = {};
+        const created: { app?: string; account?: string; profile?: string } = {};
+        const settleProfile = (
+          expected:
+            | { readonly status: "ready"; readonly deployment: string }
+            | { readonly status: "removed" },
+        ) =>
+          Effect.gen(function* () {
+            const deadline = (yield* Clock.currentTimeMillis) + 15000;
+            for (;;) {
+              const response = yield* api.request(
+                actors.owner,
+                "POST",
+                `${prefix}/apps/${created.app}/profiles/${created.profile}/reconcile`,
+              );
+              expect(response.status).toBe(200);
+              const current = yield* body(
+                Schema.Struct({
+                  status: Schema.String,
+                  reconciledDeployment: Schema.NullOr(Schema.String),
+                }),
+                response,
+              );
+              if (
+                current.status === expected.status &&
+                (expected.status === "removed" ||
+                  current.reconciledDeployment === expected.deployment)
+              )
+                return;
+              expect(yield* Clock.currentTimeMillis, JSON.stringify(current)).toBeLessThan(
+                deadline,
+              );
+              yield* Effect.sleep("100 millis");
+            }
+          });
         yield* Effect.addFinalizer(() =>
           Effect.gen(function* () {
-            if (created.subscription)
+            if (created.profile) {
               expect(
                 (yield* api.request(
                   actors.owner,
                   "DELETE",
-                  `${prefix}/apps/${created.app}/webhooks/${created.subscription}`,
+                  `${prefix}/apps/${created.app}/profiles/${created.profile}`,
                 )).status,
               ).toBe(200);
+              yield* settleProfile({ status: "removed" });
+            }
             if (created.app)
               expect(
                 (yield* api.request(actors.owner, "DELETE", `${prefix}/apps/${created.app}`))
@@ -129,6 +166,7 @@ layer(HostedLive, { excludeTestServices: true })("App handler context", (it) => 
         const app = (yield* body(App, deployed)).id;
         created.app = app;
         const profile = yield* createProfile(actors.owner, `${prefix}/apps/${app}`);
+        created.profile = profile.id;
         const connection = yield* api.request(
           actors.owner,
           "POST",
@@ -145,13 +183,22 @@ layer(HostedLive, { excludeTestServices: true })("App handler context", (it) => 
         const saved = yield* submit((yield* body(Resource, connection)).id, "synthetic-context-a");
         expect(saved.status).toBe(200);
         created.account = (yield* body(Resource, saved)).id;
-        const call = (tool: string, input: Record<string, string> = {}) =>
+        const kinds = {
+          list: "query",
+          forbidden: "query",
+          save: "mutation",
+          broken: "mutation",
+          invalid: "mutation",
+          guarded: "mutation",
+        } as const;
+        const call = (tool: keyof typeof kinds, input: Record<string, string> = {}) =>
           api.request(actors.owner, "POST", `${prefix}/apps/${app}/tools/call`, {
             profile: profile.id,
             tool,
+            kind: kinds[tool],
             input,
           });
-        expect((yield* call("mutations.save", { body: "before" })).status).toBe(200);
+        expect((yield* call("save", { body: "before" })).status).toBe(200);
         const reconnected = yield* api.request(
           actors.owner,
           "POST",
@@ -161,30 +208,48 @@ layer(HostedLive, { excludeTestServices: true })("App handler context", (it) => 
         expect(
           (yield* submit((yield* body(Resource, reconnected)).id, "synthetic-context-b")).status,
         ).toBe(200);
-        expect((yield* call("mutations.save", { body: "after" })).status).toBe(200);
-        for (const tool of [
-          "queries.forbidden",
-          "mutations.broken",
-          "mutations.invalid",
-          "mutations.guarded",
-        ]) {
+        expect((yield* call("save", { body: "after" })).status).toBe(200);
+        for (const tool of ["forbidden", "broken", "invalid", "guarded"] as const) {
           expect((yield* call(tool, { body: tool })).status).toBeGreaterThanOrEqual(400);
         }
-        const list = yield* call("queries.list");
+        const list = yield* call("list");
         expect(list.status).toBe(200);
         expect(yield* body(Rows, list)).toEqual([
           { body: "before", source: "first" },
           { body: "after", source: "second" },
         ]);
-        const registered = yield* api.request(
-          actors.owner,
-          "POST",
-          `${prefix}/apps/${app}/webhooks`,
-          { name: "messages", key: name, config: {}, profile: profile.id },
+        // Introduce the webhook only after the mutation assertions. Profile setup
+        // owns registration; racing it with manual registration creates two hooks.
+        const updated = yield* api.request(actors.owner, "POST", `${prefix}/apps/${app}/deploy`, {
+          files: files.map((file) =>
+            file.path === "index.ts"
+              ? {
+                  ...file,
+                  content: file.content.replace(
+                    "tools: router({ list, forbidden, save, broken, invalid, guarded }),",
+                    "tools: router({ list, forbidden, save, broken, invalid, guarded }), webhooks: { messages },",
+                  ),
+                }
+              : file,
+          ),
+        });
+        expect(updated.status).toBe(200);
+        const { activeDeployment } = yield* body(
+          Schema.Struct({ activeDeployment: Schema.String }),
+          yield* api.request(actors.owner, "GET", `${prefix}/apps/${app}`),
         );
-        expect(registered.status).toBe(200);
-        const subscription = yield* body(Subscription, registered);
-        created.subscription = subscription.id;
+        yield* settleProfile({ status: "ready", deployment: activeDeployment });
+        const subscriptions = yield* body(
+          Schema.Array(Subscription),
+          yield* api.request(
+            actors.owner,
+            "GET",
+            `${prefix}/apps/${app}/webhooks?profile=${profile.id}`,
+          ),
+        );
+        expect(subscriptions).toHaveLength(1);
+        const subscription = subscriptions[0];
+        if (subscription === undefined) return yield* Effect.die(new Error("Webhook missing"));
         expect(subscription.status).toBe("active");
         const anonymous = yield* api.session();
         const callback = new URL(subscription.callbackUrl).pathname;
@@ -200,7 +265,7 @@ layer(HostedLive, { excludeTestServices: true })("App handler context", (it) => 
         );
         expect(delivered.status).toBe(200);
         expect(delivered.body).toEqual({ source: "second" });
-        expect(yield* body(Rows, yield* call("queries.list"))).toEqual([
+        expect(yield* body(Rows, yield* call("list"))).toEqual([
           { body: "before", source: "first" },
           { body: "after", source: "second" },
           { body: "registered", source: "second" },

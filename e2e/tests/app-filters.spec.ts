@@ -8,6 +8,7 @@ import { HostedLive, withHostedCase } from "../support/case.ts";
 import { App } from "../support/contracts.ts";
 import { holdQuery } from "../support/query-transition.ts";
 import { scenarios } from "../test-plan.ts";
+import { appsManifest } from "../support/apps-release.ts";
 
 layer(HostedLive, { excludeTestServices: true })("App filters", (it) => {
   it.effect(scenarios.appFilters.title, (context) =>
@@ -28,11 +29,10 @@ layer(HostedLive, { excludeTestServices: true })("App filters", (it) => {
               files: [
                 {
                   path: "index.ts",
-                  content: `import { defineApp, query, object } from "apps";
-export default defineApp({ accounts: {} }, { queries: {
-  status: query({ input: object({}) }, async () => "ready")
-} });`,
+                  content: `import { defineApp, query, object, router } from "apps";
+export default defineApp({ accounts: {} }, { tools: router({ status: query({ input: object({}) }, async () => "ready") }) });`,
                 },
+                appsManifest,
               ],
             }),
           );
@@ -117,7 +117,9 @@ export default defineApp({ accounts: {} }, { queries: {
                     ).toBe(true);
                   });
                 yield* checkRetained("The group filter keeps the current cards and search");
-                const held = yield* holdQuery(paths, outcome);
+                // Retry refreshes both lists, which share a path; hold the management list the filter reads.
+                const managed = { query: { view: "managed" } };
+                const held = yield* holdQuery(paths, outcome, managed);
                 yield* browser.use("Open access selection", (page) =>
                   page.getByRole("combobox", { name: "App list" }).click(),
                 );
@@ -138,7 +140,7 @@ export default defineApp({ accounts: {} }, { queries: {
                     page.getByRole("button", { name: "Retry", exact: true }).waitFor(),
                   );
                   yield* checkRetained("The filter error preserves cards and the open controls");
-                  const retry = yield* holdQuery(paths, "continue");
+                  const retry = yield* holdQuery(paths, "continue", managed);
                   yield* browser.use("Close the popover to reach the retry action", (page) =>
                     page.keyboard.press("Escape"),
                   );

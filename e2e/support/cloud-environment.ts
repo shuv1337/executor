@@ -19,11 +19,12 @@ class CloudStartFailed extends Schema.TaggedError<CloudStartFailed>()("CloudStar
 export const startCloudEnvironment = (input: {
   readonly directory: string;
   readonly origin: string;
-  readonly apiPort: number;
   readonly appPort: number;
   readonly databasePort: number;
   readonly commit: string;
   readonly observeUI: boolean;
+  /** Registry the local Cloud compiler resolves app packages from. */
+  readonly npmRegistry?: string;
 }) =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem,
@@ -86,9 +87,13 @@ export const startCloudEnvironment = (input: {
       VITE_POSTHOG_HOST: `http://127.0.0.1:${analyticsPort}`,
       VITE_EXECUTOR_ENVIRONMENT: "test-local",
       VITE_EXECUTOR_RELEASE: input.commit,
-      CLOUD_DEV_API_PORT: String(input.apiPort),
+      // Serve the same built assets and routing as a deployed stage. Vite's
+      // on-demand source transforms must not compete with timed scenarios.
+      CLOUD_DEV_DASHBOARD: "built",
+      CLOUD_DEV_API_PORT: new URL(input.origin).port,
       CLOUD_DEV_APP_UI_PORT: String(input.appPort),
       EXECUTOR_APP_UI_BASE_URL: `http://localhost:${input.appPort}`,
+      ...(input.npmRegistry === undefined ? {} : { EXECUTOR_NPM_REGISTRY: input.npmRegistry }),
       CLOUD_DEV_DATABASE_PORT: String(input.databasePort),
       CLOUD_DEV_DATABASE_PASSWORD: databasePassword,
       CLOUD_DEV_EXTERNAL_DATABASE: "true",
@@ -174,6 +179,11 @@ export const startCloudEnvironment = (input: {
           "--env",
           "POSTGRES_PASSWORD",
           "postgres:17",
+          // The local Worker connects straight to Postgres, without PgBouncer.
+          // Parallel browser requests and their background jobs each own SQL
+          // connections; PostgreSQL's default 100 slots rejects startup bursts.
+          "-c",
+          "max_connections=512",
         ],
         {
           env: {

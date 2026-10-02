@@ -23,12 +23,35 @@ const Provider = Schema.Struct({
   clientId: Schema.NonEmptyString,
   clientSecret: Schema.NonEmptyString,
 });
+const GoogleDiscovery = Schema.Struct({
+  issuer: BaseUrl,
+  authorization_endpoint: BaseUrl,
+  token_endpoint: BaseUrl,
+  userinfo_endpoint: BaseUrl,
+  jwks_uri: BaseUrl,
+  id_token_signing_alg_values_supported: Schema.Array(Schema.Literal("RS256")).check(
+    Schema.isMinLength(1),
+  ),
+});
+const GoogleProvider = Schema.Struct({ ...Provider.fields, discovery: GoogleDiscovery }).check(
+  Schema.makeFilter(
+    ({ baseUrl, discovery }) =>
+      discovery.issuer === baseUrl &&
+      [
+        discovery.authorization_endpoint,
+        discovery.token_endpoint,
+        discovery.userinfo_endpoint,
+        discovery.jwks_uri,
+      ].every((endpoint) => endpoint.startsWith(`${baseUrl}/`)),
+  ),
+);
+
 /** Private control-plane output consumed by both deployment configuration and black-box tests. */
 export const EmulatorFixture = Schema.Struct({
-  version: Schema.Literal(2),
+  version: Schema.Literal(3),
   origin: Schema.String,
   services: Schema.Struct({
-    google: Provider,
+    google: GoogleProvider,
     github: Provider,
     mail: Schema.Struct({ baseUrl: BaseUrl, token: Schema.NonEmptyString }),
     company: Schema.Struct({ baseUrl: BaseUrl, token: Schema.NonEmptyString }),
@@ -37,9 +60,11 @@ export const EmulatorFixture = Schema.Struct({
 });
 class EmulatorFailed extends Schema.TaggedError<EmulatorFailed>()("EmulatorFailed", {
   operation: Schema.String,
+  status: Schema.optional(Schema.Number),
+  reason: Schema.optional(Schema.Literals(["timeout", "request"])),
 }) {
   get message() {
-    return `External emulator failed: ${this.operation}`;
+    return `External emulator failed: ${this.operation}${this.status === undefined ? (this.reason === undefined ? "" : ` (${this.reason})`) : ` (HTTP ${this.status})`}`;
   }
 }
 class MailPending extends Schema.TaggedError<MailPending>()("MailPending", {}) {}
@@ -57,12 +82,19 @@ export const emulatorRequest = (origin: string, path: string, payload?: unknown,
       if (payload !== undefined) request = yield* HttpClientRequest.bodyJson(request, payload);
       const response = yield* http.execute(request);
       if (response.status < 200 || response.status >= 300)
-        return yield* new EmulatorFailed({ operation: path });
+        return yield* new EmulatorFailed({ operation: path, status: response.status });
       return yield* response.json;
     }),
   ).pipe(
     Effect.timeout("30 seconds"),
-    Effect.mapError(() => new EmulatorFailed({ operation: path })),
+    Effect.catchTag("TimeoutError", () =>
+      Effect.fail(new EmulatorFailed({ operation: path, reason: "timeout" })),
+    ),
+    Effect.mapError((error) =>
+      error instanceof EmulatorFailed
+        ? error
+        : new EmulatorFailed({ operation: path, reason: "request" }),
+    ),
   );
 
 /** Provision actual hosted instances and credentials through emulators.dev's control plane. */
@@ -100,7 +132,15 @@ export const createEmulatorFixture = (origin: string) =>
           clientSecret: issued.credential.client_secret,
         };
       });
-    const google = yield* oauth("google");
+    const googleClient = yield* oauth("google");
+    const discovery = yield* emulatorRequest(
+      googleClient.baseUrl,
+      "/.well-known/openid-configuration",
+    );
+    const google = yield* Schema.decodeUnknownEffect(GoogleProvider)({
+      ...googleClient,
+      discovery,
+    });
     const github = yield* oauth("github");
     const keyed = (service: string, token?: string) =>
       Effect.gen(function* () {
@@ -119,7 +159,7 @@ export const createEmulatorFixture = (origin: string) =>
       });
     return Redacted.make(
       EmulatorFixture.make({
-        version: 2,
+        version: 3,
         origin,
         services: {
           google,
@@ -136,6 +176,10 @@ export const createEmulatorFixture = (origin: string) =>
 const make = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
   const target = yield* Target;
+  // Methods use the client captured when the service is built, not one from each caller.
+  const http = yield* HttpClient.HttpClient;
+  const request = (...args: Parameters<typeof emulatorRequest>) =>
+    emulatorRequest(...args).pipe(Effect.provideService(HttpClient.HttpClient, http));
   const file = yield* Config.String("E2E_EMULATORS");
   const fixture = yield* fs.readFileString(file).pipe(
     Effect.flatMap(Schema.decodeUnknownEffect(Schema.fromJsonString(EmulatorFixture))),
@@ -146,12 +190,7 @@ const make = Effect.gen(function* () {
   if (value.origin !== target.metadata.origin)
     return yield* new EmulatorFailed({ operation: "Fixture belongs to another server" });
   const messages = (email: string) =>
-    emulatorRequest(
-      value.services.mail.baseUrl,
-      "/emails",
-      undefined,
-      value.services.mail.token,
-    ).pipe(
+    request(value.services.mail.baseUrl, "/emails", undefined, value.services.mail.token).pipe(
       Effect.flatMap(
         Schema.decodeUnknownEffect(
           Schema.Struct({
@@ -174,13 +213,10 @@ const make = Effect.gen(function* () {
       readonly status: "active" | "trialing" | "scheduled" | "expired";
     }) =>
       Effect.gen(function* () {
-        const match =
-          /^(executor-next-[a-z0-9-]+?)-(free|free-pay-as-you-go|team|enterprise)$/.exec(
-            input.planId,
-          );
+        const match = /^(executor-next-[a-z0-9-]+?)-(free|team|enterprise)$/.exec(input.planId);
         if (!match?.[1])
           return yield* new EmulatorFailed({ operation: "Expected a stage-scoped billing plan" });
-        yield* emulatorRequest(
+        yield* request(
           value.services.billing.baseUrl,
           "/_emulate/seed",
           {
@@ -200,10 +236,10 @@ const make = Effect.gen(function* () {
         const domain = provider === "google" ? `${login}.company.example` : "example.test";
         const email = `${login}@${domain}`;
         if (provider === "google")
-          yield* emulatorRequest(value.services.company.baseUrl, "/_emulate/seed", {
+          yield* request(value.services.company.baseUrl, "/_emulate/seed", {
             brands: [{ domain, title: "Example Company" }],
           });
-        yield* emulatorRequest(value.services[provider].baseUrl, "/_emulate/seed", {
+        yield* request(value.services[provider].baseUrl, "/_emulate/seed", {
           users: [
             {
               ...(provider === "github" ? { login } : {}),
@@ -215,6 +251,15 @@ const make = Effect.gen(function* () {
         });
         return { login, email, companyName: provider === "google" ? "Example Company" : null };
       }),
+    /** Seed a Google profile for an address that may already have an Executor account. */
+    googleUser: (user: {
+      readonly email: string;
+      readonly name: string;
+      readonly picture: string;
+    }) =>
+      request(value.services.google.baseUrl, "/_emulate/seed", {
+        users: [{ ...user, email_verified: true }],
+      }).pipe(Effect.asVoid),
     received: (email: string) =>
       messages(email).pipe(Effect.map((rows) => rows.map((row) => row.id))),
     mail: (email: string, previouslyReceived: ReadonlyArray<string>) =>

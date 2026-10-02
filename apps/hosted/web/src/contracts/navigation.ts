@@ -1,4 +1,4 @@
-import { AccountConnectionId, ProfileId } from "@executor-js/sdk";
+import { AccountConnectionId, AccountId, ProfileId } from "@executor-js/sdk";
 import { AppView } from "@executor-js/ui/contracts/dashboard";
 import { Option, Schema } from "effect";
 import { OrganizationId } from "@executor-js/hosted-server/organization";
@@ -20,6 +20,18 @@ export function parseConnectionSearch(search: Record<string, unknown>): {
     client: Option.getOrUndefined(
       Schema.decodeUnknownOption(Schema.Literal("change"))(search.client),
     ),
+  };
+}
+
+/** The account list marks a linked account, which has no page of its own. */
+export function parseAccountsSearch(search: Record<string, unknown>): ReturnType<
+  typeof parseConnectionSearch
+> & {
+  readonly account?: AccountId | undefined;
+} {
+  return {
+    ...parseConnectionSearch(search),
+    account: Option.getOrUndefined(Schema.decodeUnknownOption(AccountId)(search.account)),
   };
 }
 
@@ -63,13 +75,21 @@ export function hostedPageTitle(
   if (pathname === "/invite") return "Invitation";
   if (pathname === "/mcp/authorize") return "Authorize client";
   if (pathname === "/oauth/callback") return "Connecting account";
-  const [root, , page, item, action] = pathname.split("/").filter(Boolean);
+  const [root, section, page, item, action] = pathname.split("/").filter(Boolean);
+  if (root === "account")
+    return section === "tokens"
+      ? "Tokens"
+      : section === "security"
+        ? "Security"
+        : section === "profile"
+          ? "Profile"
+          : "Account";
   if (root !== "org" || page === undefined) return "Organizations";
   if (extraPages[page] !== undefined) return extraPages[page];
   if (page === "organization") return "Settings";
   if (page === "approvals") return item ? "Review request" : "Approvals";
   if (page === "groups") return item ? "Group" : "Groups";
-  if (page === "connect") return "Connect";
+  if (page === "connect") return "Connections";
   if (page === "webhooks") return "Webhook setup";
   if (page === "connections") return "Connect account";
   if (page === "apps")
@@ -82,14 +102,31 @@ export function hostedPageTitle(
         : item
           ? "App"
           : "Apps";
-  if (page === "accounts")
-    return action === "disconnect" ? "Disconnect account" : item ? "Account" : "Accounts";
+  if (page === "accounts") return "Accounts";
   return "Dashboard";
 }
+
+/**
+ * Sign-in finishes with a fresh document. Keep the current fragment, as an HTTP redirect without its
+ * own fragment would, so an app deep link's fragment survives signing in on the way.
+ */
+export const keepFragment = (url: string): string =>
+  url.includes("#") ? url : `${url}${window.location.hash}`;
 
 /** Return providers through sign-in completion without changing the encoded final destination. */
 export const signInCallback = (redirect: string): string =>
   `/login?redirect=${encodeURIComponent(redirect)}`;
+
+/** Account pages can carry the organization a visitor came from; it only preselects choices. */
+export function parseAccountSearch(search: Record<string, unknown>): {
+  readonly organization?: string | undefined;
+} {
+  return {
+    organization: Option.getOrUndefined(
+      Schema.decodeUnknownOption(Schema.NonEmptyString)(search.organization),
+    ),
+  };
+}
 
 /** Account setup targets an explicit personal selection, or starts a new one. */
 export function parseSetupSearch(search: Record<string, unknown>): {

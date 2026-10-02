@@ -1,13 +1,9 @@
-/** Better Auth owns these endpoints outside the hosted API middleware. */
+/** Better Auth owns these endpoints outside the hosted API middleware. Reads are not product use. */
 import { APIError, createAuthMiddleware, getSessionFromCtx } from "better-auth/api";
 import type { BetterAuthPlugin } from "better-auth";
 
 const operations = new Set([
   "/organization/create",
-  "/organization/list",
-  "/organization/list-members",
-  "/organization/list-invitations",
-  "/organization/get-full-organization",
   "/organization/update",
   "/organization/update-member-role",
   "/organization/invite-member",
@@ -15,12 +11,13 @@ const operations = new Set([
   "/organization/accept-invitation",
   "/organization/cancel-invitation",
   "/api-key/create",
-  "/api-key/list",
-  "/api-key/get",
   "/api-key/delete",
   "/passkey/verify-registration",
   "/passkey/delete-passkey",
-  "/passkey/list-user-passkeys",
+  "/update-user",
+  "/change-password",
+  "/revoke-session",
+  "/revoke-other-sessions",
   "/sign-out",
 ]);
 /** Only server-established identity and authored operation names cross this callback. */

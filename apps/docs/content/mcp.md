@@ -43,7 +43,7 @@ Search returns the exact callable path and the TypeScript signature for each
 tool. The paths look like this:
 
 ```js
-const projects = await tools.vercel.queries.listProjects({});
+const projects = await tools.vercel.listProjects({});
 return projects.projects.map((project) => project.name);
 ```
 
@@ -58,7 +58,7 @@ not cached across changes, so run `tools.search` again in a new `execute` after
 you add or reconfigure an app.
 
 Some limits are fixed by the server and a client cannot raise them: 65,536
-characters of program source, 100 tool calls, 30 seconds, and 65,536 bytes of
+characters of program source, 100 tool calls, 5 minutes, and 65,536 bytes of
 output.
 
 ## Signing in from the browser

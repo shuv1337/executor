@@ -21,11 +21,13 @@ import { Link } from "@tanstack/react-router";
 import { useOrganizationRoute } from "../components/organization.tsx";
 import { createAppListAtoms } from "../../contracts/resource-access.ts";
 import { groupsAtom } from "../../contracts/groups.ts";
+import { usePreload } from "@executor-js/ui/dashboard/context";
 /** One authorized list, with independent group and explicit management filters. */
 export function AppsPage() {
   const { organization, slug: organizationSlug } = useOrganizationRoute();
   const atoms = useMemo(() => createAppListAtoms(organization), [organization]);
   const [{ view, group }, setFilters] = useAtom(atoms.filters);
+  usePreload(groupsAtom(organization), atoms.query);
   const groups = useQuery(groupsAtom(organization));
   const { data } = useQuery(atoms.query);
   const activeFilters = Number(group !== "all") + Number(view !== "available");
@@ -41,9 +43,9 @@ export function AppsPage() {
         ) : undefined
       }
       connect={
-        <Button asChild>
+        <Button asChild variant="outline">
           <Link to="/org/$organizationSlug/connect" params={{ organizationSlug }}>
-            Connect an agent
+            Connect your agent
           </Link>
         </Button>
       }
@@ -88,11 +90,11 @@ export function AppsPage() {
       filters={
         <Popover>
           <PopoverTrigger asChild>
-            <Button variant="outline" className="w-full">
+            <Button variant="outline" className="relative w-full max-[600px]:w-11 max-[600px]:px-0">
               <HugeiconsIcon icon={FilterHorizontalIcon} size={16} aria-hidden />
-              Filters
+              <span className="max-[600px]:sr-only">Filters</span>
               {activeFilters > 0 && (
-                <span className="flex size-5 items-center justify-center rounded-full bg-secondary text-xs text-secondary-foreground">
+                <span className="flex size-5 items-center justify-center rounded-full bg-secondary text-xs text-secondary-foreground max-[600px]:absolute max-[600px]:-top-1.5 max-[600px]:-right-1.5 max-[600px]:size-4 max-[600px]:text-[10px]">
                   {activeFilters}
                   <span className="sr-only"> active</span>
                 </span>

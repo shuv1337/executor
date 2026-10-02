@@ -2,6 +2,7 @@
 import { expect } from "@effect/vitest";
 import { Effect } from "effect";
 import { Browser } from "./browser.ts";
+import { openThroughBrowser } from "./in-app-navigation.ts";
 import { holdQuery } from "./query-transition.ts";
 import type { Page } from "playwright";
 
@@ -15,20 +16,37 @@ const tabs = [
   { view: "settings", title: "Settings", loading: "Loading settings" },
 ] as const;
 const redundantTitles = ["Overview", "Accounts", "Deployments", "Settings"];
+/**
+ * The bounds of a section's header row once it is laid out. An in-app navigation shows the route's
+ * pending view and then the page itself; an element being swapped out has no layout, so the
+ * measurement waits for a laid-out one.
+ */
 const box = (page: Page, title: string) =>
-  redundantTitles.includes(title)
-    ? page.getByRole("navigation", { name: "App navigation" }).evaluate((element) => {
-        const rect = element.getBoundingClientRect();
-        return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
-      })
-    : page.getByRole("heading", { name: title, exact: true, level: 2 }).evaluate((element) => {
-        const header = element.closest("header");
-        if (!header) throw new Error("Section header missing");
-        const row = element.textContent === "Working source" ? header.parentElement : header;
-        if (!row) throw new Error("Section row missing");
-        const rect = row.getBoundingClientRect();
-        return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
-      });
+  page
+    .waitForFunction(
+      ({ title, navigation }) => {
+        const row = navigation
+          ? document.querySelector('nav[aria-label="App navigation"]')
+          : (() => {
+              const heading = Array.from(document.querySelectorAll("h2")).find(
+                (element) =>
+                  element.textContent === title && element.getBoundingClientRect().width > 0,
+              );
+              const header = heading?.closest("header");
+              return title === "Working source" ? header?.parentElement : header;
+            })();
+        const rect = row?.getBoundingClientRect();
+        return rect !== undefined && rect.width > 0 && rect.height > 0
+          ? { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
+          : false;
+      },
+      { title, navigation: redundantTitles.includes(title) },
+    )
+    .then((handle) => handle.jsonValue())
+    .then((bounds) => {
+      if (bounds === false) throw new Error(`Section header missing: ${title}`);
+      return bounds;
+    });
 
 type Bounds = {
   readonly x: number;
@@ -89,10 +107,11 @@ export const checkAppLoading = (input: {
   readonly history: readonly string[];
   readonly deployments?: readonly string[];
   readonly source: readonly string[];
+  readonly viewports?: readonly { readonly width: number; readonly height: number }[];
 }) =>
   Effect.gen(function* () {
     const browser = yield* Browser;
-    for (const viewport of [
+    for (const viewport of input.viewports ?? [
       { width: 1440, height: 900 },
       { width: 390, height: 844 },
     ]) {
@@ -102,8 +121,9 @@ export const checkAppLoading = (input: {
         yield* Effect.scoped(
           Effect.gen(function* () {
             const inventory = yield* holdQuery(coldInventory, "continue", { allRequests: true });
-            yield* browser.use("Open Source before inventory arrives", (page) =>
-              page.goto(`${input.url}?view=source`),
+            yield* openThroughBrowser(
+              "Open Source before inventory arrives",
+              `${input.url}?view=source`,
             );
             yield* inventory.requested;
             yield* browser.use("Cold inventory keeps the app source frame", (page) =>
@@ -136,8 +156,9 @@ export const checkAppLoading = (input: {
             const inventory = yield* holdQuery(overviewInventory, "continue", {
               allRequests: true,
             });
-            yield* browser.use("Open Overview with inventory held", (page) =>
-              page.goto(`${input.url}?view=overview`),
+            yield* openThroughBrowser(
+              "Open Overview with inventory held",
+              `${input.url}?view=overview`,
             );
             yield* inventory.requested;
             yield* browser.use(
@@ -176,7 +197,7 @@ export const checkAppLoading = (input: {
         yield* Effect.scoped(
           Effect.gen(function* () {
             const selectedTool = tab.view === "tools" && viewport.width < 740;
-            const title = selectedTool ? "queries.hello" : tab.title;
+            const title = selectedTool ? "hello" : tab.title;
             const metadata = yield* holdQuery(input.metadata, "continue", { allRequests: true });
             const content =
               tab.view === "tools"
@@ -194,10 +215,9 @@ export const checkAppLoading = (input: {
               tab.view === "deployments" && input.deployments
                 ? yield* holdQuery(input.deployments, "continue", { allRequests: true })
                 : undefined;
-            yield* browser.use(`Open ${tab.view}`, (page) =>
-              page.goto(
-                `${input.url}?view=${tab.view}${selectedTool ? "&tool=queries.hello" : ""}`,
-              ),
+            yield* openThroughBrowser(
+              `Open ${tab.view}`,
+              `${input.url}?view=${tab.view}${selectedTool ? "&tool=hello" : ""}`,
             );
             yield* metadata.requested;
             yield* browser.use(`${tab.view} reserves its own content`, (page) =>
@@ -299,7 +319,7 @@ export const checkAppLoading = (input: {
                 yield* browser.use("Overview cards arrive", (page) =>
                   page
                     .getByRole("region", { name: "App tools preview", exact: true })
-                    .getByRole("link", { name: "queries.hello A simple greeting", exact: true })
+                    .getByRole("link", { name: "hello A simple greeting", exact: true })
                     .waitFor(),
                 );
                 break;
@@ -317,7 +337,7 @@ export const checkAppLoading = (input: {
                   );
                 } else {
                   yield* browser.use("Tool discovery completes", (page) =>
-                    page.getByRole("button", { name: "queries.hello", exact: true }).waitFor(),
+                    page.getByRole("button", { name: "hello", exact: true }).waitFor(),
                   );
                   expect(
                     yield* browser.use("The search survives loading", (page) =>

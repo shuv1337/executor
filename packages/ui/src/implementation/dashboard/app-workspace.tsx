@@ -1,3 +1,4 @@
+import { LocalTime } from "../components/local-time.tsx";
 import { EmptyState } from "./empty-state.tsx";
 import { AppWorkspaceLoading, SourceHistoryLoading } from "./app-loading.tsx";
 import { AppSectionHeader, AppSectionTitle } from "./app-section-header.tsx";
@@ -5,9 +6,12 @@ import { AppSectionHeader, AppSectionTitle } from "./app-section-header.tsx";
 import { useAtomSet, useAtomValue } from "@effect/atom-react";
 import { AsyncResult } from "effect/unstable/reactivity";
 import { Option } from "effect";
+import type { ReactNode } from "react";
 import type { App } from "@executor-js/sdk";
 import type { AppSourceDisplay } from "@executor-js/app-management/contracts";
+import type { DeploymentDisplay } from "@executor-js/app-management/contracts/source-display";
 import type { AppAcknowledgement, AppManagementProps } from "../../contracts/app-management.ts";
+import type { Query } from "../../contracts/dashboard.ts";
 import { QueryView, useDashboard } from "./context.tsx";
 import { Button } from "../components/button.tsx";
 import { Input } from "../components/input.tsx";
@@ -23,17 +27,20 @@ import {
   Clock01Icon,
 } from "@hugeicons/core-free-icons";
 
-/** Products supply metadata reconciliation and navigation; source authoring belongs to agents. */
+/** Products supply metadata reconciliation and navigation; people edit skill files in the Skills view; agents author other source. */
 export function AppWorkspace<E>({
   app,
   atoms,
   Failure,
   onApp,
   view,
+  live,
 }: AppManagementProps<E> & {
   readonly app: App;
   readonly onApp: AppAcknowledgement;
   readonly view: "source" | "history";
+  /** The active deployment, read so the toolbar can compare it with working source. */
+  readonly live?: Query<DeploymentDisplay, E> | undefined;
 }) {
   return (
     <QueryView
@@ -50,6 +57,7 @@ export function AppWorkspace<E>({
           source={source}
           onApp={onApp}
           view={view}
+          live={live}
         />
       )}
     </QueryView>
@@ -62,11 +70,13 @@ function WorkspaceSource<E>({
   source,
   onApp,
   view,
+  live,
 }: AppManagementProps<E> & {
   readonly app: App;
   readonly source: typeof AppSourceDisplay.Type;
   readonly onApp: AppAcknowledgement;
   readonly view: "source" | "history";
+  readonly live?: Query<DeploymentDisplay, E> | undefined;
 }) {
   const deployed = useAtomValue(atoms.deploy(app.id));
   const deploy = useAtomSet(atoms.deploy(app.id), { mode: "promise" });
@@ -83,19 +93,25 @@ function WorkspaceSource<E>({
         <AppSectionHeader className="min-h-0 flex-wrap border-b-0 text-muted-foreground">
           <SourceHistoryLink app={app} atoms={atoms} Failure={Failure} />
           <div className="flex flex-wrap items-center gap-2">
+            {app.activeDeployment === null ? (
+              <DeployStatus>Not deployed</DeployStatus>
+            ) : (
+              live !== undefined && (
+                <LiveStatus app={app} atoms={atoms} source={source} live={live} />
+              )
+            )}
             <CloneRepository source={source} />
-            <Button
-              size="sm"
+            <DeployLatest
+              source={source}
+              live={app.activeDeployment === null ? undefined : live}
               disabled={!source.canEdit || pending}
-              onClick={() => {
+              onDeploy={() => {
                 void deploy({
                   commit: source.revision.commit,
                   onApp,
                 }).catch(() => {});
               }}
-            >
-              Deploy
-            </Button>
+            />
           </div>
         </AppSectionHeader>
       </div>
@@ -124,8 +140,89 @@ function WorkspaceSource<E>({
     </div>
   );
 }
+/** Undefined until the live version is known; null when it was not deployed from a commit. */
+function useLiveCommit<E>(live: Query<DeploymentDisplay, E>) {
+  return Option.getOrUndefined(
+    Option.map(AsyncResult.value(useAtomValue(live)), (deployment) => deployment.sourceCommit),
+  );
+}
+function DeployStatus({ children }: { readonly children: ReactNode }) {
+  return (
+    <span role="status" className="inline-flex items-center gap-1.5 whitespace-nowrap text-xs">
+      {children}
+    </span>
+  );
+}
+function LiveStatus<E>({
+  app,
+  atoms,
+  source,
+  live,
+}: Pick<AppManagementProps<E>, "atoms"> & {
+  readonly app: App;
+  readonly source: typeof AppSourceDisplay.Type;
+  readonly live: Query<DeploymentDisplay, E>;
+}) {
+  const commit = useLiveCommit(live);
+  const history = AsyncResult.value(useAtomValue(atoms.history(app.id)));
+  if (commit === undefined || commit === null) return null;
+  if (commit === source.revision.commit) return <DeployStatus>Live · up to date</DeployStatus>;
+  // History is newest first, so the live commit's index counts the commits saved after it.
+  const newer = Option.isSome(history)
+    ? history.value.findIndex((entry) => entry.commit === commit)
+    : -1;
+  return (
+    <DeployStatus>
+      Live <code title={commit}>{commit.slice(0, 7)}</code> ·{" "}
+      {newer > 0
+        ? `${newer} newer ${newer === 1 ? "commit" : "commits"} not deployed`
+        : "newer changes not deployed"}
+    </DeployStatus>
+  );
+}
+function DeployLatest<E>({
+  source,
+  live,
+  disabled,
+  onDeploy,
+}: {
+  readonly source: typeof AppSourceDisplay.Type;
+  readonly live: Query<DeploymentDisplay, E> | undefined;
+  readonly disabled: boolean;
+  readonly onDeploy: () => void;
+}) {
+  return live === undefined ? (
+    <Button size="sm" disabled={disabled} onClick={onDeploy}>
+      Deploy latest
+    </Button>
+  ) : (
+    <DeployLiveLatest source={source} live={live} disabled={disabled} onDeploy={onDeploy} />
+  );
+}
+function DeployLiveLatest<E>({
+  source,
+  live,
+  disabled,
+  onDeploy,
+}: {
+  readonly source: typeof AppSourceDisplay.Type;
+  readonly live: Query<DeploymentDisplay, E>;
+  readonly disabled: boolean;
+  readonly onDeploy: () => void;
+}) {
+  const current = useLiveCommit(live) === source.revision.commit;
+  return (
+    <Button
+      size="sm"
+      disabled={disabled}
+      disabledReason={current ? "Your latest saved changes are already live." : undefined}
+      onClick={onDeploy}
+    >
+      Deploy latest
+    </Button>
+  );
+}
 function CloneRepository({ source }: { readonly source: typeof AppSourceDisplay.Type }) {
-  const cloneUrl = window.location.origin + source.gitPath;
   return (
     <Popover>
       <PopoverTrigger asChild>
@@ -135,27 +232,36 @@ function CloneRepository({ source }: { readonly source: typeof AppSourceDisplay.
         </Button>
       </PopoverTrigger>
       <PopoverContent aria-label="Clone repository">
-        <h2 className="text-sm font-medium">Clone</h2>
-        <div className="mt-4 border-b pb-2 text-xs font-medium">
-          {window.location.protocol === "https:" ? "HTTPS" : "HTTP"}
-        </div>
-        <div className="mt-3 flex items-center gap-2">
-          <Input
-            aria-label="Git clone URL"
-            readOnly
-            value={cloneUrl}
-            onFocus={(event) => event.target.select()}
-            className="min-w-0 font-mono text-xs"
-          />
-          <CopyButton code={cloneUrl} label="Copy clone URL" inline />
-        </div>
-        <p className="mt-3 text-xs leading-5 text-muted-foreground">
-          {source.canEdit
-            ? "Clone to work locally. Push your changes, then deploy when you’re ready."
-            : "Clone to read the files locally. Make a copy to change this app."}
-        </p>
+        <CloneDetails source={source} />
       </PopoverContent>
     </Popover>
+  );
+}
+/** Rendered only in the browser, once the popover opens. */
+function CloneDetails({ source }: { readonly source: typeof AppSourceDisplay.Type }) {
+  const cloneUrl = window.location.origin + source.gitPath;
+  return (
+    <>
+      <h2 className="text-sm font-medium">Clone</h2>
+      <div className="mt-4 border-b pb-2 text-xs font-medium">
+        {window.location.protocol === "https:" ? "HTTPS" : "HTTP"}
+      </div>
+      <div className="mt-3 flex items-center gap-2">
+        <Input
+          aria-label="Git clone URL"
+          readOnly
+          value={cloneUrl}
+          onFocus={(event) => event.target.select()}
+          className="min-w-0 font-mono text-xs"
+        />
+        <CopyButton code={cloneUrl} label="Copy clone URL" inline />
+      </div>
+      <p className="mt-3 text-xs leading-5 text-muted-foreground">
+        {source.canEdit
+          ? "Clone to work locally. Push your changes, then deploy when you’re ready."
+          : "Clone to read the files locally. Make a copy to change this app."}
+      </p>
+    </>
   );
 }
 function SourceHistoryLink<E>({
@@ -219,7 +325,7 @@ function SourceHistory<E>({ app, atoms, Failure }: AppManagementProps<E> & { rea
                   <div className="min-w-0 flex-1">
                     <p className="break-words text-sm font-medium">{entry.message}</p>
                     <p className="mt-1 text-xs text-muted-foreground">
-                      {entry.author} · {new Date(entry.timestamp * 1000).toLocaleString()}
+                      {entry.author} · <LocalTime value={entry.timestamp * 1000} />
                     </p>
                   </div>
                   <code className="shrink-0 text-xs text-muted-foreground" title={entry.commit}>

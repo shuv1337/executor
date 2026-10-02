@@ -43,13 +43,22 @@ export function AppLaunchPage({
                 app={current.app}
                 origin={current.uiUrl}
                 returnTo={returnTo}
-                contexts={accountContexts(current.app, entries)}
+                contexts={accountContexts(current.app, entries, true)}
                 accounts={data.accounts}
                 manage={
                   <Link to="/apps/$appId" params={{ appId: id }} search={{ view: "accounts" }}>
                     Manage accounts
                   </Link>
                 }
+                review={(profile) => (
+                  <Link
+                    to="/apps/$appId"
+                    params={{ appId: id }}
+                    search={{ view: "accounts", profile }}
+                  >
+                    Review accounts
+                  </Link>
+                )}
               />
             )
           }

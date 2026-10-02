@@ -1,6 +1,6 @@
 import { hostedProfileHandlers } from "./profiles.ts";
-import { appManagementHandlers } from "@executor-js/app-management";
-import { HostedAppManagementApi } from "../contracts/app-management.ts";
+import { appManagementHandlers, frameworkHandlers } from "@executor-js/app-management";
+import { HostedAppManagementApi, HostedFrameworkApi } from "../contracts/app-management.ts";
 import { hostedAppAccess } from "../app-management.ts";
 import { hostedResourceAccessHandlers } from "./resource-access.ts";
 import { hostedScheduleHandlers } from "./schedules.ts";
@@ -12,7 +12,7 @@ import { HostedApi } from "../contracts/api.ts";
 import { HostedCatalog } from "../contracts/catalog.ts";
 import { ApiAuthentication, CurrentPrincipal } from "../contracts/auth.ts";
 import { hostedOrganizationHandlers } from "./organization.ts";
-import { hostedAccountHandlers } from "./accounts.ts";
+import { hostedAccountHandlers, hostedOAuthCallbackHandlers } from "./accounts.ts";
 import { hostedAppDataHandlers } from "./app-data.ts";
 import { hostedWebhookSetupHandlers } from "./webhook-setup.ts";
 import { hostedWorkflowHandlers } from "./workflows.ts";
@@ -21,6 +21,8 @@ import { hostedToolHandlers } from "./tools.ts";
 import { hostedAppHandlers } from "./apps.ts";
 import { hostedSkillHandlers } from "./skills.ts";
 import { hostedGroupHandlers } from "./groups.ts";
+import { hostedMcpConnectionHandlers } from "./mcp-connections.ts";
+import { hostedFeedbackHandlers } from "./feedback.ts";
 
 const health = HttpApiBuilder.group(HostedApi, "health", (handlers) =>
   handlers.handle("get", () => Effect.succeed({ status: "ok" as const })),
@@ -57,6 +59,8 @@ export const hostedHandlers = Layer.mergeAll(
   appManagementHandlers(HostedAppManagementApi, HostedApi.identifier).pipe(
     Layer.provide(hostedAppAccess),
   ),
+  // Each host provides FrameworkDocumentation from its packaged authoring assets.
+  frameworkHandlers(HostedFrameworkApi, HostedApi.identifier).pipe(Layer.provide(hostedAppAccess)),
   hostedProfileHandlers,
   hostedScheduleHandlers,
   health,
@@ -71,8 +75,11 @@ export const hostedHandlers = Layer.mergeAll(
   hostedAppHandlers,
   hostedSkillHandlers,
   hostedAccountHandlers,
+  hostedOAuthCallbackHandlers,
   hostedToolHandlers,
   hostedAppDataHandlers,
+  hostedMcpConnectionHandlers,
+  hostedFeedbackHandlers,
   HttpApiBuilder.group(HostedApi, "viewer", (handlers) =>
     handlers.handle("get", () =>
       Effect.gen(function* () {

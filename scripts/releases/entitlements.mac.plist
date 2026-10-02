@@ -12,8 +12,8 @@
          DYLD_* loader variables, and nothing here sets one. The desktop starts
          its bundled Node server with ordinary EXECUTOR_* environment variables,
          which the hardened runtime passes through regardless. -->
-    <!-- Resources/runtime holds the packaged dependency tree: workerd, the
-         Motel collector's own Bun runtime and native Node addons. Library
+    <!-- Resources/runtime holds the packaged dependency tree: workerd and
+         native Node addons. Library
          validation rejects them because they are not part of the Electron
          framework's signing chain. -->
     <key>com.apple.security.cs.disable-library-validation</key>

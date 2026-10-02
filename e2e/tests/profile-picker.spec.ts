@@ -8,65 +8,123 @@ import { Actors } from "../support/actors.ts";
 import { Browser } from "../support/browser.ts";
 import { waitForAppUrl } from "../support/app-pages.ts";
 import { HostedLive, withHostedCase } from "../support/case.ts";
-import { App } from "../support/contracts.ts";
-import { holdQuery, refreshVisiblePage } from "../support/query-transition.ts";
+import { App, Resource } from "../support/contracts.ts";
+import { nameConnectedAccount } from "../support/name-account.ts";
+import {
+  advanceToReconciliation,
+  holdQuery,
+  installBrowserClock,
+  refreshVisiblePage,
+} from "../support/query-transition.ts";
 import { scenarios } from "../test-plan.ts";
+import { appsManifest } from "../support/apps-release.ts";
 const Setup = Schema.Struct({
   id: Schema.String,
   name: Schema.NullOr(Schema.String),
   revision: Schema.Number,
   accounts: Schema.Struct({ service: Schema.String, extra: Schema.Array(Schema.String) }),
 });
-const source = `import {defineApp,defineProvider,secrets,query,object,string} from "apps";
+const source = `import {defineApp,defineProvider,secrets,query,object,string, router} from "apps";
 const service=defineProvider({name:"Inbox",auth:{key:secrets({label:"Key",fields:object({token:string()})})}});
 export const who=query({input:object({})},async ctx=>({context:{auth:"auth" in ctx,profile:"profile" in ctx},account:ctx.accounts.service.id,extra:ctx.accounts.extra.map(a=>a.id)}));
-export default defineApp({accounts:{service,extra:service.many()}},{queries:{who}});`;
+export default defineApp({accounts:{service,extra:service.many()}},{tools: router({ who })});`;
+const profileFixture = Effect.gen(function* () {
+  const api = yield* Api,
+    actors = yield* Actors,
+    browser = yield* Browser;
+  const prefix = `/api/organizations/${actors.organization.id}`;
+  const files = [
+    { path: "index.ts", content: source },
+    {
+      path: "ui/index.html",
+      content:
+        '<!doctype html><html><head><title>Inbox</title></head><body><h1>Inbox identity</h1><pre id="identity"></pre><p role="status">Loading</p><script type="module" src="./main.ts"></script></body></html>',
+    },
+    {
+      path: "ui/main.ts",
+      content: `import {object,string,array,boolean} from "apps";import {createAppClient,queryReference} from "apps/client";import type {who} from "../index.ts";
+const client=createAppClient();client.query(queryReference<typeof who>("who"),{},object({context:object({auth:boolean(),profile:boolean()}),account:string(),extra:array(string())})).then(value=>{document.querySelector("#identity").textContent=JSON.stringify(value);document.querySelector('[role="status"]').textContent="Ready";}).catch(()=>{document.querySelector('[role="status"]').textContent="Load failed";});`,
+    },
+    appsManifest,
+  ];
+  const deployed = yield* api.request(actors.owner, "POST", `${prefix}/apps/deploy`, {
+    name: `Inbox ${randomUUID().slice(0, 8)}`,
+    files,
+  });
+  expect(deployed.status, JSON.stringify(deployed.body)).toBe(200);
+  const app = yield* body(
+      Schema.Struct({ ...App.fields, activeDeployment: Schema.String }),
+      deployed,
+    ),
+    path = `${prefix}/apps/${app.id}`,
+    url = `/org/${actors.organization.slug}/apps/${app.id}`;
+  const revision = yield* body(
+    Schema.Struct({ revision: Schema.String }),
+    yield* api.request(actors.owner, "GET", `${path}/access`),
+  );
+  expect(
+    (yield* api.request(actors.owner, "PATCH", `${path}/access`, {
+      revision: revision.revision,
+      audience: { kind: "everyone" },
+    })).status,
+  ).toBe(200);
+  yield* Effect.addFinalizer(() =>
+    api.request(actors.owner, "DELETE", path).pipe(Effect.asVoid, Effect.orDie),
+  );
+  return { api, actors, browser, prefix, files, app, path, url };
+});
+
+const seededProfileFixture = Effect.gen(function* () {
+  const fixture = yield* profileFixture;
+  const { api, actors, prefix, path } = fixture;
+  const [first, second] = yield* Effect.forEach(
+    ["Personal inbox", "Work inbox"],
+    (name) =>
+      Effect.gen(function* () {
+        const profile = yield* body(
+          Resource,
+          yield* api.request(actors.member, "POST", `${path}/profiles`, {
+            name,
+            accounts: { extra: [] },
+            idempotencyKey: name,
+          }),
+        );
+        const connection = yield* body(
+          Resource,
+          yield* api.request(actors.member, "POST", `${path}/connections`, {
+            profile: profile.id,
+            requirement: "service",
+            destination: { kind: "personal" },
+          }),
+        );
+        const account = yield* api.request(
+          actors.member,
+          "POST",
+          `${prefix}/connections/${connection.id}/submit`,
+          {
+            method: "key",
+            label: name,
+            fields: { token: "synthetic-inbox-key" },
+          },
+        );
+        expect(account.status).toBe(200);
+        return yield* body(
+          Setup,
+          yield* api.request(actors.member, "GET", `${path}/profiles/${profile.id}`),
+        );
+      }),
+    { concurrency: 2 },
+  );
+  if (!first || !second) return yield* Effect.die("Missing saved profiles");
+  return { ...fixture, first, second };
+});
+
 layer(HostedLive, { excludeTestServices: true })("Profile picker", (it) => {
-  it.effect(scenarios.profilePicker.title, (context) =>
+  it.effect(scenarios.profileCreation.title, (context) =>
     withHostedCase(
       context,
       Effect.gen(function* () {
-        const api = yield* Api,
-          actors = yield* Actors,
-          browser = yield* Browser;
-        const prefix = `/api/organizations/${actors.organization.id}`;
-        const files = [
-          { path: "index.ts", content: source },
-          {
-            path: "ui/index.html",
-            content:
-              '<!doctype html><html><head><title>Inbox</title></head><body><h1>Inbox identity</h1><pre id="identity"></pre><p role="status">Loading</p><script type="module" src="./main.ts"></script></body></html>',
-          },
-          {
-            path: "ui/main.ts",
-            content: `import {object,string,array,boolean} from "apps";import {createAppClient,queryReference} from "apps/client";import type {who} from "../index.ts";
-const client=createAppClient();client.query(queryReference<typeof who>("who"),{},object({context:object({auth:boolean(),profile:boolean()}),account:string(),extra:array(string())})).then(value=>{document.querySelector("#identity").textContent=JSON.stringify(value);document.querySelector('[role="status"]').textContent="Ready";}).catch(()=>{document.querySelector('[role="status"]').textContent="Load failed";});`,
-          },
-        ];
-        const deployed = yield* api.request(actors.owner, "POST", `${prefix}/apps/deploy`, {
-          name: `Inbox ${randomUUID().slice(0, 8)}`,
-          files,
-        });
-        expect(deployed.status, JSON.stringify(deployed.body)).toBe(200);
-        const app = yield* body(
-            Schema.Struct({ ...App.fields, activeDeployment: Schema.String }),
-            deployed,
-          ),
-          path = `${prefix}/apps/${app.id}`,
-          url = `/org/${actors.organization.slug}/apps/${app.id}`;
-        const revision = yield* body(
-          Schema.Struct({ revision: Schema.String }),
-          yield* api.request(actors.owner, "GET", `${path}/access`),
-        );
-        expect(
-          (yield* api.request(actors.owner, "PATCH", `${path}/access`, {
-            revision: revision.revision,
-            audience: { kind: "everyone" },
-          })).status,
-        ).toBe(200);
-        yield* Effect.addFinalizer(() =>
-          api.request(actors.owner, "DELETE", path).pipe(Effect.asVoid, Effect.orDie),
-        );
+        const { api, actors, browser, path, url } = yield* profileFixture;
         yield* browser.login(actors.member);
         yield* browser.use("Open the shared inbox app", (page) => page.goto(`${url}?view=tools`));
         for (const label of ["Personal inbox", "Work inbox"]) {
@@ -147,18 +205,11 @@ const client=createAppClient();client.query(queryReference<typeof who>("who"),{}
             expect(added?.accounts).toEqual({ extra: [] });
             expect(added?.name).toBe(label);
           }
-          yield* browser.use("Choose the profile's Inbox account", (page) =>
+          yield* browser.use("Connect a new account for the profile's Inbox", (page) =>
             page
               .getByRole("region", { name: "Inbox (service)", exact: true })
-              .getByRole("button", { name: "Add Inbox account", exact: true })
+              .getByRole("button", { name: "Connect new account", exact: true })
               .click(),
-          );
-          if (label !== "Personal inbox")
-            yield* browser.use("Connect a new account instead of a saved one", (page) =>
-              page.getByRole("button", { name: "Connect new account", exact: true }).click(),
-            );
-          yield* browser.use("Name this saved account", (page) =>
-            page.getByRole("textbox", { name: "Account name", exact: true }).fill(label),
           );
           yield* browser.use("Enter the synthetic credential", (page) =>
             page.getByLabel("Token", { exact: true }).fill("synthetic-inbox-key"),
@@ -166,11 +217,14 @@ const client=createAppClient();client.query(queryReference<typeof who>("who"),{}
           yield* browser.use("Complete account connection", (page) =>
             page.getByRole("button", { name: "Connect account", exact: true }).click(),
           );
+          yield* browser.use("Name this saved account", (page) =>
+            nameConnectedAccount(page, label),
+          );
           yield* browser.use("Open the newly connected account's tools", (page) =>
             page.getByRole("link", { name: "Tools", exact: true }).click(),
           );
           yield* browser.use("The account's full tool list appears", (page) =>
-            page.getByRole("button", { name: "queries.who", exact: true }).waitFor(),
+            page.getByRole("button", { name: "who", exact: true }).waitFor(),
           );
         }
         const entries = yield* body(
@@ -181,6 +235,16 @@ const client=createAppClient();client.query(queryReference<typeof who>("who"),{}
         const first = entries[0],
           second = entries[1];
         if (!first || !second) return yield* Effect.die("Missing saved setups");
+      }),
+    ),
+  );
+  it.effect(scenarios.profilePicker.title, (context) =>
+    withHostedCase(
+      context,
+      Effect.gen(function* () {
+        const { api, actors, browser, app, path, url, first, second } = yield* seededProfileFixture;
+        yield* browser.login(actors.member);
+        yield* installBrowserClock;
         yield* browser.use("Open the app without a selected account", (page) =>
           page.goto(`${url}?view=tools`),
         );
@@ -192,18 +256,23 @@ const client=createAppClient();client.query(queryReference<typeof who>("who"),{}
             page.getByRole("menuitemradio", { name: "Work inbox", exact: true }).click(),
           );
           yield* browser.use("Choose Work inbox", (page) =>
-            page.getByRole("button", { name: "queries.who", exact: true }).waitFor(),
+            page.getByRole("button", { name: "who", exact: true }).waitFor(),
           );
           expect(
             yield* browser.use("Choose Work inbox", (page) =>
-              page.getByRole("button", { name: "queries.who", exact: true }).count(),
+              page.getByRole("button", { name: "who", exact: true }).count(),
             ),
           ).toBe(1);
         });
         yield* browser.checkpoint("One profile tool catalog");
         yield* browser.use("Inspect the work tool", (page) =>
-          page.getByRole("button", { name: "queries.who", exact: true }).click(),
+          page.getByRole("button", { name: "who", exact: true }).click(),
         );
+        expect(
+          yield* browser.use("The runner names the selected profile and its account", (page) =>
+            page.getByText(/^Running as /).textContent(),
+          ),
+        ).toMatch(/^Running as Work inbox · Work inbox\b/);
         yield* browser.use("Run using the work account", (page) =>
           page.getByRole("button", { name: "Run tool", exact: true }).click(),
         );
@@ -219,7 +288,7 @@ const client=createAppClient();client.query(queryReference<typeof who>("who"),{}
           page.context().newPage(),
         );
         yield* browser.use("Load the work context in the second tab", () =>
-          other.goto(`${url}?view=tools&profile=${second.id}&tool=queries.who`),
+          other.goto(`${url}?view=tools&profile=${second.id}&tool=who`),
         );
         yield* browser.use("Run in the second tab", () =>
           other.getByRole("button", { name: "Run tool", exact: true }).click(),
@@ -232,10 +301,10 @@ const client=createAppClient();client.query(queryReference<typeof who>("who"),{}
             page.getByRole("button", { name: "Choose profile", exact: true }).click(),
           );
           yield* browser.use("Switch only the first tab to Personal inbox", (page) =>
-            page.getByRole("menuitemradio", { name: "Default", exact: true }).click(),
+            page.getByRole("menuitemradio", { name: "Personal inbox", exact: true }).click(),
           );
           yield* browser.use("Switch only the first tab to Personal inbox", (page) =>
-            page.getByRole("button", { name: "queries.who", exact: true }).waitFor(),
+            page.getByRole("button", { name: "who", exact: true }).waitFor(),
           );
           expect(
             new URL(
@@ -245,7 +314,7 @@ const client=createAppClient();client.query(queryReference<typeof who>("who"),{}
             ).searchParams.get("tool"),
           ).toBeNull();
           yield* browser.use("Switch only the first tab to Personal inbox", (page) =>
-            page.getByRole("button", { name: "queries.who", exact: true }).click(),
+            page.getByRole("button", { name: "who", exact: true }).click(),
           );
         });
         expect(
@@ -279,55 +348,56 @@ const client=createAppClient();client.query(queryReference<typeof who>("who"),{}
             .getByRole("link", { name: "Accounts", exact: true })
             .click(),
         );
-        yield* browser.use("The array selection uses account cards", (page) =>
-          page
-            .getByRole("region", { name: "Inbox (extra)", exact: true })
-            .getByRole("button", { name: "Add Inbox account", exact: true })
-            .click(),
+        const extra = yield* browser.use("The array selection lists saved accounts", (page) =>
+          Promise.resolve(page.getByRole("region", { name: "Inbox (extra)", exact: true })),
         );
         yield* browser.checkpoint("Personal accounts can be selected together");
-        yield* browser.use("Add Work inbox to the array requirement", (page) =>
-          page
-            .getByRole("dialog")
-            .getByRole("checkbox", { name: /Work inbox/ })
-            .check(),
+        const added = yield* browser.use("Add Work inbox to the array requirement", (page) =>
+          Promise.all([
+            page.waitForResponse(
+              (response) =>
+                response.request().method() === "PATCH" &&
+                new URL(response.url()).pathname.endsWith(`/profiles/${first.id}`),
+            ),
+            extra.getByRole("checkbox", { name: "Work inbox", exact: true }).click(),
+          ]).then(([response]) => response.status()),
         );
-        const read = yield* holdQuery(
-          [actors.organization.id, actors.organization.slug].map(
-            (org) => `/api/organizations/${org}/apps/${app.id}/profiles`,
-          ),
-          "fail",
+        expect(added).toBe(200);
+        // Periodic reconciliation can already be reading profiles when the tab regains focus.
+        // The focus refresh supersedes that read, so every profiles read in the cycle fails.
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const read = yield* holdQuery(
+              [actors.organization.id, actors.organization.slug].map(
+                (org) => `/api/organizations/${org}/apps/${app.id}/profiles`,
+              ),
+              "fail",
+              { allRequests: true },
+            );
+            yield* advanceToReconciliation;
+            yield* read.requested;
+            yield* refreshVisiblePage;
+            expect(
+              yield* browser.use("The saved choice remains while metadata loads", () =>
+                extra.getByRole("checkbox", { name: "Work inbox", exact: true }).isChecked(),
+              ),
+            ).toBe(true);
+            yield* read.release;
+            yield* browser.use("The read failure is visible", (page) =>
+              page.getByText("Unable to complete this request", { exact: true }).first().waitFor(),
+            );
+          }),
         );
-        yield* refreshVisiblePage;
-        yield* read.requested;
         expect(
-          yield* browser.use("The array draft remains while metadata loads", (page) =>
-            page
-              .getByRole("dialog")
-              .getByRole("checkbox", { name: /Work inbox/ })
-              .isChecked(),
+          yield* browser.use("The saved choice survives a failed refresh", () =>
+            extra.getByRole("checkbox", { name: "Work inbox", exact: true }).isChecked(),
           ),
         ).toBe(true);
-        yield* read.release;
-        yield* browser.use("The read failure is visible", (page) =>
-          page.getByText("Unable to complete this request", { exact: true }).first().waitFor(),
-        );
-        expect(
-          yield* browser.use("The array draft survives a failed refresh", (page) =>
-            page
-              .getByRole("dialog")
-              .getByRole("checkbox", { name: /Work inbox/ })
-              .isChecked(),
-          ),
-        ).toBe(true);
-        yield* browser.use("Save the scalar and array selection", (page) =>
-          page.getByRole("button", { name: "Use selected accounts", exact: true }).click(),
-        );
         yield* browser.use("Open the selected tools", (page) =>
           page.getByRole("link", { name: "Tools", exact: true }).click(),
         );
         yield* browser.use("Return to the selected tools", (page) =>
-          page.getByRole("button", { name: "queries.who", exact: true }).first().waitFor(),
+          page.getByRole("button", { name: "who", exact: true }).first().waitFor(),
         );
         const saved = yield* body(
           Setup,
@@ -347,25 +417,53 @@ const client=createAppClient();client.query(queryReference<typeof who>("who"),{}
             yield* api.request(actors.owner, "GET", `${path}/profiles`),
           ),
         ).toEqual([]);
+      }),
+    ),
+  );
+
+  it.effect(scenarios.profileDeployment.title, (context) =>
+    withHostedCase(
+      context,
+      Effect.gen(function* () {
+        const { actors, browser, files, path, url, first, second } = yield* seededProfileFixture;
+        yield* browser.login(actors.member);
+        yield* installBrowserClock;
+        yield* browser.use("Open the personal profile before deployment", (page) =>
+          page.goto(`${url}?view=tools&profile=${first.id}`),
+        );
+        yield* browser.use("The personal profile has the original catalog", (page) =>
+          page.getByRole("button", { name: "who", exact: true }).waitFor(),
+        );
+        const other = yield* browser.use("Open the work profile in another tab", (page) =>
+          page.context().newPage(),
+        );
+        yield* browser.use("Load the work profile before deployment", () =>
+          other.goto(`${url}?view=tools&profile=${second.id}`),
+        );
+        yield* browser.use("The work profile has the original catalog", () =>
+          other.getByRole("button", { name: "who", exact: true }).waitFor(),
+        );
         const changed = yield* saveAndDeploy(actors.owner, path, {
           files: files.map((file) =>
             file.path === "index.ts"
               ? {
                   ...file,
                   content: file.content.replace(
-                    "queries:{who}",
-                    'queries:{who,version:query({input:object({})},async()=>"two")}',
+                    "tools: router({ who })",
+                    'tools: router({ who,version:query({input:object({})},async()=>"two") })',
                   ),
                 }
               : file,
           ),
         });
         expect(changed.status, JSON.stringify(changed.body)).toBe(200);
+        // Both open tabs follow the deployment at their next idle reconciliation.
+        yield* advanceToReconciliation;
         yield* browser.use("The personal profile follows the new deployment", (page) =>
-          page.getByRole("button", { name: "queries.version", exact: true }).first().waitFor(),
+          page.getByRole("button", { name: "version", exact: true }).first().waitFor(),
         );
         yield* browser.use("The second tab follows the same deployment", () =>
-          other.getByRole("button", { name: "queries.version", exact: true }).first().waitFor(),
+          other.getByRole("button", { name: "version", exact: true }).first().waitFor(),
         );
         yield* browser.use("Review the picker on a phone", (page) =>
           page.setViewportSize({ width: 390, height: 844 }),
@@ -376,8 +474,24 @@ const client=createAppClient();client.query(queryReference<typeof who>("who"),{}
           ),
         ).toBe(true);
         yield* browser.checkpoint("Account picker on a phone");
-        yield* browser.use("Return to a desktop before opening the authored app", (page) =>
-          page.setViewportSize({ width: 1440, height: 960 }),
+      }),
+    ),
+  );
+
+  it.effect(scenarios.profileAppTabs.title, (context) =>
+    withHostedCase(
+      context,
+      Effect.gen(function* () {
+        const { api, actors, browser, app, path, url, first, second } = yield* seededProfileFixture;
+        expect(
+          (yield* api.request(actors.member, "PATCH", `${path}/profiles/${first.id}`, {
+            expectedRevision: first.revision,
+            accounts: { service: first.accounts.service, extra: [second.accounts.service] },
+          })).status,
+        ).toBe(200);
+        yield* browser.login(actors.member);
+        yield* browser.use("Open the selected profile", (page) =>
+          page.goto(`${url}?view=tools&profile=${first.id}`),
         );
         const appUrl = yield* waitForAppUrl(actors.member, `${path}/ui`);
         const selectedAppUrl = yield* browser.use(
@@ -399,7 +513,7 @@ const client=createAppClient();client.query(queryReference<typeof who>("who"),{}
           ),
         ).toBe(0);
         yield* browser.use("Launch Personal with its array selection", (page) =>
-          page.getByRole("link", { name: "Default", exact: true }).click(),
+          page.getByRole("link", { name: "Personal inbox", exact: true }).click(),
         );
 
         yield* browser.use("The app client resolves the selected account", (page) =>
@@ -446,10 +560,7 @@ const client=createAppClient();client.query(queryReference<typeof who>("who"),{}
             idempotencyKey: "other-user",
           }),
         );
-        const activeDeployment = (yield* body(
-          Schema.Struct({ app: Schema.Struct({ activeDeployment: Schema.String }) }),
-          changed,
-        )).app.activeDeployment;
+        const activeDeployment = app.activeDeployment;
         expect(
           yield* browser.use("The app session rejects another user's profile", (page) =>
             page.evaluate(

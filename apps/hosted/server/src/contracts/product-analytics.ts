@@ -1,7 +1,13 @@
-/** Product analytics are optional host capabilities; self-host has no exporter. */
+/** Product analytics are optional host capabilities. Cloud and self-host install their own sinks. */
 import { Cause, Clock, Context, Effect, Exit, Option, Schema } from "effect";
+import {
+  feedbackDisabled,
+  type FeedbackDisabled,
+  type FeedbackUnavailable,
+} from "@executor-js/telemetry/product-analytics";
 import { CurrentUserId } from "./auth.ts";
 import { CurrentOrganization } from "./organization.ts";
+import { UserFacingError } from "@executor-js/utils/user-facing-error";
 
 /** Explicit metadata only. Never add request bodies, URLs, credentials, or operation results. */
 export interface UsageProperties {
@@ -23,6 +29,8 @@ export interface UsageProperties {
   readonly resumed?: boolean;
   readonly duration_ms?: number;
   readonly error_type?: string;
+  readonly error_reason?: string;
+  readonly error_report?: string;
   readonly status_code?: number;
   readonly result_count?: number;
   readonly run_id?: string;
@@ -59,7 +67,10 @@ export const CurrentUsage = Context.Reference<UsageContext>("hosted/CurrentUsage
   defaultValue: () => ({ source: "unknown" }),
 });
 
-/** A request-owned sink installed by Cloud; the default performs no collection or network I/O. */
+/**
+ * The host's sink. Cloud installs one per request; self-host installs its process sink unless the
+ * operator opted out. The default performs no collection or network I/O and refuses feedback.
+ */
 export const ProductAnalytics = Context.Reference<{
   readonly enabled: boolean;
   readonly capture: (event: {
@@ -69,8 +80,18 @@ export const ProductAnalytics = Context.Reference<{
     readonly context: UsageContext;
     readonly properties: UsageProperties;
   }) => void;
+  /** Send explicitly submitted feedback and wait for ingestion to accept it. */
+  readonly submitFeedback: (feedback: {
+    readonly message: string;
+    readonly userId: string;
+    readonly organizationId: string;
+  }) => Effect.Effect<void, FeedbackUnavailable | FeedbackDisabled>;
 }>("hosted/ProductAnalytics", {
-  defaultValue: () => ({ enabled: false, capture: () => {} }),
+  defaultValue: () => ({
+    enabled: false,
+    capture: () => {},
+    submitFeedback: () => Effect.fail(feedbackDisabled()),
+  }),
 });
 
 /** Record only authenticated activity with the current resolved organization. */
@@ -104,17 +125,29 @@ export const recordUsage = (event: UsageEvent, properties: UsageProperties = {})
 const ErrorTag = Schema.Struct({
   _tag: Schema.String.check(Schema.isPattern(/^[A-Z][A-Za-z0-9]{0,79}$/)),
 });
+const ErrorReason = Schema.Struct({
+  reason: Schema.String.check(Schema.isPattern(/^[a-z][a-z0-9_-]{0,63}$/)),
+});
 
-/** Export a bounded error discriminator only, never its message, cause, or serialized fields. */
+/** Export bounded error discriminators only, never a message, cause, or other serialized field. */
 export const usageFailure = (cause: Cause.Cause<unknown>): UsageProperties => {
   if (Cause.hasInterrupts(cause)) return { outcome: "cancelled", ok: false };
-  const error = Cause.findErrorOption(cause).pipe(
-    Option.flatMap(Schema.decodeUnknownOption(ErrorTag)),
-  );
+  const failure = Cause.findErrorOption(cause);
+  const error = failure.pipe(Option.flatMap(Schema.decodeUnknownOption(ErrorTag)));
+  const reason = failure.pipe(Option.flatMap(Schema.decodeUnknownOption(ErrorReason)));
   return {
     outcome: "failure",
     ok: false,
     error_type: Option.isSome(error) ? error.value._tag : "UnhandledFailure",
+    ...(Option.isSome(reason) ? { error_reason: reason.value.reason } : {}),
+    // A report is curated safe evidence for failures the Executor team must fix.
+    ...Option.match(failure, {
+      onNone: () => ({}),
+      onSome: (value) =>
+        UserFacingError.is(value) && value.report !== undefined
+          ? { error_report: value.report.slice(0, 300) }
+          : {},
+    }),
   };
 };
 
@@ -143,18 +176,35 @@ export const observeUsage = <A, E, R>(
     );
   });
 
+type ProductOperation = UsageProperties & { readonly area: string; readonly operation: string };
+
+const productOperationSpan = (properties: ProductOperation) =>
+  Effect.withSpan("product.operation", {
+    attributes: {
+      "executor.product.area": properties.area,
+      "executor.product.operation": properties.operation,
+    },
+  });
+
 /** Count attempted and finished operations separately so failures and abandoned work remain visible. */
 export const observeProductOperation = <A, E, R>(
-  properties: UsageProperties & { readonly area: string; readonly operation: string },
+  properties: ProductOperation,
   effect: Effect.Effect<A, E, R>,
   result?: (value: A) => UsageProperties,
 ) =>
   recordUsage("product_operation_started", properties).pipe(
     Effect.andThen(observeUsage("product_operation_completed", properties, effect, result)),
-    Effect.withSpan("product.operation", {
-      attributes: {
-        "executor.product.area": properties.area,
-        "executor.product.operation": properties.operation,
-      },
-    }),
+    productOperationSpan(properties),
   );
+
+/**
+ * Trace a read without product analytics. Dashboard refetches and MCP discovery repeat
+ * constantly and do not represent product use; failures still reach tracing and error reporting.
+ */
+export const traceProductRead = <A, E, R>(
+  properties: ProductOperation,
+  effect: Effect.Effect<A, E, R>,
+) => effect.pipe(productOperationSpan(properties));
+
+/** Safe HTTP methods are reads; every other method is recorded as a product operation. */
+export const isReadMethod = (method: string) => method === "GET" || method === "HEAD";

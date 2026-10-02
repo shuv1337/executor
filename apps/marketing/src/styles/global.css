@@ -29,6 +29,13 @@
     scroll-behavior: smooth;
   }
 
+  @media (pointer: fine) {
+    html,
+    body {
+      overscroll-behavior-y: none;
+    }
+  }
+
   body {
     font-family: var(--font-sans);
     color: var(--color-ink);

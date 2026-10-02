@@ -1,11 +1,11 @@
 import { AppId, type Cursor, type DeploymentId, type Tool } from "@executor-js/sdk";
 import type { OrganizationId } from "@executor-js/hosted-server/organization";
 import { HostedClient } from "./api.ts";
-import { traceHeaders } from "@executor-js/telemetry";
+import { hydratedResult, requestKey } from "@executor-js/ui/contracts/http";
 import { BrowserAtoms } from "./telemetry.ts";
 import { Effect, Schema } from "effect";
 import { Atom } from "effect/unstable/reactivity";
-import { mcpAuthorization } from "./auth.ts";
+import { authCallOptions, mcpAuthorization, type AuthCallOptions } from "./auth.ts";
 
 /** Safe OAuth setup errors shown to the person granting access. */
 export class McpConnectionFailed extends Schema.TaggedError<McpConnectionFailed>()(
@@ -14,13 +14,13 @@ export class McpConnectionFailed extends Schema.TaggedError<McpConnectionFailed>
 ) {}
 const request = <A>(
   operation: string,
-  run: (options: {
-    headers: Readonly<Record<string, string>>;
-  }) => Promise<{ data: A; error: null } | { data: null; error: { status: number } }>,
+  run: (
+    options: AuthCallOptions,
+  ) => Promise<{ data: A; error: null } | { data: null; error: { status: number } }>,
 ) =>
-  Effect.flatMap(traceHeaders, (headers) =>
+  Effect.flatMap(authCallOptions, (options) =>
     Effect.tryPromise({
-      try: () => run({ headers }),
+      try: () => run(options),
       catch: () => new McpConnectionFailed({ message: "Cannot reach Executor. Try again." }),
     }),
   ).pipe(
@@ -39,14 +39,37 @@ const request = <A>(
     Effect.withSpan(`ui.mcp.${operation}`),
   );
 
+/** The registered client metadata consent shows; Better Auth's public client response decodes to it. */
+const McpClient = Schema.Struct({ client_name: Schema.optional(Schema.String) });
+
 /** Look up registered client metadata; names from the authorization URL are not trusted. */
 export const mcpClientAtom = Atom.family((clientId: string) =>
-  BrowserAtoms.atom(request("client", (options) => mcpAuthorization(options).client(clientId))),
+  BrowserAtoms.atom(
+    request("client", (options) => mcpAuthorization(options).client(clientId)).pipe(
+      Effect.flatMap((client) =>
+        Schema.decodeUnknownEffect(McpClient)(client).pipe(
+          Effect.mapError(
+            () =>
+              new McpConnectionFailed({
+                message:
+                  "This connection request could not be completed. Start again from your MCP client.",
+              }),
+          ),
+        ),
+      ),
+    ),
+  ).pipe(
+    hydratedResult({
+      key: `hosted:mcp-client:${requestKey({ clientId })}`,
+      success: McpClient,
+      error: McpConnectionFailed,
+    }),
+  ),
 );
 
 /** The chosen organization belongs to this consent POST, not a shared browser preference. */
 export const mcpConsentAtom = BrowserAtoms.fn(
-  (input: { accept: boolean; organization: string; query: string }) =>
+  (input: { accept: boolean; organization: string | undefined; query: string }) =>
     request("consent", (options) => mcpAuthorization(options).consent(input)),
 );
 

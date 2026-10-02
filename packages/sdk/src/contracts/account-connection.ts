@@ -75,24 +75,35 @@ export const GetAccountConnection = Schema.Struct({
   connection: AccountConnectionId,
   owner: Schema.optional(OwnerId),
 });
-/** Save one set of fields. Successful retries return the same account. */
+/** Save one set of fields. Successful retries return the same account. Without a label, the account is named when created. */
 export const SubmitAccountConnection = Schema.Struct({
   ...GetAccountConnection.fields,
   method: AuthMethodName,
-  label: Schema.NonEmptyString,
+  label: Schema.optional(Schema.NonEmptyString),
   fields: AccountFieldsInput,
 });
-/** OAuth setup is bound to the connection's owner and provider. */
+/**
+ * OAuth setup is bound to the connection's owner and provider. Without a label, the account is
+ * named when it is created, after sign-in, so it can be renamed once its identity is known.
+ */
 export const StartConnectionOAuth = Schema.Struct({
   ...GetAccountConnection.fields,
   method: AuthMethodName,
-  label: Schema.NonEmptyString,
+  label: Schema.optional(Schema.NonEmptyString),
   redirectUri: Schema.optional(HttpUrl),
   client: Schema.optional(OAuthClientInput),
 });
 /** Both request identity and OAuth state must match before exchanging a code. */
 export const CompleteConnectionOAuth = Schema.Struct({
   ...GetAccountConnection.fields,
+  callbackUrl: Schema.RedactedFromValue(HttpUrl),
+});
+/**
+ * The callback's state identifies the pending sign-in, so a return that lost its browser context
+ * can still find its connection. The host must authorize the returned owner and connection.
+ */
+export const FindConnectionOAuth = Schema.Struct({
+  owner: Schema.optional(OwnerId),
   callbackUrl: Schema.RedactedFromValue(HttpUrl),
 });
 /** Unknown IDs and mismatched owners have the same result. */
@@ -237,6 +248,16 @@ export const AccountConnectionsGroup = HttpApiGroup.make("accountConnections")
         OAuthSetupFailed,
       ],
     }),
+  )
+  .add(
+    HttpApiEndpoint.post("findOAuth", "/v1/account-connections/oauth/find", {
+      payload: FindConnectionOAuth,
+      success: AccountConnection,
+      error: [...errors, CredentialsError, OAuthCompletionFailed],
+    }).annotate(
+      OpenApi.Description,
+      "Find the connection whose pending OAuth sign-in issued the callback's state, for example when the provider's link opened in another browser tab. Hosts must authorize the returned owner and connection before completing it.",
+    ),
   )
   .add(
     HttpApiEndpoint.post("completeOAuth", "/v1/account-connections/oauth/complete", {

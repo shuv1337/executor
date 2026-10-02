@@ -4,10 +4,14 @@ import {
   Deployment,
   DeploymentId,
   AccountRequired,
+  credentialsRejected,
+  profileAccountProblems,
   OAuthReconnectRequired,
   OwnerId,
+  type App,
   type AppId,
   type ExecutorDatabase,
+  type SelectedAccounts,
   type Executor,
   type Runtime,
 } from "@executor-js/sdk/core";
@@ -29,10 +33,12 @@ import { appSessionCookie } from "../contracts/app-ui.ts";
 import type { ServerConfig } from "../contracts/config.ts";
 import type { LocalAuth } from "./auth.ts";
 import { appRequest } from "./app-auth.ts";
-import { AppReturnPath, appPrivateHeaders as privateHeaders, appSignInPage } from "apps/ui/auth";
+import { AppReturnPath, appPrivateHeaders as privateHeaders } from "apps/ui/auth";
 
 const failed = (reason: UiFailed["reason"] = "unavailable") => new UiFailed({ reason });
 const UiBuild = Schema.Struct({ id: DeploymentId, build: Deployment.fields.build });
+const accountIds = (accounts: SelectedAccounts) =>
+  Object.values(accounts).flatMap((value) => (typeof value === "string" ? [value] : value));
 
 /** Build app handlers and session middleware; the host composition registers their routes. */
 export const appUi = (
@@ -41,9 +47,14 @@ export const appUi = (
   runtime: Runtime,
   config: ServerConfig,
   auth: LocalAuth,
+  beginSignIn: Effect.Effect<
+    HttpServerResponse.HttpServerResponse,
+    UiForbidden | UiFailed,
+    HttpServerRequest.HttpServerRequest
+  >,
 ) => {
   const native = runtime;
-  const db = storage.orm("4.0.0");
+  const db = storage.orm("4.0.5");
   const current = (id: AppId) =>
     executor.apps
       .get({ app: id, owner: OwnerId.make("local") })
@@ -110,21 +121,23 @@ export const appUi = (
           const source = yield* safeOperation(executor.appData.subscribe(input));
           return source.pipe(
             Stream.mapError(operationFailure),
-            Stream.map(({ value }) => ({ type: "snapshot" as const, value })),
+            Stream.map(({ value, revision }) => ({ type: "snapshot" as const, value, revision })),
             Stream.merge(
               Stream.tick("15 seconds").pipe(Stream.map(() => ({ type: "heartbeat" as const }))),
             ),
             Stream.mapEffect((frame) =>
               Effect.gen(function* () {
-                yield* operation(payload).pipe(
-                  Effect.withSpan(
-                    frame.type === "snapshot"
-                      ? "app.ui.snapshot.authorize"
-                      : "app.ui.heartbeat.authorize",
-                  ),
-                );
+                // The first result belongs to this request, which was just authorized.
+                if (frame.type === "heartbeat" || frame.revision > 0)
+                  yield* operation(payload).pipe(
+                    Effect.withSpan(
+                      frame.type === "snapshot"
+                        ? "app.ui.snapshot.authorize"
+                        : "app.ui.heartbeat.authorize",
+                    ),
+                  );
                 if (frame.type === "heartbeat") return frame;
-                return { ...frame, trace: yield* currentTraceContext };
+                return { type: frame.type, value: frame.value, trace: yield* currentTraceContext };
               }).pipe(
                 Effect.withSpan(
                   frame.type === "snapshot" ? "app.ui.snapshot.send" : "app.ui.heartbeat",
@@ -184,6 +197,39 @@ export const appUi = (
     const content = yield* readAsset(version.build, params["*"]);
     return yield* appAsset(content, version.build, params["*"]);
   }).pipe(htmlResponse);
+  const dashboard = config.browserOrigin ?? `http://127.0.0.1:${config.port}`;
+  /** The dashboard chooser for this app, returning to the page without its profile. */
+  const chooser = (app: AppId, page: URL) =>
+    Effect.gen(function* () {
+      const back = new URL(page);
+      back.searchParams.delete("profile");
+      const returnTo = yield* Schema.decodeUnknownEffect(AppReturnPath)(
+        back.pathname + back.search,
+      ).pipe(Effect.mapError(() => new UiForbidden()));
+      const url = new URL(`/apps/${app}/open`, dashboard);
+      url.searchParams.set("returnTo", returnTo);
+      return url.href;
+    });
+  /** Problems with the page profile's accounts, checked before the app renders. */
+  const accountNotice = (app: App, profile: ProfileId, accounts: SelectedAccounts, page: URL) =>
+    Effect.gen(function* () {
+      const found = yield* Effect.forEach(accountIds(accounts), (account) =>
+        Effect.all({
+          account: executor.accounts.get({ account }),
+          health: executor.accounts.health({ account }),
+        }).pipe(
+          Effect.map((entry) => [[account, entry] as const]),
+          Effect.catchTag("AccountNotFound", () => Effect.succeed([])),
+          Effect.mapError(() => failed()),
+        ),
+      );
+      const problems = profileAccountProblems(app, accounts, new Map(found.flat()));
+      if (problems.length === 0) return undefined;
+      const fix = new URL(`/apps/${app.id}`, dashboard);
+      fix.searchParams.set("view", "accounts");
+      fix.searchParams.set("profile", profile);
+      return { app: app.name, problems, fix: fix.href, choose: yield* chooser(app.id, page) };
+    });
   const page = Effect.gen(function* () {
     const app = yield* authorize;
     const { target } = yield* appRequest(config.port);
@@ -212,20 +258,24 @@ export const appUi = (
             Object.hasOwn(item.accounts, slot),
           ),
       );
+      // A lone profile opens directly only when its accounts exist and none was rejected.
+      const usable = (accounts: SelectedAccounts) =>
+        Effect.forEach(accountIds(accounts), (account) =>
+          executor.accounts.health({ account }).pipe(
+            Effect.map((health) => !credentialsRejected(health, app.id)),
+            Effect.catchTag("AccountNotFound", () => Effect.succeed(false)),
+            Effect.mapError(() => failed()),
+          ),
+        ).pipe(Effect.map((results) => results.every(Boolean)));
       const only = candidates[0];
-      if (candidates.length === 1 && only !== undefined) {
+      if (candidates.length === 1 && only !== undefined && (yield* usable(only.accounts))) {
         url.searchParams.set("profile", only.id);
         return HttpServerResponse.redirect(url.href, { status: 302, headers: privateHeaders });
       }
-      const returnTo = yield* Schema.decodeUnknownEffect(AppReturnPath)(
-        url.pathname + url.search,
-      ).pipe(Effect.mapError(() => new UiForbidden()));
-      const chooser = new URL(
-        `/apps/${app.id}/open`,
-        config.browserOrigin ?? `http://127.0.0.1:${config.port}`,
-      );
-      chooser.searchParams.set("returnTo", returnTo);
-      return HttpServerResponse.redirect(chooser.href, { status: 302, headers: privateHeaders });
+      return HttpServerResponse.redirect(yield* chooser(app.id, url), {
+        status: 302,
+        headers: privateHeaders,
+      });
     }
     const selected =
       profile === undefined
@@ -244,6 +294,10 @@ export const appUi = (
     return yield* appDocument({
       profile: selected?.id,
       expectedProfileRevision: selected?.revision,
+      accounts:
+        selected === undefined
+          ? undefined
+          : yield* accountNotice(app, selected.id, selected.accounts, url),
       origin: target.origin,
       deployment: version.id,
       asset: (path) => readAsset(version.build, path),
@@ -255,8 +309,8 @@ export const appUi = (
         const navigation =
           request.headers["sec-fetch-mode"] === "navigate" ||
           request.headers.accept?.includes("text/html");
-        // This handler is registered only for the SPA, so APIs and retained assets never return a login document.
-        if (request.method === "GET" && navigation) return appSignInPage();
+        // This handler is registered only for the SPA, so APIs and retained assets never start sign-in.
+        if (request.method === "GET" && navigation) return yield* beginSignIn;
         return yield* error;
       }),
     ),

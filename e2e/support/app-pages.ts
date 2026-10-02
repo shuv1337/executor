@@ -4,6 +4,7 @@ import { Effect, Schedule, Schema } from "effect";
 import { Api, body, type Session } from "./api.ts";
 import { Browser } from "./browser.ts";
 import { Evidence } from "./evidence.ts";
+import { recordAppOpening } from "./app-open-timeline.ts";
 
 const AppLocation = Schema.Union([
   Schema.Struct({ status: Schema.Literal("ready"), url: Schema.String }),
@@ -35,8 +36,10 @@ export const waitForAppUrl = (session: Session, path: string) =>
         schedule: Schedule.spaced("2 seconds"),
         times: 120,
       }),
+      Effect.ensuring(
+        Effect.suspend(() => evidence.json("app-domain-readiness.json", { statuses })),
+      ),
     );
-    yield* evidence.json("app-domain-readiness.json", { statuses });
     return url;
   });
 
@@ -46,16 +49,24 @@ export const openPrivateApp = (url: string) =>
     const browser = yield* Browser;
     const destination = new URL(url);
     const origin = destination.origin;
-    yield* browser.use("A new app origin returns through its sign-in callback", (page) =>
+    yield* browser.use("A new app origin redirects through its sign-in callback", (page) =>
       Promise.all([
-        page.waitForURL(
-          (value) => value.origin === origin && value.pathname === "/_executor/auth/callback",
-          { waitUntil: "domcontentloaded" },
-        ),
+        // The callback is a redirect, never a rendered page. A previous page can still be
+        // navigating when this starts; only this origin's callback response counts.
+        page.waitForResponse((response) => {
+          const value = new URL(response.url());
+          return (
+            response.request().isNavigationRequest() &&
+            response.request().frame() === page.mainFrame() &&
+            value.origin === origin &&
+            value.pathname === "/_executor/auth/callback" &&
+            response.status() === 302
+          );
+        }),
         page.url() === destination.href ? page.reload() : page.goto(destination.href),
       ]),
     );
     yield* browser.use("App sign-in returns to the requested page", (page) =>
       page.waitForURL(destination.href, { waitUntil: "domcontentloaded" }),
     );
-  });
+  }).pipe(recordAppOpening, Effect.asVoid);

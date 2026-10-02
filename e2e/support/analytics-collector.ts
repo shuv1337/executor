@@ -9,7 +9,7 @@ import {
   HttpServerResponse,
 } from "effect/unstable/http";
 
-/** Own the receiver for one managed Cloud run and retain JSON batches as evidence. */
+/** Own the receiver for one managed product process and retain JSON batches as evidence. */
 export const startAnalyticsCollector = (directory: string) =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
@@ -35,54 +35,57 @@ export const startAnalyticsCollector = (directory: string) =>
       yield* fs.writeFileString(file, `${JSON.stringify(batch)}\n`, { flag: "a", mode: 0o600 });
       return HttpServerResponse.jsonUnsafe({ status: 1 });
     }).pipe(Effect.orDie);
+    // A fresh router per collector: one process can own several products, each with its own.
     const services = yield* Layer.build(
-      HttpRouter.serve(
-        Layer.mergeAll(
-          HttpRouter.add("POST", "/api/1/envelope/", sentry),
-          HttpRouter.add(
-            "OPTIONS",
-            "/api/1/envelope/",
-            Effect.succeed(
-              HttpServerResponse.empty({
-                headers: {
-                  "access-control-allow-origin": "*",
-                  "access-control-allow-methods": "POST, OPTIONS",
-                  "access-control-allow-headers": "content-type, sentry-trace, baggage",
-                },
-              }),
+      Layer.fresh(
+        HttpRouter.serve(
+          Layer.mergeAll(
+            HttpRouter.add("POST", "/api/1/envelope/", sentry),
+            HttpRouter.add(
+              "OPTIONS",
+              "/api/1/envelope/",
+              Effect.succeed(
+                HttpServerResponse.empty({
+                  headers: {
+                    "access-control-allow-origin": "*",
+                    "access-control-allow-methods": "POST, OPTIONS",
+                    "access-control-allow-headers": "content-type, sentry-trace, baggage",
+                  },
+                }),
+              ),
             ),
-          ),
-          HttpRouter.add("POST", "/batch/", handler),
-          HttpRouter.add("POST", "/e/", handler),
-          HttpRouter.add(
-            "POST",
-            "/flags/",
-            Effect.succeed(HttpServerResponse.jsonUnsafe({ flags: {}, featureFlags: {} })),
-          ),
-          HttpRouter.add(
-            "GET",
-            "/array/:token/config.js",
-            Effect.succeed(
-              HttpServerResponse.text(
-                'window._POSTHOG_REMOTE_CONFIG = {"synthetic-ingestion-key": {config: {hasFeatureFlags: false, sessionRecording: false}}};',
-                { contentType: "application/javascript" },
+            HttpRouter.add("POST", "/batch/", handler),
+            HttpRouter.add("POST", "/e/", handler),
+            HttpRouter.add(
+              "POST",
+              "/flags/",
+              Effect.succeed(HttpServerResponse.jsonUnsafe({ flags: {}, featureFlags: {} })),
+            ),
+            HttpRouter.add(
+              "GET",
+              "/array/:token/config.js",
+              Effect.succeed(
+                HttpServerResponse.text(
+                  'window._POSTHOG_REMOTE_CONFIG = {"synthetic-ingestion-key": {config: {hasFeatureFlags: false, sessionRecording: false}}};',
+                  { contentType: "application/javascript" },
+                ),
+              ),
+            ),
+            HttpRouter.add(
+              "GET",
+              "/array/:token/config",
+              Effect.succeed(
+                HttpServerResponse.jsonUnsafe({ hasFeatureFlags: false, sessionRecording: false }),
               ),
             ),
           ),
-          HttpRouter.add(
-            "GET",
-            "/array/:token/config",
-            Effect.succeed(
-              HttpServerResponse.jsonUnsafe({ hasFeatureFlags: false, sessionRecording: false }),
-            ),
-          ),
+          {
+            disableLogger: true,
+            disableListenLog: true,
+          },
+        ).pipe(
+          Layer.provideMerge(NodeHttpServer.layer(createServer, { host: "127.0.0.1", port: 0 })),
         ),
-        {
-          disableLogger: true,
-          disableListenLog: true,
-        },
-      ).pipe(
-        Layer.provideMerge(NodeHttpServer.layer(createServer, { host: "127.0.0.1", port: 0 })),
       ),
     );
     const server = yield* HttpServer.HttpServer.pipe(Effect.provideContext(services));

@@ -1,13 +1,96 @@
+import { usePageUrl } from "@executor-js/dashboard-start/page";
+import { Link } from "@tanstack/react-router";
+import { Button } from "@executor-js/ui/components/button";
+import { Code } from "@executor-js/ui/dashboard/code";
+import { McpInstallInstructions } from "@executor-js/ui/dashboard/connect";
+import { ScopedConnectionsPage } from "@executor-js/ui/dashboard/scoped-connections";
+import { ConnectionToolPicker } from "@executor-js/ui/dashboard/connection-tool-picker";
+import { useOrganizationRoute } from "../components/organization.tsx";
+import { HostedFailure } from "../components/dashboard-bindings.tsx";
+import { resourceInventoryAtom } from "../../contracts/resource-access.ts";
+import { connectionToolListAtom } from "../../contracts/apps.ts";
 import {
-  ConnectPage as ConnectPageView,
-  McpInstallInstructions,
-} from "@executor-js/ui/dashboard/connect";
+  mcpConnectionsAtom,
+  revokeMcpConnectionAtom,
+  saveMcpConnectionAtom,
+} from "../../contracts/mcp-connections.ts";
+import { documentationUrl } from "../../contracts/documentation.ts";
 
-/** Show the hosted MCP endpoint in the shared agent setup flow. */
-export function ConnectPage() {
+/** Headless setup: a personal access token against this organization's own addresses. */
+function PersonalTokenSetup({ origin }: { readonly origin: string }) {
+  const { organization, slug, id } = useOrganizationRoute();
+  const mcp = JSON.stringify(
+    {
+      mcpServers: {
+        executor: {
+          type: "http",
+          url: `${origin}/org/${encodeURIComponent(slug)}/mcp`,
+          headers: { Authorization: "Bearer <YOUR_PAT>" },
+        },
+      },
+    },
+    null,
+    2,
+  );
+  const http = `curl '${origin}/api/organizations/${encodeURIComponent(id ?? organization)}/inventory' \\\n  --header 'Authorization: Bearer <YOUR_PAT>'`;
   return (
-    <ConnectPageView>
-      <McpInstallInstructions endpoint={`${window.location.origin}/mcp`} />
-    </ConnectPageView>
+    <>
+      <p className="text-[13px] leading-5 text-muted-foreground">
+        For scripts and agents that cannot sign in. The token is yours and has your permissions
+        here; this URL names the organization, so no organization header is needed.
+      </p>
+      <div className="mt-3 overflow-hidden rounded-lg border">
+        <Code code={mcp} path="mcp.json" lineNumbers={false} copyable />
+      </div>
+      <div className="mt-3 overflow-hidden rounded-lg border">
+        <Code code={http} path="request.sh" lineNumbers={false} copyable />
+      </div>
+      <div className="mt-3">
+        <Button asChild variant="outline" size="sm">
+          <Link to="/account/tokens" search={{ organization: slug }}>
+            Manage tokens
+          </Link>
+        </Button>
+      </div>
+    </>
+  );
+}
+
+/** The member's full-access URL and scoped connections for this organization. */
+export function ConnectPage() {
+  const page = usePageUrl();
+  const { organization } = useOrganizationRoute();
+  const docs = new URL(documentationUrl(), page.origin).href;
+  return (
+    <ScopedConnectionsPage
+      key={organization}
+      query={resourceInventoryAtom(organization)}
+      connections={mcpConnectionsAtom(organization)}
+      save={saveMcpConnectionAtom(organization)}
+      revoke={revokeMcpConnectionAtom(organization)}
+      Failure={HostedFailure}
+      docs={docs}
+      installation={
+        <McpInstallInstructions
+          endpoint={`${page.origin}/mcp`}
+          docs={docs}
+          token={<PersonalTokenSetup origin={page.origin} />}
+        />
+      }
+      renderTools={({ app, profile, names, onChange }) => (
+        <ConnectionToolPicker
+          query={connectionToolListAtom({
+            organization,
+            app: app.id,
+            profile: profile?.id,
+            expectedProfileRevision: profile?.revision,
+            deployment: app.activeDeployment ?? undefined,
+          })}
+          Failure={HostedFailure}
+          names={names}
+          onChange={onChange}
+        />
+      )}
+    />
   );
 }

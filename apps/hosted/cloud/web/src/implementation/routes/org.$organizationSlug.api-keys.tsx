@@ -1,5 +1,12 @@
-import { createFileRoute } from "@tanstack/react-router";
-import { ApiKeysPage } from "@executor-js/hosted-web/pages/api-keys";
+import { createFileRoute, redirect } from "@tanstack/react-router";
 
-/** Named personal credentials in this organization. */
-export const Route = createFileRoute("/org/$organizationSlug/api-keys")({ component: ApiKeysPage });
+/** Tokens moved to personal settings; the organization in the old address preselects the scope. */
+export const Route = createFileRoute("/org/$organizationSlug/api-keys")({
+  beforeLoad: ({ params }) => {
+    throw redirect({
+      to: "/account/tokens",
+      search: { organization: params.organizationSlug },
+      replace: true,
+    });
+  },
+});

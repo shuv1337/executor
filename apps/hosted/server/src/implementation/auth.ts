@@ -1,5 +1,10 @@
 import { apiKeys, apiKeyManagement } from "./api-keys.ts";
-import { CurrentUsage, observeProductOperation } from "../contracts/product-analytics.ts";
+import {
+  CurrentUsage,
+  isReadMethod,
+  observeProductOperation,
+  traceProductRead,
+} from "../contracts/product-analytics.ts";
 import { RequireOrganization } from "../contracts/organization.ts";
 import { explicitOrganizationAuth } from "./organization-auth.ts";
 import { mcpOAuthPlugins } from "./mcp-oauth.ts";
@@ -77,9 +82,24 @@ export const authOptions = (
       ...mcpOAuthPlugins(settings.url),
     ],
     hooks: { before: apiKeyManagement },
-    session: { cookieCache: { enabled: false } },
-    rateLimit: { enabled: true, storage: "database" },
-    advanced: { cookiePrefix: "executor-hosted", ipAddress: { ipAddressHeaders } },
+    // Session age gates nothing: the account Security page lists sessions however long ago this
+    // browser signed in. Account deletion is disabled; enabling it needs its own confirmation.
+    session: { cookieCache: { enabled: false }, freshAge: 0 },
+    rateLimit: {
+      enabled: true,
+      storage: "database",
+      // Every dashboard page reads the session, and organization pages the membership list, on
+      // the server with the visitor's address. These reads require a valid session cookie and
+      // change nothing; a per-address limit on them would make whole pages unavailable to people
+      // sharing an address. Sign-in, sign-up and other credential routes keep their limits.
+      customRules: { "/get-session": false, "/organization/list": false },
+    },
+    advanced: {
+      cookiePrefix: "executor-hosted",
+      ipAddress: { ipAddressHeaders },
+      // Read a session and its user in one statement instead of one query each.
+      database: { joins: true },
+    },
   }) satisfies BetterAuthOptions;
 
 /** Project only identity fields; never expose Better Auth tokens as product identity. */
@@ -116,17 +136,20 @@ export const requireUserLive = Layer.effect(
         }
         const principal = yield* auth.current(new Headers(request.headers));
         if (principal === null) return yield* Effect.fail(new Unauthorized());
+        const operation = {
+          area: group.identifier,
+          operation: endpoint.identifier,
+          method: endpoint.method,
+        };
         const tracked = endpoint.middlewares.has(RequireOrganization)
           ? response
-          : observeProductOperation(
-              { area: group.identifier, operation: endpoint.identifier, method: endpoint.method },
-              response,
-              (result) => ({
+          : isReadMethod(endpoint.method)
+            ? traceProductRead(operation, response)
+            : observeProductOperation(operation, response, (result) => ({
                 status_code: result.status,
                 ok: result.status < 400,
                 outcome: result.status < 400 ? "success" : "failure",
-              }),
-            );
+              }));
         return (yield* tracked.pipe(
           Effect.tapCause(ErrorReporter.report),
           Effect.provideService(CurrentPrincipal, principal),

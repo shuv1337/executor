@@ -1,274 +1,90 @@
-import { previewLifetime } from "./test-stage-expiry.ts";
-/** Alchemy owns the controller, its zone-scoped token, and every runtime team DNS resource. */
+/** App domain status for API callers; the AppDomainController Worker hosts the coordinator. */
 import * as Cloudflare from "alchemy/Cloudflare";
 import { RuntimeContext } from "alchemy";
-import * as Output from "alchemy/Output";
-import { Credentials, apiTokenCredentials } from "@distilled.cloud/cloudflare/Credentials";
-import { listCertificatePacks } from "@distilled.cloud/cloudflare/ssl";
-import { PgClient } from "@effect/sql-pg";
 import { AppUiAddressInvalid } from "@executor-js/hosted-server/app-ui/contracts";
-import { OrganizationId, OrganizationSlug } from "@executor-js/hosted-server";
+import { OrganizationId, OrganizationSlug } from "@executor-js/hosted-server/organization";
 import { UiFailed } from "apps/ui/contracts";
-import { Cause, Clock, Effect, Layer, Redacted, Schema, Semaphore, Stream } from "effect";
-import { SqlClient } from "effect/unstable/sql";
-import { FetchHttpClient, HttpServerRequest, HttpServerResponse } from "effect/unstable/http";
+import { Clock, Effect, Redacted, Schema } from "effect";
+import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http";
 import { timingSafeEqual } from "node:crypto";
-import { cloudAppUiBase } from "../contracts/app-ui.ts";
-import { appDomainState } from "../implementation/app-domain-state.ts";
-import { reconcileAppDomainStack } from "../implementation/app-domain-stack.ts";
-import { sharedAppDomainZone } from "./app-domain-zone.ts";
-import { cloudDatabaseConnection } from "./database.ts";
+import { AppDomainController } from "./app-domain-controller-worker.ts";
 import { appDomainControlSecret } from "./app-domain-control.ts";
-import { AppDomainZoneSettings } from "../contracts/app-domains.ts";
+import { cloudAppUiBase } from "../contracts/app-ui.ts";
+import { readAppDomainRecord } from "../implementation/app-domain-records.ts";
 
-const Team = Schema.Struct({ id: OrganizationId, slug: OrganizationSlug });
-const DomainObservation = Schema.Struct({
-  slug: OrganizationSlug,
-  status: Schema.Literals(["pending", "ready", "failed"]),
-  checkedAt: Schema.Number,
-});
+export const Team = Schema.Struct({ id: OrganizationId, slug: OrganizationSlug });
 
-const observeDomainFailure = (phase: string, cause: Cause.Cause<unknown>) =>
-  Effect.logError("App domain operation failed", {
-    phase,
-    errors: Cause.prettyErrors(cause).map((error) => ({
-      type: /^[A-Za-z][A-Za-z0-9]{0,79}$/.test(error.name) ? error.name : "Error",
-      summary: error.message
-        .split("\n", 1)[0]
-        ?.replace(/"[^"\n]*"|'[^'\n]*'/g, "<value>")
-        .replace(/[A-Za-z0-9._~+/=-]{16,}/g, "<value>")
-        .slice(0, 180),
-      service: /^Service not found: ([A-Za-z0-9_/:. -]+)/.exec(error.message)?.[1],
-      frames: (error.stack ?? "")
-        .split("\n")
-        .slice(1)
-        .filter((line) => /^\s+at [A-Za-z0-9_.$<>]+ \([^\s?]+\.js:\d+:\d+\)$/.test(line))
-        .slice(0, 4),
-    })),
-  });
+/** Team DNS could not be emptied; the controller logged the provider failure. */
+export class AppDomainDrainFailed extends Schema.TaggedError<AppDomainDrainFailed>()(
+  "AppDomainDrainFailed",
+  {},
+) {}
 
-const makeAppDomainCoordinator = Effect.gen(function* () {
-  const base = yield* cloudAppUiBase.pipe(Effect.orDie);
-  if (base === undefined || new URL(base).protocol !== "https:") {
-    return Effect.succeed({
-      status: (_team: typeof Team.Type) => Effect.succeed("ready" as const),
-      wake: () => Effect.void,
-      alarm: () => Effect.void,
-      drain: () => Effect.void,
-      resume: () => Effect.void,
-    });
-  }
-  const suffix = new URL(base).hostname;
-  const zone = yield* sharedAppDomainZone;
-  // Mapped-output defaults include function source, which changes under minification.
-  const zoneBinding = yield* Output.named(
-    zone.pipe(Output.map((value) => value.zone)),
-    "AppDomainZoneSettings",
-  );
-  const configuration = zoneBinding.pipe(
-    Effect.flatMap(Schema.decodeUnknownEffect(AppDomainZoneSettings)),
-  );
-  const tokenBinding = yield* Output.named(
-    zone.pipe(Output.map((value) => value.controllerToken)),
-    "AppDomainControllerToken",
-  );
-  const secret = tokenBinding.pipe(
-    Effect.flatMap(Schema.decodeUnknownEffect(Schema.Redacted(Schema.NonEmptyString))),
-  );
-  const connection = yield* cloudDatabaseConnection;
-  return Effect.gen(function* () {
-    const state = yield* Cloudflare.DurableObjectState;
-    const lifetime = yield* previewLifetime;
-    const lock = yield* Semaphore.make(1);
-    const arm = (milliseconds: number) =>
-      Effect.gen(function* () {
-        if ((yield* lifetime.isBackgroundStopped) || (yield* state.storage.get<boolean>("stopped")))
-          return;
-        const due = (yield* Clock.currentTimeMillis) + milliseconds;
-        const existing = yield* state.storage.getAlarm();
-        if (existing === null || existing > due) yield* state.storage.setAlarm(due);
-      });
-    const applyTeams = (teams: ReadonlyArray<typeof Team.Type>) =>
-      Effect.gen(function* () {
-        const zone = yield* configuration;
-        const apiToken = yield* secret;
-        yield* reconcileAppDomainStack({
-          stage: suffix,
-          accountId: zone.accountId,
-          zoneId: zone.id,
-          suffix,
-          credentials: apiTokenCredentials({ apiToken: Redacted.value(apiToken) }),
-          teams,
-          state: appDomainState(state.raw.storage, "executor-team-domains", suffix),
-        });
-      }).pipe(Effect.tapCause((cause) => observeDomainFailure("dns", cause)));
-    const reconcile = lock.withPermits(1)(
-      Effect.scoped(
-        Effect.gen(function* () {
-          if (yield* state.storage.get<boolean>("stopped")) return;
-          const zone = yield* configuration;
-          if (suffix !== zone.domain && !suffix.endsWith(`.${zone.domain}`))
-            return yield* Effect.die(new Error("App domain suffix is outside the managed zone"));
-          const teams = yield* Effect.scoped(
-            Effect.gen(function* () {
-              const db = yield* PgClient.layer({
-                url: yield* connection.connectionString,
-                maxConnections: 1,
-                prepare: false,
-              }).pipe(Layer.build);
-              const sql = yield* SqlClient.SqlClient.pipe(Effect.provideContext(db));
-              return yield* sql`select id, slug from organization`.pipe(
-                Effect.flatMap(Schema.decodeUnknownEffect(Schema.Array(Team))),
-              );
-            }),
-          ).pipe(Effect.tapCause((cause) => observeDomainFailure("database", cause)));
-          const valid = teams.filter((team) => `*.${team.slug}.${suffix}`.length <= 64);
-          const apiToken = yield* secret;
-          yield* applyTeams(valid);
-          const certificates = yield* listCertificatePacks
-            .items({ zoneId: zone.id, status: "all", perPage: 50 })
-            .pipe(
-              Stream.runCollect,
-              Effect.provideService(
-                Credentials,
-                Effect.succeed(apiTokenCredentials({ apiToken: Redacted.value(apiToken) })),
-              ),
-              Effect.provide(FetchHttpClient.layer),
-              Effect.tapCause((cause) => observeDomainFailure("certificates", cause)),
-            );
-          const now = yield* Clock.currentTimeMillis;
-          let pending = false;
-          for (const team of teams) {
-            const hostname = `*.${team.slug}.${suffix}`;
-            const matching = Array.from(certificates).filter((certificate) =>
-              certificate.hosts?.includes(hostname),
-            );
-            const ready = matching.some(
-              (pack) =>
-                pack.status === "active" &&
-                pack.certificates.some(
-                  (certificate) =>
-                    certificate.status === "active" &&
-                    certificate.hosts.includes(hostname) &&
-                    certificate.expiresOn !== undefined &&
-                    certificate.expiresOn !== null &&
-                    Date.parse(certificate.expiresOn) > now,
-                ),
-            );
-            const failed =
-              hostname.length > 64 ||
-              matching.some((certificate) => certificate.status === "validation_timed_out");
-            const status = ready
-              ? ("ready" as const)
-              : failed
-                ? ("failed" as const)
-                : ("pending" as const);
-            pending ||= status === "pending";
-            yield* state.storage.put(`team:${team.id}`, {
-              slug: team.slug,
-              status,
-              checkedAt: now,
-            });
-          }
-          yield* state.storage.delete("reconcileError");
-          const ids = new Set(teams.map((team) => `team:${team.id}`));
-          for (const key of (yield* state.storage.list({ prefix: "team:" })).keys()) {
-            if (!ids.has(key)) yield* state.storage.delete(key);
-          }
-          yield* arm(pending ? 15_000 : 300_000);
-        }),
-      ).pipe(
-        Effect.catchCause((cause) =>
-          Effect.gen(function* () {
-            yield* observeDomainFailure("reconcile", cause);
-            yield* state.storage.put("reconcileError", true);
-            yield* arm(30_000);
-          }),
-        ),
-      ),
-    );
-    return {
-      status: (input: typeof Team.Type) =>
-        Effect.gen(function* () {
-          const team = yield* Schema.decodeUnknownEffect(Team)(input);
-          if (yield* state.storage.get<boolean>("stopped")) return "failed" as const;
-          if (`*.${team.slug}.${suffix}`.length > 64) return "too_long" as const;
-          const saved = yield* state.storage.get(`team:${team.id}`);
-          const observation =
-            saved === undefined
-              ? undefined
-              : yield* Schema.decodeUnknownEffect(DomainObservation)(saved);
-          if (
-            observation === undefined ||
-            observation.slug !== team.slug ||
-            observation.checkedAt + 300_000 < (yield* Clock.currentTimeMillis)
-          ) {
-            yield* arm(1);
-            if (yield* state.storage.get<boolean>("reconcileError")) return "failed" as const;
-            return "pending" as const;
-          }
-          if (observation.status !== "ready") yield* arm(15_000);
-          return observation.status;
-        }),
-      wake: () => arm(1),
-      drain: () =>
-        lock.withPermits(1)(
-          Effect.gen(function* () {
-            yield* state.storage.put("stopped", true);
-            yield* state.storage.deleteAlarm();
-            yield* applyTeams([]);
-          }),
-        ),
-      resume: () =>
-        lock.withPermits(1)(
-          Effect.gen(function* () {
-            yield* state.storage.put("stopped", false);
-            yield* arm(1);
-          }),
-        ),
-      alarm: () =>
-        Effect.gen(function* () {
-          if (yield* lifetime.isBackgroundStopped) {
-            yield* state.storage.deleteAlarm();
-            return;
-          }
-          yield* state.storage.setAlarm((yield* Clock.currentTimeMillis) + 60_000);
-          yield* reconcile;
-        }),
-    };
-  });
-}).pipe(Effect.orDie);
+interface Coordinator {
+  /** Reconcile soon: a team was created or renamed, or a visitor found no record. */
+  readonly wake: () => Effect.Effect<void, never, RuntimeContext>;
+  /** Restore a missing schedule without starting an extra pass. */
+  readonly heartbeat: () => Effect.Effect<void, never, RuntimeContext>;
+  /** Stop reconciliation and remove every team record before the stage is destroyed. */
+  readonly drain: () => Effect.Effect<void, AppDomainDrainFailed, RuntimeContext>;
+  readonly resume: () => Effect.Effect<void, never, RuntimeContext>;
+  readonly alarm: () => Effect.Effect<void, never, RuntimeContext>;
+}
 
-/** A single durable object serializes desired-state reconciliation for this deployed stage. */
+/**
+ * A single durable object serializes desired-state reconciliation for this deployed stage. The
+ * namespace, with its Alchemy resource journal, moved here from the API Worker.
+ */
 export class AppDomainCoordinator extends Cloudflare.DurableObject<
   AppDomainCoordinator,
-  Effect.Success<Effect.Success<typeof makeAppDomainCoordinator>>
->()("AppDomainCoordinator") {}
+  Coordinator
+>()("AppDomainCoordinator", { transferredFrom: "Api" }) {}
 
-/** The API owns this object and its Alchemy resource journal. */
-export const AppDomainCoordinatorLive = AppDomainCoordinator.make(makeAppDomainCoordinator);
+/** Three missed five-minute passes; a scheduled pass alone keeps a record newer than this. */
+const staleAfter = 15 * 60_000;
 
-/** Requests wake provisioning immediately; cron also discovers teams created without opening an app. */
+/**
+ * Team creation and renames wake provisioning through the durable provisioning outbox, and visitors
+ * wake it on a missing record. The coordinator's own alarm runs a full pass every five minutes,
+ * which also removes deleted teams; the five-minute background job's heartbeat only restores that
+ * schedule if it was lost.
+ */
 export const cloudAppDomains = Effect.gen(function* () {
-  const coordinator = yield* AppDomainCoordinator;
+  const coordinator = yield* AppDomainCoordinator.from(AppDomainController);
+  const base = yield* cloudAppUiBase.pipe(Effect.orDie);
+  // Local development serves apps over HTTP and provisions no domains.
+  const suffix =
+    base === undefined || new URL(base).protocol !== "https:" ? undefined : new URL(base).hostname;
   const controlSecret = yield* (yield* appDomainControlSecret).text;
+  const heartbeat = Effect.suspend(() => coordinator.getByName("domains").heartbeat()).pipe(
+    Effect.provide(RuntimeContext.phantom),
+    Effect.withSpan("app_domains.heartbeat.rpc"),
+  );
   const wake = Effect.suspend(() => coordinator.getByName("domains").wake()).pipe(
     Effect.provide(RuntimeContext.phantom),
+    Effect.withSpan("app_domains.wake.rpc"),
+    Effect.catchCause(() => Effect.fail(new UiFailed({ reason: "unavailable" }))),
   );
-  yield* Cloudflare.Workers.cron("* * * * *", () =>
-    wake.pipe(Effect.catchCause(() => Effect.logError("App domain heartbeat failed"))),
-  );
+  /**
+   * Reads the team's last observation from the database, beside the request's other queries.
+   * Only a team without a current record calls the coordinator, which may start a fresh isolate.
+   */
   const status = (team: typeof Team.Type) =>
-    Effect.suspend(() => coordinator.getByName("domains").status(team)).pipe(
-      Effect.provide(RuntimeContext.phantom),
-      Effect.mapError(() => new UiFailed({ reason: "unavailable" })),
-      // Expected domain outcomes must survive the Durable Object's RPC serialization.
-      Effect.flatMap((status) =>
-        status === "too_long"
-          ? Effect.fail(new AppUiAddressInvalid({ reason: "too_long" }))
-          : Effect.succeed(status),
-      ),
-    );
+    Effect.gen(function* () {
+      if (suffix === undefined) return "ready" as const;
+      if (`*.${team.slug}.${suffix}`.length > 64)
+        return yield* new AppUiAddressInvalid({ reason: "too_long" });
+      const record = yield* readAppDomainRecord(team.id);
+      if (record === undefined || record.slug !== team.slug) {
+        // Coalesce concurrent first visits into one pass before it reads the desired set.
+        yield* wake;
+        return "pending" as const;
+      }
+      // Issued certificates do not lapse because a pass was late, so a ready team keeps its link
+      // while the lost schedule is restored.
+      if (record.checked_at.getTime() + staleAfter < (yield* Clock.currentTimeMillis)) yield* wake;
+      return record.status;
+    }).pipe(Effect.withSpan("app_domains.status"));
   const control = (operation: "resume" | "drain") =>
     Effect.gen(function* () {
       const request = yield* HttpServerRequest.HttpServerRequest;
@@ -279,5 +95,11 @@ export const cloudAppDomains = Effect.gen(function* () {
       yield* coordinator.getByName("domains")[operation]();
       return HttpServerResponse.empty({ status: 204 });
     }).pipe(Effect.catchCause(() => Effect.succeed(HttpServerResponse.empty({ status: 503 }))));
-  return { status, control };
+  return {
+    status,
+    control,
+    heartbeat: heartbeat.pipe(
+      Effect.catchCause(() => Effect.logError("App domain heartbeat failed")),
+    ),
+  };
 });

@@ -25,6 +25,7 @@ export const holdQuery = (
         ([key, value]) => url.searchParams.get(key) === value,
       );
     const intercept = (route: Route) => {
+      // oxlint-disable-next-line executor/no-manual-effect-runtime-in-tests -- Playwright route handlers must return a Promise
       const request = Effect.runPromise(
         Effect.gen(function* () {
           if (
@@ -72,5 +73,18 @@ export const refreshVisiblePage = Effect.flatMap(Browser, (browser) =>
       if (document.visibilityState !== "visible") throw new Error("The test page is not visible");
       window.dispatchEvent(new Event("visibilitychange"));
     }),
+  ),
+);
+
+/** Hosted pages re-read idle queries every 30 seconds while visible. */
+export const idleReconciliationMillis = 30_000;
+/** Install before navigation so scenarios can reach periodic reconciliation without waiting. */
+export const installBrowserClock = Effect.flatMap(Browser, (browser) =>
+  browser.use("Control the browser clock", (page) => page.context().clock.install()),
+);
+/** Deliver the next idle reconciliation to every page in the browser context. */
+export const advanceToReconciliation = Effect.flatMap(Browser, (browser) =>
+  browser.use("Advance to the next idle reconciliation", (page) =>
+    page.context().clock.runFor(idleReconciliationMillis),
   ),
 );

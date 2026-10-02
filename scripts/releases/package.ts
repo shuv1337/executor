@@ -12,6 +12,7 @@ import {
   release,
 } from "./config.ts";
 import { installWindowsGitHttpBackend } from "./windows-git.ts";
+import { launcherAnalytics } from "./analytics.ts";
 
 const build = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
@@ -71,7 +72,7 @@ const build = Effect.gen(function* () {
       access: "public",
       tag: `${release.channel}-${target.platform}-${target.arch}`,
     },
-    engines: { node: ">=24.14.0" },
+    engines: { node: `>=${release.minimumNodeVersion}` },
     os: [process.platform],
     cpu: [process.arch],
     files: [
@@ -93,7 +94,7 @@ const build = Effect.gen(function* () {
   yield* fs.writeFileString(path.join(stage, "package.json"), JSON.stringify(manifest, null, 2));
   yield* fs.writeFileString(
     path.join(stage, "bin.mjs"),
-    `#!/usr/bin/env node\nimport { homedir } from "node:os";\nimport { join } from "node:path";\nimport { packagedRuntimeEnvironment } from "./runtime-env.mjs";\nObject.assign(process.env, packagedRuntimeEnvironment(process.env));\nprocess.env.EXECUTOR_DATA_DIR ??= join(homedir(), ".executor", "v2", "cli");\nprocess.env.EXECUTOR_BUILD_VERSION = ${JSON.stringify(version)};\nawait import("./runtime/cli.mjs");\n`,
+    `#!/usr/bin/env node\nimport { homedir } from "node:os";\nimport { join } from "node:path";\nimport { packagedRuntimeEnvironment } from "./runtime-env.mjs";\nObject.assign(process.env, packagedRuntimeEnvironment(process.env));\nprocess.env.EXECUTOR_DATA_DIR ??= join(homedir(), ".executor", "v2", "cli");\nprocess.env.EXECUTOR_BUILD_VERSION = ${JSON.stringify(version)};\n${yield* launcherAnalytics}await import("./runtime/cli.mjs");\n`,
   );
   yield* fs.chmod(path.join(stage, "bin.mjs"), 0o755);
   yield* fs.copyFile(path.join(root, "scripts/releases/README.md"), path.join(stage, "README.md"));

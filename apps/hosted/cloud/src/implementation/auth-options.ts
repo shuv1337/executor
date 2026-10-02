@@ -8,7 +8,7 @@ import type { BetterAuthOptions } from "better-auth";
 import { APIError } from "better-auth/api";
 import { authOptions } from "@executor-js/hosted-server";
 import { HttpUrl } from "@executor-js/sdk/core";
-import { cloudOrigin } from "../infrastructure/stage.ts";
+import { cloudAuthRateLimit, cloudOrigin } from "../infrastructure/stage.ts";
 import { passkey } from "@better-auth/passkey";
 import { emailOTP } from "better-auth/plugins/email-otp";
 import { organization } from "better-auth/plugins/organization";
@@ -22,6 +22,7 @@ import { passkeyEnrollmentCookie } from "../contracts/passkey-enrollment.ts";
 import { cloudEmulators } from "../infrastructure/emulators.ts";
 import { emulatedSocialProviders } from "./emulated-auth.ts";
 import { cloudSso, ssoVerifiedEmail } from "./sso.ts";
+import { cloudMemberLimit } from "./member-limit.ts";
 
 /** The better-auth endpoint that creates accounts from a verified email code. */
 const emailCodeSignInPath = "/sign-in/email-otp";
@@ -56,6 +57,7 @@ const OAuthProxySettings = Schema.Struct({
 /** Require both cloud social providers and reject blank credentials at startup. */
 export const cloudAuthSettings = Effect.gen(function* () {
   const url = yield* cloudOrigin;
+  const rateLimitEnabled = yield* cloudAuthRateLimit;
   const emulators = yield* cloudEmulators;
   const oauthRedirectUri = yield* Config.String("EXECUTOR_OAUTH_CALLBACK_URL").pipe(
     Config.option,
@@ -115,7 +117,15 @@ export const cloudAuthSettings = Effect.gen(function* () {
       });
     },
   });
-  return { url, oauthRedirectUri, oauthProxy, trustedOrigins, emulators, ...social };
+  return {
+    url,
+    oauthRedirectUri,
+    oauthProxy,
+    trustedOrigins,
+    emulators,
+    rateLimitEnabled,
+    ...social,
+  };
 });
 
 /** Promise boundary used by Better Auth's organization lifecycle. */
@@ -136,6 +146,7 @@ export const cloudAuthOptions = (
   const base = authOptions(settings, ipAddressHeaders);
   return {
     ...base,
+    rateLimit: { ...base.rateLimit, enabled: settings.rateLimitEnabled },
     account: { ...base.account, storeStateStrategy: "database" as const },
     advanced: {
       ...base.advanced,
@@ -146,6 +157,30 @@ export const cloudAuthOptions = (
       },
     },
     trustedOrigins: [...base.trustedOrigins, ...settings.trustedOrigins],
+    user: {
+      // Better Auth stores a provider photo only when it creates the user. This is the one
+      // hook that sees a returning or newly linked provider's verified profile, so keep the
+      // photo current here. Name and email stay as they are, and a provider without a photo
+      // never clears one. Accepts every identity; a failed write must not block sign-in.
+      validateUserInfo: ({ user, source }, context) =>
+        Effect.runPromise(
+          Effect.gen(function* () {
+            const { id, image } = user;
+            if (source.method !== "oauth" || source.action === "create-user") return;
+            if (typeof id !== "string" || typeof image !== "string" || image.length === 0) return;
+            const adapter = context.context.internalAdapter;
+            const current = yield* Effect.tryPromise(() => adapter.findUserById(id));
+            if (!current || current.image === image) return;
+            yield* Effect.tryPromise(() => adapter.updateUser(id, { image }));
+          }).pipe(
+            Effect.catch((error) =>
+              Effect.sync(() =>
+                context.context.logger.warn("Unable to refresh the provider photo", error),
+              ),
+            ),
+          ),
+        ),
+    } satisfies BetterAuthOptions["user"],
     databaseHooks: {
       user: {
         create: {
@@ -279,6 +314,7 @@ export const cloudAuthOptions = (
             ),
           ),
       }),
+      ...(billing === undefined ? [] : [cloudMemberLimit(billing)]),
       // The native migrator creates tables in plugin order; SSO references organization.
       cloudSso(billing),
       emailOTP({

@@ -2,19 +2,9 @@ import { Schema } from "effect";
 
 /** Wire projections owned by the tests; no server or SDK implementation imports. */
 export const Organization = Schema.Struct({ id: Schema.String, slug: Schema.String });
-/** Browser display and navigation metadata; no credential or permission fields are allowed. */
-export const SessionHint = Schema.Struct({
-  session: Schema.Struct({
-    user: Schema.Struct({
-      id: Schema.String,
-      name: Schema.String,
-      email: Schema.String,
-      image: Schema.NullOr(Schema.String),
-    }),
-  }),
-  expiresAt: Schema.Number,
-  lastOrganization: Schema.optionalKey(Schema.NonEmptyString),
-});
+/** The saved last-organization memory; navigation only, never authority. */
+export const LastOrganization = Schema.Struct({ user: Schema.String, organization: Schema.String });
+
 export const Resource = Schema.Struct({ id: Schema.String });
 export const App = Schema.Struct({ id: Schema.String, slug: Schema.String, name: Schema.String });
 export const Inventory = Schema.Struct({
@@ -22,7 +12,11 @@ export const Inventory = Schema.Struct({
   accounts: Schema.Array(Schema.Struct({ id: Schema.String, label: Schema.String })),
 });
 export const Collector = Schema.Struct({ state: Schema.Literal("running"), url: Schema.String });
-/** Motel's exported span query projection. Tests assert only delivered telemetry. */
+/**
+ * Motel's exported span query projection. Tests assert only delivered telemetry. It keeps every
+ * delivered field that can carry text, including exception events with their messages and stacks,
+ * so a privacy check over the whole projection also covers error messages.
+ */
 export const SpanQuery = Schema.Struct({
   data: Schema.Array(
     Schema.Struct({
@@ -35,6 +29,15 @@ export const SpanQuery = Schema.Struct({
         durationMs: Schema.Number,
         status: Schema.String,
         tags: Schema.Record(Schema.String, Schema.String),
+        /** Span events. Effect records a failure as an `exception` event with its message. */
+        events: Schema.Array(
+          Schema.Struct({
+            name: Schema.String,
+            attributes: Schema.Record(Schema.String, Schema.String),
+          }),
+        ),
+        // Motel keeps only the status code; Axiom also delivers the status message.
+        statusMessage: Schema.optionalKey(Schema.String),
         // Motel omits links; Axiom's adapter must supply the delivered array.
         links: Schema.optionalKey(
           Schema.Array(Schema.Struct({ traceId: Schema.String, spanId: Schema.String })),

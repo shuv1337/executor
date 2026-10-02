@@ -9,6 +9,7 @@ import {
   OwnerId,
   AppNameTaken,
   HttpUrl,
+  ToolApprovalRequired,
   type AppId,
   type ProfileId,
   type AccountId,
@@ -16,6 +17,7 @@ import {
   type Cursor,
   type DeploymentId,
   type Tool,
+  type ToolRouter,
   type Credentials,
   type Executor,
 } from "@executor-js/sdk/core";
@@ -50,7 +52,7 @@ export const dashboardAccess = (config: ServerConfig, auth: LocalAuth) =>
         Effect.mapError(() => new DashboardForbidden()),
       );
       const bearer = request.headers.authorization === `Bearer ${Redacted.value(config.apiKey)}`;
-      const session = yield* auth.valid(request.cookies[sessionCookie(config.port)]);
+      const session = yield* auth.valid(request.cookies[sessionCookie(config)]);
       if (!bearer && !session) return yield* Effect.fail(new DashboardUnauthorized());
       return (yield* response).pipe(HttpServerResponse.setHeader("cache-control", "no-store"));
     }),
@@ -76,7 +78,7 @@ export const dashboard = (
 ) => {
   const owner = OwnerId.make("local");
   const appCatalog = createCatalog(egress, catalog);
-  const db = storage.orm("4.0.0");
+  const db = storage.orm("4.0.5");
   const signIn = accountSignIn(storage, credentials);
   const query = <A, E>(work: () => Effect.Effect<A, E>) =>
     Effect.suspend(work).pipe(Effect.mapError(() => new StorageError()));
@@ -85,27 +87,31 @@ export const dashboard = (
   const access = dashboardAccess(config, auth);
   // Database reads infer dependencies in the shared storage service, including reads in SDK calls.
   const overview = Effect.gen(function* () {
-    const { apps, accounts, providers } = yield* Effect.all(
+    const { apps, accounts, health, providers } = yield* Effect.all(
       {
         apps: executor.apps.list(),
         accounts: executor.accounts.list(),
+        health: executor.accounts.listHealth(),
         providers: query(() => db.findMany("providers", {})).pipe(
           Effect.flatMap(Schema.decodeUnknownEffect(Schema.Array(Provider))),
           Effect.mapError(() => new StorageError()),
         ),
       },
-      { concurrency: 3 },
+      { concurrency: 4 },
     );
+    const checks = new Map(health.map((entry) => [entry.account, entry]));
     const definitions = new Map(providers.map((provider) => [provider.id, provider.definition]));
     const display = [];
     for (const account of accounts) {
       const definition = definitions.get(account.provider);
       if (definition === undefined) return yield* Effect.fail(new StorageError());
+      const health = checks.get(account.id);
       display.push({
         ...account,
         providerName: definition.name,
         providerUrl: providerDisplayUrl(definition),
         signIn: yield* signIn(account, definition),
+        ...(health === undefined ? {} : { health }),
       });
     }
     const profiles = (yield* Effect.forEach(apps, (app) =>
@@ -148,6 +154,7 @@ export const dashboard = (
         Effect.mapError(() => new StorageError()),
       );
       const apps = yield* executor.apps.list({ account: account.id });
+      const health = yield* executor.accounts.health({ account: account.id });
       return {
         account: {
           ...account,
@@ -157,6 +164,7 @@ export const dashboard = (
         },
         provider,
         apps,
+        health,
         canManage: account.id !== managedAccount,
       };
     });
@@ -176,7 +184,7 @@ export const dashboard = (
         Effect.mapError(() => new DashboardForbidden()),
       );
       const bearer = request.headers.authorization === `Bearer ${Redacted.value(config.apiKey)}`;
-      const cookie = request.cookies[sessionCookie(config.port)];
+      const cookie = request.cookies[sessionCookie(config)];
       const authorize: LiveAccess = bearer
         ? Effect.void
         : auth
@@ -258,6 +266,8 @@ export const dashboard = (
       let deployment: DeploymentId | undefined;
       const cursors = new Set<Cursor>();
       const tools: Tool[] = [];
+      // Every page lists the whole catalog's routers.
+      let routers: readonly ToolRouter[] = [];
       do {
         const page = yield* executor.tools.list({
           app,
@@ -271,13 +281,14 @@ export const dashboard = (
           return yield* new ToolCatalogChanged({ app });
         deployment = page.deployment;
         tools.push(...page.items);
+        routers = page.routers;
         cursor = page.next;
         if (cursor !== undefined) {
           if (cursors.has(cursor)) return yield* new ToolCatalogChanged({ app });
           cursors.add(cursor);
         }
       } while (cursor !== undefined);
-      return { tools };
+      return { tools, routers };
     }).pipe(
       Effect.timeoutOrElse({
         duration: config.mcp.timeoutMs,
@@ -357,12 +368,16 @@ export const dashboard = (
             name: payload.name,
             files: generated.files,
           });
-          return { ...app, skippedOperations: generated.skippedOperations };
+          return app;
         }),
       )
       .handle("addAccount", ({ payload }) => executor.accounts.add({ owner, ...payload }))
       .handle("account", ({ params }) => accountDetail(params.account))
-      .handle("renameAccount", ({ params, payload }) =>
+      .handle("checkAccount", ({ params }) => executor.accounts.check(params))
+      .handle("checkCredentials", ({ params, payload }) =>
+        executor.apps.checkCredentials({ ...params, ...payload }),
+      )
+      .handle("updateAccount", ({ params, payload }) =>
         manage(params.account, executor.accounts.update({ ...params, ...payload })),
       )
       .handle("replaceAccountCredentials", ({ params, payload }) =>
@@ -406,7 +421,7 @@ export const dashboard = (
             name: input.name,
             files: generated.files,
           });
-          return { ...app, skippedOperations: generated.skippedOperations };
+          return app;
         }),
       )
       .handle("oauthSetup", ({ payload }) =>
@@ -438,7 +453,32 @@ export const dashboard = (
           return { ...signIn, connection: connection.id };
         }),
       )
-      .handle("completeOAuth", ({ payload }) => executor.accountConnections.completeOAuth(payload))
+      .handle("completeOAuth", ({ payload }) =>
+        executor.accountConnections.findOAuth(payload).pipe(
+          Effect.flatMap((connection) =>
+            executor.accountConnections.completeOAuth({
+              connection: connection.id,
+              callbackUrl: payload.callbackUrl,
+            }),
+          ),
+        ),
+      )
+      // Approval policy still applies: a call that needs review does not run from the dashboard.
+      .handle("callTool", ({ params, payload }) =>
+        executor.tools.call({ ...params, ...payload }).pipe(
+          Effect.flatMap((result) =>
+            result.status === "approval-required"
+              ? Effect.fail(
+                  new ToolApprovalRequired({
+                    app: result.invocation.app,
+                    deployment: result.invocation.deployment,
+                    tool: result.invocation.tool,
+                  }),
+                )
+              : Effect.succeed(result.value),
+          ),
+        ),
+      )
       .handle("tools", ({ params, query }) =>
         executor.tools.list({ ...params, ...query }).pipe(
           Effect.timeoutOrElse({

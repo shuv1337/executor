@@ -8,7 +8,7 @@ import {
 } from "@executor-js/sdk/core";
 import { requireGroupSharing } from "./group-sharing.ts";
 import { Effect, Schema } from "effect";
-import { OrganizationForbidden } from "../contracts/organization.ts";
+import { OrganizationForbidden, OrganizationId } from "../contracts/organization.ts";
 import { ConnectionAccess, type ConnectionDestination } from "../contracts/resource-access.ts";
 import {
   currentResourceAuthority,
@@ -83,6 +83,20 @@ export const connectionAccess = (connection: AccountConnectionId) =>
     }
     yield* checkDestination(access.destination);
     return access;
+  }).pipe(
+    Effect.catchTags({ SqlError: () => new StorageError(), SchemaError: () => new StorageError() }),
+  );
+/** The organization where this user created the connection; nobody else's creation qualifies. */
+export const createdConnectionOrganization = (connection: AccountConnectionId, user: string) =>
+  Effect.gen(function* () {
+    const sql = yield* policyDatabase;
+    const rows = yield* sql`select organization_id as organization from hosted_connection_access
+    where connection_id = ${connection} and creator_id = ${user}`;
+    const created = (yield* Schema.decodeUnknownEffect(
+      Schema.Array(Schema.Struct({ organization: OrganizationId })),
+    )(rows))[0];
+    if (created === undefined) return yield* new OrganizationForbidden();
+    return created.organization;
   }).pipe(
     Effect.catchTags({ SqlError: () => new StorageError(), SchemaError: () => new StorageError() }),
   );

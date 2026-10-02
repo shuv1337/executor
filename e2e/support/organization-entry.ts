@@ -3,25 +3,28 @@ import type { Frame, Request, Route } from "playwright";
 import { Browser } from "./browser.ts";
 import { driver } from "./platform.ts";
 
-/** Wait for the public navigation hint written after the foreground organization's access check. */
+/**
+ * Wait for the browser's last-organization memory, written after the foreground organization's
+ * access check. The server reads the same cookie to choose where `/` opens.
+ */
 export const waitForLastOrganization = (organization: string) =>
   Effect.flatMap(Browser, (browser) =>
     browser.use("The foreground organization is remembered", (page) =>
       page.waitForFunction((expected) => {
-        const name = `executor-ui${location.port === "" ? "" : `-${location.port}`}=`;
+        const name = `executor-org${location.port === "" ? "" : `-${location.port}`}=`;
         const cookie = document.cookie.split("; ").find((value) => value.startsWith(name));
         if (cookie === undefined) return false;
-        let hint: unknown;
+        let saved: unknown;
         try {
-          hint = JSON.parse(decodeURIComponent(cookie.slice(name.length)));
+          saved = JSON.parse(decodeURIComponent(cookie.slice(name.length)));
         } catch {
           return false;
         }
         return (
-          typeof hint === "object" &&
-          hint !== null &&
-          "lastOrganization" in hint &&
-          hint.lastOrganization === expected
+          typeof saved === "object" &&
+          saved !== null &&
+          "organization" in saved &&
+          saved.organization === expected
         );
       }, organization),
     ),
@@ -34,6 +37,7 @@ export const holdOrganizationEntry = Effect.gen(function* () {
   const released = yield* Deferred.make<void>();
   const active = new Set<Promise<void>>();
   const hold = (route: Route) => {
+    // oxlint-disable-next-line executor/no-manual-effect-runtime-in-tests -- Playwright route handlers must return a Promise
     const pending = Effect.runPromise(
       Effect.gen(function* () {
         yield* Deferred.succeed(arrived, undefined);
@@ -62,6 +66,8 @@ export const holdOrganizationEntry = Effect.gen(function* () {
   );
   return {
     requested: Deferred.await(arrived).pipe(Effect.timeout("30 seconds")),
+    /** Whether the browser has asked for the organization list since the hold was installed. */
+    wasRequested: Deferred.isDone(arrived),
     release: Deferred.succeed(released, undefined),
   };
 });

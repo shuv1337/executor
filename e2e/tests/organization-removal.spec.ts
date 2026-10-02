@@ -10,6 +10,8 @@ import { Browser } from "../support/browser.ts";
 import { Evidence } from "../support/evidence.ts";
 import { HostedLive, withHostedCase } from "../support/case.ts";
 import { App, Inventory, Organization, Resource } from "../support/contracts.ts";
+import { managementApp } from "../support/management-app.ts";
+import { appsManifest } from "../support/apps-release.ts";
 
 /** Public projections owned by this scenario; no server or SDK implementation is imported. */
 const Access = Schema.Struct({ organization: Schema.String, role: Schema.String });
@@ -32,18 +34,19 @@ const files = [
   {
     path: "index.ts",
     content: `
-import { mutation, defineApp, defineProvider, secrets, object, string } from "apps";
+import { mutation, defineApp, defineProvider, secrets, object, string, router } from "apps";
 const service = defineProvider({ name: "Removal service", auth: {
   key: secrets({ label: "API key", fields: object({ token: string() }) })
 } });
 export default defineApp({ accounts: { service } }, async ({ accounts }) => ({
-   mutations: {
-    echo: mutation({ description: "Echo with the connected account", input: object({ message: string() })},
-      async (_, input) => ({ message: input.message, connected: accounts.service.fields.token === "synthetic-removal-token" }))
-  }
+   tools: router({
+     echo: mutation({ description: "Echo with the connected account", input: object({ message: string() })},
+      async (_, input) => ({ message: input.message, connected: accounts.service.fields.token === "synthetic-removal-token" })),
+   })
 }));
 `,
   },
+  appsManifest,
 ];
 
 layer(HostedLive, { excludeTestServices: true })("Organization removal", (it) => {
@@ -214,6 +217,10 @@ layer(HostedLive, { excludeTestServices: true })("Organization removal", (it) =>
 
         // Each user sees only their usable resources. Removal must count both
         // users' private accounts without exposing those accounts to the other.
+        yield* Effect.all(
+          [managementApp(actors.owner, created.id), managementApp(actors.admin, created.id)],
+          { concurrency: 2 },
+        );
         const held = yield* evidence.step(
           "Record everything the organization owns before removal",
           Effect.gen(function* () {
@@ -307,7 +314,7 @@ layer(HostedLive, { excludeTestServices: true })("Organization removal", (it) =>
             page.waitForResponse(
               (response) =>
                 response.request().method() === "DELETE" &&
-                new URL(response.url()).pathname === prefix,
+                [prefix, `/api/organizations/${slug}`].includes(new URL(response.url()).pathname),
             ),
             page
               .getByRole("dialog")

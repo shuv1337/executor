@@ -24,20 +24,52 @@ function canonical(value: Json): string {
   return JSON.stringify(value);
 }
 
-/** Equal JSON definitions, regardless of object key order, share a content-derived ID. */
+/**
+ * Equal JSON definitions, regardless of object key order, share a content-derived ID. Declared
+ * hosts are not part of it: each account records the hosts it was connected for, so an app that
+ * declares other hosts still fills the slot, but sends credentials only where both allow.
+ * `shared` is the definition every app with this ID agrees on, without hosts.
+ */
 export const identifyProvider = (definition: ProviderDefinition, crypto: Crypto.Crypto) =>
   Effect.gen(function* () {
     const parsed = yield* Schema.decodeUnknownEffect(ProviderDefinition)(definition).pipe(
       Effect.mapError(() => new StorageError()),
     );
-    const content = yield* Schema.decodeUnknownEffect(JsonObject)(parsed).pipe(
+    const { hosts: _hosts, ...shared } = parsed;
+    const content = yield* Schema.decodeUnknownEffect(JsonObject)(shared).pipe(
       Effect.mapError(() => new StorageError()),
     );
     const hash = yield* crypto
       .digest("SHA-256", new TextEncoder().encode(canonical(content)))
       .pipe(Effect.mapError(() => new StorageError()));
-    return { id: ProviderId.make(`prv_${Encoding.encodeHex(hash)}`), definition: parsed };
+    return { id: ProviderId.make(`prv_${Encoding.encodeHex(hash)}`), definition: parsed, shared };
   });
+
+/**
+ * Where an account's secret values may go in one app: the hosts the account was connected for,
+ * narrowed to the hosts the app declares. An account connected without hosts allows whatever the
+ * app declares; an app that declares none still sends only to the account's hosts. Undefined only
+ * when neither restricts, and app code then reads real values.
+ */
+export const grantedHosts = (
+  account: readonly string[] | null,
+  declared: readonly string[] | undefined,
+): readonly string[] | undefined => {
+  if (account === null) return declared;
+  if (declared === undefined) return account;
+  const allowed = new Set(declared);
+  return account.filter((host) => allowed.has(host));
+};
+
+/** The definition an invocation sends for one account, carrying that account's granted hosts. */
+export const grantedDefinition = (
+  definition: ProviderDefinition,
+  account: readonly string[] | null,
+): ProviderDefinition => {
+  const { hosts: declared, ...shared } = definition;
+  const hosts = grantedHosts(account, declared);
+  return hosts === undefined ? shared : { ...shared, hosts };
+};
 
 /** Validate submitted secrets against the saved provider declaration; native app decoding still runs at invocation. */
 export const validateFields = (

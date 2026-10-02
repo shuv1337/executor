@@ -1,6 +1,6 @@
 /** Exercise dependency installation and failure recovery through the real Cloud compiler. */
 import { expect, layer } from "@effect/vitest";
-import { Effect, Schedule, Schema } from "effect";
+import { Duration, Effect, Schedule, Schema } from "effect";
 import { randomUUID } from "node:crypto";
 import { scenarios } from "../test-plan.ts";
 import { Actors } from "../support/actors.ts";
@@ -10,6 +10,8 @@ import { App } from "../support/contracts.ts";
 import { Evidence, Telemetry } from "../support/evidence.ts";
 import { Browser } from "../support/browser.ts";
 import { saveAndDeploy } from "../support/app-authoring.ts";
+import { appsManifest, appsVersion, withApps } from "../support/apps-release.ts";
+import { stalledPackage } from "../support/npm-registry.ts";
 
 layer(HostedLive, { excludeTestServices: true })("Cloud compiler", (it) => {
   it.effect(scenarios.cloudCompilerMemory.title, (context) =>
@@ -25,11 +27,12 @@ layer(HostedLive, { excludeTestServices: true })("Cloud compiler", (it) => {
         const files = (version: string) => [
           {
             path: "index.ts",
-            content: `import { defineApp, query, object } from "apps";
-export default defineApp({accounts:{}}, {queries:{
-  inspect:query({description:"Read the active build",input:object({})},async()=>${JSON.stringify(version)})
-}});`,
+            content: `import { defineApp, query, object, router } from "apps";
+export default defineApp({accounts:{}}, {tools: router({
+  inspect:query({description:"Read the active build",input:object({})},async()=>${JSON.stringify(version)}),
+})});`,
           },
+          appsManifest,
         ];
         const deployed = yield* api.request(actors.owner, "POST", `${prefix}/deploy`, {
           name: `Memory proof ${randomUUID().slice(0, 8)}`,
@@ -49,24 +52,24 @@ export default defineApp({accounts:{}}, {queries:{
           files: [
             {
               path: "index.ts",
-              content: `import { defineApp, query, object } from "apps";
+              content: `import { defineApp, query, object, router } from "apps";
 import ts from "typescript";
 import * as icons from "lucide-react";
 import React from "react";
-export default defineApp({accounts:{}}, {queries:{
+export default defineApp({accounts:{}}, {tools: router({
   inspect:query({description:"Compile large dependencies",input:object({})},
-    async()=>({version:ts.version,icons:Object.keys(icons).length,react:React.version}))
-}});`,
+    async()=>({version:ts.version,icons:Object.keys(icons).length,react:React.version})),
+})});`,
             },
             {
               path: "package.json",
               content: JSON.stringify({
                 type: "module",
-                dependencies: {
+                dependencies: withApps({
                   typescript: "5.9.2",
                   "lucide-react": "0.468.0",
                   react: "19.2.0",
-                },
+                }),
               }),
             },
           ],
@@ -113,7 +116,8 @@ export default defineApp({accounts:{}}, {queries:{
         const retained = yield* body(Deployed, yield* api.request(actors.owner, "GET", path));
         expect(retained.activeDeployment).toBe(original.activeDeployment);
         const live = yield* api.request(actors.owner, "POST", `${path}/tools/call`, {
-          tool: "queries.inspect",
+          tool: "inspect",
+          kind: "query",
           input: {},
         });
         expect(live.status).toBe(200);
@@ -124,7 +128,7 @@ export default defineApp({accounts:{}}, {queries:{
           page.goto(`/org/${actors.organization.slug}/apps/${original.id}?view=source`),
         );
         yield* browser.use("Deploy the large build from the dashboard", (page) =>
-          page.getByRole("button", { name: "Deploy", exact: true }).click(),
+          page.getByRole("button", { name: "Deploy latest", exact: true }).click(),
         );
         yield* browser.use("Show the compiler memory failure and recovery", (page) =>
           page
@@ -137,7 +141,7 @@ export default defineApp({accounts:{}}, {queries:{
         yield* browser.checkpoint("Compiler memory failure preserves saved source");
 
         const invalid = yield* saveAndDeploy(actors.owner, path, {
-          files: [{ path: "index.ts", content: "export default = ;" }],
+          files: [{ path: "index.ts", content: "export default = ;" }, appsManifest],
         });
         expect(invalid.status).toBe(422);
         expect(invalid.body).toMatchObject({ _tag: "DeploymentBuildFailed" });
@@ -146,13 +150,102 @@ export default defineApp({accounts:{}}, {queries:{
         const { app: updated } = yield* body(Schema.Struct({ app: Deployed }), recovered);
         expect(updated.activeDeployment).not.toBe(original.activeDeployment);
         const working = yield* api.request(actors.owner, "POST", `${path}/tools/call`, {
-          tool: "queries.inspect",
+          tool: "inspect",
+          kind: "query",
           input: {},
         });
         expect(working.status).toBe(200);
         expect(working.body).toBe("recovered");
       }),
     ),
+  );
+  it.effect(
+    scenarios.cloudCompilerDeadline.title,
+    (context) =>
+      withHostedCase(
+        context,
+        Effect.gen(function* () {
+          const api = yield* Api,
+            actors = yield* Actors,
+            evidence = yield* Evidence,
+            telemetry = yield* Telemetry;
+          const prefix = `/api/organizations/${actors.organization.id}/apps`;
+          // The registry starts this package's metadata and never finishes it, so the compiler
+          // Worker stays busy and never answers, as a lost compiler isolate does.
+          const [duration, stalled] = yield* api
+            .request(actors.owner, "POST", `${prefix}/deploy`, {
+              name: `Compiler deadline ${randomUUID().slice(0, 8)}`,
+              files: [
+                {
+                  path: "index.ts",
+                  content: `import { defineApp, query, object, router } from "apps";
+import stalled from "${stalledPackage}";
+export default defineApp({accounts:{}}, {tools: router({
+  inspect:query({description:"Never compiles",input:object({})},async()=>String(stalled)),
+})});`,
+                },
+                {
+                  path: "package.json",
+                  content: JSON.stringify({
+                    type: "module",
+                    dependencies: withApps({ [stalledPackage]: "1.0.0" }),
+                  }),
+                },
+              ],
+            })
+            .pipe(Effect.timed);
+          const elapsed = Duration.toMillis(duration);
+          yield* evidence.json("compiler-deadline-response.json", {
+            elapsed,
+            status: stalled.status,
+            body: stalled.body,
+          });
+          expect(stalled.status, JSON.stringify(stalled.body)).toBe(422);
+          expect(stalled.body).toMatchObject({
+            _tag: "DeploymentBuildFailed",
+            stage: "compile",
+            message:
+              "App build failed at the compile stage: The compiler did not answer within 50 seconds. No new deployment was activated; deploy again.",
+          });
+          expect(elapsed).toBeGreaterThanOrEqual(50_000);
+          expect(elapsed).toBeLessThan(58_000);
+          const listed = yield* api.request(actors.owner, "GET", prefix);
+          expect(JSON.stringify(listed.body)).not.toContain("Compiler deadline");
+
+          const request = (yield* evidence.requests).find(({ path }) => path.endsWith("/deploy"));
+          if (request === undefined) return yield* Effect.die("Deploy request evidence missing");
+          const trace = yield* telemetry.query(request.traceId).pipe(
+            Effect.flatMap((trace) =>
+              trace.data.some((row) => row.span.operationName === "runtime.cloud.build")
+                ? Effect.succeed(trace)
+                : Effect.fail(new Error("The deadline trace has not reached the collector")),
+            ),
+            Effect.retry({ schedule: Schedule.spaced("1 second"), times: 30 }),
+          );
+          yield* evidence.json("compiler-deadline-trace.json", trace);
+          expect(trace.data).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({
+                span: expect.objectContaining({
+                  operationName: "runtime.cloud.compiler.request",
+                  tags: expect.objectContaining({ "build.compiler_deadline_exceeded": "true" }),
+                }),
+              }),
+              expect.objectContaining({
+                span: expect.objectContaining({
+                  operationName: "runtime.cloud.build",
+                  tags: expect.objectContaining({
+                    "build.stage": "compile",
+                    "build.cause": expect.stringContaining("The compiler did not answer"),
+                  }),
+                }),
+              }),
+            ]),
+          );
+        }),
+      ),
+    // The deadline itself takes 50 seconds before the response and its trace are checked.
+    { timeout: 120_000 },
   );
   it.effect(scenarios.cloudCatalogInstall.title, (context) =>
     withHostedCase(
@@ -249,7 +342,10 @@ export default defineApp({accounts:{}}, {queries:{
               name: `Dependency proof ${randomUUID().slice(0, 8)}`,
               files: [
                 { path: "index.ts", content: source },
-                { path: "package.json", content: JSON.stringify({ type: "module", dependencies }) },
+                {
+                  path: "package.json",
+                  content: JSON.stringify({ type: "module", dependencies: withApps(dependencies) }),
+                },
               ],
             });
             expect(response.status).toBe(200);
@@ -261,41 +357,60 @@ export default defineApp({accounts:{}}, {queries:{
           });
         const direct = yield* deploy(
           `
-import { defineApp, query, object } from "apps";
+import { defineApp, query, object, router } from "apps";
 import { z } from "zod";
 import manifest from "./package.json";
-export default defineApp({accounts:{}}, { queries:{
-  inspect: query({description:"Check the installed dependency and original manifest",input:object({})},
-    async () => ({value:z.string().parse("real-package"),version:manifest.dependencies.zod}))
-}});`,
+export default defineApp({accounts:{}}, { tools: router({
+   inspect: query({description:"Check the installed dependency and original manifest",input:object({})},
+    async () => ({value:z.string().parse("real-package"),version:manifest.dependencies.zod})),
+ })});`,
           { zod: "3.25.76" },
         );
         const checked = yield* api.request(
           actors.owner,
           "POST",
           `${prefix}/${direct.id}/tools/call`,
-          { tool: "queries.inspect", input: {} },
+          { tool: "inspect", kind: "query", input: {} },
         );
         expect(checked.status).toBe(200);
         expect(checked.body).toEqual({ value: "real-package", version: "3.25.76" });
 
         const unused = yield* deploy(
           `
-import { defineApp, query, object } from "apps";
+import { defineApp, query, object, router } from "apps";
 import manifest from "./package.json";
-export default defineApp({accounts:{}},{queries:{
-  inspect:query({description:"Read the original declaration",input:object({})},async()=>manifest.dependencies)
-}});`,
+export default defineApp({accounts:{}},{tools: router({
+  inspect:query({description:"Read the original declaration",input:object({})},async()=>manifest.dependencies),
+})});`,
           { "@executor-fixture/unused-package": "0.0.0-synthetic" },
         );
         const preserved = yield* api.request(
           actors.owner,
           "POST",
           `${prefix}/${unused.id}/tools/call`,
-          { tool: "queries.inspect", input: {} },
+          { tool: "inspect", kind: "query", input: {} },
         );
         expect(preserved.status).toBe(200);
-        expect(preserved.body).toEqual({ "@executor-fixture/unused-package": "0.0.0-synthetic" });
+        expect(preserved.body).toEqual(
+          withApps({ "@executor-fixture/unused-package": "0.0.0-synthetic" }),
+        );
+
+        // A source that declares no apps release is refused before compiling, naming this host's.
+        const undeclared = yield* api.request(actors.owner, "POST", `${prefix}/deploy`, {
+          name: `Undeclared ${randomUUID().slice(0, 8)}`,
+          files: [
+            {
+              path: "index.ts",
+              content: `import { defineApp, router } from "apps";
+export default defineApp({ accounts: {} }, async () => ({ tools: router({}) }));`,
+            },
+          ],
+        });
+        expect(undeclared.status, JSON.stringify(undeclared.body)).toBe(422);
+        expect(undeclared.body).toMatchObject({
+          _tag: "DeploymentBuildFailed",
+          reason: `Add "apps": "${appsVersion}" to package.json dependencies. Every app declares the exact apps version it uses; ${appsVersion} is this host's.`,
+        });
         yield* evidence.json("dependency-proof.json", {
           direct: checked.body,
           unused: preserved.body,

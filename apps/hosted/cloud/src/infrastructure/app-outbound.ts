@@ -1,6 +1,10 @@
 /** Dynamic app Workers need a real Fetcher; native Workflows cannot lend their implicit network. */
 import * as Cloudflare from "alchemy/Cloudflare";
-import { Effect } from "effect";
+import { Random } from "alchemy";
+import { Effect, Redacted, Schema } from "effect";
+import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http";
+import type { Fetcher } from "@cloudflare/workers-types";
+import { credentialFetch, credentialKey } from "@executor-js/sdk/workerd";
 
 export const AppOutbound = Effect.gen(function* () {
   if (globalThis.__ALCHEMY_RUNTIME__) return yield* Cloudflare.Worker.ref("AppOutbound");
@@ -12,4 +16,86 @@ export const AppOutbound = Effect.gen(function* () {
       fetch(request) { return fetch(request); }
     };`,
   });
+});
+
+/** What the runner binds to one app's outbound network. App code cannot set it. */
+const OutboundProps = Schema.Struct({ appOutbound: Schema.NonEmptyString });
+/** The private network service, as the outbound sends to it. */
+interface Network {
+  fetch(request: Request): Promise<Response>;
+}
+const NativeNetwork = Schema.declare(
+  (value): value is Network =>
+    typeof value === "object" &&
+    value !== null &&
+    "fetch" in value &&
+    typeof value.fetch === "function",
+);
+type Loopback = (options: { readonly props: typeof OutboundProps.Type }) => Fetcher;
+const Exports = Schema.Struct({
+  exports: Schema.Struct({
+    default: Schema.declare((value): value is Loopback => typeof value === "function"),
+  }),
+});
+
+/**
+ * Each app's outbound network, for a Worker that loads app code. The Worker's own default
+ * entrypoint, specialized with the app, substitutes the credential handles a request carries and
+ * sends it through the private `AppOutbound` service, which enforces public routing. Only the
+ * runner creates these specializations; requests from anywhere else carry no app and are routed
+ * normally. See credential-handles.ts in the SDK.
+ */
+export const appCredentialOutbound = Effect.gen(function* () {
+  const network = yield* AppOutbound;
+  const worker = yield* Cloudflare.Worker;
+  yield* worker.bind`${network}`({
+    bindings: [{ type: "service", name: "AppOutbound", service: network.workerName }],
+  });
+  const environment = yield* Cloudflare.WorkerEnvironment;
+  // The runner and this Worker's outbound entrypoint share it; app code never receives it.
+  const secret = yield* (yield* Random("AppCredentialKey")).text;
+  const key = secret.pipe(Effect.flatMap((value) => credentialKey(Redacted.value(value))));
+  const loopback = Effect.promise(() => import("cloudflare:workers")).pipe(
+    // Loopback exports are newer than the module declarations this package uses.
+    Effect.flatMap((module) => Schema.decodeUnknownEffect(Exports)(module)),
+    Effect.map(({ exports }) => exports),
+    Effect.orDie,
+  );
+  return {
+    key,
+    /** The network one app's isolates use for global `fetch`. */
+    outbound: Effect.gen(function* () {
+      const exports = yield* loopback;
+      return (app: string) => exports.default({ props: { appOutbound: app } });
+    }),
+    /** Serve a request sent by an app's isolate, or pass any other request to `handler`. */
+    serve: <E, R>(
+      handler: Effect.Effect<HttpServerResponse.HttpServerResponse, E, R>,
+    ): Effect.Effect<
+      HttpServerResponse.HttpServerResponse,
+      E,
+      R | HttpServerRequest.HttpServerRequest | Cloudflare.WorkerExecutionContext
+    > =>
+      Effect.gen(function* () {
+        const execution = yield* Cloudflare.WorkerExecutionContext;
+        const props = Schema.decodeUnknownOption(OutboundProps)(execution.raw.props);
+        if (props._tag === "None") return yield* handler;
+        const request = yield* HttpServerRequest.HttpServerRequest;
+        const source = request.source;
+        if (!(source instanceof Request)) return yield* Effect.die("App request is not a Request");
+        const send = yield* Schema.decodeUnknownEffect(NativeNetwork)(environment.AppOutbound).pipe(
+          Effect.orDie,
+        );
+        // The secret is read from this event's Worker environment.
+        const sealing = yield* key;
+        const response = yield* Effect.promise(() =>
+          credentialFetch(source, {
+            app: props.value.appOutbound,
+            key: sealing,
+            send: (request) => send.fetch(request),
+          }),
+        );
+        return HttpServerResponse.fromWeb(response);
+      }),
+  };
 });

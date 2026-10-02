@@ -84,7 +84,7 @@ questions:
     expected:
       - the agent writes a JavaScript program and runs it with the execute tool
       - tools.search returns the callable path and signature
-      - a tool is called as tools.<app>.queries.<name> or tools.<app>.mutations.<name>
+      - a tool is called as tools.<app>.<name>, with router groups as nested paths such as tools.<app>.<group>.<name>
     routes:
       - /mcp
       - /concepts/tools-and-approvals
@@ -93,7 +93,7 @@ questions:
     question: What limits apply to an execute program?
     expected:
       - 100 tool calls
-      - 30 seconds
+      - 5 minutes
       - 65,536 characters of program source
       - 65,536 bytes of output
       - a client cannot raise them
@@ -113,7 +113,7 @@ questions:
   - id: deploy-an-app
     question: How do I deploy an app?
     expected:
-      - call the apps_deploy mutation through the MCP endpoint
+      - call the apps.deploy mutation through the MCP endpoint
       - pass the files as path and content pairs
       - there is no executor deploy command
       - the app activates only after the build succeeds

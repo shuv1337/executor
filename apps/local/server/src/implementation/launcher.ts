@@ -7,6 +7,7 @@ import { LocalAuthApi } from "../contracts/auth.ts";
 import { localConfiguration } from "./bootstrap.ts";
 import { StartupFailed, type LaunchMode } from "../contracts/startup.ts";
 import { readDesktopBootstrap, startLocalServer } from "../node.ts";
+import { updateNotice } from "./update-notice.ts";
 
 const openBrowser = (url: Redacted.Redacted<string>, platform: string) =>
   Effect.gen(function* () {
@@ -21,8 +22,11 @@ const openBrowser = (url: Redacted.Redacted<string>, platform: string) =>
     if (code !== 0) return yield* new StartupFailed({ stage: "browser" });
   }).pipe(Effect.mapError(() => new StartupFailed({ stage: "browser" })));
 
-/** Start headless/browser/desktop using one server; pairing an existing server never opens storage. */
-export const launch = (mode: LaunchMode, platform: string) =>
+/**
+ * Start headless/browser/desktop using one server; pairing an existing server never opens storage.
+ * `installation` is the running CLI's own file, which tells the update notice how it was installed.
+ */
+export const launch = (mode: LaunchMode, platform: string, installation?: string) =>
   Effect.gen(function* () {
     const settings = yield* localConfiguration(platform);
     if (mode === "pair") {
@@ -44,13 +48,15 @@ export const launch = (mode: LaunchMode, platform: string) =>
       yield* Console.log(JSON.stringify({ version: 1, url: server.url }));
     } else {
       const link = yield* server.issuePairingLink;
+      const origin = settings.browserOrigin ?? server.url;
       yield* Console.log(
-        `Executor: ${server.url}\nMCP: ${server.url}/mcp\nConnect (one use, expires in 5 minutes):\n${Redacted.value(link.url)}`,
+        `Executor: ${origin}\nMCP: ${origin}/mcp\nConnect (one use, expires in 5 minutes):\n${Redacted.value(link.url)}`,
       );
       if (mode === "browser")
         yield* openBrowser(link.url, platform).pipe(
           Effect.catch(() => Console.log("Open the connection link above in your browser.")),
         );
+      yield* Effect.forkScoped(updateNotice(settings.directory, installation));
     }
-    yield* Effect.never;
+    return yield* Effect.never;
   });

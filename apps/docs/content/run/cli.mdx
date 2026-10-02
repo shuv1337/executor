@@ -14,10 +14,33 @@ accounts, runs your apps, and serves an MCP endpoint for your agents.
 package includes its runtime and dashboard; no source checkout or Bun install
 is needed.
 
+If npm prints `EBADENGINE`, upgrade Node before installing again. npm can report
+a successful install while skipping the native runtime on an unsupported Node
+version. After upgrading, repeat the install command with `--include=optional`.
+
+If `executor --version` still shows v1, your shell is finding an older install.
+Run `type -a executor` on macOS or Linux, or `where.exe executor` on Windows,
+to see which executable takes priority. Remove the old install with the package
+manager that installed it, then open a new terminal. For example, use
+`bun remove -g executor` for an old Bun install. This does not delete your data.
+
 On first launch, Executor saves its API and encryption keys in macOS Keychain,
-Windows Credential Manager, or Linux Secret Service. Linux needs a persistent
-Secret Service such as GNOME Keyring. Unlock the credential store and allow
-Executor access when asked.
+Windows Credential Manager, or Linux Secret Service. Unlock the credential store
+and allow Executor access when asked. If there is no credential store on the
+first launch, for example on a Linux server without GNOME Keyring, Executor saves
+the keys to `keys.json` in its data directory instead. The file is readable only
+by your user, and Executor prints its path when it creates it. Keep that
+directory private. If a credential store exists but access is denied, for
+example because you dismissed the prompt or the store is locked, Executor stops
+without writing `keys.json`. Start it again to be asked again. Where no prompt
+can appear, such as over SSH, unlock the store first: on Linux run
+`gnome-keyring-daemon --unlock`, on macOS `security unlock-keychain`.
+
+To use `keys.json` on a new data directory even when a credential store works,
+set `EXECUTOR_KEY_STORAGE=file` for its first start. Set
+`EXECUTOR_KEY_STORAGE=os` to require the credential store and never fall back to
+`keys.json`. Executor never switches an existing directory's key storage: a
+value that does not match the directory stops startup and changes nothing.
 
 | Command | Purpose |
 | --- | --- |
@@ -30,15 +53,19 @@ Executor access when asked.
 | Variable | Purpose |
 | --- | --- |
 | `EXECUTOR_PORT` | Port, default `4312`. |
+| `EXECUTOR_NO_UPDATE_CHECK` | Set to `1` to skip the daily check for a newer release. |
 | `EXECUTOR_DATA_DIR` | Data directory, default `~/.executor/v2/cli`. |
 | `EXECUTOR_BROWSER_ORIGIN` | Exact HTTPS origin for generated browser links. |
 | `EXECUTOR_WEBHOOK_ORIGIN` | Exact HTTPS origin that receives webhooks. |
+| `EXECUTOR_KEY_STORAGE` | `file` or `os`: key storage for a new data directory. |
+| `DO_NOT_TRACK` or `EXECUTOR_DISABLE_ANALYTICS` | Set to `1` to turn off anonymous [usage analytics](/run/usage-analytics) and feedback. |
 
-For a new headless installation without an OS credential store, supply both
-`EXECUTOR_API_KEY` (at least 32 characters) and `EXECUTOR_ENCRYPTION_KEY`
-(exactly 64 hexadecimal characters) from a secret manager. Keep these same keys
-for every start. Executor does not save supplied keys. A directory keeps its
-chosen key source across upgrades.
+To keep keys in a secret manager instead, supply both `EXECUTOR_API_KEY` (at
+least 32 characters) and `EXECUTOR_ENCRYPTION_KEY` (exactly 64 hexadecimal
+characters) before the first start. Keep these same keys for every start.
+Executor does not save supplied keys. A directory keeps its chosen key source
+across upgrades: a directory using the credential store still needs it later,
+and a directory using `keys.json` needs that file.
 
 ## Connect an agent
 
@@ -57,11 +84,16 @@ your secret manager.
 Missing keys stop startup. Executor will not generate replacements for an
 existing installation. Restore the original keys to recover access.
 
-Run the install command again to update. The v2 data directory stays the same
+`executor` and `executor serve` check npm at most once a day for a newer
+release on their channel and print the install command. Beta installs are told
+about stable once it is newer. The check never installs anything and is skipped
+in CI. Run the install command again to update. The v2 data directory stays the same
 when beta becomes stable. Uninstalling the package does not delete data or keys.
 
 The desktop app uses the same local server with a separate
-profile. Automatic desktop updates are not enabled; install a newer version
-over the existing application to update it.
+profile. It checks for updates in the background and asks before restarting to
+install one. Beta installs follow beta releases and move to stable when it is
+newer. On Linux, only the AppImage updates itself; install a newer `.deb` over
+the existing package.
 
 <ReleaseDesktopLink />

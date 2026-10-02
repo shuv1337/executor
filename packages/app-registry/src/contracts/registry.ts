@@ -2,6 +2,9 @@
 import { Schema, type Effect } from "effect";
 import { appSlug, SourceCommit, SourceFiles } from "@executor-js/sdk/core";
 
+/** The hosted Executor origin: the default public registry and the hosted sign-in host. */
+export const hostedExecutorOrigin = "https://v2.executor.sh";
+
 /** Public name inside a publishing owner's namespace. */
 export const PackageName = Schema.String.check(
   Schema.isPattern(/^@[a-z0-9][a-z0-9-]{0,79}\/[a-z0-9][a-z0-9-]{0,62}$/),
@@ -77,9 +80,13 @@ export class RegistryError extends Schema.TaggedError<RegistryError>()(
       "invalid-manifest",
       "unsupported-dependencies",
       "storage",
-      "registry",
+      "network",
+      "status",
+      "invalid-response",
       "limit",
     ]),
+    /** The remote registry's HTTP status, for a `status` failure. */
+    status: Schema.optional(Schema.Int),
   },
   { httpApiStatus: 400 },
 ) {}

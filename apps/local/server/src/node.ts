@@ -61,7 +61,11 @@ export const startLocalServer = (
           if (server.address._tag !== "InetAddressV4")
             return yield* new StartupFailed({ stage: "listen" });
           port = server.address.port;
-          return localApi({ ...settings, port }, globalThis.crypto, auth, options);
+          return localApi({ ...settings, port }, globalThis.crypto, auth, {
+            ...options,
+            product: options.product ?? (bootstrap === undefined ? "local" : "desktop"),
+            platform: { os: process.platform, arch: process.arch },
+          });
         }),
       );
       // Close active connections before the adapter's final shutdown. Requests receive

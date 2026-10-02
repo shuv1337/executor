@@ -6,6 +6,7 @@ import { Browser } from "../support/browser.ts";
 import { HostedLive, withHostedCase } from "../support/case.ts";
 import { oauthSetupIssuer } from "../support/oauth-setup-issuer.ts";
 import { scenarios } from "../test-plan.ts";
+import { appsManifest } from "../support/apps-release.ts";
 
 const App = Schema.Struct({
   id: Schema.String,
@@ -33,10 +34,11 @@ layer(HostedLive, { excludeTestServices: true })("OAuth setup errors", (it) => {
           files: [
             {
               path: "index.ts",
-              content: `import { defineApp, defineProvider, oauth2 } from "apps";
+              content: `import { defineApp, defineProvider, oauth2, router } from "apps";
 const service=defineProvider({name:"Sample service",auth:{oauth:oauth2({discover:${JSON.stringify(issuer.origin + "/mcp")}})}});
-export default defineApp({accounts:{service}},async()=>({queries:{}}));`,
+export default defineApp({accounts:{service}},async()=>({tools: router({})}));`,
             },
+            appsManifest,
           ],
         });
         expect(deployed.status).toBe(200);
@@ -87,9 +89,9 @@ export default defineApp({accounts:{service}},async()=>({queries:{}}));`,
           ],
           [
             "unavailable",
-            "discovery_unavailable",
+            "service_unavailable",
             "The connected service’s sign-in is unavailable",
-            "Try again.",
+            "Try again in a moment.",
             true,
           ],
         ] as const) {
@@ -101,16 +103,15 @@ export default defineApp({accounts:{service}},async()=>({queries:{}}));`,
           );
           expect(response.status).toBe(422);
           expect((yield* body(Failure, response)).reason).toBe(reason);
+          // The page responds to input once hydrated; the harness waits between steps.
           yield* browser.use(`Open account setup with ${discovery} metadata`, (page) =>
+            page.goto(`/org/${actors.organization.slug}/apps/${app.id}?view=accounts`),
+          );
+          yield* browser.use("Add an account", (page) =>
             page
-              .goto(`/org/${actors.organization.slug}/apps/${app.id}?view=accounts`)
-              .then(() =>
-                page
-                  .getByRole("button", { name: "Add Sample service account", exact: true })
-                  .click(),
-              )
-              .then(() => page.getByRole("alert").getByText(title, { exact: true }).waitFor())
-              .then(() => page.getByLabel("Account name", { exact: true }).fill("Work reports")),
+              .getByRole("button", { name: "Connect new account", exact: true })
+              .click()
+              .then(() => page.getByRole("alert").getByText(title, { exact: true }).waitFor()),
           );
           expect(
             yield* browser.use("Retry follows the cause", (page) =>
@@ -156,7 +157,6 @@ export default defineApp({accounts:{service}},async()=>({queries:{}}));`,
             expect(copied).not.toContain("PRIVATE_UPSTREAM_DIAGNOSTIC");
             expect(copied).not.toContain("with its author");
             expect(copied).not.toContain(issuer.origin);
-            expect(copied).not.toContain("Work reports");
             yield* browser.use("Review the full error card on mobile", (page) =>
               page.setViewportSize({ width: 390, height: 844 }),
             );
@@ -185,10 +185,10 @@ export default defineApp({accounts:{service}},async()=>({queries:{}}));`,
             );
           }
           expect(
-            yield* browser.use("Reading the error preserves the form", (page) =>
-              page.getByLabel("Account name", { exact: true }).inputValue(),
+            yield* browser.use("Reading the error keeps the connection form open", (page) =>
+              page.getByRole("dialog").getByRole("alert", { name: title, exact: true }).count(),
             ),
-          ).toBe("Work reports");
+          ).toBe(1);
         }
         yield* issuer.configure({ discovery: "available" });
         yield* browser.use("Retry recovers through the real setup endpoint", (page) =>
@@ -200,13 +200,80 @@ export default defineApp({accounts:{service}},async()=>({queries:{}}));`,
             )
             .then(() => page.getByRole("alert").waitFor({ state: "hidden" })),
         );
-        expect(
-          yield* browser.use("Retry preserves the name", (page) =>
-            page.getByLabel("Account name", { exact: true }).inputValue(),
-          ),
-        ).toBe("Work reports");
         expect((yield* issuer.metrics).registrations).toBe(0);
         yield* browser.checkpoint("OAuth-setup-recovered");
+        // Registration failures are split by who can act. Services that refuse Executor
+        // open manual client entry; an unusable 2xx response is Executor's problem.
+        for (const [name, registration, title, nextStep, clientEntry] of [
+          [
+            "not-approved",
+            { registrationStatus: 400, registrationError: "invalid_redirect_uri" },
+            "Service did not accept Executor",
+            "Ask the service to approve Executor’s callback URL",
+            true,
+          ],
+          [
+            "protected",
+            { registrationStatus: 401 },
+            "Register an OAuth client with the service",
+            "Create an OAuth app in the service’s developer settings",
+            true,
+          ],
+          [
+            "metadata-refused",
+            { registrationStatus: 400, registrationError: "invalid_client_metadata" },
+            "Service did not accept Executor’s callback URL",
+            "add Executor’s callback URL to its allowed redirect URIs",
+            true,
+          ],
+          [
+            "rejected",
+            { registrationStatus: 400, registrationError: "invalid_request" },
+            "Service rejected Executor’s registration",
+            "Create an OAuth app with the service and enter its client details",
+            true,
+          ],
+          [
+            "incompatible",
+            { registrationStatus: 200, malformedRegistration: true },
+            "Executor could not use the service’s response",
+            "Retrying will not help.",
+            false,
+          ],
+        ] as const) {
+          yield* issuer.configure({ malformedRegistration: false, ...registration });
+          // The page responds to input once hydrated; the harness waits between steps.
+          yield* browser.use(`Start sign-in when registration is ${name}`, (page) =>
+            page.goto(`/org/${actors.organization.slug}/apps/${app.id}?view=accounts`),
+          );
+          yield* browser.use("Add an account", (page) =>
+            page
+              .getByRole("button", { name: "Connect new account", exact: true })
+              .click()
+              .then(() =>
+                page.getByRole("button", { name: "Connect Sample service", exact: true }).click(),
+              )
+              .then(() => page.getByRole("alert").getByText(title, { exact: true }).waitFor()),
+          );
+          const text = yield* browser.use("Read the registration error", (page) =>
+            page.getByRole("alert").innerText(),
+          );
+          expect(text).toContain(nextStep);
+          expect(text).not.toContain("PRIVATE_UPSTREAM_DIAGNOSTIC");
+          // Client entry shows the callback URL once, in its own form field.
+          expect(text).not.toContain("/api/oauth/callback");
+          expect(
+            yield* browser.use("Client entry follows the cause", (page) =>
+              page.getByText("Set up an OAuth client", { exact: true }).count(),
+            ),
+          ).toBe(clientEntry ? 1 : 0);
+          expect(
+            yield* browser.use("Self-host does not claim a failure was tracked", (page) =>
+              page.getByText("We’ve tracked this automatically", { exact: false }).count(),
+            ),
+          ).toBe(0);
+          yield* browser.checkpoint(`OAuth-registration-${name}-desktop`);
+        }
       }),
     ),
   );

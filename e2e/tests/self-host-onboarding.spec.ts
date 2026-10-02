@@ -91,8 +91,11 @@ layer(TestLive, { excludeTestServices: true })("Self-host onboarding", (it) => {
         const dashboard = yield* browser.use("Remember the organization destination", (page) =>
           Promise.resolve(page.url()),
         );
+        yield* browser.use("Open the account menu", (page) =>
+          page.getByRole("button", { name: /^Account: / }).click(),
+        );
         yield* browser.use("Sign out", (page) =>
-          page.getByRole("button", { name: "Sign out", exact: true }).click(),
+          page.getByRole("menuitem", { name: "Sign out", exact: true }).click(),
         );
         yield* browser.use("Enter returning administrator email", (page) =>
           page.getByLabel("Email", { exact: true }).fill("alex@example.test"),

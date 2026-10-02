@@ -97,6 +97,37 @@ export type DesktopBootstrap = typeof DesktopBootstrap.Type;
 /** Parent/CLI ready notification contains no credential. */
 export const ServerReady = Schema.Struct({ version: Schema.Literal(1), url: Schema.String });
 
+/** OS credential-store service. Each installation's entry uses its installation ID as the account. */
+export const LocalCredentialService = "com.usefulsoftware.executor.v2";
+/**
+ * A data directory's `installation.json`. It pairs the directory with its OS credential entry,
+ * or with `keys.json` when its state is `file`.
+ */
+export const LocalInstallation = Schema.Struct({
+  version: Schema.Literal(1),
+  id: Schema.String.check(Schema.isUUID()),
+  // Binaries released before "file" reject that record as invalid instead of misreading it.
+  state: Schema.Literals(["pending", "ready", "external", "file"]),
+});
+/**
+ * Why local key setup refused to start. `credential-unavailable` means the directory needs the OS
+ * store and there is none. `credential-denied` means it exists but refused access, was cancelled
+ * or is locked; the next start prompts again. `misconfigured` means the environment's key settings
+ * (`EXECUTOR_KEY_STORAGE`, supplied keys) cannot apply to this directory and must be changed. In
+ * these the data may be intact, so a desktop parent must not offer to reset it. `credential-missing`
+ * and `invalid` mean the saved keys or record are gone or damaged.
+ */
+export const LocalConfigurationReason = Schema.Literals([
+  "credential-unavailable",
+  "credential-denied",
+  "credential-missing",
+  "invalid",
+  "misconfigured",
+  "locked",
+  "io",
+]);
+export type LocalConfigurationReason = typeof LocalConfigurationReason.Type;
+
 /** Shared contracts used by the local browser, CLI, and future desktop parent. */
 export const LocalAuthApi = HttpApi.make("local-auth").add(
   HttpApiGroup.make("auth")

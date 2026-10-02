@@ -4,8 +4,8 @@ import * as Planetscale from "alchemy/Planetscale";
 import * as Command from "alchemy/Command";
 import * as Output from "alchemy/Output";
 import { Random } from "alchemy";
-import { Config, Effect, Redacted } from "effect";
-import type { TestStage } from "./stage.ts";
+import { Config, Effect, Option, Redacted } from "effect";
+import { testStage, type TestStage } from "./stage.ts";
 
 /** Build a credential-redacted Postgres URL with hostname and certificate verification. */
 export const postgresUrl = (origin: Neon.PostgresOrigin) => {
@@ -19,13 +19,19 @@ export const postgresUrl = (origin: Neon.PostgresOrigin) => {
 };
 
 type PreviewConnection = {
-  readonly origin: Output.Output<Neon.PostgresOrigin, never>;
   readonly runtimeUrl: Output.Output<Redacted.Redacted<string>, never>;
   readonly migrationUrl: Output.Output<Redacted.Redacted<string>, never>;
   readonly branchName: Output.Output<string, never>;
   readonly username: Output.Output<string, never>;
   readonly databaseName: Output.Output<string, never>;
 };
+
+/**
+ * PgBouncer server connections for a PlanetScale preview's runtime role. The branch allows 25
+ * connections, three reserved for superusers; PgBouncer's default of 20 left none for the
+ * migration login on the next deploy. Hyperdrive previously capped previews at five.
+ */
+const previewPoolConnections = 10;
 
 /** Preview provider selection is shared by database allocation and Worker transport. */
 export const previewDatabaseProvider = Config.Literals(
@@ -38,25 +44,37 @@ export const previewDatabase = (stage: TestStage) =>
   Effect.gen(function* () {
     const provider = yield* previewDatabaseProvider;
     if (provider === "planetscale") {
-      const database = yield* Config.NonEmptyString("TEST_STAGE_DATABASE");
-      const branch = yield* Planetscale.PostgresBranch("PreviewDatabase", {
-        database,
-        name: stage.name,
-        parentBranch: "main",
-      });
-      const runtime = yield* Planetscale.PostgresRole("RuntimeRole", {
-        database,
-        branch,
-        inheritedRoles: ["pg_read_all_data", "pg_write_all_data"],
-      });
-      const migration = yield* Planetscale.PostgresRole("MigrationRole", {
-        database,
-        branch,
-        inheritedRoles: ["postgres"],
-      });
+      // Inside the Worker only the bindings' identities are needed, not provisioning config.
+      const database = globalThis.__ALCHEMY_RUNTIME__
+        ? undefined
+        : yield* Config.NonEmptyString("TEST_STAGE_DATABASE");
+      const branch =
+        database === undefined
+          ? yield* Planetscale.PostgresBranch.ref("PreviewDatabase")
+          : yield* Planetscale.PostgresBranch("PreviewDatabase", {
+              database,
+              name: stage.name,
+              parentBranch: "main",
+            });
+      const runtime =
+        database === undefined
+          ? yield* Planetscale.PostgresRole.ref("RuntimeRole")
+          : yield* Planetscale.PostgresRole("RuntimeRole", {
+              database,
+              branch,
+              inheritedRoles: ["pg_read_all_data", "pg_write_all_data"],
+            });
+      const migration =
+        database === undefined
+          ? yield* Planetscale.PostgresRole.ref("MigrationRole")
+          : yield* Planetscale.PostgresRole("MigrationRole", {
+              database,
+              branch,
+              inheritedRoles: ["postgres"],
+            });
       const connection: PreviewConnection = {
-        origin: runtime.origin,
-        runtimeUrl: runtime.origin.pipe(Output.map(postgresUrl)),
+        // Workers use the branch's PgBouncer; migrations keep the direct schema-owner connection.
+        runtimeUrl: runtime.pooledOrigin.pipe(Output.map(postgresUrl)),
         migrationUrl: migration.origin.pipe(
           Output.map((origin) => {
             const url = new URL(Redacted.value(postgresUrl(origin)));
@@ -107,9 +125,6 @@ export const previewDatabase = (stage: TestStage) =>
           timeout: "1 minute",
         });
     const connection: PreviewConnection = {
-      origin: Output.all(branch.origin, password, role.hash).pipe(
-        Output.map(([origin, password]) => ({ ...origin, user: "executor_runtime", password })),
-      ),
       // Workers use Neon's transaction pooler; migrations retain the direct owner connection.
       runtimeUrl: Output.all(branch.pooledOrigin, password, role.hash).pipe(
         Output.map(([origin, password]) =>
@@ -123,3 +138,22 @@ export const previewDatabase = (stage: TestStage) =>
     };
     return connection;
   });
+
+/**
+ * Cap a PlanetScale preview branch's PgBouncer pool. Only the stack declares this job; Worker
+ * initialization evaluates the database connection but not branch administration.
+ */
+export const previewPoolSize = Effect.gen(function* () {
+  const stage = yield* testStage;
+  if (Option.isNone(stage) || (yield* previewDatabaseProvider) !== "planetscale") return;
+  const preview = yield* previewDatabase(stage.value);
+  yield* Command.Exec("PreviewPoolSize", {
+    command: "node scripts/preview-pool-size.ts",
+    env: {
+      TEST_STAGE_DATABASE: yield* Config.NonEmptyString("TEST_STAGE_DATABASE"),
+      TEST_STAGE_DATABASE_BRANCH: preview.branchName,
+      POOL_SIZE: String(previewPoolConnections),
+    },
+    timeout: "7 minutes",
+  });
+}).pipe(Effect.orDie);

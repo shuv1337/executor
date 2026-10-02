@@ -1,5 +1,5 @@
 /** Trusted workerd host. App modules get isolated Workers/facets, never this environment. */
-import { DurableObject, WorkflowEntrypoint } from "cloudflare:workers";
+import { DurableObject, WorkerEntrypoint, WorkflowEntrypoint } from "cloudflare:workers";
 import { NonRetryableError } from "cloudflare:workflows";
 import type {
   DurableObjectState,
@@ -12,9 +12,10 @@ import type {
 import { RpcTarget, newWorkersRpcResponse, type RpcStub } from "capnweb";
 import { Cause, Effect, Redacted, Schema } from "effect";
 import {
+  DatabaseFieldReserved,
   DeclaredRequirements,
+  HostRequirementsError,
   HostResponse,
-  ElicitationReply,
   ResolvedAccounts,
   WorkflowRunId,
   WorkflowFailure,
@@ -27,36 +28,45 @@ import {
   type WorkflowDuration,
 } from "apps/contracts";
 import {
-  facetIdentity,
   makeFacetSupervisor,
   FacetInvocation,
-  FacetResult,
   type FacetBundle,
 } from "@executor-js/app-data/cloudflare";
+import { makeAppRunner } from "./app-runner.ts";
+import { credentialFetch, credentialKey } from "./credential-handles.ts";
 import {
-  appRpcBridge,
-  appFacetBridge,
-  AppRpcEntrypoint,
-  AppRpcInvocation,
-  invocationWorkflow,
-} from "../workerd.ts";
-import { workerModules } from "@executor-js/app-data/worker-bundle";
+  defaultAppWorkerLimit,
+  makeAppWorkerResidency,
+  type AppWorkerResidency,
+} from "./app-worker-residency.ts";
 import { compileWorkerApp } from "../workerd-build.ts";
+import { assembleWorkerBundle } from "./worker-build-storage.ts";
 import {
-  CompiledWorkerApp,
+  CompileWorkerApp,
+  CompileWorkerResult,
   PreparedWorkflow,
   WorkerInvocation,
   type AppHostCallbacks,
   type WorkflowHostCommand,
 } from "../contracts/workerd-host.ts";
-import { SourceFiles } from "../contracts/deployment.ts";
-import { decodeWorkflowFailure, workflowFailureMessage } from "../contracts/workflow-errors.ts";
-import framework from "executor-framework";
+import { LoadedWorkerBuild } from "../contracts/worker-build.ts";
+import {
+  describeBuildCause,
+  RuntimeAppsDependencyMissing,
+  RuntimeBuildFailed,
+  RuntimeProtocolUnsupported,
+} from "../contracts/runtime.ts";
+import {
+  decodeWorkflowFailure,
+  workflowFailureDetail,
+  workflowFailureMessage,
+} from "../contracts/workflow-errors.ts";
 
 declare const WebSocketPair: { new (): { 0: NativeWebSocket; 1: NativeWebSocket } };
 
 type Callback = (input: unknown) => Promise<unknown>;
 interface DataEntrypoint {
+  cache(namespace: string, command: unknown): Promise<unknown>;
   invoke(
     input: typeof FacetInvocation.Type,
     load: () => Promise<typeof FacetBundle.Type>,
@@ -85,26 +95,75 @@ const NativeStep = Schema.declare(
     "sleepUntil" in value &&
     typeof value.sleepUntil === "function",
 );
+interface HttpService {
+  fetch(request: Request): Promise<Response>;
+}
 interface Environment {
   readonly AUTH: string;
   /** Host decision, not an app capability: apps never see or change this binding. */
   readonly APPS_PRIVATE_FETCH: boolean;
   /** workerd network service that refuses private, loopback and link-local destinations. */
-  readonly PUBLIC_FETCH: Fetcher;
+  readonly PUBLIC_FETCH: HttpService;
+  /** This instance's own dashboard origin, or empty when the host serves none. */
+  readonly SELF_ORIGIN: string;
+  /** Reaches the product that serves `SELF_ORIGIN` without the network. */
+  readonly SELF?: HttpService;
+  /** The npm registry builds resolve packages from, or empty for the public registry. */
+  readonly NPM_REGISTRY: string;
   readonly LOADER: WorkerLoader;
+  /** Most app Workers this process keeps loaded, or null for the default. */
+  readonly APP_WORKERS?: number | null;
   readonly DATA: { getByName(name: string): DataEntrypoint };
   readonly RUNS: Workflow<{ run: string }>;
   readonly HOST: Fetcher;
 }
 const failure = () => new WorkflowFailure({ reason: "engine", retryable: true });
+/** The deployer sees the underlying failure; builds bind no accounts. */
+const buildFailed = (stage: RuntimeBuildFailed["stage"], cause: unknown) =>
+  new RuntimeBuildFailed({
+    stage,
+    message: describeBuildCause(cause),
+    ...(Schema.is(DatabaseFieldReserved)(cause) ? { declaration: cause } : {}),
+  });
+/** What the runner binds to one app's outbound network. App code cannot set it. */
+const OutboundProps = Schema.Struct({ app: Schema.NonEmptyString });
+type OutboundProps = typeof OutboundProps.Type;
+/** Handles are sealed with a key derived from the secret only this host and its runner share. */
+const credentials = (env: Environment) => credentialKey(env.AUTH);
 /**
- * Where an app isolate's global `fetch` goes. `global_fetch_strictly_public` cannot do this
- * here: it routes global fetch through workerd's `internet` service, which this runtime
- * configures to allow private addresses. An explicit outbound to the public-only network
- * service is the control. Omitting it leaves the isolate on the default network.
+ * Every app isolate's global `fetch`, bound to its app. It substitutes the credential handles the
+ * request carries when its target is allowed; see credential-handles.ts.
+ *
+ * `global_fetch_strictly_public` cannot do this here: it routes global fetch through workerd's
+ * `internet` service, which this runtime configures to allow private addresses. Requests for this
+ * instance's own dashboard origin go to the product through a service binding, so the bundled
+ * Executor app works when that origin resolves to a private address. Everything else uses the
+ * public-only network service unless the operator allows private fetch. Redirects return to the
+ * isolate, which sends each hop back here.
  */
-const appOutbound = (env: Environment): Fetcher | undefined =>
-  env.APPS_PRIVATE_FETCH ? undefined : env.PUBLIC_FETCH;
+export class AppOutbound extends WorkerEntrypoint<Environment> {
+  async fetch(request: Request): Promise<Response> {
+    const self = URL.parse(this.env.SELF_ORIGIN)?.origin;
+    return credentialFetch(request, {
+      app: Schema.decodeUnknownSync(OutboundProps)(this.ctx.props).app,
+      key: await Effect.runPromise(credentials(this.env)),
+      send: (request) => {
+        if (this.env.SELF !== undefined && new URL(request.url).origin === self)
+          return this.env.SELF.fetch(request);
+        return this.env.APPS_PRIVATE_FETCH ? fetch(request) : this.env.PUBLIC_FETCH.fetch(request);
+      },
+    });
+  }
+}
+type OutboundLoopback = (options: { readonly props: OutboundProps }) => Fetcher;
+const OutboundExports = Schema.Struct({
+  AppOutbound: Schema.declare((value): value is OutboundLoopback => typeof value === "function"),
+});
+/** The loopback binding to `AppOutbound` that workerd supplies on every context's exports. */
+const appOutbound =
+  (context: { readonly exports: unknown }) =>
+  (app: string): Fetcher =>
+    Schema.decodeUnknownSync(OutboundExports)(context.exports).AppOutbound({ props: { app } });
 const rpcOptions = { onSendError: () => new Error("App runtime request failed") };
 const json = Schema.decodeUnknownSync(Schema.Json);
 const hostRequest = (env: Environment, command: WorkflowHostCommand) =>
@@ -123,123 +182,48 @@ const hostRequest = (env: Environment, command: WorkflowHostCommand) =>
     Effect.flatMap((reply) => (reply.ok ? Effect.succeed(reply.value) : Effect.fail(reply.error))),
   );
 
-/** Run a single authorized invocation through the same generated protocol as Cloud. */
-const invoke = (
-  env: Environment,
-  input: WorkerInvocation,
-  signal: AbortSignal,
-  elicit: Callback | null,
-  controls: Callback | null,
-  execution?: WorkflowExecution,
-) =>
-  Effect.scoped(
-    Effect.gen(function* () {
-      const identity = yield* facetIdentity(input.build, JSON.stringify(input.accounts));
-      const body = JSON.stringify({
-        command: input.command,
-        accounts: input.accounts,
-        approval: input.approval,
-        replay: input.replay,
-        workflowRun: execution?.runId,
-      });
-      const data =
-        input.bundle.database &&
-        (input.command.operation === "call" ||
-          input.command.operation === "query" ||
-          input.command.operation === "mutate" ||
-          ["webhook-register", "webhook-handle", "webhook-unregister"].includes(
-            input.command.operation,
-          ));
-      if (data) {
-        const target = env.DATA.getByName(input.app),
-          id = crypto.randomUUID();
-        return yield* Effect.tryPromise({
-          try: () =>
-            target.invoke(
-              {
-                id,
-                identity,
-                body,
-                headers: input.headers,
-                write:
-                  ["mutate", "webhook-register", "webhook-handle", "webhook-unregister"].includes(
-                    input.command.operation,
-                  ) ||
-                  (input.command.operation === "call" &&
-                    input.command.tool.startsWith("mutations.")),
-              },
-              async () => ({
-                mainModule: "__executor_facet.js",
-                modules: {
-                  ...input.bundle.modules,
-                  "__executor_facet.js": appFacetBridge(input.bundle.mainModule),
-                },
-              }),
-              elicit,
-              controls,
-            ),
-          catch: failure,
-        }).pipe(
-          Effect.flatMap(Schema.decodeUnknownEffect(FacetResult)),
-          Effect.flatMap((result) =>
-            Schema.decodeUnknownEffect(Schema.Record(Schema.String, Schema.Json))(
-              result.value,
-            ).pipe(Effect.map((body) => ({ ...body, executorRevision: result.revision }))),
-          ),
-          Effect.onInterrupt(() =>
-            Effect.promise(() => target.cancel(id)).pipe(Effect.catchCause(() => Effect.void)),
-          ),
-        );
-      }
-      const outbound = appOutbound(env);
-      const worker = env.LOADER.get(
-        `${input.app}:${execution?.runId ?? "call"}:${identity}`,
-        () => ({
-          mainModule: "__executor_rpc.js",
-          modules: {
-            ...workerModules(input.bundle.modules),
-            "__executor_rpc.js": appRpcBridge(input.bundle.mainModule),
-          },
-          compatibilityDate: "2026-07-30",
-          compatibilityFlags: ["nodejs_compat"],
-          ...(outbound === undefined ? {} : { globalOutbound: outbound }),
-        }),
-      );
-      const entry = yield* Schema.decodeUnknownEffect(AppRpcEntrypoint)(worker.getEntrypoint());
-      const workflow =
-        execution === undefined ? null : yield* invocationWorkflow(execution, signal);
-      const delivery =
-        elicit === null
-          ? null
-          : async (input: unknown) =>
-              Schema.encodeSync(ElicitationReply)(
-                Schema.decodeUnknownSync(ElicitationReply)(await elicit(input)),
-              );
-      const call = yield* Effect.acquireRelease(
-        Effect.tryPromise({
-          try: () => entry.start(body, input.headers, delivery, workflow, controls),
-          catch: failure,
-        }).pipe(Effect.flatMap(Schema.decodeUnknownEffect(AppRpcInvocation))),
-        (call) =>
-          Effect.promise(async () => {
-            try {
-              await call.cancel();
-            } finally {
-              call[Symbol.dispose]();
-            }
-          }).pipe(Effect.catchCause(() => Effect.void)),
-      );
-      return yield* Effect.tryPromise({ try: () => call.result(), catch: failure });
-    }),
-  );
+/**
+ * workerd keeps this isolate, and every app Worker it loads, for the life of the process. One
+ * residency, shared by every request, bounds how many app Workers stay loaded.
+ */
+// oxlint-disable-next-line executor/no-module-level-mutable-state -- one process-wide residency bounds loaded app Workers across requests
+let residency: AppWorkerResidency | undefined;
+/** The shared runner over this Worker's loader, data supervisors and outbound network. */
+const runner = (env: Environment, context: Pick<ExecutionContext, "waitUntil" | "exports">) =>
+  makeAppRunner({
+    loader: env.LOADER,
+    residency: (residency ??= makeAppWorkerResidency(env.APP_WORKERS ?? defaultAppWorkerLimit)),
+    outbound: appOutbound(context),
+    credentialKey: credentials(env),
+    data: (app) => {
+      const target = env.DATA.getByName(app);
+      return {
+        invoke: (input, load, elicit, controls) =>
+          Effect.tryPromise({
+            try: () => target.invoke(input, load, elicit, controls),
+            catch: (cause) => cause,
+          }),
+        cancel: (id) =>
+          Effect.tryPromise({ try: () => target.cancel(id), catch: (cause) => cause }),
+        cache: (namespace, command) =>
+          Effect.tryPromise({
+            try: () => target.cache(namespace, command),
+            catch: (cause) => cause,
+          }),
+      };
+    },
+    waitUntil: (task) => context.waitUntil(task.then(ignore, ignore)),
+  });
+const ignore = () => undefined;
+const encodedJson = Schema.fromJsonString(Schema.Json);
 
 /** Each WebSocket session owns its invocation lifetime and host capabilities. */
 class AppApi extends RpcTarget {
   readonly #env: Environment;
   readonly #lifetime = new AbortController();
-  readonly #context: Pick<ExecutionContext, "waitUntil">;
+  readonly #context: Pick<ExecutionContext, "waitUntil" | "exports">;
   #active: Promise<unknown> | undefined;
-  constructor(env: Environment, context: Pick<ExecutionContext, "waitUntil">) {
+  constructor(env: Environment, context: Pick<ExecutionContext, "waitUntil" | "exports">) {
     super();
     this.#env = env;
     this.#context = context;
@@ -272,55 +256,77 @@ class AppApi extends RpcTarget {
   async compile(input: string): Promise<string> {
     return this.#run(
       Effect.gen({ self: this }, function* () {
-        const files = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(SourceFiles))(input);
-        const { bundle, ui } = yield* compileWorkerApp(files, framework);
-        const build = crypto.randomUUID();
-        const response = yield* invoke(
-          this.#env,
-          {
-            app: `declaration:${build}`,
-            build,
-            bundle: { ...bundle, database: false },
-            command: { operation: "requirements" },
-            accounts: {},
-            headers: {},
+        const request = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(CompileWorkerApp))(
+          input,
+        ).pipe(Effect.mapError((cause) => buildFailed("source", cause)));
+        const compiled = yield* compileWorkerApp(
+          request.files,
+          this.#env.NPM_REGISTRY === "" ? {} : { registry: this.#env.NPM_REGISTRY },
+        );
+        const { bundle, framework, ui } = compiled;
+        const requirements = yield* runner(this.#env, this.#context)
+          .declare({ ...assembleWorkerBundle(bundle, framework), protocol: compiled.protocol }, {})
+          .pipe(
+            Effect.flatMap(Schema.decodeUnknownEffect(HostResponse)),
+            Effect.flatMap((envelope) =>
+              envelope.ok
+                ? Schema.decodeUnknownEffect(DeclaredRequirements)(envelope.value)
+                : Schema.decodeUnknownEffect(HostRequirementsError)(envelope.error).pipe(
+                    Effect.flatMap(Effect.fail),
+                  ),
+            ),
+            Effect.mapError((cause) => buildFailed("declaration", cause)),
+          );
+        return {
+          ok: true as const,
+          value: {
+            bundle,
+            framework,
+            protocol: compiled.protocol,
+            requirements: json(yield* Schema.encodeEffect(DeclaredRequirements)(requirements)),
+            ...(ui === undefined ? {} : { ui }),
           },
-          this.#lifetime.signal,
-          null,
-          null,
-        );
-        const envelope = yield* Schema.decodeUnknownEffect(HostResponse)(response);
-        if (!envelope.ok) return yield* failure();
-        const requirements = yield* Schema.decodeUnknownEffect(DeclaredRequirements)(
-          envelope.value,
-        );
-        return yield* Schema.encodeEffect(Schema.fromJsonString(CompiledWorkerApp))({
-          bundle,
-          requirements: json(yield* Schema.encodeEffect(DeclaredRequirements)(requirements)),
-          ...(ui === undefined ? {} : { ui }),
-        });
-      }),
+        };
+      }).pipe(
+        Effect.catch((error) =>
+          Effect.succeed({
+            ok: false as const,
+            error:
+              Schema.is(RuntimeBuildFailed)(error) ||
+              Schema.is(RuntimeProtocolUnsupported)(error) ||
+              Schema.is(RuntimeAppsDependencyMissing)(error)
+                ? error
+                : buildFailed("compile", error),
+          }),
+        ),
+        Effect.flatMap(Schema.encodeEffect(Schema.fromJsonString(CompileWorkerResult))),
+      ),
     );
   }
   async invoke(value: string, callbacks: RpcStub<AppHostCallbacks>): Promise<string> {
     return this.#run(
       Schema.decodeUnknownEffect(Schema.fromJsonString(WorkerInvocation))(value).pipe(
-        Effect.flatMap((input) =>
-          invoke(
-            this.#env,
-            input,
-            this.#lifetime.signal,
-            async (input) =>
-              Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Json))(
-                await callbacks.elicit(JSON.stringify(input)),
+        Effect.flatMap(({ elicitation, workflowControls, ...invocation }) =>
+          runner(this.#env, this.#context).invoke(invocation, {
+            load: async () =>
+              Schema.decodeUnknownSync(Schema.fromJsonString(LoadedWorkerBuild))(
+                await callbacks.load(),
               ),
-            async (input) =>
-              Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Json))(
-                await callbacks.control(JSON.stringify(input)),
-              ),
-          ),
+            elicit: elicitation
+              ? async (input) =>
+                  Schema.decodeUnknownSync(encodedJson)(
+                    await callbacks.elicit(JSON.stringify(input)),
+                  )
+              : null,
+            controls: workflowControls
+              ? async (input) =>
+                  Schema.decodeUnknownSync(encodedJson)(
+                    await callbacks.control(JSON.stringify(input)),
+                  )
+              : null,
+          }),
         ),
-        Effect.flatMap(Schema.encodeUnknownEffect(Schema.fromJsonString(Schema.Json))),
+        Effect.flatMap(Schema.encodeUnknownEffect(encodedJson)),
       ),
     );
   }
@@ -331,7 +337,9 @@ export class AppDataSupervisor extends DurableObject<Environment> {
   readonly #supervisor: Promise<Effect.Success<ReturnType<typeof makeFacetSupervisor>>>;
   constructor(ctx: DurableObjectState, env: Environment) {
     super(ctx, env);
-    this.#supervisor = Effect.runPromise(makeFacetSupervisor(ctx, env.LOADER, appOutbound(env)));
+    this.#supervisor = Effect.runPromise(
+      makeFacetSupervisor(ctx, env.LOADER, appOutbound(ctx), true),
+    );
   }
   async invoke(
     input: typeof FacetInvocation.Type,
@@ -350,6 +358,9 @@ export class AppDataSupervisor extends DurableObject<Environment> {
       ),
     );
     return result;
+  }
+  async cache(namespace: string, command: unknown) {
+    return Effect.runPromise((await this.#supervisor).cache(namespace, command));
   }
   async cancel(id: string) {
     return Effect.runPromise((await this.#supervisor).cancel(id));
@@ -389,7 +400,7 @@ export class AppWorkflows extends WorkflowEntrypoint<Environment, { run: string 
             run: Schema.decodeUnknownSync(WorkflowRunId)(event.payload.run),
           }).pipe(Effect.flatMap(Schema.decodeUnknownEffect(PreparedWorkflow)));
           if (prepared.state === "complete") return prepared.output;
-          const { seed, bundle, accounts } = prepared;
+          const { seed, accounts } = prepared;
           const native = <A>(work: () => Promise<A>) =>
             Effect.tryPromise({ try: work, catch: decodeWorkflowFailure });
           const execution: WorkflowExecution = {
@@ -436,43 +447,57 @@ export class AppWorkflows extends WorkflowEntrypoint<Environment, { run: string 
                 command: json(input),
               }),
             );
-          const result = yield* invoke(
-            this.env,
-            {
-              app: seed.app,
-              build: seed.build,
-              bundle,
-              accounts,
-              command: { operation: "workflow-run", name: seed.name, input: seed.input },
-              headers: {},
-            },
-            lifetime.signal,
-            null,
-            controls,
-            execution,
-          ).pipe(
-            Effect.flatMap(Schema.decodeUnknownEffect(HostResponse)),
-            Effect.flatMap((reply): Effect.Effect<Schema.Json, WorkflowFailure> =>
-              reply.ok
-                ? Schema.decodeUnknownEffect(WorkflowValue)(reply.value).pipe(
-                    Effect.mapError(decodeWorkflowFailure),
-                  )
-                : Effect.fail(decodeWorkflowFailure(reply.error)),
-            ),
-            Effect.matchCause({
-              onSuccess: (output) => ({ ok: true as const, output }),
-              onFailure: (cause) => ({
-                ok: false as const,
-                error: decodeWorkflowFailure(Cause.squash(cause)),
+          const result = yield* runner(this.env, this.ctx)
+            .invoke(
+              {
+                app: seed.app,
+                build: seed.build,
+                database: false,
+                accounts,
+                command: { operation: "workflow-run", name: seed.name, input: seed.input },
+                headers: {},
+              },
+              {
+                // Only a cold start of the run's Worker reads its build from the product.
+                load: () =>
+                  Effect.runPromise(
+                    hostRequest(this.env, { operation: "load", run: seed.runId }).pipe(
+                      Effect.flatMap(Schema.decodeUnknownEffect(LoadedWorkerBuild)),
+                    ),
+                  ),
+                elicit: null,
+                controls,
+                workflow: execution,
+              },
+            )
+            .pipe(
+              Effect.flatMap(Schema.decodeUnknownEffect(HostResponse)),
+              Effect.flatMap((reply): Effect.Effect<Schema.Json, WorkflowFailure> =>
+                reply.ok
+                  ? Schema.decodeUnknownEffect(WorkflowValue)(reply.value).pipe(
+                      Effect.mapError(decodeWorkflowFailure),
+                    )
+                  : Effect.fail(decodeWorkflowFailure(reply.error)),
+              ),
+              Effect.matchCause({
+                onSuccess: (output) => ({ ok: true as const, output }),
+                onFailure: (cause) => ({
+                  ok: false as const,
+                  error: decodeWorkflowFailure(Cause.squash(cause)),
+                }),
               }),
-            }),
-          );
+            );
           if (!result.ok) {
+            const detail = workflowFailureDetail(result.error);
             if (result.error.reason !== "engine" || !result.error.retryable)
               yield* hostRequest(this.env, {
                 operation: "finish",
                 run: seed.runId,
-                result: { ok: false, error: result.error.reason },
+                result: {
+                  ok: false,
+                  error: result.error.reason,
+                  ...(detail === undefined ? {} : { detail }),
+                },
               });
             return yield* result.error;
           }

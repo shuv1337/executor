@@ -6,7 +6,7 @@ import { Api, body } from "../support/api.ts";
 import { HostedLive, withHostedCase } from "../support/case.ts";
 import { Target } from "../support/platform.ts";
 
-layer(HostedLive, { excludeTestServices: true })("Cloud feedback", (it) => {
+layer(HostedLive, { excludeTestServices: true })("Hosted feedback", (it) => {
   it.effect(scenarios.feedback.title, (context) =>
     withHostedCase(
       context,
@@ -16,7 +16,7 @@ layer(HostedLive, { excludeTestServices: true })("Cloud feedback", (it) => {
         const target = yield* Target;
         expect(
           target.metadata.mode,
-          "This scenario requires managed Cloud with the local analytics collector",
+          "This scenario requires a managed product with the local analytics collector",
         ).toBe("managed");
         const anonymous = yield* api.session();
         const route = "/api/organizations/{organization}/feedback";

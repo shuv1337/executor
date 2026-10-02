@@ -1,3 +1,4 @@
+import { LocalTime, timeOfDay } from "../components/local-time.tsx";
 /** A shared review page for tool consent and standard MCP form input. */
 import { useAtomRefresh, useAtomSet, useAtomValue } from "@effect/atom-react";
 import {
@@ -9,6 +10,7 @@ import { Cause, Exit, Match } from "effect";
 import { AsyncResult } from "effect/unstable/reactivity";
 import { useEffect, useState, type ReactNode } from "react";
 import { Button } from "../components/button.tsx";
+import { Code } from "./code.tsx";
 import { Input } from "../components/input.tsx";
 import { Spinner } from "../components/spinner.tsx";
 
@@ -229,9 +231,9 @@ function ApprovalForm({
         Object.keys(request.elicitation._meta).length > 0 && (
           <details className="text-sm" open>
             <summary className="cursor-pointer font-medium">Approval terms and details</summary>
-            <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-muted p-3 text-xs">
-              {JSON.stringify(request.elicitation._meta, null, 2)}
-            </pre>
+            <div className="mt-2 max-h-64 overflow-auto rounded-lg [&_pre]:whitespace-pre-wrap [&_pre]:wrap-anywhere">
+              <Code code={JSON.stringify(request.elicitation._meta, null, 2)} lineNumbers={false} />
+            </div>
           </details>
         )}
       {scopes.length > 0 && (
@@ -279,7 +281,7 @@ function ApprovalForm({
         </Button>
       </div>
       <p className="text-xs text-muted-foreground">
-        Expires at {new Date(request.expiresAt).toLocaleTimeString()}.
+        Expires at <LocalTime value={request.expiresAt} options={timeOfDay} />.
       </p>
     </form>
   );

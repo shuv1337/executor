@@ -3,10 +3,10 @@ import { AppDeploymentsLoading } from "@executor-js/ui/dashboard/app-loading";
 import { AppWorkspace } from "@executor-js/ui/dashboard/app-workspace";
 import { appManagement } from "../../contracts/app-management.ts";
 import { acknowledgeApp, toolsAtom } from "../../contracts/apps.ts";
-import { RegistryContext, useAtomSet, useAtomValue } from "@effect/atom-react";
+import { RegistryContext, useAtomMount, useAtomSet, useAtomValue } from "@effect/atom-react";
 import type { App, DeploymentId } from "@executor-js/sdk";
 import { AppDeployments as SharedAppDeployments } from "@executor-js/ui/dashboard/app-deployments";
-import { QueryView } from "@executor-js/ui/dashboard/context";
+import { QueryView, usePreload } from "@executor-js/ui/dashboard/context";
 import { Button } from "@executor-js/ui/components/button";
 import {
   Dialog,
@@ -41,31 +41,49 @@ export function AppDeployments({ app }: { readonly app: App }) {
       </EmptyStatePanel>
     );
   return (
-    <QueryView
-      query={deploymentsAtom({ organization, app: app.id })}
-      Failure={HostedFailure}
-      pending={<AppDeploymentsLoading />}
-    >
-      {(deployments) => (
-        <SharedAppDeployments
-          app={app}
-          deployments={deployments}
-          deployment={deployment}
-          onDeploymentChange={setSelected}
-          query={sourceAtom({ organization, app: app.id, deployment })}
-          file={(deployment, path) =>
-            sourceFileAtom({ organization, app: app.id, deployment, path })
-          }
-          Failure={HostedFailure}
-          actions={
-            deployment !== app.activeDeployment && (
-              <ActivateDeployment key={deployment} app={app} deployment={deployment} />
-            )
-          }
-        />
-      )}
-    </QueryView>
+    <>
+      <ReadSourceEarly app={app} deployment={deployment} />
+      <QueryView
+        query={deploymentsAtom({ organization, app: app.id })}
+        Failure={HostedFailure}
+        pending={<AppDeploymentsLoading />}
+      >
+        {(deployments) => (
+          <SharedAppDeployments
+            app={app}
+            deployments={deployments}
+            deployment={deployment}
+            onDeploymentChange={setSelected}
+            query={sourceAtom({ organization, app: app.id, deployment })}
+            file={(deployment, path) =>
+              sourceFileAtom({ organization, app: app.id, deployment, path })
+            }
+            Failure={HostedFailure}
+            actions={
+              deployment !== app.activeDeployment && (
+                <ActivateDeployment key={deployment} app={app} deployment={deployment} />
+              )
+            }
+          />
+        )}
+      </QueryView>
+    </>
   );
+}
+
+/** The shown version is known from the app, so its source loads alongside the version list. */
+function ReadSourceEarly({
+  app,
+  deployment,
+}: {
+  readonly app: App;
+  readonly deployment: DeploymentId;
+}) {
+  const { organization } = useOrganizationRoute();
+  const source = sourceAtom({ organization, app: app.id, deployment });
+  usePreload(deploymentsAtom({ organization, app: app.id }), source);
+  useAtomMount(source);
+  return null;
 }
 
 function ActivateDeployment({
@@ -175,6 +193,11 @@ export function AppSource({
         get.refresh(toolsAtom({ organization, app: saved.id }));
       }}
       view={view}
+      live={
+        app.activeDeployment === null
+          ? undefined
+          : sourceAtom({ organization, app: app.id, deployment: app.activeDeployment })
+      }
     />
   );
 }

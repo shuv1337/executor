@@ -1,10 +1,16 @@
 /** Hosted product composition, shared by cloud and self-host only. */
 export { requestServices } from "./implementation/request-services.ts";
 export * from "./contracts/product-analytics.ts";
+export { withExecutorAnalytics } from "./implementation/product-analytics.ts";
 export { HostedApi } from "./contracts/api.ts";
 export { HostedCatalog } from "./contracts/catalog.ts";
 export { hostedHandlers } from "./implementation/api.ts";
 export { catalogLive } from "./implementation/catalog.ts";
+export {
+  hostedApiDocumentRoute,
+  lazyHostedApiDocument,
+  type LazyHostedApiDocument,
+} from "./implementation/api-document.ts";
 export {
   CurrentUserId,
   ApiAuthentication,
@@ -52,6 +58,7 @@ export * from "./contracts/mcp.ts";
 export {
   mcpAuthenticationError,
   apiAuthenticationError,
+  mcpConnectionStore,
   provisionHostedOAuthResources,
 } from "./implementation/mcp-oauth.ts";
 export {
@@ -71,8 +78,6 @@ export { hostedWebhookCallback } from "./implementation/webhooks.ts";
 export { browserMcpRequest, hostedMcpApproval } from "./implementation/mcp-approvals.ts";
 
 export { makeOrganizationIcons } from "./implementation/organization-icons.ts";
-
-export * from "./contracts/execution-admission.ts";
 
 export { resolveOrganizationReference } from "./implementation/organization-reference.ts";
 

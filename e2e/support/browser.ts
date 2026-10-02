@@ -1,23 +1,59 @@
 /** Promise APIs are confined to this driver adapter; Effect owns browser and context scopes. */
-import { chromium, type Browser as NativeBrowser, type Page } from "playwright";
-import { Cause, Clock, Console, Context, Effect, Exit, Layer, Redacted, Result } from "effect";
+import {
+  chromium,
+  webkit,
+  type Browser as NativeBrowser,
+  type BrowserType,
+  type Page,
+} from "playwright";
+import {
+  Cause,
+  Clock,
+  Console,
+  Context,
+  Effect,
+  Exit,
+  Layer,
+  Redacted,
+  Result,
+  Schedule,
+} from "effect";
 import { Target, driver, type DriverFailed } from "./platform.ts";
 import { Evidence } from "./evidence.ts";
 import type { Session } from "./api.ts";
 import { RecordingFocus } from "./recording-focus.ts";
 import { captureUIObservations } from "./ui-observation.ts";
 
-const launchBrowser = (purpose: "capture" | "render") =>
+const launchBrowser = (
+  options: { readonly headless: boolean; readonly slowMo: number },
+  engine: BrowserType = chromium,
+) =>
+  Effect.acquireRelease(
+    driver("launch browser", () => engine.launch(options)),
+    (browser) => driver("close browser", () => browser.close()).pipe(Effect.orDie),
+  );
+
+/**
+ * Headless Chromium names itself "HeadlessChrome", which the dashboard server treats as a crawler
+ * and answers only once the whole page has rendered. Cases present the desktop Chrome identity so
+ * they receive the streamed page a person's browser receives.
+ */
+const visitorUserAgent = (browser: NativeBrowser) =>
+  browser.browserType().name() === "chromium"
+    ? {
+        userAgent: `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${browser.version().split(".")[0]}.0.0.0 Safari/537.36`,
+      }
+    : {};
+
+const captureBrowser = (engine: BrowserType) =>
   Effect.gen(function* () {
     const target = yield* Target;
-    return yield* Effect.acquireRelease(
-      driver("launch browser", () =>
-        chromium.launch({
-          headless: target.headless ?? !target.metadata.interactive,
-          slowMo: purpose === "capture" ? target.recordingPaceMs : 0,
-        }),
-      ),
-      (browser) => driver("close browser", () => browser.close()).pipe(Effect.orDie),
+    return yield* launchBrowser(
+      {
+        headless: target.headless ?? !target.metadata.interactive,
+        slowMo: target.recordingPaceMs,
+      },
+      engine,
     );
   });
 
@@ -26,9 +62,11 @@ export class BrowserDriver extends Context.Service<BrowserDriver, NativeBrowser>
   "e2e/BrowserDriver",
 ) {
   /** Rendering is never paced, even when the source recording was captured slowly. */
-  static readonly layer = Layer.effect(BrowserDriver, launchBrowser("render"));
+  static readonly layer = Layer.effect(BrowserDriver, launchBrowser({ headless: true, slowMo: 0 }));
   /** Instrument individual actions, including several actions inside one use call. */
-  static readonly captureLayer = Layer.effect(BrowserDriver, launchBrowser("capture"));
+  static readonly captureLayer = Layer.effect(BrowserDriver, captureBrowser(chromium));
+  /** Safari's engine, for behavior that differs from Chromium. */
+  static readonly webkitCaptureLayer = Layer.effect(BrowserDriver, captureBrowser(webkit));
 }
 /** A case-scoped browser with captured steps and a single isolated context. */
 export class Browser extends Context.Service<
@@ -67,11 +105,14 @@ export class Browser extends Context.Service<
         originMatches?: boolean;
       }[] = [];
       let page: Page | undefined;
+      // Whether the current document has been seen responding to input; see `interactive`.
+      let responsive = false;
       let tracing = true;
       const context = yield* driver("create browser context", () =>
         browser.newContext({
           baseURL: target.metadata.origin,
           viewport: { width: 1440, height: 960 },
+          ...visitorUserAgent(browser),
           recordVideo: { dir: `${evidence.directory}/raw`, size: { width: 1440, height: 960 } },
         }),
       );
@@ -88,7 +129,7 @@ export class Browser extends Context.Service<
               );
             }
             const screenshot = yield* driver("failure screenshot", () =>
-              failedPage.screenshot(),
+              failedPage.screenshot({ timeout: 5000 }),
             ).pipe(Effect.result);
             if (Result.isSuccess(screenshot))
               yield* evidence.attach("failure.png", "image/png", screenshot.success);
@@ -136,6 +177,7 @@ export class Browser extends Context.Service<
           current.setDefaultNavigationTimeout(30000);
           current.on("framenavigated", (frame) => {
             if (frame === current.mainFrame()) {
+              responsive = false;
               const url = new URL(frame.url());
               const now = clock.currentTimeMillisUnsafe();
               navigations.push({
@@ -195,13 +237,83 @@ export class Browser extends Context.Service<
           return { page: current, focus, capture };
         }),
       );
+      // Dashboard documents arrive rendered but respond to input only once hydrated, as for
+      // a person waiting for the page's scripts. Regions stream in after the page itself
+      // hydrates; TanStack removes `$_TSR` once the router has hydrated and the whole document
+      // has arrived. Other pages, such as sign-in providers, do not wait. A scenario that stops
+      // a dashboard from starting continues after the wait expires; its own assertions decide
+      // the outcome.
+      // The check walks only comment nodes natively, so it stays cheap on a page with a very
+      // large DOM. An evaluation that a navigation interrupts is repeated on the new document.
+      // Once a document responds or the wait expires, later steps skip the check until the page
+      // navigates again.
+      const interactive = (page: Page) =>
+        Effect.suspend(() =>
+          responsive
+            ? Effect.void
+            : driver("page responds to input", () =>
+                page.evaluate(() => {
+                  const root = document.documentElement;
+                  if (!root.hasAttribute("data-dashboard")) return true;
+                  if (!root.hasAttribute("data-hydrated") || "$_TSR" in window) return false;
+                  // Regions streamed into the page hydrate after the page itself. React marks
+                  // each element it has hydrated; the first element of every completed region
+                  // must carry that mark.
+                  // A region that has arrived is not shown at once: React batches reveals and
+                  // may hold one for several hundred milliseconds after the router hydrates.
+                  // Until then the region is marked `$?` or `$~`, its fallback is on screen and
+                  // its content waits in a hidden element that does not respond to input.
+                  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_COMMENT);
+                  for (let node = walker.nextNode(); node !== null; node = walker.nextNode()) {
+                    if (!(node instanceof Comment)) continue;
+                    if (node.data === "$?" || node.data === "$~") return false;
+                    if (node.data !== "$") continue;
+                    // The region ends at its closing marker; an empty region has no element.
+                    let first = node.nextSibling;
+                    while (
+                      first !== null &&
+                      !(first instanceof Element) &&
+                      !(first instanceof Comment && first.data === "/$")
+                    )
+                      first = first.nextSibling;
+                    if (
+                      first instanceof Element &&
+                      !Object.keys(first).some((key) => key.startsWith("__reactFiber$"))
+                    )
+                      return false;
+                  }
+                  return true;
+                }),
+              ).pipe(
+                Effect.flatMap((ready) =>
+                  ready
+                    ? Effect.sync(() => {
+                        responsive = true;
+                      })
+                    : Effect.fail("hydrating" as const),
+                ),
+                Effect.retry({ schedule: Schedule.spaced("50 millis") }),
+                Effect.timeout("10 seconds"),
+                Effect.ignore,
+                // Wait once per document. A document that never responds is not waited on again
+                // by later steps until the page navigates.
+                Effect.ensuring(
+                  Effect.sync(() => {
+                    responsive = true;
+                  }),
+                ),
+              ),
+        );
       const use = <A>(label: string, action: (page: Page) => Promise<A>) =>
         evidence.step(
           label,
           Effect.flatMap(getPage, ({ page, focus, capture }) =>
             focus.use(
               label,
-              driver(label, () => action(page)).pipe(Effect.tap(() => capture.settle)),
+              driver(label, () => action(page)).pipe(
+                Effect.tap(() => interactive(page)),
+                Effect.tap(() => capture.settle),
+              ),
             ),
           ),
         );

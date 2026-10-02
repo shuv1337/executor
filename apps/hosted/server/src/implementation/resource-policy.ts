@@ -52,8 +52,9 @@ const AppPolicy = Schema.Struct({
   granted: Schema.Boolean,
 });
 /** Resolve app policies in one read, retaining tenant and group checks for every row. */
-const applicationAccesses = (apps: readonly AppId[], actor: ResourceAuthority) =>
+export const applicationAccesses = (apps: readonly AppId[], actor: ResourceAuthority) =>
   Effect.gen(function* () {
+    if (apps.length === 0) return [];
     const sql = yield* policyDatabase;
     const rows = yield* sql`select p.id as app, p.creator_id as creator, p.audience, p.revision,
     array(select g.group_id from hosted_app_groups g where g.app_id = p.id order by g.group_id) as groups,
@@ -106,8 +107,9 @@ const AccountPolicy = Schema.Struct({
   granted: Schema.Boolean,
 });
 /** Read account policies together; personal accounts remain private even from administrators. */
-const accountAccesses = (accounts: readonly AccountId[], actor: ResourceAuthority) =>
+export const accountAccesses = (accounts: readonly AccountId[], actor: ResourceAuthority) =>
   Effect.gen(function* () {
+    if (accounts.length === 0) return [];
     const sql = yield* policyDatabase;
     const rows = yield* sql`select p.account_id as account, p.creator_id as creator, p.kind,
     p.personal_user_id as "personalUser", p.audience, p.revision,
@@ -164,8 +166,14 @@ export const accountAccess = (account: AccountId, actor: ResourceAuthority) =>
 
 /** Read access may include management; management never authorizes execution. */
 export const requireAppAccess = (app: AppId, action: "read" | "manage" | "use") =>
+  Effect.flatMap(currentResourceAuthority, (actor) => requireAppAccessAs(actor, app, action));
+/** Check app access for an actor already resolved in this operation. */
+export const requireAppAccessAs = (
+  actor: ResourceAuthority,
+  app: AppId,
+  action: "read" | "manage" | "use",
+) =>
   Effect.gen(function* () {
-    const actor = yield* currentResourceAuthority;
     const access = yield* applicationAccess(app, actor);
     const allowed =
       action === "use"
@@ -213,8 +221,16 @@ export const requireAppUse = (app: App, organization: OrganizationId, user: stri
   );
 /** Account metadata allows shared-account managers; personal metadata has no admin bypass. */
 export const requireAccountAccess = (account: AccountId, action: "read" | "manage" | "use") =>
+  Effect.flatMap(currentResourceAuthority, (actor) =>
+    requireAccountAccessAs(actor, account, action),
+  );
+/** Check account access for an actor already resolved in this operation. */
+export const requireAccountAccessAs = (
+  actor: ResourceAuthority,
+  account: AccountId,
+  action: "read" | "manage" | "use",
+) =>
   Effect.gen(function* () {
-    const actor = yield* currentResourceAuthority;
     const access = yield* accountAccess(account, actor);
     const allowed =
       action === "use"

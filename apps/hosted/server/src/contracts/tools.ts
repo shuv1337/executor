@@ -1,6 +1,5 @@
 import { ProfileErrors } from "@executor-js/sdk/core";
 import { RequiredAction } from "./authorization.ts";
-import { ExecutionLimitReached, ExecutionAdmissionUnavailable } from "./execution-admission.ts";
 /** Account-dependent discovery and execution within a configured app. */
 import {
   AccountNotFound,
@@ -20,6 +19,7 @@ import {
   InputInvalid,
   Json,
   OAuthReconnectRequired,
+  OAuthRenewalFailed,
   StorageError,
   RequestInvalid,
   ToolBlocked,
@@ -28,8 +28,13 @@ import {
   ToolCallFailed,
   ToolElicitationFailed,
   ToolName,
+  ToolIndex,
   ToolNotFound,
+  ToolListingTimedOut,
+  ToolKind,
+  ToolKindMismatch,
   ToolPage,
+  Tool,
 } from "@executor-js/sdk/core";
 import { Schema } from "effect";
 import { HttpApiEndpoint, HttpApiGroup } from "effect/unstable/httpapi";
@@ -48,11 +53,13 @@ const discoveryErrors = [
   AppNotDeployed,
   DeploymentNotFound,
   AppEvaluationFailed,
+  ToolListingTimedOut,
   AppProviderFailed,
   AccountNotFound,
   AccountRequired,
   AccountSelectionInvalid,
   OAuthReconnectRequired,
+  OAuthRenewalFailed,
 ] as const;
 const prefix = "/api/organizations/:organization/apps/:app/tools";
 /** Members may discover tools; execution requires an administrator in the handler. */
@@ -71,10 +78,36 @@ export const HostedTools = HttpApiGroup.make("tools")
     }).annotate(RequiredAction, "discover"),
   )
   .add(
+    HttpApiEndpoint.get("index", `${prefix}/index`, {
+      params,
+      query: {
+        deployment: Schema.optional(DeploymentId),
+        profile: Schema.optional(ProfileId),
+        expectedProfileRevision: Schema.optional(ProfileRevision),
+      },
+      success: ToolIndex,
+      error: discoveryErrors,
+    }).annotate(RequiredAction, "discover"),
+  )
+  .add(
+    HttpApiEndpoint.get("get", `${prefix}/:tool`, {
+      params: { ...params, tool: ToolName },
+      query: {
+        deployment: Schema.optional(DeploymentId),
+        profile: Schema.optional(ProfileId),
+        expectedProfileRevision: Schema.optional(ProfileRevision),
+      },
+      success: Tool,
+      error: [...discoveryErrors, ToolNotFound],
+    }).annotate(RequiredAction, "discover"),
+  )
+  .add(
     HttpApiEndpoint.post("call", `${prefix}/call`, {
       params,
       payload: Schema.Struct({
         tool: ToolName,
+        /** "query" for tools the catalog marks readOnly, otherwise "mutation". Omitted, it is read from the catalog. */
+        kind: Schema.optional(ToolKind),
         input: Json,
         deployment: Schema.optional(DeploymentId),
         profile: Schema.optional(ProfileId),
@@ -84,6 +117,7 @@ export const HostedTools = HttpApiGroup.make("tools")
       error: [
         ...discoveryErrors,
         ToolNotFound,
+        ToolKindMismatch,
         InputInvalid,
         ToolCallFailed,
         ToolElicitationFailed,
@@ -92,8 +126,6 @@ export const HostedTools = HttpApiGroup.make("tools")
         ToolPolicyFailed,
         RequestInvalid,
         OrganizationForbidden,
-        ExecutionLimitReached,
-        ExecutionAdmissionUnavailable,
       ],
     }).annotate(RequiredAction, "run"),
   )

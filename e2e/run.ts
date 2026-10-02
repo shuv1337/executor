@@ -5,6 +5,12 @@ import { Effect, Layer } from "effect";
 import { Command, Flag } from "effect/unstable/cli";
 import { FetchHttpClient } from "effect/unstable/http";
 import { runSuite } from "./sdk/suite.ts";
+
+/**
+ * Each worker runs its own product server, PGlite database and browser, which together keep about
+ * two cores busy. Sixteen workers on 12-16 vCPUs starved servers for seconds at a time.
+ */
+const defaultWorkers = Math.max(1, Math.min(16, Math.floor(navigator.hardwareConcurrency / 2)));
 const command = Command.make(
   "e2e",
   {
@@ -12,7 +18,7 @@ const command = Command.make(
       Flag.withDefault("self-host"),
     ),
     name: Flag.String("test-name").pipe(Flag.withDefault("")),
-    workers: Flag.Int("workers").pipe(Flag.withDefault(4)),
+    workers: Flag.Int("workers").pipe(Flag.withDefault(defaultWorkers)),
   },
   runSuite,
 );

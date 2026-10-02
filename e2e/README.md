@@ -2,25 +2,26 @@
 
 The suite uses Effect v4 and `@effect/vitest`. Scenarios use `layer` and `it.effect`.
 Effect owns the servers, HTTP clients, actors, browser contexts, concurrency,
-recording export, and cleanup. The test runtime uses live clocks because it talks
+raw evidence capture, and cleanup. The test runtime uses live clocks because it talks
 to real processes. It does not import Executor implementations or construct partial
 application servers.
 
 Playwright is the browser driver, behind an injected Effect adapter. Its test runner
-and fixture system are not used. React renders the saved evidence report.
+and fixture system are not used. React renders evidence only when requested.
+Normal runs, including CI and failed runs, do not build the viewer, render videos,
+or generate HTML reports.
 
 ## Run
 
 ```sh
 bun install
-bunx playwright install chromium
-# ffmpeg and ffprobe must also be on PATH.
+bunx playwright install chromium webkit
 bun run e2e:prepare
 bun run e2e:self-host
 ```
 
-`e2e:prepare` builds the dashboards and bundled Motel. Run it again after changing
-either. The server runs current TypeScript source. `bun run e2e:check` runs the
+`e2e:prepare` builds the dashboards, app framework, bundled Motel and shared
+workerd runtime artifact. Run it again after changing these inputs. The server runs current TypeScript source. `bun run e2e:check` runs the
 boundary check and TypeScript check; the root `check` includes it.
 
 ```sh
@@ -30,8 +31,9 @@ bun run e2e:self-host --test-name 'password login'
 ```
 
 The default data-volume scenario remains 1,000 accounts with four concurrent
-writers. Smaller runs use the same assertions. `--test-name` is a Vitest name
-filter; filtered cases are not counted as executed cases in the evidence view.
+writers. Smaller runs use the same assertions. `--test-name` is a regular expression
+matched against scenario titles, without the enclosing Vitest suite name.
+Filtered cases are not counted as executed cases in the evidence view.
 
 ## Dependency injection
 
@@ -52,25 +54,82 @@ filter; filtered cases are not counted as executed cases in the evidence view.
 - `RecordingFocus`: one clock and an ordered activity log for every recorded window.
 - `Terminal`: scoped Terminal Control sessions; each `use` call selects that window in the recording.
 
-Each test yields the services it needs. `withCase` provides the per-case Layers;
-it does not register tests or replace Vitest's lifecycle. `@effect/vitest` owns
-suite sharing and test interruption. Effect scopes close browsers, save evidence,
+Each test yields the services it needs. Native Vitest setup hooks start the isolated
+server and provision the actors declared in the test plan. Provisioning belongs to
+the setup deadline; scenario actions retain their full deadline. Scenarios that need
+the default management app can declare `managementProfiles` with the required actor
+roles. Setup waits for those committed profiles through public APIs. Scenarios that
+exercise provisioning progress leave that prerequisite undeclared. Scenarios that need
+another Testing SDK scenario declare `sdkScenarios`; setup creates each one in a
+child scope the test may close. Native cleanup
+hooks release those fixtures and close the server scope. `withCase` provides the per-case Layers;
+`@effect/vitest` owns suite sharing and test interruption. The scenario deadline
+is 60 seconds, with separate 60-second setup and cleanup deadlines and no retries.
+`report/lifecycle/` records setup, scenario, cleanup and total elapsed times.
+The report uses Vitest's final result so a cleanup failure cannot appear as a pass.
+Effect scopes close browsers, save evidence,
 and stop child processes. Owned server process groups get a 15-second graceful
 shutdown window before Effect escalates to SIGKILL. `Effect.forEach` bounds concurrent writes and waits for
 interrupted children. Transport failures are typed and do not expose credentials.
 
+`e2e:prepare` builds `.local/test-runtime/host.json` once. Each isolated local or
+self-host process reads that explicit artifact instead of rebuilding the same
+trusted runtime. Rebuild with `e2e:prepare` after source changes; scenario data
+and processes remain isolated. Product listeners use an OS-assigned port.
+
+Local and self-host restart scenarios can advance persisted wall time while their
+server is stopped through the authenticated runner control API. A runner-owned
+preload, loaded by Node and Bun, sets wall time for source and installed CLI
+processes. It is never packaged. The control API's `kill` ends the product process
+group with SIGKILL, running none of its shutdown, to model a crash.
+Sleep timers and duration measurements stay real. This tests
+minute-based scheduling without adding a minute of sleep to each scenario.
+
 Each case owns its fixtures. Self-host runs signup and invitations against a new
 process and PGlite directory. Local uses its own process, database and pairing key.
 Cloud shares one Worker and database while each case owns a random organization
-and three synthetic identities. A runner-owned loopback process provisions Cloud
+and three synthetic identities. Managed Cloud serves the built site through that
+Worker, including its static asset rewrites and server-resolved entry pages.
+It does not start Vite's source development server. A runner-owned loopback process provisions Cloud
 fixtures. It keeps database and signing credentials in memory. Neither those
 credentials nor fixture endpoints are installed in the Worker.
+The test plan declares `appOrigin: true` for scenarios that use private app URLs.
+Deployed preparation verifies those HTTPS origins before the scenario deadline;
+an origin that misses the infrastructure deadline produces a native setup failure
+for its scenario. Beside organization provisioning, a dedicated organization
+deploys one small app through `POST /apps/deploy` until the freshly deployed
+compiler Worker builds it, within the same infrastructure deadline; otherwise
+preparation fails with `CompilerNotReady`. An organization whose actors are not provisioned within their
+60-second deadline does the same. Independent scenarios still run. The preparation
+report retains each unavailable organization and its failure, the number of ready
+origins, both phase timings, and each origin's probe count and last safe DNS, TLS,
+or HTTP failure. All origin probes start together. Fallback
+organization cleanup uses the worker bound and preserves release order within
+each scenario, including when another organization's cleanup fails.
 
-Files run in parallel with four workers by default. Use `--workers 1` through
-`--workers 32` to set the bound. A file's cases retain their declared sequence.
+Files run in parallel with one worker per two CPUs by default, up to 16. Each worker
+runs its own product server and browser. Use `--workers 1` through `--workers 32` to
+set the bound. A file's cases retain their declared sequence.
 Interactive recordings use one worker. Filters load only applicable files.
+Each unattended test has a 60-second timeout, except the 1,000-account self-host
+inventory case, which has 120 seconds. Cleanup hooks retain a separate
+60-second timeout. Interactive inspection has no test timeout.
 Within a scenario, use `Effect.all` or `Effect.forEach` with a concurrency bound
 when operations are independent. Keep dependent actions ordered.
+
+The self-host load case creates 1,000 accounts through four concurrent API
+writers. The MCP catalog scale case deploys 29 apps with 7,000 tools and about
+46 MB of input schemas, plus three MCP apps with profiles whose server never answers, and bounds
+execute and search latency. CI gives both cases their own 16-vCPU Linux runner, one
+after the other, in parallel with the functional suite. The PGlite workload depends on single-thread speed. Running both workloads on one machine can consume its CPU budget and
+invalidate the load timing. The normal self-host command still includes every
+applicable case. To reproduce the CI split, use separate machines:
+
+```sh
+bun run e2e:self-host --test-name '^(?!.*(?:Claude Code connects|concurrent owners and admins save every account|MCP execute over 7,000 tools))'
+bun run e2e:self-host --test-name 'concurrent owners and admins save every account'
+bun run e2e:self-host --test-name 'MCP execute over 7,000 tools'
+```
 
 ## Shared SDK and interactive CLI
 
@@ -157,7 +216,19 @@ non-root execution, generated key permissions, and refusal to replace missing ke
 The explicit-settings scenario also checks allowed internal imports, preserved Host
 headers, and DNS rejection before any connection, including redirected imports.
 It clones and pushes app source through the image's Git HTTP server, then checks
-the committed files through the workspace API before and after replacement:
+the committed files through the workspace API before and after replacement.
+
+A separate case serves the image at a tailnet-style origin. It creates a Docker
+network in `100.64.0.0/10`, gives the container a fixed address there and maps
+`nexus.example.ts.net` to that address inside the container. `BETTER_AUTH_URL`
+uses that name, and `EXECUTOR_APPS_ALLOW_PRIVATE_FETCH` is unset. After
+first-admin setup, an API key calls the built-in Executor app through `/mcp`. An
+authored app then checks that it cannot fetch the container's private address.
+The runner reaches the server through a port published on `127.0.0.1` in the
+range 4431-4439. It sends each request with the tailnet `Host` header through
+`node:http`, because Node's `fetch` replaces that header. This works with Docker
+Desktop, OrbStack and Linux Docker. The case removes its container, network and
+anonymous volume:
 
 ```sh
 EXECUTOR_E2E_DOCKER_IMAGE=<image-tag> EXECUTOR_E2E_DOCKER_ARCH=arm64 \
@@ -177,6 +248,12 @@ login, encrypted credentials, app data, frontend availability and execution. It
 reads the previous build version from the image and checks the new version after
 replacement.
 
+The same config runs `docker-oauth-renewal.spec.ts` against the image. It shares the
+runner's network so the container reaches a loopback token endpoint that rotates
+refresh tokens. A slow renewal holds its claim while other calls wait, a renewal
+survives its caller disconnecting, and `docker kill` mid-renewal followed by an
+immediate `docker start` recovers the grant within an execute deadline.
+
 | Command                 | Target                                                          | Current coverage                                              |
 | ----------------------- | --------------------------------------------------------------- | ------------------------------------------------------------- |
 | `bun run e2e:self-host` | Fresh Node/PGlite self-host                                     | Shared hosted scenario, password login, account volume, Motel |
@@ -193,6 +270,11 @@ Cloudflare, PlanetScale, Google, GitHub, Context.dev, or 1Password credentials
 are needed. Docker must be running; Bun, Playwright Chromium and ffmpeg are
 normal tool prerequisites.
 
+The disposable Postgres server allows 512 connections. The local Worker connects
+directly, so concurrent requests and background jobs cannot share a pooler's
+backend connections. PostgreSQL's default 100 slots can reject parallel
+scenario startup. This capacity setting applies only to the managed test container.
+
 Setting `E2E_CLOUD_URL` explicitly attaches to that server instead. A failed
 attached target stays failed; it does not fall back to a local instance. The
 report identifies the origin, managed/attached mode and local Worker runtime.
@@ -208,9 +290,8 @@ The SDK isolation scenario also runs on the disposable Cloud stage. Deployed
 runs use a scoped Axiom reader for delivered telemetry. This is correctness
 coverage; it does not establish Cloud load capacity.
 
-Neon stages connect directly to Neon's pooled endpoint with verified TLS and
-allocate no Hyperdrive configuration. Explicit PlanetScale stages retain Hyperdrive.
-Realistic concurrent CI coverage of that path is tracked in
+Neon stages connect to Neon's pooled endpoint and PlanetScale stages to their
+branch's PgBouncer, both directly over verified TLS. Realistic concurrent CI coverage of that path is tracked in
 [#508](https://github.com/UsefulSoftwareCo/executor-next/issues/508).
 
 ### MCP server scenarios
@@ -259,20 +340,45 @@ navigation, protocol metadata and request timings remain. Protocol revisions in
 `mcp-*.json` describe the official SDK client. `claude-client.json` records the
 actual CLI version, model, permission mode and model API.
 
+`tests/local-claude-mcp.spec.ts` runs the same Claude Code journey against Local.
+Local has no organization, so its consent adapter pairs the synthetic operator
+through `/auth/pair` and `/auth/exchange`, approves the client on Local's
+`/mcp/authorize` page and revokes the grant afterwards. CI excludes both Claude
+scenarios because it holds no model API key:
+
+```sh
+bun run e2e:local --test-name 'Claude Code connects'
+```
+
 Executor's native tool-policy approval and browser tool approval remain separate
-coverage. Local is N/A for these hosted OAuth scenarios.
+coverage. The SDK protocol scenario remains hosted-only.
 App and grant cleanup uses public endpoints. Anonymous OAuth client registrations
 remain on the dedicated stage because the product has no public deletion flow;
 cleanup evidence calls this out. No active grants are deliberately retained.
 
 ## Evidence
 
-The runner prints `.local/e2e/<run>/report/index.html`. Serve that folder on loopback
-with the Effect report server:
+The runner prints the saved run directory and an explicit render command. It keeps
+raw case results, screenshots, browser/terminal captures, traces, Vitest JSON
+results, and a combined `evidence.json` manifest. No rendering runs automatically,
+even on failure. Test failures and empty filters still fail the test command.
+
+When evidence needs review, render the retained run, then serve the report on
+loopback. Rendering needs Playwright Chromium installed, plus ffmpeg and ffprobe
+on PATH. The command builds the viewer assets. It does not start servers, deploy, provision
+accounts, or need credentials. It can run after the test environment is destroyed.
 
 ```sh
+bun run e2e:render --directory .local/e2e/<run>
 bun run e2e:report --directory .local/e2e/<run>/report
 ```
+
+For CI failures, download and extract the evidence artifact, then pass the
+extracted run directory (the one containing `evidence.json` and target folders)
+to `e2e:render`. Keep the target folders together. Rendering uses relative paths,
+so it does not depend on the CI workspace path. Use the checkout at the run's
+recorded commit. The SDK also exports `renderSuiteEvidence`; SDK callers must
+build the viewer assets with `bun run e2e:viewer:build` first.
 
 All assets and media use relative links. The React viewer
 opens with a searchable results list, status/target filters and 50-row pages. Each
@@ -285,25 +391,24 @@ While dragging the seek bar, a thumbnail strip and timestamp appear above it.
 Releasing the scrubber hides the strip. It overlays the footage so the scrubber
 does not move. The exporter generates the eight-frame overview from the final
 composed video, so it follows the same edit as playback. It loads only for the
-selected test. Generation happens after
-test execution. Existing reports without thumbnails retain the plain seek bar.
+selected test. Generation happens only during the explicit render command.
+Existing reports without thumbnails retain the plain seek bar.
 
 The player includes keyboard seeking,
 five-second back/forward buttons, playback speed and fullscreen controls. Controls
 stay below the footage. The report server supports byte-range requests for seeking
 without downloading the entire recording first.
 
-Local recordings automatically pace browser actions by 500ms and leave a 1-second
-reading pause after browser and terminal operations. Playwright instruments the
-individual actions, including multiple actions inside one `Browser.use` call.
-The shared recording driver owns reading pauses; tests do not add sleeps.
-`CI=true` disables both delays while retaining recordings for failures and review.
-Override either default with `E2E_RECORDING_PACE_MS` (0–3000):
+Local and CI runs use no artificial action or reading delays. Raw evidence is
+still captured. For a deliberately slower recording, set `E2E_RECORDING_PACE_MS`
+(0–3000). Playwright instruments individual actions, including multiple actions
+inside one `Browser.use` call. The shared driver owns reading pauses; tests do
+not add sleeps.
 
 ```sh
-# Full-speed local run, with the same evidence capture
-E2E_RECORDING_PACE_MS=0 bun run e2e:cloud --test-name 'Cloud onboarding'
-# Watchable recording, even on CI
+# Full-speed run with normal evidence capture
+bun run e2e:cloud --test-name 'Cloud onboarding'
+# Deliberately slower recording for review
 E2E_RECORDING_PACE_MS=500 bun run e2e:cloud --test-name 'Cloud onboarding'
 ```
 
@@ -324,13 +429,11 @@ source captures. Terminal Control exports include startup so their time axes sta
 aligned with the browser capture.
 
 Tests save raw terminal captures and close their live sessions. Terminal video
-encoding, browser address-bar rendering, and composition start only after every
-selected target's test process has exited. Rendering one target therefore cannot
-compete with a still-running target. The CLI reports evidence-processing time
-separately, and each recording has an `evidence-processing.json` attachment. Those
-times are excluded from the test duration; raw capture and normal cleanup still
-belong to the test's resource scope. Export failures fail the overall command and
-retain the raw captures for diagnosis.
+encoding, browser address-bar rendering, and composition run only when requested
+with `e2e:render`. The render command reports processing time separately. Each
+recording has an `evidence-processing.json` attachment. Those times are excluded from the test duration; raw capture and normal cleanup still
+belong to the test's resource scope. Export failures fail the render command and
+retain the raw captures for diagnosis. They do not change the saved test result.
 
 N/A means the test is explicitly irrelevant to that target, with the reason
 available on hover. Not run means the test is relevant but has no result, or
@@ -341,10 +444,10 @@ each report; missing evidence alone never becomes N/A.
 
 Each case saves steps, request status/timings, trace IDs, latency percentiles,
 checkpoints, a Playwright trace and a video when it opens a page. Failed and
-interrupted cases retain evidence. Native Vitest diagnostics remain linked from
-the report. A failing target makes the command fail after report generation.
+interrupted cases retain evidence. Native Vitest JSON results remain linked from
+the report. A failing target makes the test command fail after saving raw results.
 
-After capture, an Effect operation adds a 72px address bar with 28px text above
+On explicit rendering, an Effect operation adds a 72px address bar with 28px text above
 the recorded page. Query strings/fragments are omitted. Playwright renders the
 bar images and scoped ffmpeg processes compose the MP4; the tested page is never
 modified. Raw video and trace artifacts remain in the case directory.
@@ -479,11 +582,12 @@ The scenario requires that observation and checks that the row remains absent
 after the authored body would otherwise have returned.
 
 The sleep scenario defaults to one second. On a dedicated deployed stage, set
-`E2E_WORKFLOW_HOLD_MS=180000` to provide a three-minute host deployment window:
+`E2E_WORKFLOW_HOLD_MS=180000` to provide a three-minute host deployment window.
+Interactive mode disables the normal 60-second test limit for this manual check:
 
 ```sh
 # Supply the running environment attachment as described above.
-E2E_WORKFLOW_HOLD_MS=180000 bun run e2e:cloud --test-name 'workflow sleep preserves'
+E2E_INTERACTIVE=1 E2E_WORKFLOW_HOLD_MS=180000 bun run e2e:cloud --test-name 'workflow sleep preserves'
 ```
 
 Wait for `Workflow sleep window` and inspect the native Cloudflare instance to
@@ -532,8 +636,10 @@ refresh and callback parameter tampering through the production transport seam.
 `app query traces connect browser, streamed host work, runtime and React commits`
 uses a real app, checks two results while its stream is open, then closes it and
 requires a complete parent graph. It checks linked source maps without embedded
-source text, preserved drafts, and a deliberately failed subscription followed
-by a linked retry. The failed attempt must also be present in the collector.
+source text and preserved drafts. Separate scenarios check warm query timing,
+a failed subscription followed by a linked retry, and live access revocation.
+Each scenario owns its app and organization. The retry scenario requires both
+the failed attempt and its native link to reach the collector.
 
 Self-host reads actual delivery through Motel. For a dedicated deployed Cloud
 stage, bind `E2E_AXIOM_TOKEN` through the credential launcher and set
@@ -547,7 +653,7 @@ results fail; missing parents are never replaced by synthetic success records.
 
 `framework discovery deploys its checked example with optimistic updates and rollback`
 reads the built-in app through MCP, checks native and imported tool output signatures,
-follows a pinned skill topic, and deploys the example returned by `framework_describe`.
+follows a pinned skill topic, and deploys the example returned by `framework.describe`.
 It holds the real write and reconciliation read at the browser boundary, checks the
 optimistic row and draft, rejects a later write, then retries and reloads persisted data.
 Run it with `bun run e2e:self-host --test-name 'framework discovery deploys'`.
@@ -569,8 +675,22 @@ all three deletions persisted after the tab closed.
 runs the ordinary Cloud scenarios, and destroys it even on failure. Supply the
 staging credentials through the approved launcher. Use `--database planetscale`
 for the release checks, or `--test-name '<scenario>'` for focused verification.
+Alchemy disables Better Auth rate limits on automated `test-e2e-*` stages so
+parallel scenarios do not share the runner IP's request allowance. Set
+`TEST_STAGE_AUTH_RATE_LIMIT=true` when deploying a stage for focused rate-limit
+checks. Production and ordinary previews always retain rate limits. Local and
+Cloud CI jobs use 16-vCPU runners. Self-host functional tests use a 12-vCPU Mac;
+the 1,000-account test runs independently on a 6-vCPU Mac.
 The same tests run on both providers. Add new Cloud scenarios normally in
 `test-plan.ts`; no deployment fixture belongs in a scenario.
+
+The deployed runner provisions the selected actor fixtures together before
+starting Vitest. Each run gives each scenario a new 128-bit identity. The runner
+then checks the actual HTTPS domains, including normal certificate verification.
+Certificate issuance belongs to environment preparation, with a five-minute
+limit, and is reported separately from test time. Per-scenario setup, assertions,
+and cleanup retain their separate 60-second deadlines. The suite owns all
+prepared organizations, including those whose tests never start after a failure.
 
 Only scenarios declaring `runtime: "managed"` require the local Cloud target
 (for example, local telemetry collectors). Their deployed report says N/A with
@@ -588,6 +708,12 @@ Run it alone with `bun run e2e:deployed --test-name 'Cloud compiler memory failu
 The default deployed filter excludes it because exhausting the shared compiler
 can interrupt other scenarios' builds.
 
+The deployed job runs after the functional checks on `main`. PRs run the emulated Cloud target.
+Main and manual deployed CI jobs share one non-cancelling concurrency group;
+scenario workers remain parallel within each job. Agents can still run targeted
+disposable deployments through this CLI. The job retains raw evidence and destroys its
+own environment.
+
 ### Installed CLI artifact
 
 To verify the installed CLI artifact through the same local scenarios, set
@@ -595,6 +721,23 @@ To verify the installed CLI artifact through the same local scenarios, set
 `bun run e2e:local`. The harness starts that entry from its isolated data directory,
 with synthetic secrets. Pairing, dashboard loading and app deployment/call use
 real HTTP requests against the installed package.
+
+The first-launch key scenarios also run against an installed entry:
+
+```sh
+EXECUTOR_E2E_LOCAL_ENTRY=/path/to/node_modules/executor/bin.mjs \
+  bunx vitest run --config e2e/local-bootstrap.config.ts
+```
+
+The OS credential scenario uses the real store and removes only its own entry.
+The key file and denied-access scenarios never touch the real store. They start
+the CLI with a stand-in keyring module that reproduces the package's errors: an
+absent store, a cancelled or dismissed prompt, and a store that grants access.
+Only an absent store may fall back to `keys.json`. The key storage scenario
+covers `EXECUTOR_KEY_STORAGE`: `file` on a new or denied-pending directory,
+no-ops on matching directories, refusals on mismatched ones, and invalid values. On Linux outside a D-Bus
+session, set `EXECUTOR_E2E_CREDENTIAL_STORE=absent` to use the real missing
+Secret Service for the key file scenario instead; release CI runs both.
 
 The desktop artifact smoke uses the packaged executable, synthetic secrets and a
 fresh profile/data directory. It deploys a dependency-using app, calls it, closes
@@ -615,3 +758,7 @@ EXECUTOR_E2E_DOCKER_ARCH=arm64 \
 
 Use `amd64` on an amd64 runner. The test checks the actual architecture, uses the
 normal image command, and removes its own synthetic container and volume.
+
+CI runs a separate cleanup step even after cancellation. It reads only the stages
+created in that job, skips confirmed destruction, and retries incomplete teardown.
+The registry lease remains the fallback if the entire runner is lost.

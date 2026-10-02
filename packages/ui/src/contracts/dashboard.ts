@@ -1,6 +1,8 @@
 /** Display contracts shared by dashboards. Hosts retain ownership, auth, and transport semantics. */
 import type {
   Account,
+  AccountCheckStatus,
+  AccountHealth,
   AccountId,
   App,
   AppId,
@@ -10,6 +12,8 @@ import type {
   Provider,
   ProviderDefinition,
   SelectedAccounts,
+  ToolRouter,
+  ToolSummary,
 } from "@executor-js/sdk";
 import type { CatalogImport } from "@executor-js/catalog/contracts";
 import type {
@@ -20,6 +24,12 @@ import type { Atom, AsyncResult } from "effect/unstable/reactivity";
 import { Schema, type Cause } from "effect";
 import type { ComponentType, ReactNode } from "react";
 
+/** An app's live tools with the routers that group them, such as one MCP server each. */
+export interface ToolCatalog {
+  readonly tools: readonly ToolSummary[];
+  readonly routers: readonly ToolRouter[];
+}
+
 /** Display metadata may be absent in a host that has not exposed provider/status details yet. */
 export type AccountSummary = Account & {
   readonly providerName?: string;
@@ -27,12 +37,16 @@ export type AccountSummary = Account & {
   readonly signIn?:
     | { readonly state: "saved"; readonly reconnectAt: Date | null }
     | { readonly state: "reconnect" | "unavailable" };
+  /** Checks by the apps that select the account, when the host exposes them. */
+  readonly health?: AccountHealth;
 };
 /** Safe account detail shared by hosts; management authority remains product-owned. */
 export interface AccountDetail {
   readonly account: AccountSummary;
   readonly provider: Provider;
   readonly apps: readonly App[];
+  /** Each listed app's latest check, when the host exposes checks. */
+  readonly health?: AccountHealth;
   readonly canManage: boolean;
 }
 /** The common inventory contains no product permission or organization fields. */
@@ -106,7 +120,7 @@ export interface AppLinkProps {
   readonly "aria-label"?: string;
   readonly "aria-current"?: "page" | undefined;
 }
-/** Accounts without a detail route can still render their label. */
+/** Accounts have no page of their own; a link opens the account list at that account. */
 export interface AccountLinkProps {
   readonly className?: string;
   readonly account: AccountId;
@@ -181,7 +195,26 @@ export function accountSelectionIssues(
     },
   );
 }
-/** Account metadata can block tool discovery; missing credential-health metadata makes no claim. */
+/** Slots that accept many accounts and have none selected. Their tools list empty, not missing. */
+export const unfilledAccountSlots = (app: App, selection: SelectedAccounts): readonly string[] =>
+  Object.keys(app.requirements.accounts).filter((slot) => {
+    const selected = selection[slot];
+    return typeof selected !== "string" && selected?.length === 0;
+  });
+/** An app's latest check of an account. Outdated or missing checks make no claim. */
+export const currentAccountCheck = (account: AccountSummary, app: AppId) => {
+  const check = account.health?.apps.find((entry) => entry.app === app)?.check;
+  return check?.current === true ? check : undefined;
+};
+/** A current failed check that does not prove the credentials are bad; the app can still open. */
+export interface AccountCheckWarning<A extends AccountSummary> {
+  readonly account: A;
+  readonly status: Exclude<AccountCheckStatus, "healthy" | "credentials_rejected">;
+}
+/**
+ * Account metadata can block tool discovery; missing credential-health metadata makes no claim.
+ * Only a current check that rejected the credentials blocks; other failed checks are warnings.
+ */
 export function appToolReadiness<A extends AccountSummary>(
   app: App,
   selection: SelectedAccounts,
@@ -191,7 +224,8 @@ export function appToolReadiness<A extends AccountSummary>(
   | { readonly state: "selection"; readonly issues: readonly AccountSelectionIssue[] }
   | { readonly state: "reconnect"; readonly accounts: readonly A[] }
   | { readonly state: "unavailable"; readonly accounts: readonly A[] }
-  | { readonly state: "ready" } {
+  | { readonly state: "rejected"; readonly accounts: readonly A[] }
+  | { readonly state: "ready"; readonly warnings: readonly AccountCheckWarning<A>[] } {
   if (app.activeDeployment === null) return { state: "not-deployed" };
   const issues = accountSelectionIssues(app, selection, accounts);
   if (issues.length > 0) return { state: "selection", issues };
@@ -201,7 +235,17 @@ export function appToolReadiness<A extends AccountSummary>(
   if (unavailable.length > 0) return { state: "unavailable", accounts: unavailable };
   const reconnect = selected.filter((account) => accountNeedsSignIn(account));
   if (reconnect.length > 0) return { state: "reconnect", accounts: reconnect };
-  return { state: "ready" };
+  const rejected = selected.filter(
+    (account) => currentAccountCheck(account, app.id)?.status === "credentials_rejected",
+  );
+  if (rejected.length > 0) return { state: "rejected", accounts: rejected };
+  const warnings = selected.flatMap((account): AccountCheckWarning<A>[] => {
+    const status = currentAccountCheck(account, app.id)?.status;
+    return status === undefined || status === "healthy" || status === "credentials_rejected"
+      ? []
+      : [{ account, status }];
+  });
+  return { state: "ready", warnings };
 }
 /** Public OAuth endpoints can supply a favicon domain; credentials are never inspected. */
 export function providerDisplayUrl(definition: ProviderDefinition | undefined): string | null {
@@ -216,11 +260,3 @@ export function providerDisplayUrl(definition: ProviderDefinition | undefined): 
     }
   return null;
 }
-/** A consistent short date for account/source metadata. */
-export const displayDate = (value: Date) =>
-  value.toLocaleString(undefined, {
-    month: "short",
-    day: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-  });

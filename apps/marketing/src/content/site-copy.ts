@@ -29,11 +29,11 @@ Docs: ${siteOrigin}/docs`;
 export const GITHUB_URL = "https://github.com/UsefulSoftwareCo/executor";
 
 /** One-line description of the product, used as the Markdown tagline. */
-export const tagline = "Built by your agents. Run by Executor.";
+export const tagline = "Your agents' cloud.";
 
 /** Shared introduction for the landing page and its Markdown representation. */
 export const introduction =
-  "Bring your own agents. Build tools, automations, and apps once. Run them on Executor and use them across all your agents.";
+  "Your connectors, skills, automations, and personal software, all in one place.";
 
 /** Introduce personal software through a familiar starting point and a growing app. */
 export const homepageStory = {
@@ -95,7 +95,7 @@ export const pricingTiers = (siteOrigin: string): ReadonlyArray<PricingTier> => 
     name: "Free",
     price: "$0 / month",
     audience: "For small teams getting started",
-    features: ["Up to 3 members", "100,000 executions per month", "Unlimited integrations"],
+    features: ["Up to 3 members", "Unlimited integrations"],
     cta: `Start free: ${siteOrigin}/login`,
   },
   {
@@ -104,7 +104,6 @@ export const pricingTiers = (siteOrigin: string): ReadonlyArray<PricingTier> => 
     audience: "For growing organizations (recommended)",
     features: [
       "14-day free trial, then $15 / member / month",
-      "Unlimited executions",
       "Verified domains & join by team domain",
     ],
     cta: `Start free trial: ${siteOrigin}/login`,

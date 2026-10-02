@@ -9,9 +9,15 @@ import { HostedLive, withHostedCase } from "../support/case.ts";
 import { Resource } from "../support/contracts.ts";
 import { oauthSetupIssuer } from "../support/oauth-setup-issuer.ts";
 import { createProfile, Profile } from "../support/profiles.ts";
+import { oauthMcpAppFiles } from "../support/authored-templates.ts";
 import { scenarios } from "../test-plan.ts";
 
 const SignIn = Schema.Struct({ authorizationUrl: Schema.String });
+const SetupFailure = Schema.Struct({
+  _tag: Schema.Literal("OAuthSetupFailed"),
+  reason: Schema.String,
+  callbackUrl: Schema.optional(Schema.String),
+});
 
 layer(HostedLive, { excludeTestServices: true })("OAuth compatibility", (it) => {
   it.effect(scenarios.oauthCompatibility.title, (context) =>
@@ -23,76 +29,112 @@ layer(HostedLive, { excludeTestServices: true })("OAuth compatibility", (it) => 
           http = yield* HttpClient.HttpClient;
         const issuer = yield* oauthSetupIssuer;
         const prefix = `/api/organizations/${actors.organization.id}`;
-        const cases = [
+        const valid = {
+          registrationStatus: 201,
+          registrationError: "invalid_client_metadata",
+          omitSecretExpiry: false,
+          issuePublicClients: false,
+          malformedRegistration: false,
+          scopes: ["read"],
+          includeIdToken: false,
+          idTokenAlgorithms: ["ES256"],
+          invalidNonce: false,
+          setupFailure: undefined,
+          completionFailure: undefined,
+        } as const;
+        const cases: ReadonlyArray<{
+          readonly name: string;
+          readonly registrationStatus: 200 | 201 | 400 | 401;
+          readonly registrationError:
+            | "invalid_client_metadata"
+            | "invalid_redirect_uri"
+            | "invalid_request";
+          readonly omitSecretExpiry: boolean;
+          readonly issuePublicClients: boolean;
+          readonly malformedRegistration: boolean;
+          readonly scopes: readonly string[];
+          readonly includeIdToken: boolean;
+          readonly idTokenAlgorithms: readonly string[];
+          readonly invalidNonce: boolean;
+          /** The 422 reason when setup must stop before sign-in. */
+          readonly setupFailure: string | undefined;
+          /** The 400 reason when completion must fail after the token exchange. */
+          readonly completionFailure: string | undefined;
+        }> = [
+          { ...valid, name: "HTTP 200", registrationStatus: 200 },
+          { ...valid, name: "Secret without expiry, HTTP 201", omitSecretExpiry: true },
           {
-            name: "HTTP 200",
+            ...valid,
+            name: "Secret without expiry, HTTP 200",
             registrationStatus: 200,
-            includeIdToken: false,
-            idTokenAlgorithms: ["ES256"],
-            invalidNonce: false,
-            malformedRegistration: false,
-            success: true,
+            omitSecretExpiry: true,
           },
+          // Vercel answers a client_secret_basic registration with a public client.
+          { ...valid, name: "Public client issued", issuePublicClients: true },
+          { ...valid, name: "ES256 OIDC", scopes: ["openid", "read"], includeIdToken: true },
+          // Executor does not use the ID token, so a service may omit it after `openid`.
+          { ...valid, name: "OpenID without ID token", scopes: ["openid", "read"] },
           {
-            name: "ES256 OIDC",
-            registrationStatus: 201,
-            includeIdToken: true,
-            idTokenAlgorithms: ["ES256"],
-            invalidNonce: false,
-            malformedRegistration: false,
-            success: true,
-          },
-          {
+            ...valid,
             name: "Unadvertised algorithm",
-            registrationStatus: 201,
+            scopes: ["openid", "read"],
             includeIdToken: true,
             idTokenAlgorithms: ["RS256"],
-            invalidNonce: false,
-            malformedRegistration: false,
-            success: false,
+            completionFailure: "incompatible_response",
           },
           {
+            ...valid,
             name: "Wrong nonce",
-            registrationStatus: 201,
+            scopes: ["openid", "read"],
             includeIdToken: true,
-            idTokenAlgorithms: ["ES256"],
             invalidNonce: true,
-            malformedRegistration: false,
-            success: false,
+            completionFailure: "incompatible_response",
           },
           {
+            ...valid,
             name: "Malformed HTTP 200",
             registrationStatus: 200,
-            includeIdToken: false,
-            idTokenAlgorithms: ["ES256"],
-            invalidNonce: false,
             malformedRegistration: true,
-            success: false,
+            setupFailure: "incompatible_response",
           },
           {
+            ...valid,
             name: "Rejected registration",
             registrationStatus: 400,
-            includeIdToken: false,
-            idTokenAlgorithms: ["ES256"],
-            invalidNonce: false,
-            malformedRegistration: false,
-            success: false,
+            registrationError: "invalid_request",
+            setupFailure: "registration_rejected",
           },
-        ] as const;
+          // Most often a callback URL outside the service's allowed redirect URIs.
+          {
+            ...valid,
+            name: "Refused client metadata",
+            registrationStatus: 400,
+            setupFailure: "client_metadata_rejected",
+          },
+          {
+            ...valid,
+            name: "Unapproved redirect URI",
+            registrationStatus: 400,
+            registrationError: "invalid_redirect_uri",
+            setupFailure: "client_not_approved",
+          },
+          // RFC 7591 registration that needs an initial access token: a manual client is required.
+          {
+            ...valid,
+            name: "Protected registration",
+            registrationStatus: 401,
+            setupFailure: "client_registration_required",
+          },
+        ];
         for (const scenario of cases) {
-          yield* issuer.configure({
-            ...scenario,
-            scopes: scenario.includeIdToken ? ["openid", "read"] : ["read"],
+          yield* issuer.configure(scenario);
+          // Deploy the quick-add OAuth source directly; these cases break discovery on purpose.
+          const name = `${scenario.name} ${randomUUID().slice(0, 8)}`;
+          const imported = yield* api.request(actors.owner, "POST", `${prefix}/apps/deploy`, {
+            name,
+            files: oauthMcpAppFiles(name, `${issuer.origin}/mcp`),
           });
-          const imported = yield* api.request(actors.owner, "POST", `${prefix}/apps/import`, {
-            source: {
-              kind: "mcp",
-              name: `${scenario.name} ${randomUUID().slice(0, 8)}`,
-              url: `${issuer.origin}/mcp`,
-              auth: { type: "auto" },
-            },
-          });
-          expect(imported.status).toBe(200);
+          expect(imported.status, JSON.stringify(imported.body)).toBe(200);
           const app = yield* body(Resource, imported);
           yield* Effect.addFinalizer(() =>
             api.request(actors.owner, "DELETE", `${prefix}/apps/${app.id}`).pipe(Effect.orDie),
@@ -114,12 +156,26 @@ layer(HostedLive, { excludeTestServices: true })("OAuth compatibility", (it) => 
               label: "Synthetic compatibility account",
             },
           );
-          if (scenario.malformedRegistration || scenario.registrationStatus === 400) {
+          if (scenario.setupFailure !== undefined) {
             expect(started.status, scenario.name).toBe(422);
+            const failure = yield* body(SetupFailure, started);
+            expect(failure.reason, scenario.name).toBe(scenario.setupFailure);
+            // Registration failures name Executor's callback so the user can request approval.
+            expect(
+              failure.callbackUrl === undefined ? undefined : new URL(failure.callbackUrl).pathname,
+              scenario.name,
+            ).toBe("/api/oauth/callback");
+            expect(JSON.stringify(started.body)).not.toContain("PRIVATE_PROVIDER_ERROR");
+            expect(JSON.stringify(started.body)).not.toContain("PRIVATE_QUERY");
             continue;
           }
           expect(started.status, scenario.name).toBe(200);
           const { authorizationUrl } = yield* body(SignIn, started);
+          if (scenario.scopes.includes("openid"))
+            expect(
+              new URL(authorizationUrl).searchParams.get("nonce"),
+              scenario.name,
+            ).not.toBeNull();
           const callbackUrl = yield* Effect.scoped(
             Effect.gen(function* () {
               const consent = yield* HttpClient.withScope(http).get(authorizationUrl);
@@ -160,14 +216,19 @@ layer(HostedLive, { excludeTestServices: true })("OAuth compatibility", (it) => 
           expect(
             completed.status,
             `${scenario.name}: ${JSON.stringify(failure)}, checks=${JSON.stringify((yield* issuer.metrics).tokenChecks)}`,
-          ).toBe(scenario.success ? 200 : 400);
+          ).toBe(scenario.completionFailure === undefined ? 200 : 400);
+          if (scenario.completionFailure !== undefined)
+            expect(failure, scenario.name).toMatchObject({
+              _tag: "OAuthCompletionFailed",
+              reason: scenario.completionFailure,
+            });
           expect((yield* issuer.metrics).tokenExchanges).toBe(exchanges + 1);
           const selected = yield* api.request(
             actors.owner,
             "GET",
             `${prefix}/apps/${app.id}/profiles/${profile.id}`,
           );
-          if (scenario.success) {
+          if (scenario.completionFailure === undefined) {
             const account = yield* body(Resource, completed);
             yield* Effect.addFinalizer(() =>
               api

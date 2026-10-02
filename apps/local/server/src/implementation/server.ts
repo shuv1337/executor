@@ -1,12 +1,19 @@
 import { publishedSkillRoutes, readExecutorSkills } from "@executor-js/app-templates/executor";
 import { localAppBrowserHandlers } from "./app-browser.ts";
 import { startupPhase } from "./startup-diagnostics.ts";
-import { startScheduleWorker, defaultScheduleWorkerOptions } from "@executor-js/sdk/scheduling";
+import {
+  startScheduleWorker,
+  defaultScheduleWorkerOptions,
+  ScheduleObservation,
+} from "@executor-js/sdk/scheduling";
 import { localScheduleHandlers } from "./schedules.ts";
 import { localMcpApproval } from "./mcp-approvals.ts";
 import { makeLocalMcpOAuth } from "./mcp-oauth.ts";
-import { remoteRegistry } from "@executor-js/app-registry";
+import { localMcpConnectionHandlers } from "./mcp-connections.ts";
+import { hostedExecutorOrigin, remoteRegistry } from "@executor-js/app-registry";
 import { localAppManagement } from "./app-management.ts";
+import { runStartupDataSteps } from "@executor-js/app-management/data-steps";
+import { SqlClient } from "effect/unstable/sql";
 
 /** Local host composition. The SDK owns operations; this package owns local resources and access. */
 import {
@@ -17,14 +24,27 @@ import {
   AccountNotFound,
   AppNotFound,
   createExecutor,
+  makeDeclarationCache,
+  declarationConfig,
   toEffectRuntime,
   executorHandlers,
   webhookCallback,
 } from "@executor-js/sdk/core";
 import { filesystemBlobStore, workerdApps } from "@executor-js/sdk/node";
-import { Config, Effect, Layer, Path, Redacted, Result, Deferred, Schedule } from "effect";
+import {
+  Config,
+  Effect,
+  Layer,
+  Option,
+  Path,
+  Redacted,
+  Result,
+  Deferred,
+  Schedule,
+  Scope,
+} from "effect";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/unstable/http";
-import { requestTiming } from "@executor-js/telemetry/http";
+import { recordRequestRejections, requestTiming } from "@executor-js/telemetry/http";
 import { safeHttpClient } from "@executor-js/utils/safe-fetch";
 import type { HostEgress } from "@executor-js/utils/url-policy";
 import { HttpApiBuilder } from "effect/unstable/httpapi";
@@ -41,17 +61,21 @@ import { localWebhookSetupHandlers } from "./webhook-setup.ts";
 import { accountConnectHandlers } from "./account-connections.ts";
 import { appUi } from "./app-ui.ts";
 import { appAuthentication, appRequest } from "./app-auth.ts";
-import { AppAuthenticationApi, appFromHost } from "../contracts/app-ui.ts";
+import { appFromHost } from "../contracts/app-ui.ts";
 import { AppUiApi } from "apps/ui/contracts";
-import { AppSignInApi, appSignInPage, appSignInScript } from "apps/ui/auth";
+import { appSignInCallbackPath } from "apps/ui/auth";
 import { DashboardApi, OAuthCallbackPath } from "../contracts/dashboard.ts";
 import { LocalAuthApi } from "../contracts/auth.ts";
 import { AccountConnectApi } from "../contracts/account-connections.ts";
 import { browserTelemetry } from "./telemetry.ts";
 import { webFiles } from "./web.ts";
+import { withHostPipeline } from "@executor-js/dashboard-start/in-process";
 import { localManagementDocument } from "../contracts/management.ts";
 import { gitSourceStorage } from "@executor-js/app-source";
 import { nativeRepositories } from "@executor-js/app-source/node";
+import { feedbackDisabled } from "@executor-js/telemetry/product-analytics";
+import { LocalFeedbackApi } from "../contracts/feedback.ts";
+import { localAnalytics, observeLocalExecutor, scheduleAnalytics } from "./product-analytics.ts";
 
 /** Initialize local persistence and compose the API, without choosing a socket implementation. */
 export const localApi = (
@@ -65,7 +89,7 @@ export const localApi = (
       const auth = existingAuth ?? (yield* makeLocalAuth(crypto, config.directory));
       const path = yield* Path.Path;
       const directory = path.resolve(config.directory);
-      const storage = yield* openStorage(directory);
+      const { storage, sql } = yield* openStorage(directory);
       const credentialStore = yield* credentials(config.encryptionKey, crypto);
       // Node can hook connect, so every host-side fetch re-checks the addresses a name resolves
       // to. The agent lives for this layer's scope, which is the process.
@@ -84,15 +108,25 @@ export const localApi = (
         // The bundled Executor app calls this process on 127.0.0.1, and local development
         // routinely targets a service on the operator's own machine.
         allowPrivateAppFetch: true,
+        ...Option.match(yield* Config.String("EXECUTOR_NPM_REGISTRY").pipe(Config.option), {
+          onNone: () => ({}),
+          onSome: (registry) => ({ npmRegistry: registry }),
+        }),
       }).pipe(startupPhase("runtime"));
       const registry = remoteRegistry(
         yield* Config.String("EXECUTOR_REGISTRY_URL").pipe(
-          Config.withDefault("https://v2.executor.sh"),
+          Config.withDefault(hostedExecutorOrigin),
         ),
       );
       const repositories = nativeRepositories(path.join(directory, "repositories"));
       const sources = gitSourceStorage(repositories);
+      const server = yield* Scope.Scope;
+      const evaluation = yield* declarationConfig;
       const executor = yield* createExecutor({
+        // Stale declarations refresh on the server's own lifetime.
+        declarations: makeDeclarationCache(evaluation.limits),
+        toolListings: evaluation.toolListings,
+        background: (work) => Effect.forkIn(work, server).pipe(Effect.as(true)),
         workflows,
         webhookOrigin:
           config.webhookOrigin ?? config.browserOrigin ?? `http://localhost:${config.port}`,
@@ -111,6 +145,20 @@ export const localApi = (
         },
       }).pipe(startupPhase("sdk"));
       yield* Deferred.succeed(ready, executor);
+      const analytics = yield* localAnalytics({
+        directory,
+        product: options.product ?? "local",
+        platform: options.platform ?? { os: "unknown", arch: "unknown" },
+        sql,
+      });
+      /** Each product surface records its own use; host-owned work uses the plain executor. */
+      const observed = (source: "mcp" | "api" | "dashboard" | "app_ui") =>
+        observeLocalExecutor(executor, analytics, source);
+      // Before background work, the Executor app's regeneration and serving; the data lock is held.
+      yield* runStartupDataSteps({ executor, repositories, blobs }, "private_local").pipe(
+        Effect.provideService(SqlClient.SqlClient, sql),
+        startupPhase("data-steps"),
+      );
       yield* Effect.forkScoped(
         recoverAppRepositories({ database: storage, sources, blobs }).pipe(
           Effect.catch(() => Effect.logWarning("App repository recovery failed")),
@@ -123,13 +171,18 @@ export const localApi = (
           Effect.repeat(Schedule.spaced("5 seconds")),
         ),
       );
-      yield* startScheduleWorker(executor, () => Effect.void, {
+      const scheduleConcurrency = yield* Config.Number("EXECUTOR_SCHEDULE_CONCURRENCY").pipe(
+        Config.withDefault(defaultScheduleWorkerOptions.concurrency),
+      );
+      const scheduler = startScheduleWorker(executor, () => Effect.void, {
         ...defaultScheduleWorkerOptions,
         runner: "local",
-        concurrency: yield* Config.Number("EXECUTOR_SCHEDULE_CONCURRENCY").pipe(
-          Config.withDefault(defaultScheduleWorkerOptions.concurrency),
-        ),
+        concurrency: scheduleConcurrency,
       });
+      // The worker's polling fibers inherit the observer it starts with.
+      yield* analytics === undefined
+        ? scheduler
+        : scheduler.pipe(Effect.provideService(ScheduleObservation, scheduleAnalytics(analytics)));
       const managed = yield* installExecutorApp(executor, storage, credentialStore, config);
       const access = HttpRouter.middleware((httpEffect) =>
         Effect.gen(function* () {
@@ -165,7 +218,8 @@ export const localApi = (
         }),
       );
       const oauth = yield* makeLocalMcpOAuth(config, auth, crypto);
-      const mcp = yield* localMcp(executor, config.mcp, config, oauth);
+      const mcp = yield* localMcp(observed("mcp"), config.mcp, config, oauth);
+      const api = observed("api");
       const programmatic = Layer.mergeAll(
         HttpRouter.add(
           "GET",
@@ -175,9 +229,9 @@ export const localApi = (
         HttpApiBuilder.layer(ExecutorApi).pipe(
           Layer.provide(
             executorHandlers({
-              ...executor,
+              ...api,
               accountConnections: {
-                ...executor.accountConnections,
+                ...api.accountConnections,
                 create: (input) => {
                   if (input.account === managed.account)
                     return Effect.fail(new AccountNotFound({ account: input.account }));
@@ -189,9 +243,31 @@ export const localApi = (
             }),
           ),
         ),
+        HttpApiBuilder.layer(LocalFeedbackApi).pipe(
+          Layer.provide(
+            HttpApiBuilder.group(LocalFeedbackApi, "feedback", (handlers) =>
+              Effect.succeed(
+                handlers.handle("submit", ({ payload }) =>
+                  analytics === undefined
+                    ? Effect.fail(feedbackDisabled())
+                    : analytics
+                        .submit("feedback_submitted", { message: payload.message })
+                        .pipe(Effect.as({ status: "accepted" as const })),
+                ),
+              ),
+            ),
+          ),
+        ),
       ).pipe(Layer.provide(access.layer));
-      const ui = appUi(executor, storage, toEffectRuntime(runtime, blobs), config, auth);
       const signIn = yield* appAuthentication(executor, auth, config, crypto);
+      const ui = appUi(
+        observed("app_ui"),
+        storage,
+        toEffectRuntime(runtime, blobs),
+        config,
+        auth,
+        signIn.begin,
+      );
       const privateResponses = HttpRouter.middleware((response) =>
         response.pipe(
           Effect.map((response) =>
@@ -215,15 +291,13 @@ export const localApi = (
       const notFound = HttpServerResponse.empty({ status: 404 });
       // App-host routes: typed APIs plus explicit browser, asset and SPA handlers.
       const appRoutes = Layer.mergeAll(
-        HttpApiBuilder.layer(AppSignInApi).pipe(Layer.provide(signIn.app)),
         HttpApiBuilder.layer(AppUiApi).pipe(
           Layer.provide(ui.api),
           Layer.provide(ui.authenticated.layer),
         ),
         HttpRouter.add("POST", "/_executor/api/telemetry/traces", ui.telemetry("traces")),
         HttpRouter.add("POST", "/_executor/api/telemetry/logs", ui.telemetry("logs")),
-        HttpRouter.add("GET", "/_executor/auth/callback", appSignInPage()),
-        HttpRouter.add("GET", "/_executor/auth/browser.js", appSignInScript()),
+        HttpRouter.add("GET", appSignInCallbackPath, signIn.callback),
         HttpRouter.add("GET", "/_executor/version", ui.versions),
         HttpRouter.add("GET", "/_executor/watch.js", ui.watch),
         HttpRouter.add("GET", "/_executor/assets/:deployment/*", ui.asset),
@@ -235,22 +309,36 @@ export const localApi = (
         HttpRouter.add("GET", "/mcp/*", notFound),
         HttpRouter.add("GET", "*", ui.page),
       ).pipe(Layer.provide(appOriginAccess.layer), Layer.provide(privateResponses.layer));
-      const dashboardApi = dashboard(executor, storage, credentialStore, config, auth, egress, {
-        managedApp: managed.app,
-        managedAccount: managed.account,
-      });
+      const dashboardApi = dashboard(
+        observed("dashboard"),
+        storage,
+        credentialStore,
+        config,
+        auth,
+        egress,
+        {
+          managedApp: managed.app,
+          managedAccount: managed.account,
+        },
+      );
       const web = options.web ?? (yield* webFiles);
       // Dashboard-host routes never include the app-origin APIs.
-      const authoring = yield* localAppManagement(config, auth, managed.app, {
-        executor,
-        sources,
-        repositories,
-        registry,
-        blobs,
-      });
       const publicSkills = yield* readExecutorSkills;
+      const authoring = yield* localAppManagement(
+        config,
+        auth,
+        managed.app,
+        {
+          executor: api,
+          sources,
+          repositories,
+          registry,
+          blobs,
+        },
+        publicSkills,
+      );
       const productRoutes = Layer.mergeAll(
-        publishedSkillRoutes(publicSkills),
+        publishedSkillRoutes(Effect.succeed(publicSkills)),
         HttpApiBuilder.layer(LocalWebhookSetupApi).pipe(
           Layer.provide(localWebhookSetupHandlers(executor, config, auth)),
         ),
@@ -263,10 +351,6 @@ export const localApi = (
           browserTelemetry(config, "traces"),
         ),
         HttpRouter.add("POST", "/dashboard/api/telemetry/logs", browserTelemetry(config, "logs")),
-        HttpApiBuilder.layer(AppAuthenticationApi).pipe(
-          Layer.provide(signIn.dashboard),
-          Layer.provide(privateResponses.layer),
-        ),
         programmatic,
         HttpRouter.add("*", "/mcp", mcp.http),
         HttpRouter.add("*", "/api/auth/*", oauth.handler),
@@ -287,13 +371,14 @@ export const localApi = (
           localMcpApproval(mcp.approvals, auth, config, executor, oauth),
         ),
         HttpApiBuilder.layer(AccountConnectApi).pipe(
-          Layer.provide(accountConnectHandlers(executor, config, crypto, managed)),
+          Layer.provide(accountConnectHandlers(observed("dashboard"), config, crypto, managed)),
           Layer.provide(privateResponses.layer),
         ),
         HttpApiBuilder.layer(DashboardApi).pipe(
           Layer.provide(dashboardApi.handlers),
           Layer.provide(localScheduleHandlers(executor, config, auth)),
           Layer.provide(localAppBrowserHandlers(executor)),
+          Layer.provide(localMcpConnectionHandlers(executor, oauth)),
           Layer.provide(dashboardApi.access),
         ),
         HttpApiBuilder.layer(LocalAuthApi).pipe(
@@ -304,7 +389,7 @@ export const localApi = (
         HttpRouter.add("GET", "/apps", web.document),
         HttpRouter.add("GET", "/apps/add/custom", web.document),
         HttpRouter.add("GET", "/apps/:app", web.document),
-        HttpRouter.add("GET", "/app-auth", web.document),
+        HttpRouter.add("GET", "/app-auth", signIn.signIn(web.document)),
         HttpRouter.add("GET", "/apps/:app/setup", web.document),
         HttpRouter.add("GET", "/apps/:app/open", web.document),
         HttpRouter.add("GET", "/apps/:app/delete", web.document),
@@ -317,6 +402,8 @@ export const localApi = (
         HttpRouter.add("GET", "/accounts/:account", web.document),
         HttpRouter.add("GET", "/accounts/:account/credentials", web.document),
         HttpRouter.add("GET", "/accounts/:account/disconnect", web.document),
+        // Manual webhook setup links issued to agents open this dashboard page.
+        HttpRouter.add("GET", "/webhooks/:app/:subscription", web.document),
         HttpRouter.add(
           "GET",
           OAuthCallbackPath,
@@ -339,12 +426,15 @@ export const localApi = (
       return HttpRouter.add(
         "*",
         "*",
-        Effect.gen(function* () {
-          const request = yield* HttpServerRequest.HttpServerRequest;
-          return yield* appFromHost(request.headers.host, config.port) === undefined
-            ? productHandler
-            : appHandler.pipe(requestTiming);
-        }),
+        // Server-rendered pages read the product API through this same dispatch, in-process.
+        withHostPipeline(
+          Effect.gen(function* () {
+            const request = yield* HttpServerRequest.HttpServerRequest;
+            return yield* appFromHost(request.headers.host, config.port) === undefined
+              ? productHandler
+              : appHandler.pipe(requestTiming);
+          }).pipe(recordRequestRejections),
+        ),
       );
     }),
   );

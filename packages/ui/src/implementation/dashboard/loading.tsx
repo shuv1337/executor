@@ -5,12 +5,15 @@ import { PageFrame, PageHeader } from "./page.tsx";
 /** One placeholder shares the footprint of an installed app card. */
 export function AppCardSkeleton() {
   return (
-    <div aria-hidden className="flex min-h-[137px] flex-col rounded-lg border p-4">
-      <div className="flex items-center gap-3">
-        <Skeleton className="size-8.5 shrink-0 rounded-md" />
-        <Skeleton className="h-3.5 w-28 max-w-[60%]" />
+    <div
+      aria-hidden
+      className="flex min-h-[137px] flex-col rounded-lg border p-4 max-[600px]:grid max-[600px]:min-h-0 max-[600px]:grid-cols-[auto_minmax(0,1fr)] max-[600px]:items-center max-[600px]:gap-x-3 max-[600px]:gap-y-1.5 max-[600px]:px-3.5 max-[600px]:py-3"
+    >
+      <div className="flex items-center gap-3 max-[600px]:contents">
+        <Skeleton className="size-8.5 shrink-0 rounded-md max-[600px]:row-span-2" />
+        <Skeleton className="h-3.5 w-28 max-w-[60%] max-[600px]:self-end" />
       </div>
-      <Skeleton className="mt-auto h-3 w-36 max-w-[80%]" />
+      <Skeleton className="mt-auto h-3 w-36 max-w-[80%] max-[600px]:col-start-2 max-[600px]:mt-0 max-[600px]:self-start" />
     </div>
   );
 }
@@ -21,7 +24,7 @@ export function AppCardsSkeleton() {
     <div
       role="status"
       aria-label="Loading apps"
-      className="grid grid-cols-3 gap-4 max-[1100px]:grid-cols-2 max-[600px]:grid-cols-1"
+      className="grid grid-cols-3 gap-4 max-[1100px]:grid-cols-2 max-[600px]:grid-cols-1 max-[600px]:gap-2"
     >
       {Array.from({ length: 6 }, (_, index) => (
         <AppCardSkeleton key={index} />
@@ -37,17 +40,18 @@ export function AccountRowsSkeleton() {
     <div role="status" aria-label="Loading accounts" className="overflow-hidden rounded-lg border">
       <div
         aria-hidden
-        className="grid grid-cols-[minmax(200px,_1.5fr)_minmax(130px,_0.8fr)_minmax(170px,_1fr)] items-center gap-6.25 bg-muted px-4 py-[9px] text-[11px] text-muted-foreground max-[1000px]:grid-cols-[minmax(0,_1.3fr)_minmax(0,_1fr)] max-[1000px]:gap-4 max-[740px]:hidden"
+        className="grid grid-cols-[minmax(200px,_1.5fr)_minmax(130px,_0.8fr)_minmax(170px,_1fr)_auto] items-center gap-6.25 bg-muted px-4 py-[9px] text-[11px] text-muted-foreground max-[1000px]:grid-cols-[minmax(0,_1.3fr)_minmax(0,_1fr)_auto] max-[1000px]:gap-4 max-[740px]:hidden"
       >
         <span>Account</span>
         <span className="max-[1000px]:hidden">Added</span>
         <span>Apps</span>
+        <span className="size-8" />
       </div>
       {Array.from({ length: 5 }, (_, index) => (
         <div
           key={index}
           aria-hidden
-          className="grid min-h-16 grid-cols-[minmax(200px,_1.5fr)_minmax(130px,_0.8fr)_minmax(170px,_1fr)] items-center gap-6.25 border-t px-4 py-3 max-[1000px]:grid-cols-[minmax(0,_1.3fr)_minmax(0,_1fr)] max-[1000px]:gap-4 max-[740px]:grid-cols-1 max-[740px]:gap-3 max-[740px]:first:border-t-0"
+          className="grid min-h-16 grid-cols-[minmax(200px,_1.5fr)_minmax(130px,_0.8fr)_minmax(170px,_1fr)_auto] items-center gap-6.25 border-t px-4 py-3 max-[1000px]:grid-cols-[minmax(0,_1.3fr)_minmax(0,_1fr)_auto] max-[1000px]:gap-4 max-[740px]:grid-cols-[minmax(0,_1fr)_auto] max-[740px]:gap-3 max-[740px]:first:border-t-0"
         >
           <div className="flex items-center gap-3">
             <Skeleton className="size-8.5 shrink-0 rounded-md" />
@@ -57,7 +61,8 @@ export function AccountRowsSkeleton() {
             </div>
           </div>
           <Skeleton className="h-3 w-20 max-[1000px]:hidden" />
-          <Skeleton className="h-5 w-28" />
+          <Skeleton className="h-5 w-28 max-[740px]:col-span-2" />
+          <Skeleton className="size-8 rounded-md max-[740px]:col-start-2 max-[740px]:row-start-1" />
         </div>
       ))}
       <span className="sr-only">Loading accounts…</span>

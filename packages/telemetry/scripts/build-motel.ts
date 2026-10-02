@@ -7,15 +7,14 @@ import { realpath } from "node:fs";
 import { promisify } from "node:util";
 
 const build = Effect.gen(function* () {
-  if (process.versions.bun !== "1.3.11")
-    return yield* Effect.die(new Error("Build the collector with Bun 1.3.11."));
-  const runtime = process.argv.includes("--workerd") ? "workerd" : "bun";
+  if (process.versions.bun !== "1.4.2")
+    return yield* Effect.die(new Error("Build the collector with Bun 1.4.2."));
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const processes = yield* ChildProcessSpawner.ChildProcessSpawner;
   const root = yield* path.fromFileUrl(new URL("../", import.meta.url));
   const source = path.join(root, "motel");
-  const output = path.join(root, runtime === "workerd" ? "dist/motel-workerd" : "dist/motel");
+  const output = path.join(root, "dist/motel");
   const pinned = yield* fs.readFileString(path.join(source, "source.json")).pipe(
     Effect.flatMap(
       Schema.decodeUnknownEffect(
@@ -55,33 +54,13 @@ const build = Effect.gen(function* () {
   yield* command("git", ["checkout", "--quiet", "--detach", "FETCH_HEAD"]);
   yield* bun(["install", "--frozen-lockfile"]);
   yield* bun(["run", "web:build"]);
+  // Replace the whole bundle so no file from an earlier build survives.
+  yield* fs.remove(output, { recursive: true, force: true });
   yield* fs.makeDirectory(output, { recursive: true });
-  if (runtime === "workerd") {
-    yield* bun(["run", "workerd:build"]);
-    yield* fs.copy(path.join(scratch, "dist/workerd"), output, { overwrite: true });
-  } else {
-    yield* fs.copyFile(
-      path.join(source, "server.mjs"),
-      path.join(scratch, "src/executor-server.ts"),
-    );
-    yield* bun([
-      "build",
-      "src/executor-server.ts",
-      "src/services/telemetryWorker.ts",
-      "src/services/telemetryQueryWorker.ts",
-      "--target",
-      "bun",
-      "--sourcemap=external",
-      "--outdir",
-      path.join(output, "src"),
-      "--entry-naming",
-      "[name].ts",
-    ]);
-    const binary = path.join(output, process.platform === "win32" ? "bun.exe" : "bun");
-    yield* fs.copyFile(process.execPath, binary);
-    yield* fs.chmod(binary, 0o755);
-    yield* fs.copyFile(path.join(source, "BUN-LICENSE.md"), path.join(output, "BUN-LICENSE.md"));
-  }
+  yield* bun(["run", "workerd:build"]);
+  yield* fs.copy(path.join(scratch, "dist/workerd"), output, { overwrite: true });
+  // Hosts serve the bundle from this config; they supply its data directory and port.
+  yield* fs.copyFile(path.join(source, "motel.capnp"), path.join(output, "motel.capnp"));
   yield* fs.copy(path.join(scratch, "web/dist"), path.join(output, "web/dist"), {
     overwrite: true,
   });
@@ -91,12 +70,10 @@ const build = Effect.gen(function* () {
     path.join(output, "build.json"),
     JSON.stringify({
       ...pinned,
-      runtime,
-      platform: process.platform,
-      arch: process.arch,
+      runtime: "workerd",
     }),
   );
-  yield* Effect.logInfo(`Built Motel for ${runtime} at ${output}`);
+  yield* Effect.logInfo(`Built Motel for workerd at ${output}`);
 });
 
 BunRuntime.runMain(Effect.scoped(build).pipe(Effect.provide(BunServices.layer)));

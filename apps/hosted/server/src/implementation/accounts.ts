@@ -3,7 +3,12 @@ import { ScheduleWakeup } from "../contracts/schedules.ts";
 import { CurrentAuthorization } from "../contracts/authorization.ts";
 import { permitsApp, permittedAppIds } from "@executor-js/authorization";
 import { OrganizationForbidden } from "../contracts/organization.ts";
-import { recordConnection, checkConnection, checkDestination } from "./connection-policy.ts";
+import {
+  recordConnection,
+  checkConnection,
+  checkDestination,
+  createdConnectionOrganization,
+} from "./connection-policy.ts";
 import { accountDestination } from "./resource-lifecycle.ts";
 import {
   requireAccountAccess,
@@ -13,13 +18,25 @@ import {
 } from "./resource-policy.ts";
 import type { ConnectionDestination } from "../contracts/resource-access.ts";
 /** Account use cases, connection grants and OAuth routes share the same ownership checks. */
-import { type AccountId, type AppId, type Executor, type OwnerId } from "@executor-js/sdk/core";
-import { Effect } from "effect";
+import {
+  type AccountHealth,
+  type AccountId,
+  type App,
+  type AppId,
+  type Executor,
+  type OwnerId,
+  StorageError,
+} from "@executor-js/sdk/core";
+import { Effect, Schema } from "effect";
 import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http";
 import { HttpApiBuilder } from "effect/unstable/httpapi";
 import { HostedApi } from "../contracts/api.ts";
-import { ApiAuthentication, Authentication } from "../contracts/auth.ts";
-import { CurrentOrganization } from "../contracts/organization.ts";
+import { ApiAuthentication, Authentication, CurrentPrincipal } from "../contracts/auth.ts";
+import {
+  CurrentOrganization,
+  OrganizationSlug,
+  organizationOwner,
+} from "../contracts/organization.ts";
 import { HostedExecutor } from "../contracts/executor.ts";
 import {
   executionManagerOwner,
@@ -41,7 +58,40 @@ export const getAccount = (owner: OwnerId, account: AccountId) =>
       Effect.flatMap(visibleApps),
     );
     if (policy.tools.kind !== "all" && apps.length === 0) return yield* new OrganizationForbidden();
-    return { account: metadata, provider, apps };
+    const health = yield* executor.accounts.health({ owner, account });
+    return { account: metadata, provider, apps, health: visibleHealth(health, apps) };
+  });
+/** Keep only the checks of apps the caller can see. */
+const visibleHealth = (health: AccountHealth, apps: readonly App[]): AccountHealth => {
+  const visible = new Set(apps.map((app) => app.id));
+  return { ...health, apps: health.apps.filter((entry) => visible.has(entry.app)) };
+};
+/** Check unsaved credentials with an app the caller can use; nothing is saved. */
+export const checkCredentials = (
+  owner: OwnerId,
+  input: Omit<Parameters<Executor["apps"]["checkCredentials"]>[0], "owner">,
+) =>
+  Effect.gen(function* () {
+    const executor = yield* Effect.flatten(HostedExecutor);
+    yield* requireAppAccess(input.app, "use");
+    return yield* executor.apps.checkCredentials({ ...input, owner });
+  });
+/** Run the checks of the apps the caller can use, with the caller's own account access. */
+export const checkAccount = (owner: OwnerId, account: AccountId) =>
+  Effect.gen(function* () {
+    const executor = yield* Effect.flatten(HostedExecutor);
+    yield* requireAccountAccess(account, "use");
+    const policy = yield* CurrentAuthorization;
+    const apps = yield* executor.apps.list({ owner, account }).pipe(
+      Effect.map((apps) => apps.filter((app) => permitsApp(policy, app.id))),
+      Effect.flatMap(visibleApps),
+    );
+    const health = yield* executor.accounts.check({
+      owner,
+      account,
+      apps: apps.map((app) => app.id),
+    });
+    return visibleHealth(health, apps);
   });
 /** Check only providers reachable through the caller's app or account access; return no client details. */
 export const oauthSetup = (
@@ -94,11 +144,18 @@ export const disconnectAccount = (owner: OwnerId, account: AccountId) =>
     yield* executor.accounts.get({ owner, account });
     return yield* executor.accounts.remove({ owner, account });
   });
-/** Update metadata using the owner-filtered SDK primitive. */
-export const renameAccount = (owner: OwnerId, account: AccountId, label: string) =>
+/** Update the label or description using the owner-filtered SDK primitive. */
+export const updateAccount = (
+  owner: OwnerId,
+  account: AccountId,
+  metadata: {
+    readonly label?: string | undefined;
+    readonly description?: string | null | undefined;
+  },
+) =>
   Effect.gen(function* () {
     const executor = yield* Effect.flatten(HostedExecutor);
-    return yield* executor.accounts.update({ owner, account, label });
+    return yield* executor.accounts.update({ ...metadata, owner, account });
   });
 /** Create a sign-in request for an app requirement belonging to this organization. */
 export const connectAccount = (
@@ -204,6 +261,14 @@ export const hostedAccountHandlers = HttpApiBuilder.group(HostedApi, "accounts",
           };
         }),
       )
+      .handle("checkCredentials", ({ params, payload }) =>
+        Effect.flatMap(currentOwner, (owner) =>
+          checkCredentials(owner, { app: params.app, ...payload }),
+        ),
+      )
+      .handle("check", ({ params }) =>
+        Effect.flatMap(currentOwner, (owner) => checkAccount(owner, params.account)),
+      )
       .handle("reconnect", ({ params }) =>
         Effect.flatMap(accountManagerOwner(params.account), (owner) =>
           reconnectAccount(owner, params.account),
@@ -214,9 +279,9 @@ export const hostedAccountHandlers = HttpApiBuilder.group(HostedApi, "accounts",
           disconnectAccount(owner, params.account),
         ),
       )
-      .handle("rename", ({ params, payload }) =>
+      .handle("update", ({ params, payload }) =>
         Effect.flatMap(accountManagerOwner(params.account), (owner) =>
-          renameAccount(owner, params.account, payload.label),
+          updateAccount(owner, params.account, payload),
         ),
       )
       .handle("oauthSetup", ({ params }) =>
@@ -241,9 +306,22 @@ export const hostedAccountHandlers = HttpApiBuilder.group(HostedApi, "accounts",
         }),
       )
       .handle("connection", ({ params }) =>
-        Effect.flatMap(currentOwner, (owner) => getConnection(owner, params)).pipe(
-          Effect.map((connection) => ({ ...connection, redirectUri })),
-        ),
+        Effect.gen(function* () {
+          const owner = yield* currentOwner;
+          const connection = yield* getConnection(owner, params);
+          const target = connection.target;
+          const app =
+            target === null || target === undefined
+              ? undefined
+              : yield* Effect.flatten(HostedExecutor).pipe(
+                  Effect.flatMap((executor) => executor.apps.get({ owner, app: target.app })),
+                );
+          const requirement =
+            app === undefined || target === null || target === undefined
+              ? undefined
+              : app.requirements.accounts[target.requirement];
+          return { ...connection, redirectUri, checkable: requirement?.health === true };
+        }),
       )
       .handle("submit", ({ params, payload }) =>
         Effect.flatMap(currentOwner, (owner) =>
@@ -265,6 +343,50 @@ export const hostedAccountHandlers = HttpApiBuilder.group(HostedApi, "accounts",
         ),
       );
   }),
+);
+
+/**
+ * A provider's link can open in a tab or browser without the page that started sign-in. The
+ * callback's state finds the pending connection, which only its creator, still a member of its
+ * organization, may resume. Completion then runs the organization route's full checks.
+ */
+export const hostedOAuthCallbackHandlers = HttpApiBuilder.group(
+  HostedApi,
+  "oauthCallback",
+  (handlers) =>
+    Effect.gen(function* () {
+      const auth = yield* Authentication;
+      const redirectUri = accountOAuthRedirectUri(auth);
+      return handlers.handle("resolve", ({ payload }) =>
+        Effect.gen(function* () {
+          const principal = yield* CurrentPrincipal;
+          const executor = yield* Effect.flatten(HostedExecutor);
+          const connection = yield* executor.accountConnections.findOAuth(payload);
+          const organization = yield* createdConnectionOrganization(
+            connection.id,
+            principal.userId,
+          );
+          if (organizationOwner(organization) !== connection.owner)
+            return yield* new OrganizationForbidden();
+          yield* auth.membership(principal, organization);
+          const request = yield* HttpServerRequest.HttpServerRequest;
+          const organizationSlug = yield* auth
+            .organizationSlug(new Headers(request.headers), organization)
+            .pipe(
+              Effect.flatMap(Schema.decodeUnknownEffect(OrganizationSlug)),
+              Effect.catchTag("SchemaError", () => new StorageError()),
+            );
+          return {
+            organizationSlug,
+            connection: connection.id,
+            app: connection.target?.app ?? null,
+            profile: connection.target?.profile,
+            redirectUri,
+            reconnect: connection.reconnectAccount !== null,
+          };
+        }),
+      );
+    }),
 );
 
 /** Keep the existing provider redirect URL. Completion still requires the browser session and membership. */

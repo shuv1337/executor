@@ -22,6 +22,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,6 +42,15 @@ func randomKey() string {
 		panic(err)
 	}
 	return hex.EncodeToString(b)
+}
+func randomUUID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		panic(err)
+	}
+	b[6] = b[6]&0x0f | 0x40
+	b[8] = b[8]&0x3f | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 func exists(path string) bool { _, err := os.Stat(path); return err == nil }
 func saveKey(path, value string) error {
@@ -77,7 +87,7 @@ func configuration(directory string, exporting bool) (map[string]string, error) 
 	values := map[string]string{}
 	for _, entry := range os.Environ() {
 		name, value, _ := strings.Cut(entry, "=")
-		if strings.HasPrefix(name, "EXECUTOR_") || strings.HasPrefix(name, "OTEL_") || strings.HasPrefix(name, "BETTER_AUTH_") || strings.HasPrefix(name, "SSO_") || strings.HasPrefix(name, "FIRST_PARTY_") || name == "NODE_ENV" {
+		if strings.HasPrefix(name, "EXECUTOR_") || strings.HasPrefix(name, "OTEL_") || strings.HasPrefix(name, "BETTER_AUTH_") || strings.HasPrefix(name, "SSO_") || strings.HasPrefix(name, "FIRST_PARTY_") || name == "NODE_ENV" || name == "DO_NOT_TRACK" {
 			values[name] = value
 		}
 	}
@@ -140,6 +150,43 @@ func configuration(directory string, exporting bool) (map[string]string, error) 
 		}
 		values[key.name] = value
 	}
+	// Analytics identity is not needed to read existing data: a missing or invalid file is replaced.
+	identities := []struct {
+		name, file string
+		valid      func(string) bool
+		generate   func() string
+	}{
+		{"EXECUTOR_INSTALL_ID", "install-id", func(v string) bool {
+			return regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`).MatchString(v)
+		}, randomUUID},
+		{"EXECUTOR_ANALYTICS_SECRET", "analytics-secret.key", func(v string) bool { return regexp.MustCompile(`^[0-9a-fA-F]{64}$`).MatchString(v) }, randomKey},
+	}
+	for _, identity := range identities {
+		if value := os.Getenv(identity.name); identity.valid(value) {
+			values[identity.name] = value
+			continue
+		}
+		path := filepath.Join(directory, identity.file)
+		content, err := os.ReadFile(path)
+		value := strings.TrimSpace(string(content))
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		if err != nil || !identity.valid(value) {
+			value = identity.generate()
+			if err = saveKey(path, value); err != nil {
+				return nil, err
+			}
+		}
+		values[identity.name] = value
+	}
+	// Node's platform names, matching the native hosts.
+	arch := runtime.GOARCH
+	if arch == "amd64" {
+		arch = "x64"
+	}
+	values["EXECUTOR_HOST_OS"] = runtime.GOOS
+	values["EXECUTOR_HOST_ARCH"] = arch
 	return values, nil
 }
 
@@ -446,21 +493,28 @@ func serve(mode string) error {
 	if err != nil {
 		return err
 	}
-	// The generated file contains paths and a network-policy boolean, never keys.
+	// The generated file contains paths, the dashboard origin and a network-policy boolean, never keys.
+	// App requests for the dashboard origin reach the product through a service binding, so the
+	// bundled Executor app never needs private fetch. Other private destinations are an explicit opt-in.
 	privateFetch := values["EXECUTOR_APPS_ALLOW_PRIVATE_FETCH"]
-	if mode == "export" {
+	if privateFetch == "" || mode == "export" {
 		privateFetch = "false"
-	}
-	if privateFetch == "" {
-		u, _ := url.Parse(values["BETTER_AUTH_URL"])
-		host := u.Hostname()
-		ip := net.ParseIP(host)
-		privateFetch = strconv.FormatBool(host == "localhost" || strings.HasSuffix(host, ".localhost") || !strings.Contains(host, ".") || (ip != nil && (ip.IsLoopback() || ip.IsPrivate())))
 	}
 	if privateFetch != "true" && privateFetch != "false" {
 		return errors.New("EXECUTOR_APPS_ALLOW_PRIVATE_FETCH must be true or false")
 	}
 	config = bytes.ReplaceAll(config, []byte("@@APPS_PRIVATE_FETCH@@"), []byte(privateFetch))
+	// The most app Workers workerd keeps loaded; the apps Worker applies its default for null.
+	appWorkers := "null"
+	if value := values["EXECUTOR_APP_WORKERS"]; value != "" {
+		number, err := strconv.Atoi(value)
+		if err != nil || number < 1 {
+			return errors.New("EXECUTOR_APP_WORKERS must be a positive integer")
+		}
+		appWorkers = strconv.Itoa(number)
+	}
+	config = bytes.ReplaceAll(config, []byte("@@APP_WORKERS@@"), []byte(appWorkers))
+	config = bytes.ReplaceAll(config, []byte("@@SELF_ORIGIN@@"), []byte(strconv.Quote(values["BETTER_AUTH_URL"])))
 	config = bytes.ReplaceAll(config, []byte("@@RUNTIME@@"), []byte(strings.Trim(strconv.Quote(runtime), "\"")))
 	service := `"product"`
 	if mode == "export" {
@@ -534,24 +588,7 @@ func serve(mode string) error {
 		return exportDatabase(filepath.Join(temporary, "export.sock"), os.Args[2])
 	}
 
-	proxy := &httputil.ReverseProxy{
-		Rewrite: func(request *httputil.ProxyRequest) {
-			request.SetURL(&url.URL{Scheme: "http", Host: "product.internal"})
-			request.Out.Host = request.In.Host
-			address, _, err := net.SplitHostPort(request.In.RemoteAddr)
-			if err != nil {
-				address = request.In.RemoteAddr
-			}
-			request.Out.Header.Set("x-executor-client-ip", address)
-		},
-		Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, "unix", filepath.Join(temporary, "product.sock"))
-		}},
-		FlushInterval: -1,
-		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, _ error) {
-			http.Error(w, "Executor is starting", http.StatusServiceUnavailable)
-		},
-	}
+	proxy := productProxy(filepath.Join(temporary, "product.sock"), workerdIdleTimeout)
 	publicListener, err := net.Listen("tcp", net.JoinHostPort(setting("HOST", "0.0.0.0"), port))
 	if err != nil {
 		command.Process.Kill()
@@ -582,6 +619,47 @@ func serve(mode string) error {
 		return <-stopped
 	}
 }
+
+// workerd serves HTTP with kj's default HttpServerSettings; its pipelineTimeout
+// closes a keep-alive connection after 5 seconds without a request.
+const workerdIdleTimeout = 5 * time.Second
+
+// The proxy closes pooled connections at half workerd's idle timeout, so it never
+// sends a request on a connection workerd is closing. Go replays only requests
+// that are safe to repeat, so losing that race failed POSTs such as workflow runs.
+
+func productProxy(socket string, upstreamIdleTimeout time.Duration) *httputil.ReverseProxy {
+	return &httputil.ReverseProxy{
+		Rewrite: func(request *httputil.ProxyRequest) {
+			request.SetURL(&url.URL{Scheme: "http", Host: "product.internal"})
+			request.Out.Host = request.In.Host
+			address, _, err := net.SplitHostPort(request.In.RemoteAddr)
+			if err != nil {
+				address = request.In.RemoteAddr
+			}
+			request.Out.Header.Set("x-executor-client-ip", address)
+		},
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", socket)
+			},
+			IdleConnTimeout: upstreamIdleTimeout / 2,
+		},
+		FlushInterval: -1,
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			// Until workerd listens, its socket is missing or refuses connections.
+			if errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ECONNREFUSED) {
+				http.Error(w, "Executor is starting", http.StatusServiceUnavailable)
+				return
+			}
+			if r.Context().Err() == nil {
+				fmt.Fprintln(os.Stderr, "Executor request failed:", r.Method, err)
+			}
+			http.Error(w, "Executor did not complete the request", http.StatusBadGateway)
+		},
+	}
+}
+
 func main() {
 	mode := "serve"
 	if len(os.Args) > 1 {

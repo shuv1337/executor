@@ -21,8 +21,7 @@ from `@executor-js/sdk/core`; trusted Promise callers can iterate
 The descriptor contains names and arguments, never executable closures or
 credentials. The local host now provides private UI hosting and browser authentication.
 
-See `playground/sdk/live-app.ts` for two callers: one subscribes while another
-writes. The current coordinator supports one local/Docker server process.
+The current coordinator supports one local/Docker server process.
 Cloudflare Durable Object restoration and multi-server delivery are not implemented.
 
 `client.ts` builds typed references using type-only imports of the server

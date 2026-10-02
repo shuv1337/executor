@@ -1,0 +1,599 @@
+/**
+ * The one app Worker runner. It runs beside the Worker Loader on every host: in the Cloud API
+ * Worker, and in the trusted apps Worker of self-host and local. It names each Worker, loads it,
+ * wraps the authored modules and delivers each call's accounts, run, approval, replay and deadline.
+ * Secret fields of providers that declare hosts leave the runner only as sealed handles.
+ * A host supplies only its bindings and, per invocation, a build loader that the runner calls from
+ * the Worker Loader's cold-start callback, so a warm call reads and transfers no code. Every
+ * request and reply passes through the adapter of the protocol the build's framework speaks.
+ */
+import type { Fetcher, WorkerLoader } from "@cloudflare/workers-types";
+import { Effect, Exit, Option, Redacted, Schema, Semaphore } from "effect";
+import {
+  ElicitationReply,
+  type HostRequest,
+  type InvocationDeadline,
+  type ResolvedAccounts,
+  type TrustedToolApproval,
+  type WorkflowExecution,
+  type WorkflowReplay,
+} from "apps/contracts";
+import {
+  facetIdentity,
+  failedColdStart,
+  FacetResult,
+  loadWorker,
+  type FacetBundle,
+  type FacetInvocation,
+} from "@executor-js/app-data/cloudflare";
+import { workerModules } from "@executor-js/app-data/worker-bundle";
+import {
+  CacheCommand,
+  CacheError,
+  CacheReply,
+  type CacheTransport,
+} from "@executor-js/app-cache/contracts";
+import { holdLeases } from "@executor-js/app-cache";
+import { discardsEvaluated } from "@executor-js/app-cache/changes";
+import { describeBuildCause, RuntimeProtocolFailed } from "../contracts/runtime.ts";
+import type { LoadedWorkerBuild, WorkerBundle } from "../contracts/worker-build.ts";
+import { appProtocol, type AppProtocol } from "./app-protocols.ts";
+import { appFacetBridge, appRpcBridge } from "./worker-bridge.ts";
+import { sealAccounts } from "./credential-handles.ts";
+import { AppRpcEntrypoint, AppRpcInvocation } from "./worker-elicitation.ts";
+import { invocationWorkflow } from "./worker-workflow-rpc.ts";
+import type { AppWorkerResidency } from "./app-worker-residency.ts";
+
+type Callback = (input: unknown) => Promise<unknown>;
+
+/** One app's data supervisor. It owns the facet and its database; the runner only calls it. */
+export interface AppDataHost {
+  readonly invoke: (
+    input: typeof FacetInvocation.Type,
+    load: () => Promise<typeof FacetBundle.Type>,
+    elicit: Callback | null,
+    controls: Callback | null,
+  ) => Effect.Effect<unknown, unknown>;
+  readonly cancel: (id: string) => Effect.Effect<void, unknown>;
+  readonly cache: (namespace: string, command: unknown) => Effect.Effect<unknown, unknown>;
+}
+
+/** Host bindings. None of them reaches authored code except the outbound network. */
+export interface AppRunnerHost {
+  readonly loader: Pick<WorkerLoader, "get">;
+  /**
+   * The network an app's isolates use for global `fetch`, bound to that app. It opens the
+   * credential handles the runner seals with `credentialKey`; see credential-handles.ts.
+   */
+  readonly outbound: (app: string) => Fetcher;
+  /** Seals the secret fields of providers that declare hosts. App code never holds it. */
+  readonly credentialKey: Effect.Effect<CryptoKey>;
+  readonly data: (app: string) => AppDataHost;
+  /** Keep a successful call's release, including its cache refreshes, alive after it returns. */
+  readonly waitUntil: (task: Promise<unknown>) => void;
+  /**
+   * The bound on named Workers kept loaded, for a host whose process never unloads them itself.
+   * Shared by every runner in the process.
+   */
+  readonly residency?: AppWorkerResidency;
+}
+
+/** The authorized call. Credentials travel here, never in a Worker name or retained code. */
+export interface AppInvocation {
+  readonly app: string;
+  readonly build: string;
+  readonly database: boolean;
+  readonly command: HostRequest;
+  readonly accounts: typeof ResolvedAccounts.Type;
+  readonly approval?: typeof TrustedToolApproval.Type;
+  readonly replay?: typeof WorkflowReplay.Type;
+  readonly deadline?: typeof InvocationDeadline.Type;
+  readonly headers: Readonly<Record<string, string>>;
+}
+
+/** Capabilities owned by one invocation and released with it. */
+export interface AppCapabilities {
+  /**
+   * Read this invocation's build. Only the Worker Loader's cold-start callback, inside the runner
+   * or the trusted data supervisor, calls it. Authored code never receives it.
+   */
+  readonly load: () => Promise<LoadedWorkerBuild>;
+  readonly elicit: Callback | null;
+  readonly controls: Callback | null;
+  readonly workflow?: WorkflowExecution;
+}
+
+/** Operations an app with a database serves from its data facet, with its storage. */
+const dataOperations: ReadonlySet<HostRequest["operation"]> = new Set([
+  "call",
+  "query",
+  "mutate",
+  "webhooks",
+  "webhook-validate",
+  "webhook-complete",
+  "webhook-register",
+  "webhook-handle",
+  "webhook-unregister",
+]);
+const writeOperations: ReadonlySet<HostRequest["operation"]> = new Set([
+  "mutate",
+  "webhook-register",
+  "webhook-handle",
+  "webhook-unregister",
+]);
+const compatibilityDate = "2026-07-30";
+/** The longest a call's release, including its cache refreshes, may keep running. */
+const releaseLimit = "35 seconds";
+
+/**
+ * In-flight cache commands from one call to its app's store. On Cloudflare, Workers RPC
+ * occasionally never delivered one of four or more concurrent calls to the same Durable Object
+ * while an immediate repeat arrived, which stalled the loader holding the key. Two lanes keep a
+ * load's writes parallel without that burst. Lanes belong to one call: workerd forbids a request
+ * from resuming another request's I/O, so they are never shared across calls.
+ */
+const cacheLanes = 2;
+
+/** One call's cache channel and the leases it owns until the call's release has finished. */
+interface CacheSession {
+  readonly callback: Callback;
+  readonly close: Effect.Effect<void>;
+}
+
+const failed = (cause: unknown) => {
+  const message = describeBuildCause(cause);
+  return Effect.annotateCurrentSpan("executor.runtime.cause", message).pipe(
+    Effect.andThen(Effect.fail(new RuntimeProtocolFailed({ message }))),
+  );
+};
+const attempt = <A>(work: () => Promise<A>) =>
+  Effect.tryPromise({ try: work, catch: (cause) => cause }).pipe(Effect.catch(failed));
+/**
+ * The protocol of each build this process has loaded, least recently used first. Builds are
+ * immutable, so a build's protocol is learned from the load of its first cold start and warm calls
+ * read no code. A self-host or local process holds every app Worker it starts, so it always starts
+ * one before calling it. A Cloud isolate can reach a Worker that another isolate started; it reads
+ * that build once to learn its protocol.
+ */
+const protocols = new Map<string, AppProtocol>();
+const protocolLimit = 4096;
+/**
+ * Reads of builds whose protocol is not known yet. Concurrent first calls of a build, such as a
+ * tool call and the profile setup that an account selection started, share one read, so the
+ * Worker they both reach loads its build once.
+ */
+const reads = new Map<string, Promise<LoadedWorkerBuild>>();
+
+/** Record a build's protocol from its read; the cold start reuses that read. */
+const learn = (build: string, loaded: LoadedWorkerBuild) =>
+  appProtocol(loaded.protocol).pipe(
+    Effect.catch(failed),
+    Effect.map((protocol) => {
+      protocols.set(build, protocol);
+      if (protocols.size > protocolLimit) {
+        const oldest = protocols.keys().next();
+        if (oldest.done !== true) protocols.delete(oldest.value);
+      }
+      return { protocol, load: async () => loaded };
+    }),
+  );
+
+/**
+ * The adapter for an invocation's build, and the loader its cold start uses. When the protocol is
+ * not known yet, the build is read once here and the cold start reuses that read.
+ */
+const protocolOf = (build: string, load: () => Promise<LoadedWorkerBuild>) =>
+  Effect.suspend(() => {
+    const known = protocols.get(build);
+    if (known !== undefined) {
+      protocols.delete(build);
+      protocols.set(build, known);
+      return Effect.succeed({ protocol: known, load });
+    }
+    const pending = reads.get(build);
+    if (pending !== undefined)
+      // Share the read another call started. If it fails, for instance because that caller was
+      // cancelled, this call reads the build itself and reports its own failure.
+      return attempt(() => pending).pipe(
+        Effect.flatMap((loaded) => learn(build, loaded)),
+        Effect.catch(() => attempt(load).pipe(Effect.flatMap((loaded) => learn(build, loaded)))),
+      );
+    // A loader that throws before returning its promise still fails through `attempt`.
+    const read = (async () => load())();
+    reads.set(build, read);
+    return attempt(() => read).pipe(
+      Effect.flatMap((loaded) => learn(build, loaded)),
+      // Removed only once the protocol is recorded, so no later call reads the build again.
+      Effect.ensuring(
+        Effect.sync(() => {
+          if (reads.get(build) === read) reads.delete(build);
+        }),
+      ),
+    );
+  });
+
+/** A call whose Worker failed to load in this isolate. No authored code ran for it. */
+class ColdStartFailed extends Schema.TaggedError<ColdStartFailed>()("ColdStartFailed", {
+  cause: Schema.Unknown,
+}) {}
+
+/**
+ * The runtime an invocation uses and its name. A call that uses an app's database runs in its data
+ * facet; everything else runs in the app Worker. Both are named by app, build and the selected
+ * account IDs, never by credential values or workflow runs.
+ */
+export const appWorker = (
+  invocation: Pick<AppInvocation, "app" | "build" | "database" | "command" | "accounts">,
+) =>
+  facetIdentity(invocation.build, invocation.accounts).pipe(
+    Effect.map((identity) => ({
+      identity,
+      mode:
+        invocation.database && dataOperations.has(invocation.command.operation)
+          ? ("facet" as const)
+          : ("worker" as const),
+      name: `${invocation.app}:${identity}`,
+    })),
+  );
+
+/**
+ * A workflow whose steps read their accounts as this app's invocations do: secret fields of
+ * providers with hosts are sealed. The host resolves current credentials for each step.
+ */
+const sealedWorkflow = (
+  execution: WorkflowExecution,
+  app: string,
+  key: Effect.Effect<CryptoKey>,
+): WorkflowExecution => ({
+  ...execution,
+  resolve: () =>
+    execution
+      .resolve()
+      .pipe(
+        Effect.flatMap((context) =>
+          sealAccounts(Redacted.value(context.accounts), { app, key }).pipe(
+            Effect.map((accounts) => ({ ...context, accounts: Redacted.make(accounts) })),
+          ),
+        ),
+      ),
+});
+
+/** Build the runner for one host's bindings. */
+export const makeAppRunner = (host: AppRunnerHost) => {
+  /** Start one call in a loaded Worker and release its invocation capability afterwards. */
+  const startOnce = (
+    name: string | null,
+    code: () => Promise<WorkerBundle>,
+    options: {
+      readonly body: string;
+      readonly headers: Readonly<Record<string, string>>;
+      readonly globalOutbound: Fetcher | null;
+      readonly elicit: Callback | null;
+      readonly controls: Callback | null;
+      readonly workflow?: WorkflowExecution;
+      readonly cache: Effect.Effect<CacheSession> | null;
+    },
+  ) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const lifetime = yield* Effect.acquireRelease(
+          Effect.sync(() => new AbortController()),
+          (controller) => Effect.sync(() => controller.abort()),
+        );
+        // The Worker stays loaded until the call, including a successful call's release, is over.
+        let held = false;
+        const residency = host.residency;
+        const unhold =
+          name === null || residency === undefined
+            ? Effect.void
+            : yield* Effect.acquireRelease(residency.hold(host.loader, name), (unhold) =>
+                held ? Effect.void : unhold,
+              );
+        const load = async () => {
+          const bundle = await code();
+          return {
+            mainModule: "__executor_rpc.js",
+            modules: {
+              ...workerModules(bundle.modules),
+              "__executor_rpc.js": appRpcBridge(bundle.mainModule),
+            },
+            compatibilityDate,
+            compatibilityFlags: ["nodejs_compat"],
+            globalOutbound: options.globalOutbound,
+          };
+        };
+        const worker =
+          name === null ? host.loader.get(null, load) : loadWorker(host.loader, name, load).worker;
+        const entry = yield* Schema.decodeUnknownEffect(AppRpcEntrypoint)(
+          worker.getEntrypoint(),
+        ).pipe(Effect.catch(failed));
+        const workflow =
+          options.workflow === undefined
+            ? null
+            : yield* invocationWorkflow(options.workflow, lifetime.signal);
+        const elicit = options.elicit;
+        const delivery =
+          elicit === null
+            ? null
+            : async (input: unknown) =>
+                Schema.encodeSync(ElicitationReply)(
+                  Schema.decodeUnknownSync(ElicitationReply)(await elicit(input)),
+                );
+        const cache = options.cache === null ? undefined : yield* options.cache;
+        const closeCache = cache?.close ?? Effect.void;
+        const call = yield* Effect.acquireRelease(
+          Effect.tryPromise({
+            try: () =>
+              entry.start(
+                options.body,
+                options.headers,
+                delivery,
+                workflow,
+                options.controls,
+                cache?.callback ?? null,
+              ),
+            catch: (cause) => cause,
+          }).pipe(
+            Effect.catch((cause): Effect.Effect<never, RuntimeProtocolFailed | ColdStartFailed> =>
+              name !== null && failedColdStart(cause)
+                ? Effect.fail(new ColdStartFailed({ cause }))
+                : failed(cause),
+            ),
+            Effect.flatMap((value) =>
+              Schema.decodeUnknownEffect(AppRpcInvocation)(value).pipe(Effect.catch(failed)),
+            ),
+            Effect.withSpan("runtime.app.rpc.start"),
+            Effect.onError(() => closeCache),
+          ),
+          (call, exit) => {
+            let released: Promise<void> | undefined;
+            // Bounded, so a release RPC that never settles cannot hold its owner open.
+            const release = Effect.promise(
+              () =>
+                (released ??= (async () => {
+                  try {
+                    if (Exit.isSuccess(exit)) await call.drain?.();
+                  } finally {
+                    try {
+                      await call.cancel();
+                    } finally {
+                      call[Symbol.dispose]();
+                    }
+                  }
+                })()),
+            ).pipe(
+              Effect.interruptible,
+              Effect.timeoutOption(releaseLimit),
+              Effect.tap((settled) =>
+                Option.isNone(settled)
+                  ? Effect.annotateCurrentSpan("executor.release.timed_out", true)
+                  : Effect.void,
+              ),
+              Effect.withSpan("runtime.app.rpc.release"),
+              Effect.catchCause(() => Effect.void),
+            );
+            // Leases are released once the call's own work is over: a cancelled call at once, a
+            // successful one after its background refreshes, even past the release limit.
+            if (Exit.isFailure(exit)) return release.pipe(Effect.ensuring(closeCache));
+            held = true;
+            // A release that outlives its limit still runs in the Worker, draining cache refreshes:
+            // keep the Worker loaded until it settles, so the residency never unloads it midway.
+            const settled = Effect.promise(
+              () => released?.catch(() => undefined) ?? Promise.resolve(),
+            );
+            return Effect.context<never>().pipe(
+              Effect.flatMap((services) =>
+                Effect.sync(() =>
+                  host.waitUntil(
+                    Effect.runPromiseWith(services)(
+                      release.pipe(
+                        Effect.ensuring(settled),
+                        Effect.ensuring(closeCache),
+                        Effect.ensuring(unhold),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            );
+          },
+        );
+        return yield* attempt(() => call.result()).pipe(Effect.withSpan("runtime.app.rpc.result"));
+      }),
+    );
+  /**
+   * Callers that share a cold start share its failure, including one caused by the first caller's
+   * cancellation. The failed load retired the name, so each of them starts once more under the
+   * fresh name with its own build loader.
+   */
+  const start = (
+    ...args: Parameters<typeof startOnce>
+  ): Effect.Effect<unknown, RuntimeProtocolFailed> =>
+    startOnce(...args).pipe(
+      Effect.catchTag("ColdStartFailed", () =>
+        startOnce(...args).pipe(
+          Effect.withSpan("runtime.app.cold_start.retry"),
+          Effect.catchTag("ColdStartFailed", ({ cause }) => failed(cause)),
+        ),
+      ),
+    );
+
+  /** Run one call through its data supervisor, which loads the facet only on a cold start. */
+  const facet = (
+    invocation: AppInvocation,
+    identity: string,
+    capabilities: AppCapabilities,
+    protocol: AppProtocol,
+    load: () => Promise<LoadedWorkerBuild>,
+    body: string,
+  ) =>
+    Effect.gen(function* () {
+      const target = host.data(invocation.app);
+      const id = crypto.randomUUID();
+      const { command } = invocation;
+      const result = yield* target
+        .invoke(
+          {
+            id,
+            app: invocation.app,
+            identity,
+            cacheNamespace: invocation.build,
+            body,
+            headers: invocation.headers,
+            write:
+              writeOperations.has(command.operation) ||
+              // A call without a kind is to a tool the catalog does not list; it may write.
+              (command.operation === "call" && command.kind !== "query"),
+          },
+          async () => {
+            const bundle = await load();
+            return {
+              mainModule: "__executor_facet.js",
+              modules: {
+                ...bundle.modules,
+                "__executor_facet.js": appFacetBridge(bundle.mainModule),
+              },
+            };
+          },
+          capabilities.elicit,
+          capabilities.controls,
+        )
+        .pipe(
+          Effect.catch(failed),
+          Effect.flatMap((value) =>
+            Schema.decodeUnknownEffect(FacetResult)(value).pipe(Effect.catch(failed)),
+          ),
+          Effect.onInterrupt(() => target.cancel(id).pipe(Effect.catchCause(() => Effect.void))),
+        );
+      const value = yield* protocol
+        .response(command, result.value)
+        .pipe(
+          Effect.flatMap(Schema.decodeUnknownEffect(Schema.Record(Schema.String, Schema.Json))),
+          Effect.catch(failed),
+        );
+      return {
+        ...value,
+        executorRevision: result.revision,
+        ...(result.cacheChanged === true ? { cacheChanged: true } : {}),
+      };
+    });
+
+  return {
+    /**
+     * Run an authorized call of a retained build. Its Worker is named by app, build and account
+     * selection, so renewed credentials, other runs and other calls of the same selection reuse it.
+     */
+    invoke: (invocation: AppInvocation, capabilities: AppCapabilities) =>
+      Effect.gen(function* () {
+        const { identity, mode, name } = yield* appWorker(invocation).pipe(Effect.catch(failed));
+        yield* Effect.annotateCurrentSpan({
+          "executor.runtime.mode": mode,
+          "executor.worker.identity": name,
+        });
+        // The build's protocol adapter owns this boundary: requests leave, and replies return, in
+        // the host's current model whichever protocol the retained bundle speaks.
+        const { protocol, load } = yield* protocolOf(invocation.build, capabilities.load);
+        // A command this protocol's bundles would not run as asked fails without reaching them.
+        const refused = protocol.refuse(invocation.command);
+        if (refused !== undefined) return { ok: false, error: refused };
+        const accounts = yield* sealAccounts(invocation.accounts, {
+          app: invocation.app,
+          key: host.credentialKey,
+        });
+        const body = protocol.invocation({
+          command: invocation.command,
+          accounts,
+          ...(invocation.approval === undefined ? {} : { approval: invocation.approval }),
+          ...(invocation.replay === undefined ? {} : { replay: invocation.replay }),
+          ...(invocation.deadline === undefined ? {} : { deadline: invocation.deadline }),
+          ...(capabilities.workflow === undefined
+            ? {}
+            : { workflowRun: capabilities.workflow.runId }),
+        });
+        if (mode === "facet")
+          return yield* facet(invocation, identity, capabilities, protocol, load, body);
+        const data = host.data(invocation.app);
+        const services = yield* Effect.context<never>();
+        // Cache writes after the result (background refreshes) are not reported to the host.
+        let cacheChanged = false;
+        const store =
+          (lanes: Semaphore.Semaphore): CacheTransport =>
+          (command) =>
+            lanes
+              .withPermits(1)(data.cache(invocation.build, command))
+              .pipe(
+                Effect.flatMap(Schema.decodeUnknownEffect(CacheReply)),
+                Effect.mapError(() => new CacheError({ reason: "storage" })),
+                Effect.flatMap((reply) =>
+                  reply.ok ? Effect.succeed(reply.value) : Effect.fail(reply.error),
+                ),
+              );
+        // Each attempt owns the leases its Worker claims until that attempt's release finishes.
+        const cache = Effect.suspend(() =>
+          holdLeases(store(Semaphore.makeUnsafe(cacheLanes))),
+        ).pipe(
+          Effect.map((leases): CacheSession => ({
+            callback: (command) =>
+              Effect.runPromiseWith(services)(
+                Schema.decodeUnknownEffect(CacheCommand)(command).pipe(
+                  Effect.mapError(() => new CacheError({ reason: "invalid" })),
+                  Effect.flatMap(leases.transport),
+                  Effect.tap(() =>
+                    Effect.sync(() => {
+                      if (discardsEvaluated(command)) cacheChanged = true;
+                    }),
+                  ),
+                  Effect.match({
+                    onSuccess: (value) => ({ ok: true as const, value }),
+                    onFailure: (error) => ({ ok: false as const, error }),
+                  }),
+                  Effect.flatMap(Schema.encodeEffect(CacheReply)),
+                ),
+              ),
+            close: leases.close,
+          })),
+        );
+        const reply = yield* start(name, load, {
+          body,
+          headers: invocation.headers,
+          globalOutbound: host.outbound(invocation.app),
+          elicit: capabilities.elicit,
+          controls: capabilities.controls,
+          ...(capabilities.workflow === undefined
+            ? {}
+            : {
+                workflow: protocol.workflow(
+                  sealedWorkflow(capabilities.workflow, invocation.app, host.credentialKey),
+                ),
+              }),
+          cache,
+        });
+        const result = yield* protocol.response(invocation.command, reply);
+        return cacheChanged &&
+          typeof result === "object" &&
+          result !== null &&
+          !Array.isArray(result)
+          ? { ...result, cacheChanged: true }
+          : result;
+      }).pipe(Effect.withSpan("runtime.app.invoke")),
+    /**
+     * Evaluate a new build's declarations before it is retained. No later call can reuse this
+     * Worker, so it is not named and the runtime does not keep it; it has no network or cache.
+     */
+    declare: (bundle: LoadedWorkerBuild, headers: Readonly<Record<string, string>>) =>
+      Effect.gen(function* () {
+        const protocol = yield* appProtocol(bundle.protocol).pipe(Effect.catch(failed));
+        const command = { operation: "requirements" } as const;
+        const reply = yield* start(null, async () => bundle, {
+          body: protocol.invocation({ command, accounts: {} }),
+          headers,
+          globalOutbound: null,
+          elicit: null,
+          controls: null,
+          cache: null,
+        });
+        return yield* protocol.response(command, reply);
+      }).pipe(Effect.withSpan("runtime.app.declare")),
+  };
+};
+export type AppRunner = ReturnType<typeof makeAppRunner>;

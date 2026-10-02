@@ -8,6 +8,8 @@ import {
   App,
   Provider,
   Account,
+  AccountHealth,
+  CredentialCheck,
   AccountId,
   AccountNotFound,
   AccountConnection,
@@ -38,10 +40,12 @@ import {
 import { Schema } from "effect";
 import { HttpApiEndpoint, HttpApiGroup } from "effect/unstable/httpapi";
 import {
+  OrganizationSlug,
   OrganizationReference,
   OrganizationForbidden,
   RequireOrganization,
 } from "./organization.ts";
+import { AuthenticationUnavailable, RequireUser } from "./auth.ts";
 
 const params = { organization: OrganizationReference };
 const app = { ...params, app: AppId };
@@ -72,6 +76,8 @@ export const BrowserAccountConnection = Schema.Struct({
 export const HostedAccountConnection = Schema.Struct({
   ...AccountConnection.fields,
   redirectUri: HttpUrl,
+  /** The target app's check can validate credentials entered for this connection. */
+  checkable: Schema.Boolean,
 });
 export type HostedAccountConnection = typeof HostedAccountConnection.Type;
 /** Browser return context preserves the callback URL bound into the OAuth attempt. */
@@ -92,6 +98,8 @@ export const HostedAccountDetail = Schema.Struct({
   account: Account,
   provider: Provider,
   apps: Schema.Array(App),
+  /** Checks by the apps in `apps` only; reading it never runs a check. */
+  health: AccountHealth,
   canManage: Schema.Boolean,
 });
 /** Credentials travel directly to the authorized host and never appear in successful responses. */
@@ -102,6 +110,31 @@ export const HostedAccounts = HttpApiGroup.make("accounts")
       success: HostedAccountDetail,
       error: [StorageError, AccountNotFound, ProviderNotFound],
     }).annotate(RequiredAction, "read"),
+  )
+  .add(
+    HttpApiEndpoint.post("checkCredentials", `${prefix}/apps/:app/credential-checks`, {
+      params: app,
+      payload: Schema.Struct({
+        provider: ProviderId,
+        method: AuthMethodName,
+        fields: AccountFieldsInput,
+      }),
+      success: Schema.NullOr(CredentialCheck),
+      error: [
+        StorageError,
+        AppNotFound,
+        AuthMethodInvalid,
+        AccountFieldsInvalid,
+        OrganizationForbidden,
+      ],
+    }).annotate(RequiredAction, "run"),
+  )
+  .add(
+    HttpApiEndpoint.post("check", `${prefix}/accounts/:account/health`, {
+      params: { ...params, account: AccountId },
+      success: AccountHealth,
+      error: [StorageError, AccountNotFound, OrganizationForbidden],
+    }).annotate(RequiredAction, "run"),
   )
   .add(
     HttpApiEndpoint.post("reconnect", `${prefix}/accounts/:account/connections`, {
@@ -124,10 +157,14 @@ export const HostedAccounts = HttpApiGroup.make("accounts")
     }).annotate(RequiredAction, "manage"),
   )
   .add(
-    HttpApiEndpoint.patch("rename", `${prefix}/accounts/:account`, {
+    HttpApiEndpoint.patch("update", `${prefix}/accounts/:account`, {
       params: { ...params, account: AccountId },
+      /** Only supplied fields change; a null description removes it. */
       payload: Schema.Struct({
-        label: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(120)),
+        label: Schema.optional(Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(120))),
+        description: Schema.optional(
+          Schema.NullOr(Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(500))),
+        ),
       }),
       success: Account,
       error: [StorageError, AccountNotFound, OrganizationForbidden],
@@ -164,7 +201,7 @@ export const HostedAccounts = HttpApiGroup.make("accounts")
       params: connection,
       payload: Schema.Struct({
         method: Schema.NonEmptyString,
-        label: Schema.NonEmptyString,
+        label: Schema.optional(Schema.NonEmptyString),
         fields: AccountFieldsInput,
       }),
       success: Account,
@@ -176,7 +213,7 @@ export const HostedAccounts = HttpApiGroup.make("accounts")
       params: connection,
       payload: Schema.Struct({
         method: Schema.NonEmptyString,
-        label: Schema.NonEmptyString,
+        label: Schema.optional(Schema.NonEmptyString),
         client: Schema.optional(OAuthClientInput),
       }),
       success: HostedOAuthStartResult,
@@ -192,3 +229,33 @@ export const HostedAccounts = HttpApiGroup.make("accounts")
     }).annotate(RequiredAction, "manage"),
   )
   .middleware(RequireOrganization);
+
+/** Where a provider's callback returns: the connection it completes and the page that follows. */
+export const HostedOAuthCallback = Schema.Struct({
+  /** Dashboard state is keyed by the organization's route reference, its slug. */
+  organizationSlug: OrganizationSlug,
+  connection: AccountConnectionId,
+  app: Schema.NullOr(AppId),
+  profile: Schema.optional(ProfileId),
+  redirectUri: HttpUrl,
+  reconnect: Schema.Boolean,
+});
+export type HostedOAuthCallback = typeof HostedOAuthCallback.Type;
+/**
+ * The callback's OAuth state finds its pending connection, so the sign-in can finish in any tab
+ * or browser where the connection's creator is signed in. Completion repeats every check.
+ */
+export const HostedOAuthCallbacks = HttpApiGroup.make("oauthCallback")
+  .add(
+    HttpApiEndpoint.post("resolve", "/api/oauth/callback/resolve", {
+      payload: Schema.Struct({ callbackUrl: Schema.RedactedFromValue(HttpUrl) }),
+      success: HostedOAuthCallback,
+      error: [
+        ...connectionErrors,
+        CredentialsError,
+        OAuthCompletionFailed,
+        AuthenticationUnavailable,
+      ],
+    }),
+  )
+  .middleware(RequireUser);

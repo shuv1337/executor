@@ -1,6 +1,7 @@
 import { hostedAppCapabilities } from "@executor-js/hosted-server/app-management";
 import { executorSelfHostApiDocument } from "../contracts/api.ts";
 import { AppManagementHost } from "@executor-js/app-management";
+import { runStartupDataSteps } from "@executor-js/app-management/data-steps";
 import { createAppRegistry, makeRegistryStorage, storedRegistry } from "@executor-js/app-registry";
 import { gitSourceStorage } from "@executor-js/app-source";
 import type { RepositoryBackend } from "@executor-js/app-source";
@@ -11,8 +12,9 @@ import {
   makeExecutorStorage,
   WorkflowHost,
   recoverAppRepositories,
+  makeDeclarationCache,
+  declarationConfig,
   type Executor,
-  type SourceFile,
 } from "@executor-js/sdk/core";
 import {
   HostedExecutor,
@@ -22,12 +24,14 @@ import {
   makeOrganizationIcons,
   OrganizationDefaults,
   organizationDefaults,
+  lazyHostedApiDocument,
+  withExecutorAnalytics,
 } from "@executor-js/hosted-server";
 import { postgresExecutor } from "@executor-js/hosted-server/database";
 import { HostedAppRuntime } from "@executor-js/hosted-server/app-ui/contracts";
 import { workerdHostHandler } from "@executor-js/sdk/workerd";
 import type { AppRuntime, BlobStorage, WorkflowRuntime } from "@executor-js/sdk/core";
-import { Config, Effect, Layer, Option, Deferred, Schedule, Context } from "effect";
+import { Config, Effect, Layer, Option, Deferred, Schedule, Context, Scope } from "effect";
 import { GroupDatabase } from "@executor-js/hosted-server/groups";
 import { SqlClient } from "effect/unstable/sql";
 
@@ -47,7 +51,6 @@ export class SelfHostWorkflowRequests extends Context.Service<
 
 /** Database initialization finishes before this service is acquired. */
 export const selfHostExecutorServices = <E, R>(
-  skills: readonly SourceFile[],
   egress: HostEgress,
   acquire: (executor: Effect.Effect<Executor>) => Effect.Effect<SelfHostPlatform, E, R>,
 ) =>
@@ -60,6 +63,8 @@ export const selfHostExecutorServices = <E, R>(
         Config.map(Option.getOrUndefined),
       );
       const storage = yield* makeExecutorStorage({ provider: "postgresql" });
+      const evaluation = yield* declarationConfig;
+      const server = yield* Scope.Scope;
       const ready = yield* Deferred.make<Executor>();
       const { runtime, workflows, blobs, repositories } = yield* acquire(Deferred.await(ready));
       const registryStorage = yield* makeRegistryStorage;
@@ -74,9 +79,19 @@ export const selfHostExecutorServices = <E, R>(
           urlPolicy: egress.policy,
           ...(clientMetadataUrl === undefined ? {} : { clientMetadataUrl }),
         },
-        { storage, webhookOrigin: origin, workflows },
+        {
+          storage,
+          webhookOrigin: origin,
+          workflows,
+          declarations: makeDeclarationCache(evaluation.limits),
+          toolListings: evaluation.toolListings,
+          // Stale declarations refresh on the server's own lifetime.
+          background: (work) => Effect.forkIn(work, server).pipe(Effect.as(true)),
+        },
       );
       yield* Deferred.succeed(ready, executor);
+      // The schema is current and nothing serves or builds yet; the caller holds the data lock.
+      yield* runStartupDataSteps({ executor, repositories, blobs }, "private_hosted");
       yield* Effect.forkScoped(
         recoverAppRepositories({ database: storage, sources, blobs }).pipe(
           Effect.catch(() => Effect.logWarning("App repository recovery failed")),
@@ -93,8 +108,7 @@ export const selfHostExecutorServices = <E, R>(
         executor,
         origin,
         storage,
-        skills,
-        executorSelfHostApiDocument(origin),
+        lazyHostedApiDocument(() => executorSelfHostApiDocument(origin)).document,
         // Password registration is admitted locally; self-host does not send verification mail.
         false,
       );
@@ -112,7 +126,7 @@ export const selfHostExecutorServices = <E, R>(
         Layer.succeed(
           AppManagementHost,
           Effect.succeed({
-            executor,
+            executor: withExecutorAnalytics(executor),
             sources,
             repositories,
             registry: (identity) =>
@@ -127,7 +141,8 @@ export const selfHostExecutorServices = <E, R>(
             access: yield* hostedAppCapabilities,
           }),
         ),
-        Layer.succeed(HostedExecutor, Effect.succeed(executor)),
+        // Records only inside requests that carry this instance's analytics sink.
+        Layer.succeed(HostedExecutor, Effect.succeed(withExecutorAnalytics(executor))),
         Layer.succeed(OrganizationDefaults, initialize),
         Layer.succeed(HostedAppRuntime, toEffectRuntime(runtime, blobs)),
       );

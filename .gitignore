@@ -4,6 +4,7 @@ dist/
 .reference/
 
 .local/
+.screenshots/
 .env*
 .alchemy/
 .wrangler/

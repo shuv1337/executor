@@ -42,6 +42,11 @@ Two accounts of the same provider are normal. "Work Vercel" and "Personal
 Vercel" hold different tokens, and an app selects one of them. Several apps can
 select the same account without copying the credential.
 
+An account can also have a **description**: free text for agents, such as
+"reads only; use the sandbox account for writes". Agents read it with the label
+when they choose between accounts. Set it when you create the account or edit
+it later; neither changes the credential.
+
 Fields are an object that matches the method's schema — `{ token }`, or
 `{ email, key }` — not one normalized secret string.
 

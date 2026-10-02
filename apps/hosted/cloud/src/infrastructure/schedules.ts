@@ -1,4 +1,6 @@
 import { cloudArtifactsTokensLive } from "./artifacts-tokens.ts";
+import { dispatchBackground } from "../implementation/background-dispatch.ts";
+import { makeScheduleDispatch } from "../implementation/schedule-dispatch.ts";
 import { cloudSentry } from "../implementation/error-reporting.ts";
 import { cloudAnalytics, recordBackgroundUsage } from "../implementation/product-analytics.ts";
 import { ScheduleObservation } from "@executor-js/sdk/scheduling";
@@ -9,53 +11,50 @@ import { scheduleRecoveryMilliseconds } from "../contracts/schedules.ts";
 import * as Cloudflare from "alchemy/Cloudflare";
 import { RuntimeContext } from "alchemy";
 import { Config, Clock, Effect, Layer, Schema, Semaphore } from "effect";
-import {
-  HostedExecutor,
-  ScheduledAuthority,
-  ScheduleWakeup,
-  ExecutionAdmission,
-} from "@executor-js/hosted-server";
+import { HostedExecutor, ScheduledAuthority, ScheduleWakeup } from "@executor-js/hosted-server";
 import { defaultScheduleWorkerOptions } from "@executor-js/sdk/scheduling";
 import { cloudExecutor } from "./executor.ts";
-import { AppDataSupervisor, AppDataSupervisorLive } from "./app-data.ts";
+import { appDataSupervisors } from "./app-data.ts";
 import { cloudAuthDatabase } from "./auth-database.ts";
-import { cloudTelemetry } from "./telemetry.ts";
-import { billingLive } from "../implementation/billing.ts";
-import { BillingMeter } from "../contracts/billing-meter.ts";
+import { cloudObjectDatabase, ObjectDatabase } from "./object-database.ts";
 
 const makeScheduleCoordinator = Effect.gen(function* () {
   const analytics = yield* cloudAnalytics;
   const report = yield* cloudSentry;
-  const resources = yield* cloudExecutor(yield* AppDataSupervisor, yield* cloudArtifactsTokensLive);
-  const billing = yield* billingLive;
-  const meter = yield* BillingMeter.pipe(Effect.provide(billing));
+  const resources = yield* cloudExecutor(
+    yield* appDataSupervisors,
+    yield* cloudArtifactsTokensLive,
+  );
   const concurrency = yield* Config.Number("EXECUTOR_SCHEDULE_CONCURRENCY").pipe(
     Config.withDefault(defaultScheduleWorkerOptions.concurrency),
     Effect.flatMap(Schema.decodeUnknownEffect(Schema.Int.check(Schema.isGreaterThan(0)))),
     Effect.orDie,
   );
+  const objectDatabase = yield* cloudObjectDatabase;
   return Effect.gen(function* () {
     const state = yield* Cloudflare.DurableObjectState;
     const lifetime = yield* previewLifetime;
+    // Alarms, wakes and the dispatched runs share the coordinator's held connections.
+    const database = yield* objectDatabase("schedules");
     const pool = yield* Semaphore.make(concurrency);
     const lifecycle = yield* Semaphore.make(1);
     const alarms = yield* Semaphore.make(1);
+    const dispatch = yield* makeScheduleDispatch;
     let initialized = false;
     const provide = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-      effect.pipe(
-        Effect.provide(resources),
-        Effect.provideService(ExecutionAdmission, meter.consume),
-      );
+      effect.pipe(Effect.provide(resources), Effect.provideService(ObjectDatabase, database));
     const arm = alarms.withPermits(1)(
       provide(
         Effect.gen(function* () {
           const executor = yield* Effect.flatten(HostedExecutor);
           const next = yield* executor.scheduler.nextWake;
-          if (next === null) yield* state.storage.deleteAlarm();
+          // Requested profile setup keeps its wake: deleting it would leave the change to the
+          // cron heartbeat, up to a minute later.
+          if (next === null && !(yield* dispatch.requested)) yield* state.storage.deleteAlarm();
           else
             yield* state.storage.setAlarm(
               Math.max(
-                next.getTime(),
+                next?.getTime() ?? 0,
                 (yield* Clock.currentTimeMillis) + defaultScheduleWorkerOptions.pollMilliseconds,
               ),
             );
@@ -77,13 +76,16 @@ const makeScheduleCoordinator = Effect.gen(function* () {
               }),
             );
             // Alarm callbacks own this work through waitUntil; new wakes can discover other due apps meanwhile.
-            yield* executor[ProfileHost].tick(concurrency);
-            yield* executor.scheduler.tick({
-              runner: "cloud",
-              maxCandidates: concurrency,
-              authorize,
-              execute: (operation) => pool.withPermitsIfAvailable(1)(operation).pipe(Effect.asVoid),
-            });
+            yield* dispatch.run(
+              executor[ProfileHost].tick(concurrency),
+              executor.scheduler.tick({
+                runner: "cloud",
+                maxCandidates: concurrency,
+                authorize,
+                execute: (operation) =>
+                  pool.withPermitsIfAvailable(1)(operation).pipe(Effect.asVoid),
+              }),
+            );
             yield* arm;
           }),
         ).pipe(
@@ -124,6 +126,8 @@ const makeScheduleCoordinator = Effect.gen(function* () {
               yield* state.storage.deleteAlarm();
               return;
             }
+            // Profile changes wake the coordinator; the request outlives a pass already running.
+            yield* dispatch.request;
             yield* state.storage.setAlarm(
               (yield* Clock.currentTimeMillis) + defaultScheduleWorkerOptions.pollMilliseconds,
             );
@@ -143,7 +147,7 @@ const makeScheduleCoordinator = Effect.gen(function* () {
               );
             }),
           );
-          yield* state.waitUntil(run);
+          yield* dispatchBackground(run, state.waitUntil);
           // Keep considering unclaimed due work while admitted runs are waiting on external I/O.
           yield* Effect.scoped(arm).pipe(
             lifetime.background,
@@ -155,10 +159,7 @@ const makeScheduleCoordinator = Effect.gen(function* () {
         }),
     };
   });
-}).pipe(
-  Effect.provide(Layer.mergeAll(AppDataSupervisorLive, cloudAuthDatabase, cloudTelemetry)),
-  Effect.orDie,
-);
+}).pipe(Effect.provide(cloudAuthDatabase), Effect.orDie);
 
 /** Only this object owns the cloud runner identity; restart recovery never claims another live runner. */
 export class ScheduleCoordinator extends Cloudflare.DurableObject<
@@ -169,19 +170,27 @@ export class ScheduleCoordinator extends Cloudflare.DurableObject<
 /** The API owns the coordinator and supplies its private service bindings. */
 export const ScheduleCoordinatorLive = ScheduleCoordinator.make(makeScheduleCoordinator);
 
-/** Route changes wake the coordinator promptly; a native cron heartbeat repairs missing alarms after failures. */
+/**
+ * Route changes wake the coordinator promptly; the minute background job repairs missing alarms
+ * after failures.
+ */
 export const cloudSchedules = Effect.gen(function* () {
   const coordinator = yield* ScheduleCoordinator;
+  // Worker placement does not place Durable Objects. Keep new coordinators near
+  // the hosted Postgres region instead of the first caller's edge location.
+  const locationHint = yield* Config.Literals(
+    ["wnam", "enam", "sam", "weur", "eeur", "apac", "oc", "afr", "me"],
+    "CLOUD_SCHEDULE_LOCATION_HINT",
+  ).pipe(Config.withDefault("enam"));
   const report = yield* cloudSentry;
   const lifetime = yield* previewLifetime;
   // The namespace binding only exists at runtime, so resolve the stub when the wake runs.
   const wake = Effect.scoped(
-    report(Effect.suspend(() => coordinator.getByName("executor").wake())),
+    report(Effect.suspend(() => coordinator.getByName("executor", { locationHint }).wake())),
   ).pipe(
     Effect.withSpan("schedule.wake"),
     Effect.catch(() => Effect.logError("Schedule coordinator wake failed")),
     Effect.provide(RuntimeContext.phantom),
   );
-  yield* Cloudflare.Workers.cron("* * * * *", () => wake.pipe(lifetime.background));
-  return Layer.succeed(ScheduleWakeup, wake);
+  return { layer: Layer.succeed(ScheduleWakeup, wake), wake: wake.pipe(lifetime.background) };
 });

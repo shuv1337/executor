@@ -6,9 +6,18 @@ description: Build and deploy Executor apps with tools, storage, UI, accounts an
 # Build an Executor app
 
 An app is TypeScript source with a default `defineApp` export from `apps`.
-The host supplies the framework unless `package.json` selects an exact Executor
-`apps` version. App authors use ordinary async functions; Effect stays inside
+Its `package.json` declares the exact `apps` version it uses; new apps already
+do. App authors use ordinary async functions; Effect stays inside
 the framework. An app's installed name is separate from its source definition.
+
+## Choose how to work
+
+With a shell, prefer the **local CLI path** in [deploy.md](deploy.md): keep the
+source in a directory, edit it with your file tools, and deploy with
+`executor apps` (npm `executor@beta`). The pinned `apps` package from npm
+supplies types and `framework-reference.json`, so writing code needs no MCP.
+Use MCP only to connect accounts and call the deployed app. Without a shell,
+build through `execute`; source then travels as data inside tool calls.
 
 ## Read only the topics needed
 
@@ -19,8 +28,8 @@ the framework. An app's installed name is separate from its source definition.
 | Create, save, deploy, update or select dependencies          | [deploy.md](deploy.md)             |
 | Build a React UI and subscribe to data                       | [ui.md](ui.md)                     |
 | Store, query or modify app data                              | [storage.md](storage.md)           |
-| Connect provider accounts                                    | [accounts.md](accounts.md)         |
-| Import MCP, OpenAPI or GraphQL operations                    | [integrations.md](integrations.md) |
+| Connect provider accounts and check they work                | [accounts.md](accounts.md)         |
+| Add a service: MCP, OpenAPI, GraphQL or another API          | [integrations.md](integrations.md) |
 | Handle webhooks                                              | [webhooks.md](webhooks.md)         |
 | Run workflows or scheduled mutations                         | [workflows.md](workflows.md)       |
 
@@ -43,7 +52,7 @@ Load files through the MCP `skills` tool using the returned app slug, profile, d
 ## Discover exact contracts
 
 Use `tools.search` inside `execute` to find callable app tools and their input
-and output signatures. Discover `framework_search` and `framework_describe`
+and output signatures. Discover `framework.search` and `framework.describe`
 on this Executor app to inspect library functions and methods. These queries
 return generated signatures, related types, examples and documentation links.
 Framework functions are imports or methods used in app source, not MCP tools.
@@ -55,7 +64,7 @@ that identity on subsequent reads. Do not assume a host reference describes a
 different pinned `apps` package; that package ships `framework-reference.json`.
 
 Hosted management calls require an explicit organization. Discover and call
-`context_get({})` first. Local management calls have no organization parameter.
+`context.get({})` first. Local management calls have no organization parameter.
 Read each discovered signature; do not guess route arguments.
 
 ## Build and verify
@@ -69,3 +78,9 @@ the page renders. Verify the requested behavior on the authenticated app page.
 If browser access is unavailable, report exactly what remains unverified.
 Never put credentials in source, browser code or tool arguments. Use the secure
 account connection flow described in `accounts.md`.
+
+## Send feedback
+
+Send feedback with the Executor app's `feedback.submit` tool before your final
+reply, and whenever something blocks you. Read [feedback.md](feedback.md) for
+what to write. Skip it only if the tool reports that feedback is disabled.

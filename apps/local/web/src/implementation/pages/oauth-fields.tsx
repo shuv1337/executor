@@ -1,3 +1,4 @@
+import { usePageUrl } from "@executor-js/dashboard-start/page";
 import type { OAuthSubmission } from "@executor-js/ui/contracts/credentials";
 import { useAtomSet } from "@effect/atom-react";
 import type { Atom } from "effect/unstable/reactivity";
@@ -5,6 +6,7 @@ import { Cause, Effect, Option, Schema } from "effect";
 import {
   OAuthClientUnavailable,
   OAuthSetupFailed,
+  oauthClientEntryReasons,
   type Account,
   type Provider,
   type AccountConnectionId,
@@ -39,10 +41,11 @@ export function OAuthFields({
   readonly account?: Account;
   readonly connection?: ConnectionGrant;
   readonly onSaved: (account: Account) => void;
-  readonly returnTo?: Omit<typeof OAuthAppReturn.Type, "connection">;
+  readonly returnTo?: typeof OAuthAppReturn.Type;
   readonly onPendingChange?: (pending: boolean) => void;
   readonly disabled?: boolean;
 }) {
+  const page = usePageUrl();
   const start = useAtomSet(startOAuthAtom, { mode: "promiseExit" });
   const startConnection = useAtomSet(startConnectionOAuthAtom, { mode: "promiseExit" });
   const reconnect = useAtomSet(reconnectAccountAtom, { mode: "promiseExit" });
@@ -63,35 +66,35 @@ export function OAuthFields({
           setupAction={action}
           disabled={disabled}
           {...(onPendingChange ? { onPendingChange } : {})}
-          redirectUri={new URL(OAuthCallbackPath, window.location.origin).href}
+          redirectUri={new URL(OAuthCallbackPath, page.origin).href}
           requiresClient={(cause) => {
             const failure = Cause.findErrorOption(cause);
             const required =
               Option.isSome(failure) &&
               (Schema.is(OAuthClientUnavailable)(failure.value) ||
                 (Schema.is(OAuthSetupFailed)(failure.value) &&
-                  failure.value.reason === "invalid_client"));
+                  oauthClientEntryReasons.has(failure.value.reason)));
             if (required) refresh();
             return required;
           }}
-          start={({ label, ...client }: OAuthSubmission) =>
+          start={(client: OAuthSubmission) =>
             connection
-              ? startConnection({ payload: { ...connection, method, label, ...client } })
+              ? startConnection({ payload: { ...connection, method, ...client } })
               : account
                 ? reconnect({ params: { account: account.id }, payload: client })
-                : start({ payload: { provider: provider.id, method, label, ...client } })
+                : start({ payload: { provider: provider.id, method, ...client } })
           }
           onAuthorized={(value) => {
             refresh();
             if (value.status === "completed") {
               onSaved(value.account);
-              return;
+              return "done";
             }
             if (connection) Effect.runSync(openConnectionOAuth(value.authorizationUrl, connection));
             else if (value.connection !== undefined)
-              Effect.runSync(
-                openOAuth(value.authorizationUrl, value.connection, account?.id, returnTo),
-              );
+              Effect.runSync(openOAuth(value.authorizationUrl, account?.id, returnTo));
+            else return "done";
+            return "navigating";
           }}
         />
       )}

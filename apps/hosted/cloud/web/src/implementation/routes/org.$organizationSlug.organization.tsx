@@ -1,57 +1,62 @@
-import { createFileRoute, Link } from "@tanstack/react-router";
-import { OrganizationPage } from "@executor-js/hosted-web/pages/organization";
-import { DeleteOrganization } from "../components/delete-organization.tsx";
+import { Suspense } from "react";
+import { useAtomValue } from "@effect/atom-react";
+import { Link, createFileRoute } from "@tanstack/react-router";
+import { OrganizationPage, type MemberLimit } from "@executor-js/hosted-web/pages/organization";
 import { useOrganizationRoute } from "@executor-js/hosted-web/organization";
-import { SsoSettings } from "../components/sso-settings.tsx";
 import { Button } from "@executor-js/ui/components/button";
-import {
-  Card,
-  CardDescription,
-  CardFooter,
-  CardHeader,
-  CardTitle,
-} from "@executor-js/ui/components/card";
+import { Option } from "effect";
+import { AsyncResult, Atom } from "effect/unstable/reactivity";
+import { DeleteOrganization } from "../components/delete-organization.tsx";
+import { SsoSettings } from "../components/sso-settings.tsx";
+import { BillingSettings } from "../components/billing-settings.tsx";
+import { memberLimitAtom } from "../../contracts/billing.ts";
 
-/** Cloud adds billing settings and owner-only removal to the shared organization page. */
-export const Route = createFileRoute("/org/$organizationSlug/organization")({
-  component: () => (
-    <OrganizationPage emailInvitations footer={<DeleteOrganization />}>
-      <BillingSettings />
-      <SsoSettings />
-    </OrganizationPage>
-  ),
-});
+/** Members cannot read billing, and cannot invite, so they never ask for the limit. */
+const noMemberLimit = Atom.make(AsyncResult.initial<{ readonly limit: number | null }>());
 
-function BillingSettings() {
+/** Owners and admins see the plan's member limit and an upgrade prompt when it is reached. */
+function useMemberLimit(): MemberLimit | undefined {
   const organization = useOrganizationRoute();
-  return (
-    <Card className="gap-0 py-0">
-      <CardHeader className="gap-1.5 px-4 pt-4 pb-3">
-        <CardTitle>
-          <h2>Billing</h2>
-        </CardTitle>
-        <CardDescription>Manage your plan and payment details.</CardDescription>
-      </CardHeader>
-      <CardFooter className="px-4 pb-4">
-        <Button
-          asChild
-          variant="outline"
-          disabled={organization.role === undefined}
-          disabledReason={
-            organization.role === "member"
-              ? "Only organization owners and admins can manage billing."
-              : undefined
-          }
+  const administrator = organization.role === "owner" || organization.role === "admin";
+  const result = useAtomValue(
+    administrator ? memberLimitAtom(organization.organization) : noMemberLimit,
+  );
+  const confirmed = Option.getOrUndefined(AsyncResult.value(result));
+  if (confirmed === undefined) return undefined;
+  return {
+    limit: confirmed.limit,
+    upgrade: (
+      <Button asChild>
+        <Link
+          to="/org/$organizationSlug/billing"
+          params={{ organizationSlug: organization.slug }}
+          search={{ organization: "", plan: "" }}
         >
-          <Link
-            to="/org/$organizationSlug/billing"
-            params={{ organizationSlug: organization.slug }}
-            search={{ organization: "", plan: "" }}
-          >
-            Open billing
-          </Link>
-        </Button>
-      </CardFooter>
-    </Card>
+          Upgrade plan
+        </Link>
+      </Button>
+    ),
+  };
+}
+
+function CloudOrganizationPage() {
+  return (
+    <OrganizationPage
+      emailInvitations
+      memberLimit={useMemberLimit()}
+      footer={<DeleteOrganization />}
+    >
+      <BillingSettings />
+      {/* Only enterprise plans show this card, and its plan check calls the billing provider;
+          the rest of the page does not wait for it. */}
+      <Suspense fallback={null}>
+        <SsoSettings />
+      </Suspense>
+    </OrganizationPage>
   );
 }
+
+/** Cloud adds billing settings, the member limit and owner-only removal to the shared organization page. */
+export const Route = createFileRoute("/org/$organizationSlug/organization")({
+  component: CloudOrganizationPage,
+});

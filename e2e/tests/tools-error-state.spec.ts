@@ -4,13 +4,20 @@ import { Actors } from "../support/actors.ts";
 import { Api, body } from "../support/api.ts";
 import { Browser } from "../support/browser.ts";
 import { HostedLive, withHostedCase } from "../support/case.ts";
+import { openThroughBrowser } from "../support/in-app-navigation.ts";
 import { holdQuery } from "../support/query-transition.ts";
 import { scenarios } from "../test-plan.ts";
+import { appsManifest } from "../support/apps-release.ts";
 
 const App = Schema.Struct({ id: Schema.String });
 const EvaluationFailure = Schema.Struct({
   _tag: Schema.Literal("AppEvaluationFailed"),
   reason: Schema.String,
+  failure: Schema.Struct({
+    source: Schema.String,
+    errorName: Schema.String,
+    message: Schema.String,
+  }),
 });
 
 layer(HostedLive, { excludeTestServices: true })("Tools errors", (it) => {
@@ -27,11 +34,12 @@ layer(HostedLive, { excludeTestServices: true })("Tools errors", (it) => {
           files: [
             {
               path: "index.ts",
-              content: `import { defineApp } from "apps";
+              content: `import { defineApp, router } from "apps";
 export default defineApp({ accounts: {} }, async () => {
-  throw new Error("PRIVATE_TOOL_DIAGNOSTIC");
+  throw new Error("SYNTHETIC_FACTORY_FAILURE");
 });`,
             },
+            appsManifest,
           ],
         });
         expect(response.status).toBe(200);
@@ -41,11 +49,14 @@ export default defineApp({ accounts: {} }, async () => {
         );
         const failed = yield* api.request(actors.owner, "GET", `${prefix}/apps/${app.id}/tools`);
         expect(failed.status).toBe(502);
-        expect((yield* body(EvaluationFailure, failed)).reason).not.toContain(
-          "PRIVATE_TOOL_DIAGNOSTIC",
-        );
+        // The app's own factory error explains the failure to its caller.
+        expect((yield* body(EvaluationFailure, failed)).failure).toEqual({
+          source: "app",
+          errorName: "Error",
+          message: "SYNTHETIC_FACTORY_FAILURE",
+        });
         const paths = [actors.organization.id, actors.organization.slug].map(
-          (organization) => `/api/organizations/${organization}/apps/${app.id}/tools`,
+          (organization) => `/api/organizations/${organization}/apps/${app.id}/tools/index`,
         );
         const pageUrl = `/org/${actors.organization.slug}/apps/${app.id}?view=tools`;
         yield* browser.login(actors.owner);
@@ -62,7 +73,7 @@ export default defineApp({ accounts: {} }, async () => {
         expect(copy).toContain("Executor could not load this app’s tool definitions.");
         expect(copy).toContain("AppEvaluationFailed");
         expect(copy).not.toContain("Check its accounts");
-        expect(copy).not.toContain("PRIVATE_TOOL_DIAGNOSTIC");
+        expect(copy).toContain("The app threw Error: SYNTHETIC_FACTORY_FAILURE");
         yield* browser.checkpoint("Tools-error-desktop");
         const prompt = yield* browser.use("Copy a safe, contextual repair prompt", (page) =>
           page
@@ -73,8 +84,8 @@ export default defineApp({ accounts: {} }, async () => {
         );
         expect(prompt).toContain(app.id);
         expect(prompt).toContain("AppEvaluationFailed");
-        expect(prompt).toContain("does not identify which cause occurred");
-        expect(prompt).not.toContain("PRIVATE_TOOL_DIAGNOSTIC");
+        expect(prompt).toContain("raised this error, not Executor");
+        expect(prompt).toContain("SYNTHETIC_FACTORY_FAILURE");
 
         const retry = yield* holdQuery(paths, "continue");
         yield* browser.use("Retry the failed discovery", (page) =>
@@ -127,11 +138,14 @@ export default defineApp({ accounts: {} }, async () => {
             files: [
               {
                 path: "index.ts",
-                content: `import { defineApp, query, object } from "apps";
+                content: `import { defineApp, query, object, router } from "apps";
 export default defineApp({ accounts: {} }, async () => ({
-  queries: { status: query({ description: "Service status", input: object({}) }, async () => "ready") }
+  tools: router({
+    status: query({ description: "Service status", input: object({}) }, async () => "ready"),
+  })
 }));`,
               },
+              appsManifest,
             ],
           },
         );
@@ -139,12 +153,16 @@ export default defineApp({ accounts: {} }, async () => ({
         yield* browser.use("Return to desktop", (page) =>
           page.setViewportSize({ width: 1440, height: 960 }),
         );
-        const unavailable = yield* holdQuery(paths, "fail");
-        yield* browser.use("Reopen Tools with a failed network read", (page) => page.goto(pageUrl));
-        yield* unavailable.requested;
-        yield* unavailable.release;
-        yield* browser.use("Unclassified failures still have a safe recovery", (page) =>
-          page.getByRole("alert", { name: "Action unavailable", exact: true }).waitFor(),
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const unavailable = yield* holdQuery(paths, "fail", { allRequests: true });
+            yield* openThroughBrowser("Reopen Tools with a failed network read", pageUrl);
+            yield* unavailable.requested;
+            yield* unavailable.release;
+            yield* browser.use("Unclassified failures still have a safe recovery", (page) =>
+              page.getByRole("alert", { name: "Action unavailable", exact: true }).waitFor(),
+            );
+          }),
         );
         const recovery = yield* holdQuery(paths, "continue");
         yield* browser.use("Retry the temporary failure", (page) =>
@@ -160,7 +178,7 @@ export default defineApp({ accounts: {} }, async () => ({
         yield* browser.use("The real tool catalog returns after retry", (page) =>
           page
             .getByRole("navigation", { name: "App tools", exact: true })
-            .getByRole("button", { name: "queries.status", exact: true })
+            .getByRole("button", { name: "status", exact: true })
             .waitFor(),
         );
         yield* browser.use("The error clears after recovery", (page) =>

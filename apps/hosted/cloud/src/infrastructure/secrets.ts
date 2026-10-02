@@ -21,27 +21,32 @@ export interface CloudSecrets {
 }
 
 /**
+ * Only the credential key. Workers that store credentials but never sign sessions bind this
+ * instead of `cloudSecrets`, so they do not receive the auth secret.
+ */
+export const cloudEncryptionKey = Effect.gen(function* () {
+  if (Option.isNone(yield* testStage)) {
+    const encryptionKey = yield* Config.Redacted("EXECUTOR_ENCRYPTION_KEY").pipe(
+      Effect.flatMap(Schema.decodeUnknownEffect(EncryptionKey)),
+    );
+    return Effect.succeed(encryptionKey);
+  }
+  return yield* (yield* Random("EncryptionKey", { bytes: 32 })).text;
+});
+
+/**
  * Configured stages read both secrets from their environment at deploy time.
  * Test stages own `Random` resources instead; Alchemy binds each value into the Worker
  * and the accessor reads it back at runtime, so nothing is copied into a vault.
  */
 export const cloudSecrets = Effect.gen(function* () {
+  const encryptionKey = yield* cloudEncryptionKey;
   if (Option.isNone(yield* testStage)) {
     const authSecret = yield* Config.Redacted("BETTER_AUTH_SECRET").pipe(
       Effect.flatMap(Schema.decodeUnknownEffect(SigningSecret)),
     );
-    const encryptionKey = yield* Config.Redacted("EXECUTOR_ENCRYPTION_KEY").pipe(
-      Effect.flatMap(Schema.decodeUnknownEffect(EncryptionKey)),
-    );
-    return {
-      authSecret: Effect.succeed(authSecret),
-      encryptionKey: Effect.succeed(encryptionKey),
-    } satisfies CloudSecrets;
+    return { authSecret: Effect.succeed(authSecret), encryptionKey } satisfies CloudSecrets;
   }
   const authSecret = yield* Random("AuthSecret");
-  const encryptionKey = yield* Random("EncryptionKey", { bytes: 32 });
-  return {
-    authSecret: yield* authSecret.text,
-    encryptionKey: yield* encryptionKey.text,
-  } satisfies CloudSecrets;
+  return { authSecret: yield* authSecret.text, encryptionKey } satisfies CloudSecrets;
 });

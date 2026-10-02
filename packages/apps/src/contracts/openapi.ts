@@ -44,7 +44,10 @@ export const OpenapiRequestBody = Schema.Struct({
 
 /** Credential-free operation data emitted by the OpenAPI importer. */
 export const OpenapiOperation = Schema.Struct({
+  /** The tool name after `queries.` or `mutations.`, grouped as `<group>.<leaf>`. */
   name: Schema.NonEmptyString,
+  /** The document's operationId, when it declares one. `kinds` overrides are keyed by it. */
+  operationId: Schema.optionalKey(Schema.String),
   description: Schema.String,
   method: Schema.Literals(["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]),
   path: Schema.String,
@@ -60,6 +63,8 @@ export const OpenapiOperation = Schema.Struct({
   }),
   /** Streams remain in the metadata but cannot run through a single-result tool call. */
   streaming: Schema.optionalKey(Schema.Literal(true)),
+  /** The operation's OpenAPI tags, shown to agents as labels within its router. */
+  tags: Schema.optionalKey(Schema.Array(Schema.NonEmptyString)),
   input: JsonObject,
   outputSchema: Schema.optionalKey(JsonObject),
   errorResponses: Schema.optionalKey(Schema.Array(OpenapiErrorResponse)),
@@ -83,6 +88,17 @@ export const OpenapiAccount = Schema.Struct({
 });
 export type OpenapiAccount = typeof OpenapiAccount.Type;
 
+/**
+ * Parameter values bound by the selected account, grouped as in tool input. Callers may omit
+ * these parameters; an explicit value still takes precedence and the API still authorizes it.
+ */
+export const OpenapiParameterDefaults = Schema.Struct({
+  path: Schema.optionalKey(Schema.Record(Schema.String, Schema.String)),
+  query: Schema.optionalKey(Schema.Record(Schema.String, Schema.String)),
+  headers: Schema.optionalKey(Schema.Record(Schema.String, Schema.String)),
+});
+export type OpenapiParameterDefaults = typeof OpenapiParameterDefaults.Type;
+
 /** Parsed options for one account's evaluation. */
 export const OpenapiToolsOptions = Schema.Struct({
   operations: Schema.Array(OpenapiOperation),
@@ -94,6 +110,7 @@ export const OpenapiToolsOptions = Schema.Struct({
   methods: Schema.Record(Schema.String, Schema.Array(CredentialBinding)),
   oauth: Schema.Array(Schema.String),
   account: Schema.optional(OpenapiAccount),
+  parameterDefaults: Schema.optional(OpenapiParameterDefaults),
   signal: Schema.optional(Schema.instanceOf(AbortSignal)),
   fetch: Schema.optional(
     Schema.declare((value): value is typeof globalThis.fetch => typeof value === "function"),
@@ -138,6 +155,11 @@ export const isOpenapiTextMedia = (type: string): boolean =>
   /^(?:text\/|application\/(?:[\w.-]+\+)?(?:json|xml)|application\/(?:javascript|x-ndjson|x-www-form-urlencoded))/i.test(
     type,
   );
+/** A form field that carries raw file bytes: OpenAPI 3.1 `contentMediaType` without an
+ * encoding, or the `format: binary` string that 3.1 documents still commonly use. */
+export const isOpenapiFileSchema = (shape: Readonly<Record<string, unknown>>): boolean =>
+  (shape.contentMediaType !== undefined && shape.contentEncoding === undefined) ||
+  (shape.type === "string" && shape.format === "binary");
 /** JSON-safe binary result, independent of the host's file storage. */
 export const openapiBinaryResultSchema: JsonObject = {
   type: "object",

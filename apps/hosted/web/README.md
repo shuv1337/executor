@@ -2,7 +2,8 @@
 
 Reusable React pages and components for cloud and self-host. This package has no
 browser entry or route tree and imports neither host. Each host builds its own
-SPA with TanStack Router; neither uses SSR.
+TanStack Start app and renders it on the server; see
+[dashboard rendering](../../../notes/dashboard-rendering.md).
 
 - `src/contracts/api.ts`: common Effect Atom queries derived from `HostedApi`.
 - `src/contracts/auth.ts`: typed Better Auth operations and session state through Effect Atom.
@@ -19,18 +20,17 @@ Executable frontends live in `../cloud/web` and `../self-host/web`. Add
 host-specific pages, navigation, and atoms there. Their API calls can use that
 host's API contract without making the shared package depend on it.
 
-The cloud build uses TanStack's route-generation hook to emit its `_redirects`
-asset. The shared Vite configuration accepts route plugins without depending on
-Cloudflare. Self-host continues to serve its SPA through its filesystem adapter.
-Organization pages share one `/org/*` rewrite; TanStack resolves their nested
-routes and not-found views. API, Git, docs and asset paths keep their own handling.
-The combined site build puts fixed redirects first and rejects files over
-Cloudflare's 2,000 static / 100 dynamic rule limits before Worker upload.
+The cloud build derives its Worker-first page routes from Start's route manifest
+(`cloud/web/cloudflare-routes.ts`) and marks hashed `/assets/*` files immutable.
+Organization pages share one `/org/*` rule; TanStack resolves their nested routes
+and not-found views. Self-host serves its build through its filesystem adapter.
 
-Run `bun run hosted:self-host:web:dev` from the repository root for self-host HMR
-on port 4410, proxying to Docker on port 4400. Run `bun run hosted:cloud:web:dev`
+Run `bun run hosted:dev` from the repository root for self-host HMR; it starts the
+API and a Node web server behind this checkout's Portless origin. The Node server
+renders documents with host context and uses Vite for source assets and HMR. Run
+`bun run hosted:cloud:web:dev`
 for cloud HMR on port 4412, proxying to the local Alchemy Worker on port 4411.
-Both accept `HOSTED_API_URL` as an override.
-Set the server's `BETTER_AUTH_URL` to the frontend origin when using HMR.
+The cloud dashboard accepts `HOSTED_API_URL` as an override. Set its server's
+`BETTER_AUTH_URL` to the frontend origin when using HMR.
 
 See [hosted deployment](../README.md) for build and deployment commands.

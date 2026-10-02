@@ -1,10 +1,26 @@
 /** Shared authored workflow fixture and public wire projections for real product HTTP tests. */
 import { Schema } from "effect";
+import { withApps } from "./apps-release.ts";
+
+/** Each fixture tool's kind, as the app declares it. Calls must name it. */
+export const workflowToolKinds = {
+  isolation: "query",
+  rows: "query",
+  save: "mutation",
+  release: "mutation",
+  released: "query",
+  denied: "mutation",
+  approval: "mutation",
+  interactive: "query",
+  timeoutWrite: "mutation",
+  launch: "mutation",
+  history: "query",
+} as const;
 
 export const workflowFiles = (version: string) => [
   {
     path: "package.json",
-    content: JSON.stringify({ dependencies: { "brotli-wasm": "3.0.1" } }),
+    content: JSON.stringify({ dependencies: withApps({ "brotli-wasm": "3.0.1" }) }),
   },
   {
     path: "context.ts",
@@ -13,12 +29,15 @@ if (!(wasm instanceof WebAssembly.Module) || !WebAssembly.Module.exports(wasm).s
   throw new Error("Retained WASM module was not available in this app context");
 }
 import { defineDatabase, defineProvider, secrets, table, object, string,
-  type QueryContext, type MutationContext, type WorkflowContext } from "apps";
+  type QueryContext, type MutationContext, type WorkflowContext,
+  router,
+} from "apps";
 const service = defineProvider({ name: "Workflow fixture", auth: {
   key: secrets({ label: "Key", fields: object({ token: string() }) })
 } });
 export const requirements = { accounts: { service }, database: defineDatabase({
-  events: table({ label: string(), source: string() })
+  events: table({ label: string(), source: string() }),
+  checkpoints: table({ label: string() })
 }) };
 export type QueryCtx = QueryContext<typeof requirements>;
 export type MutationCtx = MutationContext<typeof requirements>;
@@ -44,6 +63,12 @@ export const save = mutation({ input: object({ label: string() }) }, async (ctx:
   await new Promise((resolve) => setTimeout(resolve, 10));
   return row;
 });
+export const release = mutation({ input: object({ label: string() }) }, async (ctx: MutationCtx, input) => {
+  await ctx.db.checkpoints.insert(input);
+  return null;
+});
+export const released = query({ input: object({ label: string() }) }, async (ctx: QueryCtx, input) =>
+  (await ctx.db.checkpoints.withIndex("by_creation").collect()).some(row => row.label === input.label));
 export const denied = mutation({ input: object({}), approval: () => "denied" }, async () => "unreachable");
 export const approval = mutation({ input: object({}), approval: () => "user-approval" }, async () => "unreachable");
 export const interactive = query({ input: object({}) }, async (ctx) => {
@@ -55,6 +80,10 @@ export const timeoutWrite = mutation({ input: object({}) }, async (ctx: Mutation
   await new Promise((resolve) => setTimeout(resolve, 1000));
   return null;
 });
+export const explode = mutation({ input: object({}) }, async (ctx: MutationCtx) => {
+  await ctx.db.events.insert({ label: "explode:rollback", source: "synthetic" });
+  throw new TypeError("Synthetic mutation failure");
+});
 export const launch = mutation({ input: object({ key: string() }) }, async (ctx: MutationCtx, input) =>
   ctx.workflows.start({ workflow: "quick", input: {}, key: input.key }));
 export const history = query({ input: object({}) }, async (ctx: QueryCtx) => ctx.workflows.list({ limit: 1 }));
@@ -63,7 +92,7 @@ export const history = query({ input: object({}) }, async (ctx: QueryCtx) => ctx
   {
     path: "workflows.ts",
     content: `import { workflow, object, string, NonRetryableError } from "apps";
-import { rows, save, denied, approval, interactive, timeoutWrite } from "./operations.ts";
+import { rows, save, released, denied, approval, interactive, timeoutWrite, explode } from "./operations.ts";
 import type { WorkflowCtx } from "./context.ts";
 export const process = workflow({ input: object({ label: string() }) }, async (ctx: WorkflowCtx, input) => {
   if ("db" in ctx || "accounts" in ctx || "elicit" in ctx) throw new NonRetryableError("Invalid body context");
@@ -77,7 +106,9 @@ export const process = workflow({ input: object({ label: string() }) }, async (c
     return { source: step.accounts.service.fields.token, attempts, key };
   });
   await ctx.step.runMutation("save", save, { label: input.label + ":before" });
-  await ctx.step.sleep("hold", "12 seconds");
+  while (!(await ctx.step.runQuery("released", released, { label: input.label }))) {
+    await ctx.step.sleep("hold", "100 milliseconds");
+  }
   const after = await ctx.step.do("credential", async (step) => step.accounts.service.fields.token);
   await Promise.all(["left", "right"].map((name) => ctx.step.runMutation("save", save, { label: input.label + ":" + name })));
   const stored = await ctx.step.runQuery("read", rows, {});
@@ -96,6 +127,12 @@ export const deniedRun = workflow({ input: object({}) }, async (ctx: WorkflowCtx
 export const approvalRun = workflow({ input: object({}) }, async (ctx: WorkflowCtx) => ctx.step.runMutation("approval", approval, {}));
 export const interactiveRun = workflow({ input: object({}) }, async (ctx: WorkflowCtx) => ctx.step.runQuery("interactive", interactive, {}, { retries: { limit: 0, delay: 0 } }));
 export const timeoutRun = workflow({ input: object({}) }, async (ctx: WorkflowCtx) => ctx.step.runMutation("timeout", timeoutWrite, {}, { timeout: 100, retries: { limit: 0, delay: 0 } }));
+export const leak = workflow({ input: object({}) }, async (ctx: WorkflowCtx) =>
+  ctx.step.do("leak", { retries: { limit: 0, delay: 0 } }, async (step) => {
+    throw new NonRetryableError("Rejected token " + step.accounts.service.fields.token);
+  }));
+export const explodeRun = workflow({ input: object({}) }, async (ctx: WorkflowCtx) =>
+  ctx.step.runMutation("explode", explode, {}, { retries: { limit: 0, delay: 0 } }));
 export const fatal = workflow({ input: object({}) }, async (ctx: WorkflowCtx) => {
   let calls = 0;
   return ctx.step.do("fatal", { retries: { limit: 2, delay: 10 } }, async () => {
@@ -107,12 +144,15 @@ export const fatal = workflow({ input: object({}) }, async (ctx: WorkflowCtx) =>
   },
   {
     path: "index.ts",
-    content: `import { defineApp } from "apps";
+    content: `import { defineApp, router } from "apps";
 import { requirements } from "./context.ts";
-import { rows, save, denied, approval, interactive, timeoutWrite, launch, history, isolation } from "./operations.ts";
+import { rows, save, release, released, denied, approval, interactive, timeoutWrite, explode, launch, history, isolation } from "./operations.ts";
 import * as workflows from "./workflows.ts";
 export default defineApp(requirements, {
-  queries: { rows, interactive, history, isolation }, mutations: { save, denied, approval, timeoutWrite, launch }, workflows
+  tools: router({
+    rows, released, interactive, history, isolation,
+    save, release, denied, approval, timeoutWrite, explode, launch,
+  }), workflows
 });`,
   },
 ];
@@ -123,6 +163,13 @@ export const WorkflowRun = Schema.Struct({
   status: Schema.String,
   output: Schema.optionalKey(Schema.Json),
   error: Schema.optionalKey(Schema.String),
+  failure: Schema.optionalKey(
+    Schema.Struct({
+      step: Schema.optionalKey(Schema.String),
+      errorName: Schema.optionalKey(Schema.String),
+      message: Schema.optionalKey(Schema.String),
+    }),
+  ),
 });
 export const WorkflowRows = Schema.Array(
   Schema.Struct({ label: Schema.String, source: Schema.String }),

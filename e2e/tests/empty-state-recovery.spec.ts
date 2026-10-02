@@ -1,4 +1,4 @@
-import { createProfile } from "../support/profiles.ts";
+import { Profile } from "../support/profiles.ts";
 import { expect, layer } from "@effect/vitest";
 import { Effect, Schema } from "effect";
 import { randomUUID } from "node:crypto";
@@ -6,11 +6,12 @@ import { Actors } from "../support/actors.ts";
 import { Api, body } from "../support/api.ts";
 import { Browser } from "../support/browser.ts";
 import { HostedLive, withHostedCase } from "../support/case.ts";
-import { App, Resource } from "../support/contracts.ts";
+import { App } from "../support/contracts.ts";
 import { scenarios } from "../test-plan.ts";
+import { appsManifest } from "../support/apps-release.ts";
 
-const source = `import { defineApp } from "apps";
-export default defineApp({ accounts: {} }, async () => ({ queries: {} }));`;
+const source = `import { defineApp, router } from "apps";
+export default defineApp({ accounts: {} }, async () => ({ tools: router({}) }));`;
 
 layer(HostedLive, { excludeTestServices: true })("Empty state recovery", (it) => {
   it.effect(scenarios.emptyStateRecovery.title, (context) =>
@@ -21,15 +22,15 @@ layer(HostedLive, { excludeTestServices: true })("Empty state recovery", (it) =>
           actors = yield* Actors,
           browser = yield* Browser;
         const prefix = `/api/organizations/${actors.organization.id}`;
-        const draft = yield* body(
+        const undeployed = yield* body(
           App,
-          yield* api.request(actors.owner, "POST", `${prefix}/apps/drafts`, {
-            name: `Empty draft ${randomUUID().slice(0, 8)}`,
-            files: [{ path: "index.ts", content: source }],
+          yield* api.request(actors.owner, "POST", `${prefix}/apps`, {
+            name: `Empty app ${randomUUID().slice(0, 8)}`,
+            files: [{ path: "index.ts", content: source }, appsManifest],
           }),
         );
         yield* Effect.addFinalizer(() =>
-          api.request(actors.owner, "DELETE", `${prefix}/apps/${draft.id}`).pipe(Effect.orDie),
+          api.request(actors.owner, "DELETE", `${prefix}/apps/${undeployed.id}`).pipe(Effect.orDie),
         );
         yield* browser.login(actors.owner);
         yield* browser.use("Use dark theme", (page) => page.emulateMedia({ colorScheme: "dark" }));
@@ -37,11 +38,13 @@ layer(HostedLive, { excludeTestServices: true })("Empty state recovery", (it) =>
           { width: 1440, height: 960 },
           { width: 390, height: 844 },
         ]) {
-          yield* browser.use("Set draft viewport", (page) => page.setViewportSize(viewport));
-          yield* browser.use("Open draft overview", (page) =>
-            page.goto(`/org/${actors.organization.slug}/apps/${draft.id}`),
+          yield* browser.use("Set undeployed app viewport", (page) =>
+            page.setViewportSize(viewport),
           );
-          yield* browser.use("Draft has a direct source action", (page) =>
+          yield* browser.use("Open undeployed app overview", (page) =>
+            page.goto(`/org/${actors.organization.slug}/apps/${undeployed.id}`),
+          );
+          yield* browser.use("Undeployed app has a direct source action", (page) =>
             page.getByRole("link", { name: "Open source", exact: true }).waitFor(),
           );
           yield* browser.use("The source preview has loaded", (page) =>
@@ -53,14 +56,14 @@ layer(HostedLive, { excludeTestServices: true })("Empty state recovery", (it) =>
             ),
           ).toBe(1);
           expect(
-            yield* browser.use("Draft source is visible without scrolling", (page) =>
+            yield* browser.use("Undeployed app source is visible without scrolling", (page) =>
               page
                 .getByRole("region", { name: "App source", exact: true })
                 .evaluate((element) => element.getBoundingClientRect().top < window.innerHeight),
             ),
           ).toBe(true);
-          yield* browser.checkpoint(`${viewport.width} draft overview`);
-          yield* browser.use("Open draft schedules", (page) =>
+          yield* browser.checkpoint(`${viewport.width} undeployed overview`);
+          yield* browser.use("Open undeployed app schedules", (page) =>
             page
               .getByRole("navigation", { name: "App navigation" })
               .getByRole("link", { name: "Schedules", exact: true })
@@ -70,20 +73,21 @@ layer(HostedLive, { excludeTestServices: true })("Empty state recovery", (it) =>
             page.getByRole("heading", { name: "No deployment yet", exact: true }).waitFor(),
           );
           expect(
-            yield* browser.use("No useless retry for a draft", (page) =>
+            yield* browser.use("No useless retry for an undeployed app", (page) =>
               page.getByRole("button", { name: "Retry", exact: true }).count(),
             ),
           ).toBe(0);
-          yield* browser.use("Draft schedules offer source after access resolves", (page) =>
-            page.getByRole("link", { name: "Open source", exact: true }).waitFor(),
+          yield* browser.use(
+            "Undeployed app schedules offer source after access resolves",
+            (page) => page.getByRole("link", { name: "Open source", exact: true }).waitFor(),
           );
-          yield* browser.use("The draft header has finished loading", (page) =>
+          yield* browser.use("The undeployed app header has finished loading", (page) =>
             page.locator("[data-slot=skeleton]").first().waitFor({ state: "hidden" }),
           );
-          yield* browser.checkpoint(`${viewport.width} draft schedules`);
+          yield* browser.checkpoint(`${viewport.width} undeployed schedules`);
         }
         yield* browser.use("Open sharing without groups", (page) =>
-          page.goto(`/org/${actors.organization.slug}/apps/${draft.id}?view=settings`),
+          page.goto(`/org/${actors.organization.slug}/apps/${undeployed.id}?view=settings`),
         );
         yield* browser.use("Choose sharing audience", (page) =>
           page.getByRole("combobox", { name: "Who can use this app?", exact: true }).click(),
@@ -105,7 +109,7 @@ layer(HostedLive, { excludeTestServices: true })("Empty state recovery", (it) =>
           App,
           yield* api.request(actors.owner, "POST", `${prefix}/apps/deploy`, {
             name: `Empty capabilities ${randomUUID().slice(0, 8)}`,
-            files: [{ path: "index.ts", content: source }],
+            files: [{ path: "index.ts", content: source }, appsManifest],
           }),
         );
         yield* Effect.addFinalizer(() =>
@@ -206,8 +210,25 @@ layer(HostedLive, { excludeTestServices: true })("Empty state recovery", (it) =>
         yield* browser.use("Owner sees the authoring action", (page) =>
           page.goto(`/org/${actors.organization.slug}/apps/${deployed.id}?view=skills`),
         );
-        yield* browser.use("Author can copy a skills prompt", (page) =>
-          page.getByRole("button", { name: "Copy prompt", exact: true }).waitFor(),
+        yield* browser.use("Author can start a skill from the empty state", (page) =>
+          page
+            .getByRole("heading", { name: "Give your app its first skill", exact: true })
+            .locator("..")
+            .getByRole("button", { name: "New skill", exact: true })
+            .click()
+            .then(() =>
+              page
+                .getByRole("dialog", { name: "New skill", exact: true })
+                .getByLabel("Name", { exact: true })
+                .fill("First skill"),
+            ),
+        );
+        yield* browser.checkpoint("Owner can author a first skill directly");
+        yield* browser.use("Cancel the skill draft without changing the empty app", (page) =>
+          page
+            .getByRole("dialog", { name: "New skill", exact: true })
+            .getByRole("button", { name: "Cancel", exact: true })
+            .click(),
         );
         yield* browser.login(actors.member);
         for (const tab of ["skills", "schedules"] as const) {
@@ -238,7 +259,7 @@ layer(HostedLive, { excludeTestServices: true })("Empty state recovery", (it) =>
     ),
   );
 
-  it.effect(scenarios.emptyAccountSearch.title, (context) =>
+  it.effect(scenarios.emptyAccountTools.title, (context) =>
     withHostedCase(
       context,
       Effect.gen(function* () {
@@ -249,82 +270,72 @@ layer(HostedLive, { excludeTestServices: true })("Empty state recovery", (it) =>
         const deployed = yield* body(
           App,
           yield* api.request(actors.owner, "POST", `${prefix}/apps/deploy`, {
-            name: `Account search ${randomUUID().slice(0, 8)}`,
+            name: `Per-account tools ${randomUUID().slice(0, 8)}`,
             files: [
               {
                 path: "index.ts",
-                content: `import { defineApp, defineProvider, object, secrets, string } from "apps";
-const service = defineProvider({ name: "Search accounts", auth: { key: secrets({ label: "API key", fields: object({ token: string() }) }) } });
-export default defineApp({ accounts: { primary: service, many: service.many() } }, async () => ({ queries: {} }));`,
+                content: `import { accountRouter, defineApp, defineProvider, object, router, secrets, string } from "apps";
+const service = defineProvider({ name: "Per-account service", auth: { key: secrets({ label: "API key", fields: object({ token: string() }) }) } });
+export default defineApp({ accounts: { service: service.many() } }, async ({ accounts, signal }) => ({
+  tools: await accountRouter(accounts.service, async () => router({}), { signal }),
+}));`,
               },
+              appsManifest,
             ],
           }),
         );
-        const accounts: string[] = [];
         yield* Effect.addFinalizer(() =>
-          Effect.gen(function* () {
-            yield* api.request(actors.owner, "DELETE", `${prefix}/apps/${deployed.id}`);
-            for (const account of accounts)
-              yield* api.request(actors.owner, "DELETE", `${prefix}/accounts/${account}`);
-          }).pipe(Effect.orDie),
+          api.request(actors.owner, "DELETE", `${prefix}/apps/${deployed.id}`).pipe(Effect.orDie),
         );
-        const profile = yield* createProfile(actors.owner, `${prefix}/apps/${deployed.id}`);
-        for (let index = 1; index <= 7; index++) {
-          const connection = yield* body(
-            Resource,
-            yield* api.request(actors.owner, "POST", `${prefix}/apps/${deployed.id}/connections`, {
-              requirement: "primary",
-              profile: profile.id,
-            }),
-          );
-          const saved = yield* body(
-            Resource,
-            yield* api.request(
-              actors.owner,
-              "POST",
-              `${prefix}/connections/${connection.id}/submit`,
-              { method: "key", label: `Account ${index}`, fields: { token: "synthetic-only" } },
-            ),
-          );
-          accounts.push(saved.id);
-        }
+        // A many-account slot with nothing selected is a valid profile, so tool discovery runs
+        // and the app lists nothing. The page must ask for an account rather than report no tools.
+        const profile = yield* body(
+          Profile,
+          yield* api.request(actors.owner, "POST", `${prefix}/apps/${deployed.id}/profiles`, {
+            accounts: { service: [] },
+            idempotencyKey: randomUUID(),
+          }),
+        );
+        expect(profile.accounts).toEqual({ service: [] });
         yield* browser.login(actors.owner);
         yield* browser.use("Use dark theme", (page) => page.emulateMedia({ colorScheme: "dark" }));
-        yield* browser.use("Open multiple-account selection", (page) =>
-          page.goto(`/org/${actors.organization.slug}/apps/${deployed.id}?view=accounts`),
+        yield* browser.use("Open the tools of a profile without accounts", (page) =>
+          page.goto(
+            `/org/${actors.organization.slug}/apps/${deployed.id}?view=tools&profile=${profile.id}`,
+          ),
         );
-        yield* browser.use("Open saved accounts", (page) =>
+        yield* browser.use("Tools ask for an account", (page) =>
+          page.getByRole("heading", { name: "No accounts connected", exact: true }).waitFor(),
+        );
+        expect(
+          yield* browser.use("Tools do not claim the app exposes nothing", (page) =>
+            page.getByRole("heading", { name: "No tools", exact: true }).count(),
+          ),
+        ).toBe(0);
+        yield* browser.checkpoint("Tools ask for an account");
+        yield* browser.use("The account step is one click away", (page) =>
           page
-            .getByRole("region", { name: "Search accounts (many)", exact: true })
-            .getByRole("button", { name: "Add Search accounts account", exact: true })
+            .locator(".tools-section")
+            .getByRole("link", { name: "Accounts", exact: true })
             .click(),
         );
-        yield* browser.use("Keep an unsaved account choice", (page) =>
-          page.getByRole("checkbox", { name: /Account 1/ }).check(),
+        yield* browser.use("Accounts opens for the same profile", (page) =>
+          page.waitForURL(
+            (url) =>
+              url.searchParams.get("view") === "accounts" &&
+              url.searchParams.get("profile") === profile.id,
+          ),
         );
-        for (const viewport of [
-          { width: 1440, height: 960 },
-          { width: 390, height: 844 },
-        ]) {
-          yield* browser.use("Set account-picker viewport", (page) =>
-            page.setViewportSize(viewport),
-          );
-          yield* browser.use("Search without a match", (page) =>
-            page.getByLabel("Search saved accounts", { exact: true }).fill("does-not-exist"),
-          );
-          yield* browser.use("No matching accounts is explicit", (page) =>
-            page.getByRole("heading", { name: "No matching accounts", exact: true }).waitFor(),
-          );
-          yield* browser.checkpoint(`${viewport.width} unmatched saved-account search`);
-          yield* browser.use("Clear the search", (page) =>
-            page.getByRole("button", { name: "Clear search", exact: true }).click(),
-          );
-          expect(
-            yield* browser.use("The unsaved selection survives filtering", (page) =>
-              page.getByRole("checkbox", { name: /Account 1/ }).isChecked(),
-            ),
-          ).toBe(true);
-        }
+        yield* browser.use("Open the overview of a profile without accounts", (page) =>
+          page.goto(`/org/${actors.organization.slug}/apps/${deployed.id}?profile=${profile.id}`),
+        );
+        yield* browser.use("The overview tools card asks for an account", (page) =>
+          page
+            .getByRole("region", { name: "App tools preview", exact: true })
+            .getByRole("heading", { name: "No accounts connected", exact: true })
+            .waitFor(),
+        );
+        yield* browser.checkpoint("Overview tools ask for an account");
       }),
     ),
   );

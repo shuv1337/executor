@@ -4,7 +4,7 @@ import { createServer as createHttpServer } from "node:http";
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { Config, Console, Effect, FileSystem, Layer, Path, Schema } from "effect";
+import { Config, Console, Effect, FileSystem, Layer, Option, Path, Schema } from "effect";
 import { HttpRouter, HttpClient, HttpServerRequest, FetchHttpClient } from "effect/unstable/http";
 import { CloudEntry } from "../src/contracts/entry.ts";
 import { cloudEntryDocument } from "../src/implementation/entry.ts";
@@ -15,6 +15,7 @@ import { homepageResponse } from "../src/implementation/homepage-response.ts";
 import { marketingFiles } from "../src/implementation/marketing.ts";
 import { developmentDashboard } from "../src/implementation/development-web.ts";
 import { cloudDevtools } from "@executor-js/hosted-testing/cloud";
+import { dashboardPageRoutes } from "../src/implementation/dashboard.ts";
 
 /** Route map shared by the cloud development entry point and its HTTP checks. */
 export const developmentRoutes = (
@@ -27,7 +28,7 @@ export const developmentRoutes = (
     HttpRouter.add(
       "GET",
       "/",
-      homepageResponse(cookiePrefix, marketing.experiment, dashboard.document),
+      homepageResponse(cookiePrefix, marketing.experiment, dashboard.document(null)),
     ),
     ...(["login", "login/sso", "create"] as const).map((page) =>
       HttpRouter.add(
@@ -54,6 +55,7 @@ export const developmentRoutes = (
         ),
       ),
     ),
+    ...dashboardPageRoutes.map((route) => HttpRouter.add("GET", route, dashboard.document(null))),
     HttpRouter.add("GET", "/home", marketing.document),
     ...marketing.paths.map((path) => HttpRouter.add("GET", path, marketing.asset)),
     HttpRouter.add("*", "*", dashboard.handler),
@@ -73,14 +75,16 @@ const main = Effect.scoped(
     const marketingRoot = path.resolve(root, "../../../marketing");
     const configuration = yield* cloudDevelopment;
     const origin = new URL(configuration.origin);
+    // Behind the local proxy the origin's TLS ends at the proxy; this process serves plain HTTP.
+    const proxied = Option.isSome(configuration.webPort);
     const tls =
-      origin.protocol === "https:"
+      origin.protocol === "https:" && !proxied
         ? {
             cert: Buffer.from(yield* fs.readFile(path.join(home, ".portless/server.pem"))),
             key: Buffer.from(yield* fs.readFile(path.join(home, ".portless/server-key.pem"))),
           }
         : null;
-    const listenHost = origin.hostname === "[::1]" ? "::1" : "127.0.0.1";
+    const listenHost = !proxied && origin.hostname === "[::1]" ? "::1" : "127.0.0.1";
     const socket = yield* Effect.sync(() =>
       tls === null ? createHttpServer() : createServer(tls),
     );
@@ -89,23 +93,25 @@ const main = Effect.scoped(
       tls === null ? createHttpServer() : createServer(tls),
     );
     yield* Layer.build(NodeHttpServer.layerServer(() => hmrSocket, { host: listenHost, port: 0 }));
-    const dashboard = yield* developmentDashboard(root, hmrSocket, origin);
+    // The proxy routes whole hostnames, so a proxied HMR client connects to its loopback listener.
+    const apiOrigin = `http://127.0.0.1:${configuration.apiPort}`;
+    const dashboard = yield* developmentDashboard(
+      root,
+      hmrSocket,
+      proxied ? new URL(`http://${listenHost}`) : origin,
+      apiOrigin,
+    );
     const marketing = yield* marketingFiles(path.join(marketingRoot, "dist"));
     const routes = Layer.mergeAll(
       yield* cloudDevtools,
-      developmentRoutes(
-        marketing,
-        dashboard,
-        cloudSessionCookiePrefix(origin.origin),
-        `http://127.0.0.1:${configuration.apiPort}`,
-      ),
+      developmentRoutes(marketing, dashboard, cloudSessionCookiePrefix(origin.origin), apiOrigin),
     );
     yield* Layer.build(
       HttpRouter.serve(routes, { disableLogger: true }).pipe(
         Layer.provide(
           NodeHttpServer.layer(() => socket, {
             host: listenHost,
-            port: Number(origin.port),
+            port: Option.getOrElse(configuration.webPort, () => Number(origin.port)),
             gracefulShutdownTimeout: 1_000,
           }),
         ),
@@ -113,7 +119,7 @@ const main = Effect.scoped(
     );
     yield* Effect.addFinalizer(() => Effect.sync(() => socket.closeAllConnections()));
     yield* Console.log(`Executor cloud dev: ${origin.origin}`);
-    yield* Effect.never;
+    return yield* Effect.never;
   }),
 ).pipe(Effect.provide(NodeServices.layer));
 

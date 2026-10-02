@@ -5,7 +5,7 @@ import { Clock, type Crypto, Effect, Schema } from "effect";
 import { Account, AccountNotFound } from "../contracts/account.ts";
 import type { Executor, ResourceLifecycle } from "../contracts/executor.ts";
 import { Provider, ProviderNotFound } from "../contracts/provider.ts";
-import { AccountId, StorageError, type OwnerId } from "../contracts/shared.ts";
+import { AccountId, StorageError, type OwnerId, type ProviderId } from "../contracts/shared.ts";
 import { StoredAccount, type Credentials } from "../contracts/storage.ts";
 import { query, transaction, type Query } from "./database.ts";
 import { validateFields } from "./provider.ts";
@@ -25,9 +25,34 @@ export const storedAccount = (db: Query, account: AccountId, owner?: OwnerId) =>
     );
   });
 
+/**
+ * An account created without a name starts with the owner's first free "Default" label for its
+ * provider, so it can be named once its identity is known. Read inside the creating transaction.
+ */
+export const defaultLabel = (tx: Query, owner: OwnerId, provider: ProviderId) =>
+  Effect.gen(function* () {
+    const rows = yield* query(() =>
+      tx.findMany("accounts", {
+        select: ["label"],
+        where: (b) => b.and(b("owner", "=", owner), b("provider", "=", provider)),
+      }),
+    );
+    const labels = new Set(rows.map((row) => row.label));
+    let label = "Default";
+    for (let number = 2; labels.has(label); number++) label = `Default ${number}`;
+    return label;
+  });
+
 /** Apply the caller's owner filter before reading or mutating a saved account. */
 export const ownedAccount = (db: Query, input: Parameters<Executor["accounts"]["get"]>[0]) =>
   storedAccount(db, input.account, input.owner);
+
+/** An encrypted OAuth grant whose account deletion has committed. */
+export interface RemovedGrant {
+  readonly account: AccountId;
+  readonly provider: string;
+  readonly encrypted: Uint8Array;
+}
 
 /** Bind account operations to caller-owned storage and credentials. */
 export const makeAccounts = (
@@ -35,6 +60,8 @@ export const makeAccounts = (
   credentials: Credentials,
   crypto: Crypto.Crypto,
   lifecycle?: ResourceLifecycle,
+  /** Best-effort provider-side revocation; it never fails and runs only after the delete commits. */
+  revokeRemoved?: (removed: RemovedGrant) => Effect.Effect<void>,
 ) => ({
   add: (input: Parameters<Executor["accounts"]["add"]>[0]) =>
     Effect.gen(function* () {
@@ -52,24 +79,28 @@ export const makeAccounts = (
         input.method,
         input.fields,
       );
-      const account = {
+      const identity = {
         id: AccountId.make(
           `acc_${yield* crypto.randomUUIDv4.pipe(Effect.mapError(() => new StorageError()))}`,
         ),
         owner: input.owner,
         provider: provider.id,
         method: input.method,
-        label: input.label,
         createdAt: new Date(yield* Clock.currentTimeMillis),
       };
-      const encryptedCredentials = yield* credentials.encrypt(account.id, fields);
-      yield* transaction(db, (tx) =>
+      const encryptedCredentials = yield* credentials.encrypt(identity.id, fields);
+      return yield* transaction(db, (tx) =>
         Effect.gen(function* () {
+          const account = {
+            ...identity,
+            label: input.label ?? (yield* defaultLabel(tx, input.owner, provider.id)),
+            description: input.description ?? null,
+          };
           yield* query(() => tx.create("accounts", { ...account, encryptedCredentials }));
           if (lifecycle) yield* lifecycle.accountCreated(account);
+          return account;
         }),
       );
-      return account;
     }).pipe(Effect.withSpan("sdk.accounts.add")),
   get: (input: Parameters<Executor["accounts"]["get"]>[0]) =>
     Effect.gen(function* () {
@@ -93,13 +124,14 @@ export const makeAccounts = (
     transaction(db, (tx) =>
       Effect.gen(function* () {
         const account = yield* ownedAccount(tx, input);
+        const set = {
+          ...(input.label === undefined ? {} : { label: input.label }),
+          ...(input.description === undefined ? {} : { description: input.description }),
+        };
         yield* query(() =>
-          tx.updateMany("accounts", {
-            where: (b) => b("id", "=", account.id),
-            set: { label: input.label },
-          }),
+          tx.updateMany("accounts", { where: (b) => b("id", "=", account.id), set }),
         );
-        return yield* Schema.decodeUnknownEffect(Account)({ ...account, label: input.label }).pipe(
+        return yield* Schema.decodeUnknownEffect(Account)({ ...account, ...set }).pipe(
           Effect.mapError(() => new StorageError()),
         );
       }),
@@ -125,7 +157,7 @@ export const makeAccounts = (
         yield* query(() =>
           tx.updateMany("accounts", {
             where: (b) => b("id", "=", account.id),
-            set: { encryptedCredentials },
+            set: { encryptedCredentials, credentialGeneration: account.credentialGeneration + 1 },
           }),
         );
         return yield* Schema.decodeUnknownEffect(Account)(account).pipe(
@@ -134,54 +166,68 @@ export const makeAccounts = (
       }),
     ).pipe(Effect.withSpan("sdk.accounts.replaceCredentials")),
   remove: (input: Parameters<Executor["accounts"]["remove"]>[0]) =>
-    transaction(db, (tx) =>
-      Effect.gen(function* () {
-        const row = yield* query(() =>
-          tx.findFirst("accounts", {
-            where: (b) =>
-              b.and(
-                b("id", "=", input.account),
-                input.owner === undefined ? true : b("owner", "=", input.owner),
-              ),
-          }),
-        );
-        if (row !== null) {
-          yield* query(() =>
-            tx.updateMany("accounts", {
-              where: (b) => b("id", "=", row.id),
-              set: { createdAt: row.createdAt },
+    Effect.gen(function* () {
+      const removed = yield* transaction(db, (tx) =>
+        Effect.gen(function* () {
+          const row = yield* query(() =>
+            tx.findFirst("accounts", {
+              where: (b) =>
+                b.and(
+                  b("id", "=", input.account),
+                  input.owner === undefined ? true : b("owner", "=", input.owner),
+                ),
             }),
           );
-          const linked = yield* query(() =>
-            tx.findFirst("webhookAccounts", { where: (b) => b("account", "=", row.id) }),
-          );
-          if (linked !== null) return yield* new AccountWebhooksActive({ account: row.id });
-          const workflow = yield* query(() =>
-            tx.findFirst("workflowAccounts", { where: (b) => b("account", "=", row.id) }),
-          );
-          if (workflow !== null) return yield* new AccountWorkflowsActive({ account: row.id });
-          if (lifecycle) {
-            const account = yield* Schema.decodeUnknownEffect(Account)(row).pipe(
-              Effect.mapError(() => new StorageError()),
+          if (row !== null) {
+            yield* query(() =>
+              tx.updateMany("accounts", {
+                where: (b) => b("id", "=", row.id),
+                set: { createdAt: row.createdAt },
+              }),
             );
-            yield* lifecycle.accountRemoving(account);
+            const linked = yield* query(() =>
+              tx.findFirst("webhookAccounts", { where: (b) => b("account", "=", row.id) }),
+            );
+            if (linked !== null) return yield* new AccountWebhooksActive({ account: row.id });
+            const workflow = yield* query(() =>
+              tx.findFirst("workflowAccounts", { where: (b) => b("account", "=", row.id) }),
+            );
+            if (workflow !== null) return yield* new AccountWorkflowsActive({ account: row.id });
+            if (lifecycle) {
+              const account = yield* Schema.decodeUnknownEffect(Account)(row).pipe(
+                Effect.mapError(() => new StorageError()),
+              );
+              yield* lifecycle.accountRemoving(account);
+            }
+            const grant = yield* query(() =>
+              tx.findFirst("oauthGrants", { where: (b) => b("id", "=", input.account) }),
+            );
+            yield* query(() =>
+              tx.deleteMany("oauthGrants", { where: (b) => b("id", "=", input.account) }),
+            );
+            yield* query(() =>
+              tx.deleteMany("accountChecks", { where: (b) => b("account", "=", input.account) }),
+            );
+            yield* query(() =>
+              tx.deleteMany("accounts", { where: (b) => b("id", "=", input.account) }),
+            );
+            return grant === null
+              ? undefined
+              : { account: row.id, provider: row.provider, encrypted: grant.encrypted };
           }
-          yield* query(() =>
-            tx.deleteMany("oauthGrants", { where: (b) => b("id", "=", input.account) }),
-          );
-          yield* query(() =>
-            tx.deleteMany("accounts", { where: (b) => b("id", "=", input.account) }),
-          );
-        }
-        // Keep selected IDs as unresolved references. An app must never silently switch accounts or run a partial collection.
-        return { account: input.account };
-      }),
-    ).pipe(Effect.withSpan("sdk.accounts.remove")),
+          return undefined;
+        }),
+      );
+      // Revoke only after the deletion is durable; the outcome cannot change the result.
+      if (removed !== undefined && revokeRemoved !== undefined) yield* revokeRemoved(removed);
+      // Keep selected IDs as unresolved references. An app must never silently switch accounts or run a partial collection.
+      return { account: input.account };
+    }).pipe(Effect.withSpan("sdk.accounts.remove")),
   list: (input: NonNullable<Parameters<Executor["accounts"]["list"]>[0]> = {}) =>
     Effect.gen(function* () {
       const rows = yield* query(() =>
         db.findMany("accounts", {
-          select: ["id", "provider", "method", "label", "owner", "createdAt"],
+          select: ["id", "provider", "method", "label", "description", "owner", "createdAt"],
           where: (b) =>
             b.and(
               input.owner === undefined ? true : b("owner", "=", input.owner),

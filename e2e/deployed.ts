@@ -12,7 +12,7 @@ const command = Command.make(
     name: Flag.String("test-name").pipe(
       Flag.withDefault("^(?!.*(?:Claude Code connects|Cloud compiler memory failures))"),
     ),
-    workers: Flag.Int("workers").pipe(Flag.withDefault(4)),
+    workers: Flag.Int("workers").pipe(Flag.withDefault(16)),
   },
   runDeployedSuite,
 );

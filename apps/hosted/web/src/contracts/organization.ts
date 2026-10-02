@@ -1,20 +1,27 @@
+import { hydrated } from "@executor-js/ui/contracts/http";
+import { revalidated } from "@executor-js/ui/contracts/refresh";
 import { pollingQuery } from "@executor-js/ui/contracts/polling";
 import { observeBrowserUsage } from "./product-analytics.ts";
 import { protectedQuery } from "./protected-query.ts";
+import { hydratedResult } from "@executor-js/ui/contracts/http";
 import {
   organizationTargetAtom,
   organizationPresentationAtom,
   organizationAccessVersionAtom,
 } from "./organization-reference.ts";
 import { OrganizationReference, OrganizationSlug } from "@executor-js/hosted-server/organization";
-import { traceHeaders } from "@executor-js/telemetry";
 import { BrowserAtoms } from "./telemetry.ts";
 import { UploadedOrganizationIcon } from "@executor-js/hosted-server/organization-icon";
-import { OrganizationForbidden } from "@executor-js/hosted-server/organization";
+import { OrganizationAccess, OrganizationForbidden } from "@executor-js/hosted-server/organization";
 import { OrganizationId } from "@executor-js/hosted-server/organization";
 import { Effect, Option, Schema } from "effect";
 import { AsyncResult, Atom } from "effect/unstable/reactivity";
-import { organizationOperations, sessionAtom } from "./auth.ts";
+import {
+  authCallOptions,
+  organizationOperations,
+  sessionAtom,
+  type AuthCallOptions,
+} from "./auth.ts";
 import { HostedClient } from "./api.ts";
 import {
   acknowledge,
@@ -30,15 +37,15 @@ export class OrganizationFailed extends Schema.TaggedError<OrganizationFailed>()
 ) {}
 const request = <A>(
   operation: string,
-  run: (options: {
-    headers: Readonly<Record<string, string>>;
-  }) => Promise<
+  run: (
+    options: AuthCallOptions,
+  ) => Promise<
     { data: A; error: null } | { data: null; error: { status: number; code?: string | undefined } }
   >,
 ) =>
-  Effect.flatMap(traceHeaders, (headers) =>
+  Effect.flatMap(authCallOptions, (options) =>
     Effect.tryPromise({
-      try: () => run({ headers }),
+      try: () => run(options),
       catch: () => new OrganizationFailed({ message: "Cannot reach the server. Try again." }),
     }),
   ).pipe(
@@ -51,9 +58,13 @@ const request = <A>(
                 result.error.code === "ORGANIZATION_SLUG_ALREADY_TAKEN" ||
                 result.error.code === "ORGANIZATION_ALREADY_EXISTS"
                   ? "This organization URL is already in use. Choose another."
-                  : result.error.status === 403
-                    ? "You do not have permission to do that."
-                    : "Unable to update the organization. Check the details and try again.",
+                  : result.error.code === "INVITATION_NOT_FOUND"
+                    ? "This invitation has already been used, was revoked, or has expired. Ask an administrator for a new invitation."
+                    : result.error.code === "ORGANIZATION_MEMBERSHIP_LIMIT_REACHED"
+                      ? "This organization has reached its plan's member limit. An owner or admin can upgrade the plan to add members."
+                      : result.error.status === 403
+                        ? "You do not have permission to do that."
+                        : "Unable to update the organization. Check the details and try again.",
             }),
           ),
     ),
@@ -91,12 +102,24 @@ const organizationsQuery = BrowserAtoms.atom((get) => {
   return request("list", (options) => organizationOperations(options).list()).pipe(
     Effect.flatMap(Schema.decodeUnknownEffect(Schema.Array(OrganizationSummary))),
   );
-});
+}).pipe(
+  hydratedResult({
+    key: "hosted:organizations",
+    success: Schema.Array(OrganizationSummary),
+    error: OrganizationFailed,
+  }),
+);
 
 /** A server-rendered entry document can supply membership before the browser mounts. */
 export const entryOrganizationsAtom = Atom.make<Option.Option<ReadonlyArray<OrganizationSummary>>>(
   Option.none(),
-).pipe(Atom.keepAlive);
+).pipe(
+  Atom.serializable({
+    key: "hosted:entry-organizations",
+    schema: Schema.Option(Schema.Array(OrganizationSummary)),
+  }),
+  Atom.keepAlive,
+);
 const initialOrganizationsQuery = Atom.readable(
   (get) => {
     const entry = get(entryOrganizationsAtom);
@@ -111,7 +134,7 @@ const initialOrganizationsQuery = Atom.readable(
     refresh(entryOrganizationsAtom);
     refresh(organizationsQuery);
   },
-).pipe(Atom.refreshOnWindowFocus);
+).pipe(revalidated);
 /** Confirmed writes and source waiting state are shared by every route consumer. */
 export const organizationsAtom = acknowledgedQuery(initialOrganizationsQuery);
 
@@ -146,7 +169,15 @@ export const accessAtom = Atom.family((organization: OrganizationReference) =>
         ),
       );
     })
-    .pipe(Atom.refreshOnWindowFocus, currentQuery),
+    .pipe(
+      hydratedResult({
+        key: `hosted:organization-access:${organization}`,
+        success: OrganizationAccess,
+        error: OrganizationForbidden,
+      }),
+      revalidated,
+      currentQuery,
+    ),
 );
 /** Known presentation follows canonical identity across a successful slug rename. */
 export const organizationPresentation = Atom.family((reference: OrganizationReference) =>
@@ -157,16 +188,39 @@ export const organizationPresentation = Atom.family((reference: OrganizationRefe
 );
 /** Persisted app/account inventory for the current organization. */
 export const inventoryAtom = Atom.family((organization: OrganizationReference) =>
-  HostedClient.query("organization", "inventory", { params: { organization } }).pipe(
-    Atom.refreshOnWindowFocus,
+  HostedClient.query("organization", "inventory", hydrated({ params: { organization } })).pipe(
+    revalidated,
     pollingQuery,
     protectedQuery,
   ),
 );
+/** The member and invitation fields the settings page shows; Better Auth's responses decode to them. */
+const OrganizationMember = Schema.Struct({
+  id: Schema.String,
+  userId: Schema.String,
+  role: Schema.String,
+  user: Schema.Struct({
+    name: Schema.String,
+    email: Schema.String,
+    image: Schema.optional(Schema.NullOr(Schema.String)),
+  }),
+});
+const OrganizationInvitation = Schema.Struct({
+  id: Schema.String,
+  email: Schema.String,
+  role: Schema.String,
+  status: Schema.String,
+  expiresAt: Schema.Date,
+});
+const OrganizationMembers = Schema.Struct({
+  members: Schema.Array(OrganizationMember),
+  invitations: Schema.Array(OrganizationInvitation),
+});
 /** Follow native pagination so search includes members beyond Better Auth's first page. */
 export const membersAtom = Atom.family((organizationId: OrganizationId) =>
-  BrowserAtoms.atom(
-    Effect.gen(function* () {
+  BrowserAtoms.atom((get) => {
+    const organization = get(organizationPresentationAtom(organizationId));
+    const allMembers = Effect.gen(function* () {
       const first = yield* request("members", (options) =>
         organizationOperations(options).members(organizationId, 0),
       );
@@ -178,12 +232,38 @@ export const membersAtom = Atom.family((organizationId: OrganizationId) =>
         if (next.members.length === 0) break;
         members.push(...next.members);
       }
-      const invitations = yield* request("invitations", (options) =>
-        organizationOperations(options).invitations(organizationId),
+      return members;
+    });
+    // Presentation only selects which query to make; the server rechecks the
+    // current membership before returning any invitation credentials.
+    const invitations =
+      organization?.role === "owner" || organization?.role === "admin"
+        ? request("invitations", (options) =>
+            organizationOperations(options).invitations(organizationId),
+          )
+        : Effect.succeed([]);
+    return Effect.gen(function* () {
+      const [members, pending] = yield* Effect.all([allMembers, invitations], {
+        concurrency: "unbounded",
+      });
+      return yield* Schema.decodeUnknownEffect(OrganizationMembers)({
+        members,
+        invitations: pending,
+      }).pipe(
+        Effect.mapError(
+          () => new OrganizationFailed({ message: "Unable to load members. Try again." }),
+        ),
       );
-      return { members, invitations };
+    });
+  }).pipe(
+    hydratedResult({
+      key: `hosted:organization-members:${organizationId}`,
+      success: OrganizationMembers,
+      error: OrganizationFailed,
     }),
-  ).pipe(Atom.refreshOnWindowFocus, acknowledgedQuery),
+    revalidated,
+    acknowledgedQuery,
+  ),
 );
 /** Reuse pending invitations so failed email delivery can be retried safely. */
 export const inviteAtom = Atom.family((organizationId: OrganizationId) =>
@@ -336,17 +416,26 @@ export const updateMemberRoleAtom = Atom.family((organizationId: OrganizationId)
     ),
   ),
 );
-/** Accept only an invitation for the signed-in user's email, enforced by Better Auth. */
+/**
+ * Accept only an invitation for the signed-in user's email, enforced by Better Auth.
+ * `alreadyMember` names the organization when this repeats an earlier acceptance.
+ */
 export const acceptInvitationAtom = BrowserAtoms.fn((invitationId: string, get) =>
   request("acceptInvitation", (options) =>
     organizationOperations(options).acceptInvitation(invitationId),
   ).pipe(
     Effect.flatMap(
       Schema.decodeUnknownEffect(
-        Schema.Struct({ member: Schema.Struct({ organizationId: OrganizationId }) }),
+        Schema.Struct({
+          member: Schema.Struct({ organizationId: OrganizationId }),
+          alreadyMember: Schema.optionalKey(Schema.Struct({ name: Schema.String })),
+        }),
       ),
     ),
-    Effect.map((result) => result.member.organizationId),
+    Effect.map((result) => ({
+      organization: result.member.organizationId,
+      alreadyMember: result.alreadyMember,
+    })),
     Effect.tap(() => Effect.sync(() => get.refresh(organizationsAtom))),
   ),
 );

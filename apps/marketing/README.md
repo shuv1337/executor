@@ -18,7 +18,7 @@ Standalone builds default to `https://v2.executor.sh`; malformed overrides fail 
 Cloud dashboard docs links stay on the current origin. Local and self-host dashboards
 use the public v2 docs because they do not serve the cloud documentation assets.
 
-Cloud development at `https://127.0.0.1:5395` serves the static marketing build
+Cloud development (`bun run hosted:cloud:dev`) serves the static marketing build
 beside the dashboard's Vite server. Rebuild marketing after edits and reload the
 page; dashboard hot reload is unchanged.
 
@@ -31,3 +31,7 @@ The `cookie` dependency is explicit because Astro's prerender output imports
 its v2 ESM API. Resolving the older workspace cookie package breaks the build.
 GitHub stars are fetched at build time. Analytics remains disabled unless its
 public build configuration and proxy are deliberately supplied.
+
+`public/og-image.png` is rendered from `og/og-image.html` at a 1200x630
+viewport with a device scale factor of 2. Update the source and re-render it
+when the homepage story changes.

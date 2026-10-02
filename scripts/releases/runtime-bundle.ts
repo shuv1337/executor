@@ -102,7 +102,7 @@ export const bundleLocalRuntime = (root: string, stage: string) =>
               builder.onLoad(
                 { filter: /sdk[/\\]src[/\\]implementation[/\\]workerd-bundle\.ts$/ },
                 () => ({
-                  contents: `import { Effect } from "effect"; export const bundleWorkerdHost = Effect.succeed([${prepared.join(",")}]);`,
+                  contents: `import { Effect } from "effect"; export const workerdHostModules = Effect.succeed([${prepared.join(",")}]);`,
                   loader: "js",
                   resolveDir: path.join(root, "packages/sdk"),
                 }),
@@ -184,13 +184,18 @@ export const bundleLocalRuntime = (root: string, stage: string) =>
       }).pipe(Effect.orDie);
     const sdk = path.join(root, "packages/sdk");
     const alchemy = yield* requiredPackage("@alchemy.run/cloudflare-runtime", sdk);
+    const codemode = yield* requiredPackage(
+      "@opencode-ai/codemode",
+      path.join(root, "packages/mcp"),
+    );
     for (const [name, owner] of [
       ["ws", sdk],
       ["workerd", alchemy],
       ["sharp", alchemy],
       ["@electric-sql/pglite", yield* requiredPackage("@effect/sql-pglite", sdk)],
       ["@napi-rs/keyring", root],
-      ["typescript", root],
+      // Codemode transpiles with its own TypeScript; the workspace compiler has no JS API.
+      ["typescript", codemode],
       ["dugite", root],
     ] as const) {
       yield* copyPackage(yield* requiredPackage(name, owner));
@@ -263,7 +268,11 @@ else process.exitCode = result.status ?? 1;
       yield* fs.chmod(executable, 0o755);
     }
     yield* fs.copy(path.join(alchemy, "dist/core/workers"), path.join(stage, "alchemy-workers"));
-    yield* fs.copy(path.join(root, "apps/local/web/dist"), path.join(stage, "apps/local/web/dist"));
+    // The runtime bundles the document renderer; only browser files are read from disk.
+    yield* fs.copy(
+      path.join(root, "apps/local/web/dist/client"),
+      path.join(stage, "apps/local/web/dist/client"),
+    );
     yield* fs.copy(
       path.join(root, "packages/telemetry/dist/motel"),
       path.join(stage, "packages/telemetry/dist/motel"),
@@ -281,11 +290,16 @@ else process.exitCode = result.status ?? 1;
         yield* fs.rename(path.join(directory, file), destination);
       }
     }
-    for (const [name, directory, resource] of [
-      ["@executor-js/app-templates", path.join(root, "packages/app-templates"), "executor"],
-      ["apps", path.join(root, "packages/apps/dist"), "framework-reference.json"],
+    // Bundled dependencies must also be published: bun and yarn resolve them from the
+    // registry. Private resources sit beside the bundle instead, where resolution from
+    // runtime/*.mjs finds them first, and are never declared as dependencies.
+    for (const [name, directory, resource, published] of [
+      ["@executor-js/app-templates", path.join(root, "packages/app-templates"), "executor", false],
+      ["apps", path.join(root, "packages/apps/dist"), "framework-reference.json", true],
     ] as const) {
-      const destination = path.join(stage, "node_modules", name);
+      const destination = published
+        ? path.join(stage, "node_modules", name)
+        : path.join(output, "node_modules", name);
       yield* fs.makeDirectory(destination, { recursive: true });
       yield* fs.copy(path.join(directory, resource), path.join(destination, resource));
       const pkg = Schema.decodeUnknownSync(
@@ -301,7 +315,7 @@ else process.exitCode = result.status ?? 1;
         path.join(destination, "package.json"),
         JSON.stringify({ name, version, exports: pkg.exports }),
       );
-      dependencies[name] = version;
+      if (published) dependencies[name] = version;
       licenseDirectories.add(directory);
     }
     // Keep full license files for bundled code, as well as esbuild's inline/external notices.

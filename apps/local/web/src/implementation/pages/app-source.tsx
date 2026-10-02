@@ -55,6 +55,11 @@ export function AppSource({
         get.refresh(toolsAtom({ app: app.id }));
       }}
       view={view}
+      live={
+        data.app.activeDeployment === null
+          ? undefined
+          : sourceAtom({ app: data.app.id, deployment: data.app.activeDeployment })
+      }
     />
   );
 }

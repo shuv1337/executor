@@ -18,6 +18,8 @@ const make = Effect.gen(function* () {
       options: {
         readonly organization?: string;
         readonly mode?: "model" | "native" | "browser";
+        /** A scoped connection's URL; its grants are only valid at that URL. */
+        readonly connection?: string;
       } = {},
     ) =>
       Effect.gen(function* () {
@@ -40,6 +42,7 @@ const make = Effect.gen(function* () {
           });
         // Record methods, revisions and timing only. OAuth headers and tool arguments are excluded.
         const observedFetch: typeof fetch = (input, init) =>
+          // oxlint-disable-next-line executor/no-manual-effect-runtime-in-tests -- the MCP SDK transport takes a Promise-returning fetch
           Effect.runPromise(
             Effect.gen(function* () {
               const request = new Request(input, init);
@@ -87,6 +90,8 @@ const make = Effect.gen(function* () {
             }),
           );
         const endpoint = new URL(`${target.metadata.origin}/mcp`);
+        if (options.connection !== undefined)
+          endpoint.searchParams.set("connection", options.connection);
         if (options.mode !== undefined) endpoint.searchParams.set("elicitation_mode", options.mode);
         const transport = new StreamableHTTPClientTransport(endpoint, {
           requestInit: {

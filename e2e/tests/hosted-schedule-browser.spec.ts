@@ -1,3 +1,4 @@
+import { openThroughBrowser } from "../support/in-app-navigation.ts";
 /** The same dashboard controls and browser approval, driven through the hosted product. */
 import { expect, layer } from "@effect/vitest";
 import { Effect, Schedule, Schema } from "effect";
@@ -5,15 +6,17 @@ import { randomUUID } from "node:crypto";
 import { Actors } from "../support/actors.ts";
 import { Api, body } from "../support/api.ts";
 import { Browser } from "../support/browser.ts";
+import { Evidence } from "../support/evidence.ts";
 import { HostedLive, withHostedCase } from "../support/case.ts";
 import { scenarios } from "../test-plan.ts";
 import { holdQuery, refreshVisiblePage } from "../support/query-transition.ts";
+import { appsManifest } from "../support/apps-release.ts";
 
 class Pending extends Schema.TaggedError<Pending>()("Pending", {}) {}
-const source = `import { defineApp, mutation, object, interval } from "apps";
+const source = `import { defineApp, mutation, object, interval, router } from "apps";
 import { always } from "apps/operations/approval";
 const send = mutation({ input: object({}), approval: always() }, async () => ({ done: true }));
-export default defineApp({ accounts: {} }, async () => ({  mutations: { send }, schedules: { digest: interval({ hours: 1 }, send, {}) } }));`;
+export default defineApp({ accounts: {} }, async () => ({  tools: router({ send }), schedules: { digest: interval({ hours: 1 }, send, {}) } }));`;
 layer(HostedLive, { excludeTestServices: true })("Hosted schedule dashboard", (it) => {
   it.effect(scenarios.scheduleLoading.title, (context) =>
     withHostedCase(
@@ -25,7 +28,7 @@ layer(HostedLive, { excludeTestServices: true })("Hosted schedule dashboard", (i
         const prefix = `/api/organizations/${actors.organization.id}`;
         const deployed = yield* api.request(actors.owner, "POST", `${prefix}/apps/deploy`, {
           name: `Schedule layout ${randomUUID().slice(0, 8)}`,
-          files: [{ path: "index.ts", content: source }],
+          files: [{ path: "index.ts", content: source }, appsManifest],
         });
         expect(deployed.status).toBe(200);
         const app = yield* body(Schema.Struct({ id: Schema.String }), deployed);
@@ -59,7 +62,17 @@ layer(HostedLive, { excludeTestServices: true })("Hosted schedule dashboard", (i
                 page.getByRole("region", { name: "App tools preview", exact: true }).waitFor(),
               );
               const reference = yield* frame("Overview");
-              const metadata = yield* holdQuery(paths, "continue", { allRequests: true });
+              // Inventory can supply the same metadata before the app read completes.
+              const metadata = yield* holdQuery(
+                [
+                  ...paths,
+                  ...[actors.organization.id, actors.organization.slug].map(
+                    (organization) => `/api/organizations/${organization}/inventory`,
+                  ),
+                ],
+                "continue",
+                { allRequests: true },
+              );
               const settings = yield* holdQuery(
                 paths.map((path) => `${path}/schedules`),
                 "continue",
@@ -70,8 +83,9 @@ layer(HostedLive, { excludeTestServices: true })("Hosted schedule dashboard", (i
                 "continue",
                 { allRequests: true },
               );
-              yield* browser.use("Open Schedules with its reads held", (page) =>
-                page.goto(`/org/${actors.organization.slug}/apps/${app.id}?view=schedules`),
+              yield* openThroughBrowser(
+                "Open Schedules with its reads held",
+                `/org/${actors.organization.slug}/apps/${app.id}?view=schedules`,
               );
               yield* metadata.requested;
               expect(
@@ -193,7 +207,7 @@ layer(HostedLive, { excludeTestServices: true })("Hosted schedule dashboard", (i
         const name = `Schedule states ${randomUUID().slice(0, 8)}`;
         const deployed = yield* api.request(actors.owner, "POST", `${prefix}/apps/deploy`, {
           name,
-          files: [{ path: "index.ts", content: source }],
+          files: [{ path: "index.ts", content: source }, appsManifest],
         });
         expect(deployed.status).toBe(200);
         const app = yield* body(Schema.Struct({ id: Schema.String }), deployed);
@@ -216,8 +230,9 @@ layer(HostedLive, { excludeTestServices: true })("Hosted schedule dashboard", (i
           });
         yield* browser.login(actors.owner);
         const failed = yield* holdQuery(paths, "fail");
-        yield* browser.use("Open schedules with definition discovery held", (page) =>
-          page.goto(`/org/${actors.organization.slug}/apps/${app.id}?view=schedules`),
+        yield* openThroughBrowser(
+          "Open schedules with definition discovery held",
+          `/org/${actors.organization.slug}/apps/${app.id}?view=schedules`,
         );
         yield* failed.requested;
         yield* browser.use("Definition discovery is loading", (page) =>
@@ -254,9 +269,10 @@ layer(HostedLive, { excludeTestServices: true })("Hosted schedule dashboard", (i
           files: [
             {
               path: "index.ts",
-              content: `import { defineApp } from "apps";
+              content: `import { defineApp, router } from "apps";
 export default defineApp({ accounts: {} }, async () => ({  }));`,
             },
+            appsManifest,
           ],
         });
         expect(empty.status).toBe(200);
@@ -264,8 +280,9 @@ export default defineApp({ accounts: {} }, async () => ({  }));`,
         yield* Effect.addFinalizer(() =>
           api.request(actors.owner, "DELETE", `${prefix}/apps/${emptyApp.id}`).pipe(Effect.orDie),
         );
-        yield* browser.use("Open the app without schedules", (page) =>
-          page.goto(`/org/${actors.organization.slug}/apps/${emptyApp.id}?view=schedules`),
+        yield* openThroughBrowser(
+          "Open the app without schedules",
+          `/org/${actors.organization.slug}/apps/${emptyApp.id}?view=schedules`,
         );
         yield* browser.use("Successful discovery can report an empty list", (page) =>
           page.getByRole("heading", { name: "No schedules yet", exact: true }).waitFor(),
@@ -296,12 +313,13 @@ export default defineApp({ accounts: {} }, async () => ({  }));`,
           files: [
             {
               path: "index.ts",
-              content: `import { defineApp, defineProvider, secrets, object, string } from "apps";
+              content: `import { defineApp, defineProvider, secrets, object, string, router } from "apps";
 const service = defineProvider({ name: "Schedule fixture", auth: {
   key: secrets({ label: "API key", fields: object({ token: string() }) })
 } });
 export default defineApp({ accounts: { service } }, async () => ({  }));`,
             },
+            appsManifest,
           ],
         });
         expect(deployed.status).toBe(200);
@@ -317,8 +335,9 @@ export default defineApp({ accounts: { service } }, async () => ({  }));`,
           )).status,
         ).toBe(409);
         yield* browser.login(actors.owner);
-        yield* browser.use("Open schedules without a selected account", (page) =>
-          page.goto(`/org/${actors.organization.slug}/apps/${app.id}?view=schedules`),
+        yield* openThroughBrowser(
+          "Open schedules without a selected account",
+          `/org/${actors.organization.slug}/apps/${app.id}?view=schedules`,
         );
         yield* browser.use("Account setup explains the blocked discovery", (page) =>
           page
@@ -340,7 +359,7 @@ export default defineApp({ accounts: { service } }, async () => ({  }));`,
           page.getByRole("button", { name: "Go to Accounts", exact: true }).click(),
         );
         yield* browser.use("The account selection action is available", (page) =>
-          page.getByRole("button", { name: "Add Schedule fixture account", exact: true }).waitFor(),
+          page.getByRole("button", { name: "Connect new account", exact: true }).waitFor(),
         );
       }),
     ),
@@ -356,7 +375,7 @@ export default defineApp({ accounts: { service } }, async () => ({  }));`,
         const prefix = `/api/organizations/${actors.organization.id}`;
         const deployed = yield* api.request(actors.owner, "POST", `${prefix}/apps/deploy`, {
           name: `Browser schedules ${randomUUID().slice(0, 8)}`,
-          files: [{ path: "index.ts", content: source }],
+          files: [{ path: "index.ts", content: source }, appsManifest],
         });
         expect(deployed.status).toBe(200);
         const app = yield* body(Schema.Struct({ id: Schema.String }), deployed);
@@ -379,9 +398,18 @@ export default defineApp({ accounts: { service } }, async () => ({  }));`,
           page.getByRole("button", { name: "Pause", exact: true }).waitFor(),
         );
         yield* browser.checkpoint("01 Hosted schedule controls");
-        yield* browser.use("Request a run", (page) =>
-          page.getByRole("button", { name: "Run now", exact: true }).click(),
-        );
+        expect(
+          yield* browser.use("Request a run and wait for acceptance", (page) =>
+            Promise.all([
+              page.waitForResponse(
+                (response) =>
+                  response.request().method() === "POST" &&
+                  new URL(response.url()).pathname.endsWith("/schedules/digest/run"),
+              ),
+              page.getByRole("button", { name: "Run now", exact: true }).click(),
+            ]).then(([response]) => response.status()),
+          ),
+        ).toBe(200);
         yield* browser.use("Open approvals", (page) =>
           page.getByRole("link", { name: "Approvals", exact: true }).click(),
         );
@@ -409,14 +437,32 @@ export default defineApp({ accounts: { service } }, async () => ({  }));`,
             .waitFor(),
         );
         yield* browser.checkpoint("04 Approval saved");
+        const evidence = yield* Evidence;
         yield* api.request(actors.owner, "GET", `${prefix}/scheduled-runs?app=${app.id}`).pipe(
           Effect.flatMap((response) =>
-            body(Schema.Array(Schema.Struct({ status: Schema.String })), response),
+            body(
+              Schema.Array(
+                Schema.Struct({
+                  id: Schema.String,
+                  status: Schema.String,
+                  failure: Schema.NullOr(Schema.String),
+                }),
+              ),
+              response,
+            ),
           ),
           Effect.flatMap((runs) =>
-            runs.some((run) => run.status === "succeeded")
-              ? Effect.void
-              : Effect.fail(new Pending()),
+            Effect.gen(function* () {
+              yield* evidence.json("approved-schedule-runs.json", runs);
+              const completed = runs.find(
+                (run) => !["ready", "running", "awaiting-approval"].includes(run.status),
+              );
+              if (completed === undefined) return yield* new Pending();
+              expect(
+                completed,
+                "The approved run must complete; terminal failures are not slow runs",
+              ).toMatchObject({ status: "succeeded", failure: null });
+            }),
           ),
           Effect.retry({
             while: (error) => error instanceof Pending,

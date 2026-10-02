@@ -51,6 +51,32 @@ export const captureConnectionTarget = (db: Query, target: typeof AccountConnect
     return { provider: requirement.provider, snapshot };
   });
 
+/**
+ * The provider as the target app declares it now, with the hosts connecting will grant. Undefined
+ * when the app no longer requires this provider for the slot; completing the connection then fails.
+ */
+export const targetProvider = (db: Query, target: StoredConnectionTarget, provider: ProviderId) =>
+  Effect.gen(function* () {
+    const app = yield* storedApp(db, { app: target.app, owner: target.owner }).pipe(
+      Effect.catchTag("AppNotFound", () => Effect.succeed(undefined)),
+    );
+    if (app === undefined) return undefined;
+    const deployment = yield* storedDeployment(db, app).pipe(
+      Effect.catchTags({
+        DeploymentNotFound: () => Effect.succeed(undefined),
+        AppNotDeployed: () => Effect.succeed(undefined),
+      }),
+    );
+    const required =
+      deployment !== undefined &&
+      Object.hasOwn(deployment.requirements.accounts, target.requirement)
+        ? deployment.requirements.accounts[target.requirement]
+        : undefined;
+    return required?.provider === provider
+      ? { id: provider, definition: required.definition }
+      : undefined;
+  });
+
 /** Run in the account-save transaction. A changed target rolls back credentials and selection together. */
 export const applyConnectionTarget = (
   db: Query,
@@ -87,6 +113,13 @@ export const applyConnectionTarget = (
     });
     if (!profile.enabled || profile.status === "removed" || profile.status === "removing")
       return yield* changed();
+    // Connecting for this app grants the hosts it declares, replacing any earlier grant.
+    yield* query(() =>
+      db.updateMany("accounts", {
+        where: (b) => b("id", "=", account.id),
+        set: { allowedHosts: required.definition.hosts ?? null },
+      }),
+    );
     const bindings = profile.accounts;
     const selected = Object.hasOwn(bindings, target.requirement)
       ? bindings[target.requirement]

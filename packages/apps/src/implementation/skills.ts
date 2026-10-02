@@ -1,19 +1,81 @@
 /** Remote skill readers return complete portable bundles, never installed host files. */
 import { Effect, Ref, Schema, Stream } from "effect";
-import { FetchHttpClient, HttpClient } from "effect/unstable/http";
+import { FetchHttpClient, HttpBody, HttpClient } from "effect/unstable/http";
 import { skillFromFiles } from "./skill-files.ts";
+import { wrap } from "./schema.ts";
+import { httpProviderError } from "./provider-error.ts";
+import { InflateLimitExceeded } from "./inflate.ts";
+import {
+  gitRequestHeaders,
+  lsRefsRequest,
+  parseLsRefs,
+  parseTreeFetch,
+  refCandidates,
+  treeFetchRequest,
+} from "./git.ts";
+import { catalogCache } from "./catalog-cache.ts";
+import type { AppCache } from "../contracts/cache.ts";
+import type { JsonValue } from "../contracts/schema.ts";
 import {
   AppSkillMetadata,
+  AppSkillSource,
   AppSkills,
   SkillFilePath,
   SkillLoadFailed,
+  SkillServiceName,
   skillLoadLimits,
   type GitHubSkillsOptions,
+  type SkillCacheOptions,
   type WellKnownSkillsOptions,
   type SkillTransport,
 } from "../contracts/skills.ts";
 
 const failed = (reason: SkillLoadFailed["reason"]) => new SkillLoadFailed({ reason });
+/** Keep only the status and whether the service reported a rate limit. */
+const rejected = (status: number, headers: Readonly<Record<string, string>>) =>
+  new SkillLoadFailed({
+    reason:
+      httpProviderError(status, headers)?.reason === "rate_limited" ? "rate_limited" : "request",
+    status,
+  });
+/** Describe a loader failure for people, naming the service it came from. */
+const describe = (service: string, { reason, status }: SkillLoadFailed) => {
+  switch (reason) {
+    case "rate_limited":
+      return `${service} is rate limiting skill requests (HTTP ${status}).`;
+    case "request":
+      return status === undefined
+        ? `Could not reach ${service} to load skills.`
+        : `${service} returned HTTP ${status} while loading skills.`;
+    case "source":
+      return `The ${service} skill source settings are not valid.`;
+    case "document":
+      return `A skill from ${service} is not a valid skill document.`;
+    case "limit":
+      return `The skills from ${service} exceed Executor’s file or size limits.`;
+    case "changed":
+      return `The skills on ${service} changed while they were being read.`;
+    case "encoding":
+      return `A skill file from ${service} is not valid UTF-8 text.`;
+  }
+};
+/** Give every failure without a message one that names the service. */
+export const withService =
+  (service: string | undefined) =>
+  <A, R>(effect: Effect.Effect<A, SkillLoadFailed, R>) =>
+    service === undefined || !Schema.is(SkillServiceName)(service)
+      ? effect
+      : effect.pipe(
+          Effect.mapError((error) =>
+            !error.message
+              ? new SkillLoadFailed({
+                  reason: error.reason,
+                  message: describe(service, error),
+                  ...(error.status === undefined ? {} : { status: error.status }),
+                })
+              : error,
+          ),
+        );
 const parse = <S extends Schema.Top>(schema: S, input: unknown) =>
   Schema.decodeUnknownEffect(schema)(input).pipe(Effect.mapError(() => failed("document")));
 
@@ -34,10 +96,14 @@ const pathUrl = (base: string, path: string) =>
   new URL(path.split("/").map(encodeURIComponent).join("/"), base).href;
 
 /** One loader invocation owns its byte budget and all of its network requests. */
-const reader = (transport: SkillTransport) =>
+export const reader = (transport: SkillTransport) =>
   Effect.gen(function* () {
-    const bytes = yield* Ref.make(0);
-    const read = (url: string) =>
+    const budget = yield* Ref.make(0);
+    /** Fetch one response body within the per-file and per-load byte limits. */
+    const fetchBytes = (
+      url: string,
+      post?: { readonly body: Uint8Array; readonly headers: Record<string, string> },
+    ) =>
       Effect.gen(function* () {
         const parsed = yield* Effect.try({
           try: () => new URL(url),
@@ -51,16 +117,21 @@ const reader = (transport: SkillTransport) =>
         )
           return yield* failed("source");
         const client = HttpClient.withScope(yield* HttpClient.HttpClient);
-        const response = yield* client
-          .get(parsed, {
-            headers: {
-              "User-Agent": "executor-skills",
-              Accept: "application/json, text/plain",
-              "Cache-Control": "no-cache",
-            },
-          })
-          .pipe(Effect.mapError(() => failed("request")));
-        if (response.status < 200 || response.status >= 300) return yield* failed("request");
+        const headers = {
+          "User-Agent": "executor-skills",
+          Accept: "application/json, text/plain",
+          "Cache-Control": "no-cache",
+        };
+        const response = yield* (
+          post === undefined
+            ? client.get(parsed, { headers })
+            : client.post(parsed, {
+                headers: { ...headers, ...post.headers },
+                body: HttpBody.uint8Array(post.body, post.headers["Content-Type"]),
+              })
+        ).pipe(Effect.mapError(() => failed("request")));
+        if (response.status < 200 || response.status >= 300)
+          return yield* rejected(response.status, response.headers);
         const chunks: Uint8Array[] = [];
         let size = 0;
         yield* response.stream.pipe(
@@ -68,7 +139,7 @@ const reader = (transport: SkillTransport) =>
           Stream.runForEach((chunk) =>
             Effect.gen(function* () {
               size += chunk.byteLength;
-              const total = yield* Ref.updateAndGet(bytes, (total) => total + chunk.byteLength);
+              const total = yield* Ref.updateAndGet(budget, (total) => total + chunk.byteLength);
               if (size > skillLoadLimits.fileBytes || total > skillLoadLimits.totalBytes)
                 return yield* failed("limit");
               chunks.push(chunk);
@@ -81,29 +152,195 @@ const reader = (transport: SkillTransport) =>
           result.set(chunk, offset);
           offset += chunk.byteLength;
         }
-        return yield* Effect.try({
-          try: () => new TextDecoder("utf-8", { fatal: true }).decode(result),
-          catch: () => failed("encoding"),
-        });
+        return result;
       }).pipe(
         Effect.scoped,
         Effect.provide(FetchHttpClient.layer),
         Effect.provideService(FetchHttpClient.RequestInit, { redirect: "manual" }),
         Effect.provideService(FetchHttpClient.Fetch, transport.fetch ?? globalThis.fetch),
       );
+    const read = (url: string) =>
+      fetchBytes(url).pipe(
+        Effect.flatMap((result) =>
+          Effect.try({
+            try: () => new TextDecoder("utf-8", { fatal: true }).decode(result),
+            catch: () => failed("encoding"),
+          }),
+        ),
+      );
     const json = (url: string) =>
       read(url).pipe(Effect.flatMap((text) => parse(Schema.fromJsonString(Schema.Unknown), text)));
-    return { read, json };
+    return { fetchBytes, read, json };
   });
 
-const Commit = Schema.Struct({ sha: Schema.String.check(Schema.isPattern(/^[a-f0-9]{40}$/)) });
-const Tree = Schema.Struct({
-  truncated: Schema.Boolean,
-  tree: Schema.Array(
-    Schema.Struct({ path: Schema.String, type: Schema.String, mode: Schema.String }),
-  ),
-});
-/** Resolve a branch once, then fetch all skill files from that exact Git commit. */
+type Remote = Effect.Success<ReturnType<typeof reader>>;
+const unreadable = () =>
+  new SkillLoadFailed({
+    reason: "request",
+    message: "GitHub returned a git response Executor could not read.",
+  });
+const git = <A>(run: () => A | Promise<A>) =>
+  Effect.tryPromise({
+    try: async () => run(),
+    catch: (error) => (error instanceof InflateLimitExceeded ? failed("limit") : unreadable()),
+  });
+
+/**
+ * Resolve a branch, tag or HEAD with git's `ls-refs`, asking only for the matching refs so large
+ * repositories stay small.
+ */
+const resolveCommit = (remote: Remote, repo: string, ref: string | undefined) =>
+  Effect.gen(function* () {
+    if (ref !== undefined && /^[a-f0-9]{40}$/.test(ref)) return ref;
+    const names = refCandidates(ref);
+    const response = yield* remote
+      .fetchBytes(`https://github.com/${repo}.git/git-upload-pack`, {
+        body: lsRefsRequest(names),
+        headers: gitRequestHeaders,
+      })
+      .pipe(
+        // GitHub asks for credentials when a repository is missing or private.
+        Effect.mapError((error) =>
+          error.status === 401 || error.status === 404
+            ? new SkillLoadFailed({
+                reason: "source",
+                message: `GitHub has no public repository named ${repo}.`,
+                status: error.status,
+              })
+            : error,
+        ),
+      );
+    const refs = yield* git(() => parseLsRefs(response));
+    const commit = names.map((name) => refs.get(name)).find((sha) => sha !== undefined);
+    if (commit === undefined)
+      return yield* new SkillLoadFailed({
+        reason: "source",
+        message: `GitHub repository ${repo} has no branch or tag named ${ref}.`,
+      });
+    return commit;
+  });
+
+/** List files at a commit from a shallow git fetch of its trees, without file contents. */
+const listFiles = (remote: Remote, repo: string, commit: string, path: string | undefined) =>
+  remote
+    .fetchBytes(`https://github.com/${repo}.git/git-upload-pack`, {
+      body: treeFetchRequest(commit),
+      headers: gitRequestHeaders,
+    })
+    .pipe(
+      Effect.flatMap((response) =>
+        git(() =>
+          parseTreeFetch(response, commit, path, { objectBytes: skillLoadLimits.fileBytes }),
+        ),
+      ),
+    );
+
+/**
+ * Resolve a ref once, then fetch all skill files from that exact commit. No request uses the
+ * REST API, whose unauthenticated budget is shared by every client on the same IP address.
+ */
+const SkillDirectories = Schema.Array(
+  Schema.Struct({
+    directory: Schema.String,
+    files: Schema.Array(Schema.Struct({ path: Schema.String, mode: Schema.String })),
+  }),
+);
+type SkillDirectories = typeof SkillDirectories.Type;
+
+/** Group the files at a commit by skill directory, within the file limit. */
+const skillDirectories = (
+  remote: Remote,
+  repo: string,
+  commit: string,
+  path: string | undefined,
+): Effect.Effect<SkillDirectories, SkillLoadFailed> =>
+  Effect.gen(function* () {
+    const files = yield* listFiles(remote, repo, commit, path);
+    const documents = files.filter(
+      (file) => file.path === "SKILL.md" || file.path.endsWith("/SKILL.md"),
+    );
+    const directories = documents.map((document) => {
+      const directory = document.path.slice(0, -"SKILL.md".length);
+      return { directory, files: files.filter((file) => file.path.startsWith(directory)) };
+    });
+    if (directories.reduce((count, item) => count + item.files.length, 0) > skillLoadLimits.files)
+      return yield* failed("limit");
+    return directories;
+  });
+
+/**
+ * Reuse a commit's skill file list from the app cache. The list is small and never changes for a
+ * commit, so the entry stays fresh for the longest retention the cache allows.
+ */
+const cachedSkillDirectories = (
+  cache: AppCache,
+  transport: SkillTransport,
+  repo: string,
+  commit: string,
+  path: string | undefined,
+) =>
+  Effect.tryPromise({
+    try: () =>
+      cache.get({
+        key: ["apps/githubSkills/directories", 1, repo, commit, path ?? null],
+        schema: wrap(SkillDirectories, false),
+        freshFor: "7 days",
+        load: (context) =>
+          Effect.runPromise(
+            // Keep the author's fetch, as every other read in this load does.
+            reader({ fetch: transport.fetch, signal: context.signal }).pipe(
+              Effect.flatMap((remote) => skillDirectories(remote, repo, commit, path)),
+            ),
+            { signal: context.signal },
+          ),
+      }),
+    catch: (error) =>
+      Schema.is(SkillLoadFailed)(error)
+        ? error
+        : new SkillLoadFailed({
+            reason: "request",
+            message: "Executor could not read or update the app cache for skills.",
+          }),
+  });
+
+/**
+ * Keep a loaded catalog in the app cache, paged and refreshed like an MCP tool catalog. A refresh
+ * keeps the author's fetch and uses the cache's signal, never the finished request's.
+ */
+const cachedCatalog = (
+  options: SkillCacheOptions & SkillTransport,
+  prefix: readonly JsonValue[],
+  load: (
+    transport: SkillTransport,
+    cache: AppCache | undefined,
+  ) => Effect.Effect<typeof AppSkills.Type, SkillLoadFailed>,
+) =>
+  options.cache === undefined
+    ? load(options, undefined)
+    : catalogCache({
+        cache: options.cache,
+        ...(options.freshFor === undefined ? {} : { freshFor: options.freshFor }),
+        ...(options.staleFor === undefined ? {} : { staleFor: options.staleFor }),
+        prefix,
+        schema: AppSkillSource,
+        summary: { schema: AppSkillMetadata, of: ({ files: _files, ...metadata }) => metadata },
+        load: (context) =>
+          (context === undefined
+            ? load(options, options.cache)
+            : load({ fetch: options.fetch, signal: context.signal }, context.cache)
+          ).pipe(Effect.map((tools) => ({ tools }))),
+      }).pipe(
+        Effect.flatMap((catalog) => catalog.list()),
+        Effect.mapError((error) =>
+          Schema.is(SkillLoadFailed)(error)
+            ? error
+            : new SkillLoadFailed({
+                reason: "request",
+                message: "Executor could not read or update the app cache for skills.",
+              }),
+        ),
+      );
+
 export const githubSkillsEffect = (options: GitHubSkillsOptions) =>
   Effect.gen(function* () {
     if (
@@ -111,34 +348,25 @@ export const githubSkillsEffect = (options: GitHubSkillsOptions) =>
       (options.path !== undefined && !resourcePath(options.path))
     )
       return yield* failed("source");
-    const remote = yield* reader(options);
-    const api = `https://api.github.com/repos/${options.repo}`;
-    const commit = yield* remote
-      .json(`${api}/commits/${encodeURIComponent(options.ref ?? "HEAD")}`)
-      .pipe(Effect.flatMap((value) => parse(Commit, value)));
-    const tree = yield* remote
-      .json(`${api}/git/trees/${commit.sha}?recursive=1`)
-      .pipe(Effect.flatMap((value) => parse(Tree, value)));
-    if (tree.truncated) return yield* failed("limit");
-    const prefix = options.path === undefined ? "" : `${options.path}/`;
-    const documents = tree.tree.filter(
-      (entry) =>
-        entry.type === "blob" &&
-        entry.path.startsWith(prefix) &&
-        (entry.path === "SKILL.md" || entry.path.endsWith("/SKILL.md")),
+    return yield* cachedCatalog(
+      options,
+      ["apps/githubSkills/catalog", 1, options.repo, options.ref ?? null, options.path ?? null],
+      (transport, cache) => githubCatalog(options, transport, cache),
     );
-    const resources = documents.map((document) => {
-      const directory = document.path.slice(0, -"SKILL.md".length);
-      return {
-        directory,
-        files: tree.tree.filter(
-          (entry) => entry.type === "blob" && entry.path.startsWith(directory),
-        ),
-      };
-    });
-    if (resources.reduce((count, item) => count + item.files.length, 0) > skillLoadLimits.files)
-      return yield* failed("limit");
-    const base = `https://raw.githubusercontent.com/${options.repo}/${commit.sha}/`;
+  }).pipe(withService("GitHub"));
+
+const githubCatalog = (
+  options: GitHubSkillsOptions,
+  transport: SkillTransport,
+  cache: AppCache | undefined,
+) =>
+  Effect.gen(function* () {
+    const remote = yield* reader(transport);
+    const commit = yield* resolveCommit(remote, options.repo, options.ref);
+    const resources = yield* cache === undefined
+      ? skillDirectories(remote, options.repo, commit, options.path)
+      : cachedSkillDirectories(cache, transport, options.repo, commit, options.path);
+    const base = `https://raw.githubusercontent.com/${options.repo}/${commit}/`;
     const skills = yield* Effect.forEach(
       resources,
       ({ directory, files }) =>
@@ -184,7 +412,16 @@ export const wellKnownSkillsEffect = (options: WellKnownSkillsOptions) =>
     if (url.pathname === "/") url.pathname = "/.well-known/agent-skills/index.json";
     else if (!url.pathname.endsWith("index.json"))
       url.pathname = `${url.pathname.replace(/\/$/, "")}/index.json`;
-    const remote = yield* reader(options);
+    return yield* cachedCatalog(
+      options,
+      ["apps/wellKnownSkills/catalog", 1, url.href],
+      (transport) => wellKnownCatalog(url, transport),
+    );
+  }).pipe(withService(URL.canParse(options.url) ? new URL(options.url).hostname : undefined));
+
+const wellKnownCatalog = (url: URL, transport: SkillTransport) =>
+  Effect.gen(function* () {
+    const remote = yield* reader(transport);
     const first = yield* remote.read(url.href);
     const index = yield* parse(Schema.fromJsonString(Index), first);
     if (

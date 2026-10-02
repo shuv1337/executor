@@ -7,15 +7,17 @@ import { Cause, Effect, Schema } from "effect";
 import { GroupDatabase } from "@executor-js/hosted-server/groups";
 import {
   provision,
+  provisionTeam,
   ProvisioningFailed,
   type ProvisioningServices,
 } from "@executor-js/hosted-server/provisioning";
 import { SqlClient } from "effect/unstable/sql";
 import { cloudExecutor } from "./executor.ts";
-import { AppDataSupervisor } from "./app-data.ts";
+import { appDataSupervisors } from "./app-data.ts";
 import { cloudEmail } from "./email.ts";
 import { cloudWelcomeEmails } from "./welcome-email.ts";
 import { AppDomainCoordinator } from "./app-domains.ts";
+import { AppDomainController } from "./app-domain-controller-worker.ts";
 import { billingLive } from "../implementation/billing.ts";
 import { BillingMeter } from "../contracts/billing-meter.ts";
 import { cloudAnalytics } from "../implementation/product-analytics.ts";
@@ -25,11 +27,11 @@ export class Provisioning extends Cloudflare.Workflow<Provisioning>()(
   "Provisioning",
   Effect.gen(function* () {
     const executor = yield* cloudExecutor(
-      yield* AppDataSupervisor,
+      yield* appDataSupervisors,
       yield* cloudArtifactsTokensLive,
     );
     const emails = yield* cloudWelcomeEmails((yield* cloudEmail.pipe(Effect.orDie)).welcome);
-    const domains = yield* AppDomainCoordinator;
+    const domains = yield* AppDomainCoordinator.from(AppDomainController);
     const meter = yield* BillingMeter.pipe(Effect.provide(yield* billingLive.pipe(Effect.orDie)));
     const analytics = yield* cloudAnalytics;
     const services: ProvisioningServices = {
@@ -99,48 +101,80 @@ const NativeProvisioning = Schema.declare(
     "create" in value &&
     typeof value.create === "function",
 );
-/** Start by stable outbox ID. A crash after create is recovered by observing the same instance. */
-export const dispatchProvisioning = Effect.gen(function* () {
-  const environment = yield* Cloudflare.WorkerEnvironment;
-  const binding = yield* Schema.decodeUnknownEffect(NativeProvisioning)(environment.Provisioning);
-  const sql = yield* Effect.flatten(GroupDatabase);
-  const jobs =
-    yield* sql`select id from hosted_provisioning where status = 'queued' or (status = 'running' and updated_at < now() - interval '30 minutes') order by available_at limit 50`.pipe(
-      Effect.flatMap(
-        Schema.decodeUnknownEffect(Schema.Array(Schema.Struct({ id: Schema.String }))),
-      ),
-    );
-  yield* Effect.forEach(
-    jobs,
-    (job) =>
-      Effect.gen(function* () {
-        const status = yield* Effect.tryPromise({
-          try: async () => {
-            try {
-              await binding.create({ id: job.id, params: { id: job.id } });
-              return "running" as const;
-            } catch {
-              const instance = await (await binding.get(job.id)).status();
-              if (instance.status === "unknown")
-                throw new Error("Provisioning instance unavailable");
-              return instance.status;
-            }
-          },
-          catch: () => new ProvisioningFailed(),
-        });
-        const persisted =
-          status === "complete"
-            ? "succeeded"
-            : status === "errored" || status === "terminated"
-              ? "failed"
-              : "running";
-        yield* sql`update hosted_provisioning set status = ${persisted}, updated_at = now()
+const ClaimedJobs = Schema.Array(
+  Schema.Struct({
+    id: Schema.String,
+    kind: Schema.Literals(["user", "member", "team", "billing", "domain"]),
+  }),
+);
+/**
+ * Start by stable outbox ID. A crash after create is recovered by observing the same instance.
+ * Once a team installation's workflow exists and has not finished, `installTeam` may also run
+ * that job at once (see {@link provisionTeamNow}); its other jobs keep dispatching meanwhile.
+ */
+export const dispatchProvisioning = <R>(
+  installTeam: (job: string) => Effect.Effect<void, never, R>,
+) =>
+  Effect.gen(function* () {
+    const environment = yield* Cloudflare.WorkerEnvironment;
+    const binding = yield* Schema.decodeUnknownEffect(NativeProvisioning)(environment.Provisioning);
+    const sql = yield* Effect.flatten(GroupDatabase);
+    const jobs =
+      // Claim a short dispatch lease in one statement. Concurrent request finalizers
+      // must not each submit the same queued jobs to the provider. A lost dispatch
+      // becomes eligible again; the workflow ID remains the durable identity.
+      yield* sql`with candidates as (
+      select id from hosted_provisioning where available_at <= now() and
+        (status = 'queued' or (status = 'running' and updated_at < now() - interval '30 minutes'))
+      order by case when kind = 'team' then 0 else 1 end, available_at
+      for update skip locked limit 50
+    ) update hosted_provisioning job set available_at = now() + interval '30 seconds'
+      from candidates where job.id = candidates.id returning job.id, job.kind`.pipe(
+        Effect.flatMap(Schema.decodeUnknownEffect(ClaimedJobs)),
+      );
+    yield* Effect.forEach(
+      jobs,
+      (job) =>
+        Effect.gen(function* () {
+          const status = yield* Effect.tryPromise({
+            try: async () => {
+              try {
+                await binding.create({ id: job.id, params: { id: job.id } });
+                return "running" as const;
+              } catch {
+                const instance = await (await binding.get(job.id)).status();
+                if (instance.status === "unknown")
+                  throw new Error("Provisioning instance unavailable");
+                return instance.status;
+              }
+            },
+            catch: () => new ProvisioningFailed(),
+          });
+          const persisted =
+            status === "complete"
+              ? "succeeded"
+              : status === "errored" || status === "terminated"
+                ? "failed"
+                : "running";
+          yield* sql`update hosted_provisioning set status = ${persisted}, updated_at = now()
           where id = ${job.id} and status in ('queued', 'running')`;
-        if (persisted === "failed")
-          yield* Effect.logError("Provisioning workflow needs attention", { job: job.id });
-      }).pipe(
-        Effect.catch(() => Effect.logWarning("Provisioning dispatch failed", { job: job.id })),
-      ),
-    { concurrency: 4, discard: true },
-  );
-}).pipe(Effect.mapError(() => new ProvisioningFailed()));
+          if (persisted === "failed")
+            yield* Effect.logError("Provisioning workflow needs attention", { job: job.id });
+          if (job.kind === "team" && persisted === "running") yield* installTeam(job.id);
+        }).pipe(
+          Effect.catch(() => Effect.logWarning("Provisioning dispatch failed", { job: job.id })),
+        ),
+      { concurrency: 4, discard: true },
+    );
+  }).pipe(Effect.mapError(() => new ProvisioningFailed()));
+
+/**
+ * Install a new team in this isolate instead of waiting for its workflow to be scheduled.
+ * Run only jobs handed over by {@link dispatchProvisioning}: their workflow already exists, so
+ * it finishes an attempt here that fails or is cut short, and finds a successful one done.
+ */
+export const provisionTeamNow = (job: string) =>
+  Effect.gen(function* () {
+    const sql = yield* Effect.flatten(GroupDatabase);
+    yield* provisionTeam(job, true).pipe(Effect.provideService(SqlClient.SqlClient, sql));
+  });

@@ -3,10 +3,18 @@ import { Effect, Schema } from "effect";
 import type { Route } from "playwright";
 import { Browser } from "./browser.ts";
 
-/** Replace readiness on real workspace reads to cover each repair state in the shared dialog. */
+type WorkspaceDisplay = { readonly revision: { readonly commit: string } };
+const WorkspaceDisplay = Schema.Struct({
+  revision: Schema.Struct({ commit: Schema.String }),
+});
+
+/**
+ * Replace readiness on real workspace reads to cover repair states in the shared dialog.
+ * A function derives the result from the real revision, so saved repairs can change readiness.
+ */
 export const publishingPreview = (
   app: string,
-  publication: unknown,
+  publication: object | ((display: WorkspaceDisplay) => object),
   published: readonly unknown[] = [],
 ) =>
   Effect.gen(function* () {
@@ -23,7 +31,11 @@ export const publishingPreview = (
             contentType: "application/json",
             body: JSON.stringify({
               ...Schema.decodeUnknownSync(Schema.Record(Schema.String, Schema.Unknown))(body),
-              publication,
+              publicationAudience: "public",
+              publication:
+                typeof publication === "function"
+                  ? publication(Schema.decodeUnknownSync(WorkspaceDisplay)(body))
+                  : publication,
             }),
           }),
         );
@@ -45,6 +57,7 @@ export const publishingPreview = (
               body: JSON.stringify({
                 ...Schema.decodeUnknownSync(Schema.Record(Schema.String, Schema.Unknown))(body),
                 canPublish: true,
+                publicationAudience: "public",
               }),
             }),
           );

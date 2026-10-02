@@ -152,7 +152,7 @@ export const usageReports: readonly UsageReport[] = [
     id: "FeatureUsage",
     name: "Operations by product area",
     description:
-      "Authenticated API and MCP operations, including reads. This measures feature use rather than productive users.",
+      "Authenticated API and MCP operations that change state or run tools. Reads are traced, not counted.",
     query: trend([event("product_operation_completed", success)], "area"),
   },
   {

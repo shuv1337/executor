@@ -1,8 +1,10 @@
 /** Typed app bindings share reconciliation; products supply their existing client and runtime. */
+import { revalidated } from "./refresh.ts";
 import type { App, AppId } from "@executor-js/sdk";
 import { AppAccess, appManagementApi, type CopyApp } from "@executor-js/app-management/contracts";
-import { Data, Effect, type Cause } from "effect";
+import { Array as Arr, Data, Effect, Schema, type Cause } from "effect";
 import type { HttpApiClient } from "effect/unstable/httpapi";
+import { hydratedResult, requestKey } from "./http.ts";
 import { Atom } from "effect/unstable/reactivity";
 import { acknowledge, acknowledgedQuery } from "./mutations.ts";
 
@@ -23,6 +25,12 @@ type Client<E> = {
     request: WithoutResponseMode<Parameters<WireClient[K]>[0]>,
   ) => Effect.Effect<Endpoints[K]["~Success"]["Type"], E>;
 };
+/** A read rendered on the server reaches the browser with the page, keyed by its request. */
+const hydrate = <K extends keyof Endpoints>(endpoint: K, request: object) =>
+  hydratedResult({
+    key: `app-management:${endpoint}:${requestKey(request)}`,
+    success: Schema.Union([...api.groups.appManagement.endpoints[endpoint].success]),
+  });
 /** Each host patches confirmed app metadata using its existing mutation conventions. */
 export type AppAcknowledgement = (get: Atom.FnContext, app: App) => void;
 /** Product client errors remain typed; the shared builder owns no transport or authentication. */
@@ -34,19 +42,25 @@ export const makeAppManagementAtoms = <R, E>(
 ) => {
   const catalog = runtime
     .atom(Effect.flatMap(client, (api) => api.catalog({ params, query: {} })))
-    .pipe(Atom.refreshOnWindowFocus, (source) => acknowledgedQuery(source, retainFailure));
+    .pipe(hydrate("catalog", params), revalidated, (source) =>
+      acknowledgedQuery(source, retainFailure),
+    );
   const published = runtime
     .atom(Effect.flatMap(client, (api) => api.published({ params })))
-    .pipe((source) => acknowledgedQuery(source, retainFailure));
+    .pipe(hydrate("published", params), (source) => acknowledgedQuery(source, retainFailure));
   const authoring = Atom.family((app: AppId) =>
     runtime
       .atom(Effect.flatMap(client, (api) => api.authoring({ params: { ...params, app } })))
-      .pipe(Atom.refreshOnWindowFocus, (source) => acknowledgedQuery(source, retainFailure)),
+      .pipe(hydrate("authoring", { ...params, app }), revalidated, (source) =>
+        acknowledgedQuery(source, retainFailure),
+      ),
   );
   const source = Atom.family((app: AppId) =>
     runtime
       .atom(Effect.flatMap(client, (api) => api.sourceDisplay({ params: { ...params, app } })))
-      .pipe(Atom.refreshOnWindowFocus, (source) => acknowledgedQuery(source, retainFailure)),
+      .pipe(hydrate("sourceDisplay", { ...params, app }), revalidated, (source) =>
+        acknowledgedQuery(source, retainFailure),
+      ),
   );
   // A commit is immutable, so a loaded file never needs a refresh.
   const sourceFiles = Atom.family((key: SourceFileKey) =>
@@ -59,12 +73,73 @@ export const makeAppManagementAtoms = <R, E>(
           }),
         ),
       )
-      .pipe(Atom.setIdleTTL("5 minutes")),
+      .pipe(
+        hydrate("sourceDisplayFile", {
+          ...params,
+          app: key.app,
+          commit: key.commit,
+          path: key.path,
+        }),
+        Atom.setIdleTTL("5 minutes"),
+      ),
   );
   const history = Atom.family((app: AppId) =>
     runtime
       .atom(Effect.flatMap(client, (api) => api.history({ params: { ...params, app } })))
-      .pipe(Atom.refreshOnWindowFocus),
+      .pipe(hydrate("history", { ...params, app }), revalidated),
+  );
+  /**
+   * Exact working bytes for an editor. The page's first read reaches the browser with the page;
+   * unmounted editors release it, so each later edit reads afresh.
+   */
+  const workspace = Atom.family((app: AppId) =>
+    runtime
+      .atom(Effect.flatMap(client, (api) => api.source({ params: { ...params, app } })))
+      .pipe(hydrate("source", { ...params, app }), (source) =>
+        acknowledgedQuery(source, retainFailure),
+      ),
+  );
+  /**
+   * Commit one text file on top of the current working source; a null base creates a new file. Like a Git host's web
+   * editor. A commit never deploys. Other files may have changed since the editor opened; the file itself must not have.
+   * The server's `expected` check still rejects a commit that lands between this read and write.
+   */
+  const commitFile = Atom.family((app: AppId) =>
+    runtime.fn(
+      (
+        input: {
+          path: string;
+          base: string | null;
+          content: string;
+          message: string;
+        },
+        get,
+      ) =>
+        Effect.gen(function* () {
+          const api = yield* client;
+          const current = yield* api.source({ params: { ...params, app } });
+          const file = current.files.find((item) => item.path === input.path);
+          if ((file === undefined ? null : file.content) !== input.base) {
+            // Let the editor offer the newer version when the person discards their draft.
+            get.refresh(workspace(app));
+            return { _tag: "FileChanged" as const };
+          }
+          const files =
+            file === undefined
+              ? Arr.append(current.files, { path: input.path, content: input.content })
+              : Arr.map(current.files, (item) =>
+                  item.path === input.path ? { path: item.path, content: input.content } : item,
+                );
+          const saved = yield* api.commit({
+            params: { ...params, app },
+            payload: { expected: current.revision.commit, files, message: input.message },
+          });
+          acknowledge(get, workspace(app), (previous) => ({ ...previous, ...saved }));
+          get.refresh(source(app));
+          get.refresh(history(app));
+          return { _tag: "Committed" as const, commit: saved.revision.commit };
+        }),
+    ),
   );
   const deploy = Atom.family((app: AppId) =>
     runtime.fn(
@@ -136,6 +211,8 @@ export const makeAppManagementAtoms = <R, E>(
     sourceFile: (key: ConstructorParameters<typeof SourceFileKey>[0]) =>
       sourceFiles(new SourceFileKey(key)),
     history,
+    workspace,
+    commitFile,
     deploy,
     copy: (from: typeof CopyApp.Type.from) =>
       copies("app" in from ? new OwnedCopy(from) : new PublicCopy(from)),

@@ -87,9 +87,28 @@ export class SkillDefinitionInvalid extends Schema.TaggedError<SkillDefinitionIn
 export const AppSkills = Schema.Array(AppSkillSource).check(
   Schema.makeFilter((skills) => new Set(skills.map((skill) => skill.name)).size === skills.length),
 );
-/** Safe loader failure; source bodies and authorization headers remain private. */
+/** Short display name for a skill source, such as "GitLab" or an index host name. */
+export const SkillServiceName = Schema.String.check(
+  Schema.isPattern(/^[A-Za-z0-9](?:[A-Za-z0-9 .-]{0,98}[A-Za-z0-9])?$/),
+);
+/**
+ * A skill loader failure shown to people. `message` is the explanation they read; write it for
+ * them and never include URLs, tokens or response bodies. `reason` selects the title and whether
+ * a retry can help. Custom loaders throw this error to get the same presentation as built-ins.
+ */
 export class SkillLoadFailed extends Schema.TaggedError<SkillLoadFailed>()("SkillLoadFailed", {
-  reason: Schema.Literals(["source", "request", "document", "limit", "changed", "encoding"]),
+  reason: Schema.Literals([
+    "source",
+    "request",
+    "rate_limited",
+    "document",
+    "limit",
+    "changed",
+    "encoding",
+  ]),
+  // Error instances read an omitted message as "", so an empty message means none was given.
+  message: Schema.optional(Schema.String.check(Schema.isMaxLength(500))),
+  status: Schema.optional(Schema.Int.check(Schema.isBetween({ minimum: 100, maximum: 599 }))),
 }) {}
 /** Bounds shared by skill loaders across all app hosts. */
 export const skillLoadLimits = {
@@ -103,14 +122,32 @@ export interface SkillTransport {
   readonly fetch?: typeof globalThis.fetch | undefined;
   readonly signal?: AbortSignal | undefined;
 }
-/** A public GitHub repository and an optional immutable commit, tag or branch. */
-export interface GitHubSkillsOptions extends SkillTransport {
+/** A custom loader's transport and the service name shown when a request fails. */
+export interface SkillReaderOptions extends SkillTransport {
+  readonly service: string;
+}
+/**
+ * Catalog reuse shared by remote skill loaders, with the same policy as MCP tool catalogs. Pass
+ * `ctx.cache` to keep the loaded catalog; without it every read fetches the source again.
+ */
+export interface SkillCacheOptions {
+  readonly cache?: import("./cache.ts").AppCache;
+  /** Reuse the catalog for this duration. Defaults to five minutes. */
+  readonly freshFor?: import("effect").Duration.Input;
+  /** Serve the retained catalog while refreshing. Defaults to one day. */
+  readonly staleFor?: import("effect").Duration.Input;
+}
+/**
+ * A public GitHub repository and an optional immutable commit, tag or branch. With a cache, a
+ * branch or tag is resolved again when the catalog refreshes, and each commit's file list is kept.
+ */
+export interface GitHubSkillsOptions extends SkillTransport, SkillCacheOptions {
   readonly repo: string;
   readonly path?: string;
   readonly ref?: string;
 }
 /** A published directory index, including its listed skill documents and text references. */
-export interface WellKnownSkillsOptions extends SkillTransport {
+export interface WellKnownSkillsOptions extends SkillTransport, SkillCacheOptions {
   readonly url: string;
 }
 

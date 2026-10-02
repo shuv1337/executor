@@ -6,11 +6,13 @@ import { DashboardFrame } from "./dashboard-frame.tsx";
 export function DashboardShell({
   navigation,
   banner,
+  support,
   children,
   allowCreateOrganization = true,
 }: {
   readonly navigation: ReactNode;
   readonly banner?: ReactNode;
+  readonly support?: ReactNode;
   readonly children: ReactNode;
   readonly allowCreateOrganization?: boolean;
 }) {
@@ -21,6 +23,7 @@ export function DashboardShell({
       organization={<OrganizationSwitcher allowCreate={allowCreateOrganization} />}
       navigation={navigation}
       banner={banner}
+      support={support}
     >
       {children}
     </DashboardFrame>

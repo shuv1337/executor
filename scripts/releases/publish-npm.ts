@@ -1,4 +1,7 @@
-/** Publish one complete version once. An accepted upload is polled, never uploaded again. */
+/**
+ * Publish one complete version once. An accepted upload is polled, never uploaded again;
+ * a retried job skips archives whose registry integrity matches byte for byte.
+ */
 import { createHash } from "node:crypto";
 import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -72,6 +75,20 @@ NodeRuntime.runMain(
         Effect.flatMap(Schema.decodeUnknownEffect(Tags)),
       );
       const before = yield* tags;
+      const integrityOf = (file: string) =>
+        Effect.gen(function* () {
+          const hash = createHash("sha512");
+          yield* fs.stream(file).pipe(
+            Stream.runForEach((bytes) =>
+              Effect.sync(() => {
+                hash.update(bytes);
+              }),
+            ),
+          );
+          return `sha512-${hash.digest("base64")}`;
+        });
+      // A retried job resumes only over archives npm already holds byte for byte.
+      const pending: Array<(typeof packages)[number] & { integrity: string }> = [];
       for (const pkg of packages) {
         if (!(yield* fs.exists(pkg.file)))
           return yield* Effect.die(new Error(`Missing ${pkg.file}`));
@@ -79,14 +96,24 @@ NodeRuntime.runMain(
           return yield* Effect.die(
             new Error(`npm archive exceeds the 180 MiB release budget: ${pkg.file}`),
           );
+        const integrity = yield* integrityOf(pkg.file);
         const response = yield* http.get(`${registry}/executor/${pkg.version}`);
-        yield* response.text;
-        if (response.status !== 404)
+        if (response.status === 404) {
+          yield* response.text;
+          pending.push({ ...pkg, integrity });
+          continue;
+        }
+        const published =
+          response.status === 200
+            ? yield* response.json.pipe(Effect.flatMap(Schema.decodeUnknownEffect(RegistryVersion)))
+            : undefined;
+        if (published?.dist.integrity !== integrity)
           return yield* Effect.die(
             new Error(
-              `Cannot publish ${pkg.version}: registry returned ${response.status}. Inspect existing publication before retrying.`,
+              `Cannot publish ${pkg.version}: the registry holds a different archive (status ${response.status}). Inspect existing publication before retrying.`,
             ),
           );
+        yield* Console.log(`Already published ${pkg.version} with matching integrity`);
       }
       const temporary = yield* fs.makeTempDirectoryScoped({ prefix: "executor-npm-" });
       const npmrc = path.join(temporary, "npmrc");
@@ -94,16 +121,7 @@ NodeRuntime.runMain(
       yield* fs.writeFileString(npmrc, "//registry.npmjs.org/:_authToken=${NPM_TOKEN}\n", {
         mode: 0o600,
       });
-      for (const pkg of packages) {
-        const hash = createHash("sha512");
-        yield* fs.stream(pkg.file).pipe(
-          Stream.runForEach((bytes) =>
-            Effect.sync(() => {
-              hash.update(bytes);
-            }),
-          ),
-        );
-        const integrity = `sha512-${hash.digest("base64")}`;
+      for (const { integrity, ...pkg } of pending) {
         const code = yield* processes.exitCode(
           ChildProcess.make(
             "npm",
@@ -131,7 +149,8 @@ NodeRuntime.runMain(
               : Effect.fail(new Error(`Registry integrity does not match ${pkg.version}`)),
           ),
           Effect.timeout(15_000),
-          Effect.retry({ schedule: Schedule.spaced(10_000), times: 60 }),
+          // npm can take over 15 minutes to expose a large accepted archive.
+          Effect.retry({ schedule: Schedule.spaced(15_000), times: 160 }),
         );
         yield* Console.log(`Verified public npm archive ${pkg.version}`);
       }

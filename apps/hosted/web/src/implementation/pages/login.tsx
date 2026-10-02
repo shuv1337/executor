@@ -5,6 +5,7 @@ import { AsyncResult } from "effect/unstable/reactivity";
 import { useAtomRefresh, useAtomSet, useAtomValue } from "@effect/atom-react";
 import { Cause, Exit, Option } from "effect";
 import { useState, type ReactNode } from "react";
+import { LoginFrame } from "./login-frame.tsx";
 import { AuthFailed, sessionAtom, signInAtom } from "../../contracts/auth.ts";
 import { Button } from "@executor-js/ui/components/button";
 import { Spinner } from "@executor-js/ui/components/spinner";
@@ -18,14 +19,31 @@ const callbackError = (error: unknown): string | null => {
   return "Sign-in could not be completed. Please try again.";
 };
 
-/** Preserve internal return paths and render only known, safe OAuth error messages. */
+/**
+ * Preserve internal return paths and render only known, safe OAuth error messages. A missing
+ * return path stays missing, so the server renders the requested address instead of redirecting
+ * to one with a default added.
+ */
 export const loginSearch = (
   search: Record<string, unknown>,
-): { redirect: string; error?: string } => {
+): { redirect?: string; error?: string } => {
   const error =
     typeof search.error === "string" && search.error !== "" ? { error: search.error } : {};
-  return { redirect: browserReturnTo(search.redirect), ...error };
+  return search.redirect === undefined
+    ? error
+    : { redirect: browserReturnTo(search.redirect), ...error };
 };
+
+/** What a sign-in page receives: where to go afterwards (home when none was given). */
+export interface LoginProps {
+  readonly redirect: string;
+  readonly error?: string;
+}
+
+export const loginProps = (search: ReturnType<typeof loginSearch>): LoginProps => ({
+  ...search,
+  redirect: browserReturnTo(search.redirect),
+});
 
 function GoogleIcon() {
   return (
@@ -63,35 +81,6 @@ function GitHubIcon() {
   );
 }
 
-/** Shared themed card for Cloud sign-in, SSO, and credential enrollment. */
-export function LoginFrame({
-  title,
-  children,
-  footer,
-}: {
-  readonly title: string;
-  readonly children: ReactNode;
-  readonly footer?: ReactNode;
-}) {
-  return (
-    <main className="auth-page flex min-h-dvh flex-col items-center justify-center bg-background px-4 py-12 text-foreground">
-      <div className="w-full max-w-110">
-        <h1 className="mb-6 text-center text-2xl font-semibold leading-8 tracking-tight">
-          {title}
-        </h1>
-        <section className="auth-form rounded-2xl border border-border bg-muted/50 p-12 max-[520px]:p-6 [&_form]:flex [&_form]:flex-col [&_form]:gap-6 [&_label]:flex [&_label]:flex-col [&_label]:gap-2 [&_label]:text-sm [&_label]:font-semibold [&_input]:h-10 [&_input]:bg-background [&_input]:text-base [&_input]:font-normal [&_input]:shadow-none [&_input]:placeholder:text-muted-foreground [&_form_>_button]:min-h-10">
-          {children}
-        </section>
-        {footer && (
-          <div className="mt-5 flex flex-col items-center gap-4 text-sm text-muted-foreground [&_.auth-legal]:mt-0">
-            {footer}
-          </div>
-        )}
-      </div>
-    </main>
-  );
-}
-
 /** Cloud social sign-in, composed with additional cloud credentials. */
 export function LoginPage({
   redirect,
@@ -100,7 +89,7 @@ export function LoginPage({
   title = "Sign in",
   cardFooter,
   footer,
-}: ReturnType<typeof loginSearch> & {
+}: LoginProps & {
   readonly children?: ReactNode;
   readonly title?: string;
   readonly cardFooter?: ReactNode;

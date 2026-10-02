@@ -13,6 +13,11 @@ export const sentryWorkerBuild = (
     // Normal ESM ordering avoids an initializer wrapper around every module.
     // This graph is covered by the workerd MCP and app-UI tests; keep source maps for diagnostics.
     strictExecutionOrder: false,
+    // Re-chunking the prebuilt dashboard graph by entry reach can evaluate a chunk that reads a
+    // binding before the chunk that initializes it. One chunk keeps that graph's own module order.
+    codeSplitting: {
+      groups: [{ name: "dashboard", test: "/web/dist/server/" }],
+    },
     keepNames: false,
     sourcemap: "hidden",
     plugins: [

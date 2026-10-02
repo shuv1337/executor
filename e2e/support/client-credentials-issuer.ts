@@ -1,7 +1,7 @@
 /** A real loopback token service. It exposes protocol observations, never submitted secrets or access tokens. */
 import { createServer } from "node:http";
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
-import { Deferred, Effect, Encoding, Layer } from "effect";
+import { Clock, Deferred, Effect, Encoding, Layer } from "effect";
 import {
   HttpRouter,
   HttpServer,
@@ -17,6 +17,25 @@ export const machineClient = {
 const formEncode = (value: string) =>
   new URLSearchParams({ value }).toString().slice("value=".length);
 
+/**
+ * Token request parameters from an RFC 6749 form or, for services such as Notion, a JSON object
+ * of strings. Anything else yields no parameters.
+ */
+export const tokenRequestParameters = (contentType: string | undefined, text: string) => {
+  if (contentType?.split(";")[0]?.trim() !== "application/json") return new URLSearchParams(text);
+  try {
+    const value: unknown = JSON.parse(text);
+    if (typeof value !== "object" || value === null || Array.isArray(value))
+      return new URLSearchParams();
+    const entries = Object.entries(value);
+    return entries.every((entry): entry is [string, string] => typeof entry[1] === "string")
+      ? new URLSearchParams(entries)
+      : new URLSearchParams();
+  } catch {
+    return new URLSearchParams();
+  }
+};
+
 /** Token issuance and resource access use actual HTTP; renewal is visible through the token generation. */
 export const clientCredentialsIssuer = Effect.gen(function* () {
   const address = yield* Deferred.make<string>();
@@ -24,15 +43,18 @@ export const clientCredentialsIssuer = Effect.gen(function* () {
   let rejected = false;
   let method: "client_secret_post" | "client_secret_basic" | "client_secret_basic_raw" =
     "client_secret_basic";
+  /** The body encoding the token endpoint accepts; the other one is refused. */
+  let format: "form" | "json" = "form";
   let requests = 0;
   let generation = 0;
-  let token = "";
+  const tokens = new Map<string, { generation: number; expiresAt: number }>();
   let hold: { entered: Deferred.Deferred<void>; released: Deferred.Deferred<void> } | undefined;
   let observed:
     | {
         grant: string | null;
         scope: string | null;
         resource: string | null;
+        contentType: string | undefined;
         hasCallback: boolean;
         authenticated: boolean;
       }
@@ -57,7 +79,8 @@ export const clientCredentialsIssuer = Effect.gen(function* () {
       Effect.gen(function* () {
         requests++;
         const request = yield* HttpServerRequest.HttpServerRequest;
-        const parameters = new URLSearchParams(yield* request.text);
+        const contentType = request.headers["content-type"]?.split(";")[0]?.trim();
+        const parameters = tokenRequestParameters(contentType, yield* request.text);
         const pair =
           method === "client_secret_basic_raw"
             ? `${machineClient.clientId}:${machineClient.clientSecret}`
@@ -74,12 +97,18 @@ export const clientCredentialsIssuer = Effect.gen(function* () {
           grant: parameters.get("grant_type"),
           scope: parameters.get("scope"),
           resource: parameters.get("resource"),
+          contentType,
           hasCallback:
             parameters.has("redirect_uri") ||
             parameters.has("code") ||
             parameters.has("code_verifier"),
           authenticated,
         };
+        const encoded =
+          contentType ===
+          (format === "json" ? "application/json" : "application/x-www-form-urlencoded");
+        if (!encoded)
+          return yield* HttpServerResponse.json({ error: "invalid_request" }, { status: 400 });
         if (rejected || !authenticated || observed.grant !== "client_credentials")
           return yield* HttpServerResponse.json({ error: "invalid_client" }, { status: 400 });
         const pending = hold;
@@ -88,7 +117,11 @@ export const clientCredentialsIssuer = Effect.gen(function* () {
           yield* Deferred.succeed(pending.entered, undefined);
           yield* Deferred.await(pending.released);
         }
-        token = `synthetic-access-${++generation}`;
+        const token = `synthetic-access-${++generation}`;
+        tokens.set(`Bearer ${token}`, {
+          generation,
+          expiresAt: (yield* Clock.currentTimeMillis) + expiresIn * 1000,
+        });
         return yield* HttpServerResponse.json({
           access_token: token,
           token_type: "Bearer",
@@ -101,9 +134,12 @@ export const clientCredentialsIssuer = Effect.gen(function* () {
       "/resource",
       Effect.gen(function* () {
         const request = yield* HttpServerRequest.HttpServerRequest;
+        const issued = tokens.get(request.headers.authorization ?? "");
         return yield* HttpServerResponse.json({
-          authenticated: request.headers.authorization === `Bearer ${token}`,
-          generation,
+          // Issuing another token does not revoke an unexpired in-flight token.
+          authenticated:
+            issued !== undefined && issued.expiresAt > (yield* Clock.currentTimeMillis),
+          generation: issued?.generation ?? 0,
         });
       }),
     ),
@@ -126,8 +162,14 @@ export const clientCredentialsIssuer = Effect.gen(function* () {
       yield* Effect.addFinalizer(() => Deferred.succeed(released, undefined));
       return { entered: Deferred.await(entered), release: Deferred.succeed(released, undefined) };
     }),
-    configure: (input: { expiresIn?: number; rejected?: boolean; method?: typeof method }) =>
+    configure: (input: {
+      expiresIn?: number;
+      rejected?: boolean;
+      method?: typeof method;
+      format?: typeof format;
+    }) =>
       Effect.sync(() => {
+        if (input.format !== undefined) format = input.format;
         if (input.expiresIn !== undefined) expiresIn = input.expiresIn;
         if (input.rejected !== undefined) rejected = input.rejected;
         if (input.method !== undefined) method = input.method;

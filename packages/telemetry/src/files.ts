@@ -18,6 +18,11 @@ export const rotatingJsonLogger = (directory: string, name: string, maxBytes = 1
           .withPermit(
             Effect.gen(function* () {
               if (lines.length === 0) return;
+              // The directory can be moved away, as a desktop data reset does. Start a new file.
+              if (!(yield* fs.exists(file))) {
+                yield* fs.makeDirectory(directory, { recursive: true, mode: 0o700 });
+                size = 0;
+              }
               const bytes = encoder.encode(`${lines.join("\n")}\n`);
               if (size > 0 && size + bytes.length > maxBytes) {
                 for (let index = 4; index >= 1; index--) {

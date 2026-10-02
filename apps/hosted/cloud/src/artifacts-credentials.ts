@@ -1,0 +1,256 @@
+/**
+ * Private entry point for Artifacts token coordinators. A coordinator that wakes in a fresh isolate
+ * loads and initializes only this Worker, not the API with its routes, auth and executor.
+ */
+import { AppCodeId, aesGcmCredentials } from "@executor-js/sdk/core";
+import { externalTrace, TraceContext, traceLinks } from "@executor-js/telemetry";
+import * as Cloudflare from "alchemy/Cloudflare";
+import { Clock, Effect, Layer, Option, Redacted, Schedule, Schema, Semaphore } from "effect";
+import { ArtifactsCredentials } from "./infrastructure/artifacts-credentials-worker.ts";
+import {
+  ArtifactsTokenCoordinator,
+  cloudSourceNamespace,
+  creation,
+  credential,
+  envelope,
+  unavailable,
+} from "./infrastructure/artifacts-tokens.ts";
+import { cloudEncryptionKey } from "./infrastructure/secrets.ts";
+import {
+  cloudObservability,
+  cloudTelemetry,
+  telemetryBindings,
+} from "./infrastructure/telemetry.ts";
+import { providerFailureCode } from "./implementation/provider-failure.ts";
+
+const tokenLifetimeSeconds = 31_536_000;
+const refreshBeforeExpiryMs = 5 * 60_000;
+const issued = Schema.Struct({
+  id: Schema.NonEmptyString,
+  plaintext: Schema.RedactedFromValue(Schema.NonEmptyString),
+  scope: Schema.Literal("write"),
+  expiresAt: Schema.String.check(Schema.makeFilter((value) => Number.isFinite(Date.parse(value)))),
+});
+const pendingPreparation = Schema.Struct({
+  repository: AppCodeId,
+  trace: Schema.NullOr(TraceContext),
+});
+
+const makeArtifactsTokenCoordinator = Effect.gen(function* () {
+  const namespace = yield* cloudSourceNamespace;
+  const resource = yield* Cloudflare.Artifacts.Namespace("AppSources", { namespace });
+  const binding = yield* Cloudflare.Artifacts.ReadWriteNamespace(resource);
+  const encryptionKey = yield* cloudEncryptionKey;
+  return Effect.gen(function* () {
+    const state = yield* Cloudflare.DurableObjectState;
+    const encryption = yield* aesGcmCredentials(yield* encryptionKey, crypto);
+    const lock = yield* Semaphore.make(1);
+    const acquire = (repository: AppCodeId, rejectedGeneration: string | null) =>
+      lock
+        .withPermits(1)(
+          Effect.scoped(
+            Effect.gen(function* () {
+              if (rejectedGeneration !== null)
+                yield* Effect.annotateCurrentSpan(
+                  "source.token.rejected_generation",
+                  rejectedGeneration,
+                );
+              const now = yield* Clock.currentTimeMillis;
+              const stored = yield* state.storage.get<unknown>("credential");
+              if (stored !== undefined) {
+                const saved = yield* Schema.decodeUnknownEffect(envelope)(stored);
+                const decoded = yield* encryption.decrypt(
+                  repository,
+                  Redacted.make(saved.encrypted),
+                );
+                const token = yield* Schema.decodeUnknownEffect(credential)(
+                  Redacted.value(decoded),
+                );
+                if (token.repository !== repository || token.namespace !== namespace)
+                  return yield* unavailable();
+                if (
+                  token.expiresAt > now + refreshBeforeExpiryMs &&
+                  token.generation !== rejectedGeneration
+                ) {
+                  yield* Effect.annotateCurrentSpan("source.token.reused", true);
+                  yield* Effect.annotateCurrentSpan("source.token.generation", token.generation);
+                  return saved;
+                }
+              }
+              const repo = yield* Effect.acquireRelease(
+                binding.get(repository).pipe(
+                  Effect.retry({
+                    while: (error) =>
+                      error.message ===
+                      `Repository "${repository}" is currently being created. The repository is not yet available. Retry after 5 seconds.`,
+                    schedule: Schedule.spaced("5 seconds"),
+                    times: 2,
+                  }),
+                  Effect.withSpan("source.repository.open"),
+                ),
+                (repo) => disposeRpc(repo.raw),
+              );
+              const result = yield* Effect.acquireRelease(
+                repo
+                  .createToken("write", tokenLifetimeSeconds)
+                  .pipe(Effect.withSpan("source.repository.token")),
+                (result) => disposeRpc(result),
+              );
+              // RPC properties are read while the provider handle is alive; no plaintext is logged or stored.
+              const minted = yield* Effect.tryPromise({
+                try: async () => ({
+                  id: await result.id,
+                  plaintext: await result.plaintext,
+                  scope: await result.scope,
+                  expiresAt: await result.expiresAt,
+                }),
+                catch: unavailable,
+              }).pipe(Effect.flatMap(Schema.decodeUnknownEffect(issued)));
+              const expiresAt = Date.parse(minted.expiresAt);
+              if (expiresAt <= now + refreshBeforeExpiryMs) return yield* unavailable();
+              const payload = yield* Schema.encodeEffect(credential)({
+                repository,
+                namespace,
+                token: minted.plaintext,
+                generation: minted.id,
+                expiresAt,
+              });
+              const encrypted = yield* encryption.encrypt(repository, Redacted.make(payload));
+              const saved = { version: 1 as const, encrypted };
+              yield* state.storage.put("credential", saved);
+              yield* Effect.annotateCurrentSpan("source.token.reused", false);
+              yield* Effect.annotateCurrentSpan("source.token.generation", minted.id);
+              yield* Effect.annotateCurrentSpan(
+                "source.token.lifetime_seconds",
+                tokenLifetimeSeconds,
+              );
+              return saved;
+            }),
+          ),
+        )
+        .pipe(Effect.mapError(unavailable), Effect.withSpan("source.repository.token.acquire"));
+    return {
+      acquire: (id: string, rejectedGeneration: string | null, trace: TraceContext | undefined) =>
+        Schema.decodeUnknownEffect(AppCodeId)(id).pipe(
+          Effect.flatMap((repository) =>
+            Schema.decodeUnknownEffect(Schema.NullOr(Schema.NonEmptyString))(
+              rejectedGeneration,
+            ).pipe(Effect.flatMap((rejected) => acquire(repository, rejected))),
+          ),
+          Effect.withSpan("source.repository.credentials", {
+            parent: Option.getOrUndefined(externalTrace(trace)),
+          }),
+          Effect.mapError(unavailable),
+        ),
+      create: (id: string, trace: TraceContext | undefined) =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const repository = yield* Schema.decodeUnknownEffect(AppCodeId)(id);
+            const created = yield* Effect.acquireRelease(
+              binding.create(repository, { setDefaultBranch: "main" }).pipe(
+                Effect.tapError((error) =>
+                  Effect.annotateCurrentSpan(
+                    "source.repository.create.failure",
+                    providerFailureCode(error),
+                  ),
+                ),
+                // Creation is keyed by the same immutable repository ID. If an
+                // internal provider failure committed before its reply failed,
+                // ALREADY_EXISTS below reconciles the existing repository.
+                Effect.retry({
+                  while: (error) => providerFailureCode(error) === "internal",
+                  schedule: Schedule.exponential("1 second"),
+                  times: 2,
+                }),
+                Effect.withSpan("source.repository.create"),
+                Effect.catchTag("ArtifactsError", (error) =>
+                  Option.isSome(
+                    Schema.decodeUnknownOption(
+                      Schema.Struct({ code: Schema.Literal("ALREADY_EXISTS") }),
+                    )(error.cause),
+                  )
+                    ? Effect.succeed(null)
+                    : Effect.fail(error),
+                ),
+              ),
+              (created) => disposeRpc(created),
+            );
+            if (created === null) return null;
+            const token = yield* Effect.tryPromise({
+              try: async () => created.token,
+              catch: unavailable,
+            }).pipe(
+              Effect.flatMap(
+                Schema.decodeUnknownEffect(Schema.RedactedFromValue(Schema.NonEmptyString)),
+              ),
+              Effect.withSpan("source.repository.initial-token.read"),
+            );
+            const payload = yield* Schema.encodeEffect(creation)({ repository, namespace, token });
+            const encrypted = yield* encryption.encrypt(repository, Redacted.make(payload));
+            // A separate durable alarm owns issuance and its telemetry, even after this RPC returns.
+            yield* state.storage.put("prepare", {
+              repository,
+              trace: Option.getOrNull(Schema.decodeUnknownOption(TraceContext)(trace)),
+            });
+            yield* state.storage.setAlarm(yield* Clock.currentTimeMillis);
+            return { version: 1 as const, encrypted };
+          }),
+        ).pipe(
+          Effect.mapError(unavailable),
+          Effect.withSpan("source.repository.initialize", {
+            parent: Option.getOrUndefined(externalTrace(trace)),
+          }),
+        ),
+      alarm: () =>
+        Effect.gen(function* () {
+          const raw = yield* state.storage.get<unknown>("prepare");
+          if (raw === undefined) return;
+          const pending = yield* Schema.decodeUnknownEffect(pendingPreparation)(raw);
+          yield* acquire(pending.repository, null).pipe(
+            Effect.withSpan("source.repository.token.prepare", {
+              root: true,
+              links: traceLinks(pending.trace, "repository-creation"),
+            }),
+          );
+          yield* state.storage.delete("prepare");
+        }).pipe(
+          Effect.mapError(unavailable),
+          Effect.tapError(() =>
+            Effect.logError("Artifacts token preparation failed; the alarm will retry"),
+          ),
+          Effect.orDie,
+        ),
+    };
+  }).pipe(Effect.orDie);
+}).pipe(Effect.provide(Cloudflare.Artifacts.ReadWriteNamespaceBinding), Effect.orDie);
+
+/** Dispose provider RPC handles without retaining them in the credential store. */
+const disposeRpc = (value: unknown) =>
+  Effect.sync(() => {
+    if (
+      value !== null &&
+      (typeof value === "object" || typeof value === "function") &&
+      Symbol.dispose in value
+    ) {
+      const dispose = value[Symbol.dispose];
+      if (typeof dispose === "function") dispose.call(value);
+    }
+  });
+
+export default ArtifactsCredentials.make(
+  Effect.gen(function* () {
+    if (globalThis.__ALCHEMY_RUNTIME__) return { main: import.meta.url };
+    return {
+      main: import.meta.url,
+      ...(yield* cloudObservability),
+      workersDev: false,
+      compatibility: { date: "2026-09-08", flags: ["nodejs_compat"] },
+      env: yield* telemetryBindings,
+    };
+  }),
+  Effect.succeed({}).pipe(
+    Effect.provide(
+      Layer.mergeAll(ArtifactsTokenCoordinator.make(makeArtifactsTokenCoordinator), cloudTelemetry),
+    ),
+  ),
+);

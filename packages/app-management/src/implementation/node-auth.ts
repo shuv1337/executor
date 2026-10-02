@@ -2,7 +2,6 @@ import { homedir } from "node:os";
 import { lock } from "proper-lockfile";
 /** CLI OAuth and OS credential-store adapter. Credentials never enter repositories or config files. */
 import { createServer } from "node:http";
-import { AsyncEntry } from "@napi-rs/keyring";
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import {
   Console,
@@ -17,6 +16,10 @@ import {
   Schema,
 } from "effect";
 import {
+  FetchHttpClient,
+  HttpClient,
+  HttpClientRequest,
+  HttpClientResponse,
   HttpRouter,
   HttpServer,
   HttpServerRequest,
@@ -55,26 +58,32 @@ const Session = Schema.Struct({
   namespace: Schema.String,
 });
 const authError = () => new AppClientError({ reason: "authentication" });
+// Loaded lazily so a native binding that cannot load fails here instead of at process start.
 const entry = (host: string) =>
-  Effect.try({ try: () => new AsyncEntry("Executor Registry", host), catch: authError });
-const request = <A>(url: string, body: URLSearchParams | object, schema: Schema.Decoder<A>) =>
   Effect.tryPromise({
-    try: async (signal) => {
-      const form = body instanceof URLSearchParams;
-      const response = await fetch(url, {
-        method: "POST",
-        headers: {
-          "content-type": form ? "application/x-www-form-urlencoded" : "application/json",
-        },
-        body: form ? body : JSON.stringify(body),
-        redirect: "error",
-        signal,
-      });
-      if (!response.ok) throw new Error("OAuth request failed");
-      return response.json();
+    try: async () => {
+      const { AsyncEntry } = await import("@napi-rs/keyring");
+      return new AsyncEntry("Executor Registry", host);
     },
     catch: authError,
-  }).pipe(Effect.flatMap(Schema.decodeUnknownEffect(schema)), Effect.mapError(authError));
+  });
+/** Read a JSON response from the Executor host; redirects fail rather than carry credentials. */
+const fetchJson = <A>(request: HttpClientRequest.HttpClientRequest, schema: Schema.Decoder<A>) =>
+  HttpClient.execute(request).pipe(
+    Effect.flatMap(HttpClientResponse.filterStatusOk),
+    Effect.flatMap((response) => response.json),
+    Effect.flatMap(Schema.decodeUnknownEffect(schema)),
+    Effect.mapError(authError),
+    Effect.provideService(FetchHttpClient.RequestInit, { redirect: "error" }),
+    Effect.provide(FetchHttpClient.layer),
+  );
+const request = <A>(url: string, body: URLSearchParams | object, schema: Schema.Decoder<A>) =>
+  body instanceof URLSearchParams
+    ? fetchJson(HttpClientRequest.post(url).pipe(HttpClientRequest.bodyUrlParams(body)), schema)
+    : HttpClientRequest.bodyJson(HttpClientRequest.post(url), body).pipe(
+        Effect.mapError(authError),
+        Effect.flatMap((request) => fetchJson(request, schema)),
+      );
 const save = (host: string, session: typeof Session.Type) =>
   Effect.gen(function* () {
     const store = yield* entry(host);
@@ -248,24 +257,11 @@ export const registryLogin = (host: string, platform: string) =>
         }),
         Token,
       );
-      const context = yield* Effect.tryPromise({
-        try: async (signal) => {
-          const response = await fetch(`${host}/api/context`, {
-            headers: { authorization: `Bearer ${token.access_token}` },
-            signal,
-            redirect: "error",
-          });
-          if (!response.ok) throw new Error("Context unavailable");
-          return response.json();
-        },
-        catch: authError,
-      }).pipe(
-        Effect.flatMap(
-          Schema.decodeUnknownEffect(
-            Schema.Struct({ organization: Schema.String, slug: Schema.String }),
-          ),
+      const context = yield* fetchJson(
+        HttpClientRequest.get(`${host}/api/context`).pipe(
+          HttpClientRequest.bearerToken(token.access_token),
         ),
-        Effect.mapError(authError),
+        Schema.Struct({ organization: Schema.String, slug: Schema.String }),
       );
       yield* withSessionLock(
         host,

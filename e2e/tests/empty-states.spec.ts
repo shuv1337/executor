@@ -1,3 +1,4 @@
+import { openThroughBrowser } from "../support/in-app-navigation.ts";
 import { expect, layer } from "@effect/vitest";
 import { Effect, Schema } from "effect";
 import { randomUUID } from "node:crypto";
@@ -93,14 +94,17 @@ layer(HostedLive, { excludeTestServices: true })("Empty states", (it) => {
           { width: 390, height: 844 },
         ]) {
           yield* browser.use("Set first-use viewport", (page) => page.setViewportSize(viewport));
-          for (const section of ["apps", "accounts", "api-keys"] as const) {
-            yield* browser.use(`Open first-use ${section}`, (page) =>
-              page.goto(`/org/${actors.organization.slug}/${section}`),
+          for (const section of ["apps", "accounts", "tokens"] as const) {
+            yield* openThroughBrowser(
+              `Open first-use ${section}`,
+              section === "tokens"
+                ? `/account/tokens?organization=${actors.organization.slug}`
+                : `/org/${actors.organization.slug}/${section}`,
             );
             yield* browser.use("The next action is visible", (page) =>
               page
                 .locator(".empty-state")
-                .getByRole(section === "api-keys" ? "button" : "link", {
+                .getByRole(section === "tokens" ? "button" : "link", {
                   name:
                     section === "apps"
                       ? "Add app"
@@ -134,9 +138,7 @@ layer(HostedLive, { excludeTestServices: true })("Empty states", (it) => {
         yield* browser.use("Close without creating a credential", (page) =>
           page.keyboard.press("Escape"),
         );
-        yield* browser.use("Open filtered Apps", (page) =>
-          page.goto(`/org/${actors.organization.slug}/apps`),
-        );
+        yield* openThroughBrowser("Open filtered Apps", `/org/${actors.organization.slug}/apps`);
         yield* browser.use("Open app filters", (page) =>
           page.getByRole("button", { name: "Filters", exact: true }).click(),
         );
@@ -162,8 +164,9 @@ layer(HostedLive, { excludeTestServices: true })("Empty states", (it) => {
         yield* browser.use("The unfiltered first-use state returns", (page) =>
           page.getByRole("heading", { name: "No apps available", exact: true }).waitFor(),
         );
-        yield* browser.use("Choose an app from Accounts", (page) =>
-          page.goto(`/org/${actors.organization.slug}/accounts`),
+        yield* openThroughBrowser(
+          "Choose an app from Accounts",
+          `/org/${actors.organization.slug}/accounts`,
         );
         yield* browser.use("Follow account setup", (page) =>
           page.getByRole("link", { name: "Choose an app", exact: true }).click(),
@@ -178,8 +181,9 @@ layer(HostedLive, { excludeTestServices: true })("Empty states", (it) => {
             (route) => route.abort("failed"),
           ),
         );
-        yield* browser.use("Open Add app during the failure", (page) =>
-          page.goto(`/org/${actors.organization.slug}/apps/add`),
+        yield* openThroughBrowser(
+          "Open Add app during the failure",
+          `/org/${actors.organization.slug}/apps/add`,
         );
         yield* browser.use("The catalog error is visible", (page) =>
           page.getByText("Unable to complete this request", { exact: true }).first().waitFor(),
@@ -221,8 +225,9 @@ layer(HostedLive, { excludeTestServices: true })("Empty states", (it) => {
           { width: 390, height: 844 },
         ]) {
           yield* browser.use("Set group detail viewport", (page) => page.setViewportSize(viewport));
-          yield* browser.use("Open a group with no members or shared apps", (page) =>
-            page.goto(`/org/${actors.organization.slug}/groups/${group.id}`),
+          yield* openThroughBrowser(
+            "Open a group with no members or shared apps",
+            `/org/${actors.organization.slug}/groups/${group.id}`,
           );
           yield* browser.use("Empty members offer setup", (page) =>
             page.getByRole("button", { name: "Add members", exact: true }).waitFor(),

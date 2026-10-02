@@ -7,24 +7,37 @@ import { Actors } from "../support/actors.ts";
 import { Api, body } from "../support/api.ts";
 import { Browser } from "../support/browser.ts";
 import { openPrivateApp, waitForAppUrl } from "../support/app-pages.ts";
+import {
+  committedDocuments,
+  recordAppOpening,
+  screens,
+  type Entry,
+} from "../support/app-open-timeline.ts";
 import { HostedLive, withHostedCase } from "../support/case.ts";
+import { password } from "../support/actors.ts";
 import { App } from "../support/contracts.ts";
 import { Target } from "../support/platform.ts";
 
 import { McpOAuth } from "../support/mcp-oauth.ts";
 import { McpClient } from "../support/mcp-client.ts";
+import { managementApp } from "../support/management-app.ts";
+import { holdQuery } from "../support/query-transition.ts";
+import { appsManifest } from "../support/apps-release.ts";
 
 const files = [
   {
     path: "index.ts",
-    content: `import { defineApp, defineDatabase, table, query, mutation, object, string } from "apps";
+    content: `import { defineApp, defineDatabase, table, query, mutation, object, string, router } from "apps";
 const database = defineDatabase({ messages: table({ body: string() }) });
 export const list = query({ input: object({}) }, async ({ db }) =>
   (await db.messages.withIndex("by_creation").collect()).map((row) => row.body));
 export const save = mutation({ input: object({ body: string() }) }, async ({ db }, input) => {
   await db.messages.insert(input); return input.body;
 });
-export default defineApp({ accounts: {}, database }, {  queries: { list }, mutations: { save } });`,
+export default defineApp({ accounts: {}, database }, {  tools: router({
+    list,
+    save,
+  }) });`,
   },
   {
     path: "ui/index.html",
@@ -56,118 +69,94 @@ document.querySelector('form').addEventListener('submit', (event) => {
 });
 load().catch(() => { status.textContent = "Load failed"; });`,
   },
+  appsManifest,
 ];
 const Location = Schema.Struct({ url: Schema.String });
 const OperationSecurity = Schema.Array(Schema.Record(Schema.String, Schema.Array(Schema.String)));
 const PublicOperation = Schema.Struct({ operationId: Schema.String, security: OperationSecurity });
-const GeneratedOperation = Schema.Struct({
-  name: Schema.String,
-  method: Schema.String,
-  path: Schema.String,
-  security: Schema.Array(Schema.Array(Schema.String)),
-  streaming: Schema.optionalKey(Schema.Boolean),
-});
 const Completed = Schema.Struct({
   status: Schema.Literal("completed"),
   execution: Schema.Struct({ ok: Schema.Literal(true), value: Schema.Unknown }),
 });
 
+/** Sign-in is redirects only: no host-owned page renders and nothing says "Opening app…". */
+const expectNoSignInPages = (timeline: ReadonlyArray<Entry>) => {
+  expect(screens(timeline)).not.toContain("Opening app…");
+  expect(
+    committedDocuments(timeline)
+      .map((url) => url.pathname)
+      .filter((path) => path === "/app-auth" || path.startsWith("/_executor/auth/")),
+  ).toEqual([]);
+};
+
+const appFixture = Effect.gen(function* () {
+  const api = yield* Api,
+    actors = yield* Actors,
+    browser = yield* Browser,
+    target = yield* Target;
+  const prefix = `/api/organizations/${actors.organization.id}`;
+  const deployed = yield* api.request(actors.owner, "POST", `${prefix}/apps/deploy`, {
+    name: `Private UI ${randomUUID().slice(0, 8)}`,
+    files,
+  });
+  expect(deployed.status).toBe(200);
+  const app = yield* body(App, deployed);
+  yield* Effect.addFinalizer(() =>
+    api.request(actors.owner, "DELETE", `${prefix}/apps/${app.id}`).pipe(Effect.orDie),
+  );
+  const url = yield* waitForAppUrl(actors.owner, `${prefix}/apps/${app.id}/ui`);
+  expect(new URL(url).hostname.split(".").slice(0, 2).join(".")).toBe(
+    `${app.slug}.${actors.organization.slug}`,
+  );
+  const bookmark = `${url}/inbox/unread?filter=new#latest`;
+  return { api, actors, browser, target, prefix, app, url, bookmark };
+});
+
+/** The owner's browser grants an MCP client that addresses the owner's Executor profile. */
+const mcpSession = Effect.gen(function* () {
+  const actors = yield* Actors,
+    browser = yield* Browser,
+    oauth = yield* McpOAuth,
+    mcp = yield* McpClient;
+  yield* browser.login(actors.owner);
+  const { profile } = yield* managementApp(actors.owner);
+  expect(profile.accounts.service).toBeTypeOf("string");
+  const tools = `tools.executor.profiles[${JSON.stringify(profile.id)}]`;
+  const grant = yield* oauth.authorize;
+  yield* Effect.addFinalizer(() => oauth.revoke(grant).pipe(Effect.orDie));
+  const client = yield* mcp.connect(
+    Redacted.make(Redacted.value(grant.tokens).access_token),
+    "app-ui-discovery",
+  );
+  return { tools, client };
+});
+
 layer(HostedLive, { excludeTestServices: true })("Private app pages", (it) => {
-  it.effect(scenarios.appUi.title, (context) =>
+  it.effect(scenarios.appUiApiDocument.title, (context) =>
     withHostedCase(
       context,
       Effect.gen(function* () {
         const api = yield* Api,
           actors = yield* Actors,
-          browser = yield* Browser,
           target = yield* Target;
         const prefix = `/api/organizations/${actors.organization.id}`;
         const anonymous = yield* api.session();
         const apiDocument = yield* body(
           Schema.Struct({
             paths: Schema.Record(Schema.String, Schema.Record(Schema.String, PublicOperation)),
+            components: Schema.Struct({
+              securitySchemes: Schema.Record(Schema.String, Schema.Json),
+            }),
           }),
           yield* api.request(anonymous, "GET", "/openapi.json"),
         );
         expect(Object.keys(apiDocument.paths)).toContain(
           "/api/organizations/{organization}/apps/{app}/ui",
         );
-        expect(Object.keys(apiDocument.paths)).toContain("/api/app-ui/authorize");
+        expect(Object.keys(apiDocument.paths)).not.toContain("/api/app-ui/authorize");
         expect(Object.keys(apiDocument.paths)).toContain("/api/viewer");
-        expect(apiDocument.paths["/api/app-ui/authorize"]?.post?.security).toEqual([
-          { browserSession: [] },
-        ]);
-        const deployed = yield* api.request(actors.owner, "POST", `${prefix}/apps/deploy`, {
-          name: `Private UI ${randomUUID().slice(0, 8)}`,
-          files,
-        });
-        expect(deployed.status).toBe(200);
-        const app = yield* body(App, deployed);
-        yield* Effect.addFinalizer(() =>
-          api.request(actors.owner, "DELETE", `${prefix}/apps/${app.id}`).pipe(Effect.orDie),
-        );
-        const seeded = yield* api.request(
-          actors.owner,
-          "POST",
-          `${prefix}/apps/${app.id}/data/mutate`,
-          { name: "save", input: { body: "Saved from the management API" } },
-        );
-        expect(seeded.status).toBe(200);
-        const url = yield* waitForAppUrl(actors.owner, `${prefix}/apps/${app.id}/ui`);
-        expect(new URL(url).hostname.split(".").slice(0, 2).join(".")).toBe(
-          `${app.slug}.${actors.organization.slug}`,
-        );
-        const bookmark = `${url}/inbox/unread?filter=new#latest`;
-        yield* browser.omitNetworkTrace;
-        expect(
-          (yield* browser.use("Unsigned protected assets stay private", (page) =>
-            page.context().request.get(`${url}/mark.svg`),
-          )).status(),
-        ).toBe(401);
-        expect(
-          (yield* browser.use("App origin has no management routes", (page) =>
-            page.context().request.get(`${url}/api/auth/get-session`),
-          )).status(),
-        ).toBe(404);
-        yield* browser.use("Direct bookmark requires the existing product login", (page) =>
-          page.goto(bookmark),
-        );
-        yield* browser.use("Sign-in return stays on the dashboard", (page) =>
-          page
-            .getByRole("heading", {
-              name: target.metadata.target === "cloud" ? "Sign in" : "Sign in to Executor",
-              exact: true,
-            })
-            .waitFor(),
-        );
-        yield* browser.login(actors.owner);
-        // Inventory provisions the ordinary Executor app and this user's personal profile.
-        const inventory = yield* body(
-          Schema.Struct({
-            apps: Schema.Array(
-              Schema.Struct({
-                id: Schema.String,
-                slug: Schema.String,
-              }),
-            ),
-          }),
-          yield* api.request(actors.owner, "GET", `${prefix}/inventory`),
-        );
-        const management = inventory.apps.find((item) => item.slug === "executor");
-        if (management === undefined) return yield* Effect.die("Executor app was not installed");
-        const profiles = yield* body(
-          Schema.Array(
-            Schema.Struct({
-              id: Schema.String,
-              accounts: Schema.Struct({ service: Schema.String }),
-            }),
-          ),
-          yield* api.request(actors.owner, "GET", `${prefix}/apps/${management.id}/profiles`),
-        );
-        expect(profiles).toHaveLength(1);
-        const profile = profiles[0];
-        if (profile === undefined) return yield* Effect.die("Executor profile was not installed");
-        const tools = `tools.executor.profiles[${JSON.stringify(profile.id)}]`;
+        const { app: management, profile } = yield* managementApp(actors.owner);
+        expect(profile.accounts.service).toBeTypeOf("string");
         const source = yield* body(
           Schema.Struct({
             files: Schema.Array(
@@ -179,43 +168,31 @@ layer(HostedLive, { excludeTestServices: true })("Private app pages", (it) => {
           }),
           yield* api.request(actors.owner, "GET", `${prefix}/apps/${management.id}/source`),
         );
-        const metadataFile = source.files.find((file) => file.path === "operations.json");
-        if (metadataFile === undefined)
-          return yield* Effect.die("Executor app has no operations metadata");
-        const metadata = yield* Schema.decodeUnknownEffect(
+        const configurationFile = source.files.find((file) => file.path === "openapi.json");
+        if (configurationFile === undefined)
+          return yield* Effect.die("Executor app has no live OpenAPI configuration");
+        const configuration = yield* Schema.decodeUnknownEffect(
           Schema.fromJsonString(
             Schema.Struct({
-              operations: Schema.Array(GeneratedOperation),
+              source: Schema.Struct({ url: Schema.String }),
+              baseUrl: Schema.String,
+              allowedOrigin: Schema.String,
+              securitySchemes: Schema.Record(Schema.String, Schema.Json),
             }),
           ),
-        )(metadataFile.content);
-        const expected = Object.entries(apiDocument.paths)
-          .flatMap(([path, methods]) =>
-            Object.entries(methods).map(([method, operation]) => ({
-              name: operation.operationId.replace(/[^a-zA-Z0-9_]/g, "_"),
-              method: method.toUpperCase(),
-              path,
-              security: operation.security.map((requirement) => Object.keys(requirement).sort()),
-            })),
-          )
-          .sort((a, b) => a.name.localeCompare(b.name));
-        expect(
-          metadata.operations
-            .map(({ streaming: _streaming, ...operation }) => operation)
-            .sort((a, b) => a.name.localeCompare(b.name)),
-        ).toEqual(expected);
-        expect(
-          metadata.operations.find((operation) => operation.name === "appData_subscribe")
-            ?.streaming,
-        ).toBe(true);
-        const oauth = yield* McpOAuth;
-        const mcp = yield* McpClient;
-        const grant = yield* oauth.authorize;
-        yield* Effect.addFinalizer(() => oauth.revoke(grant).pipe(Effect.orDie));
-        const client = yield* mcp.connect(
-          Redacted.make(Redacted.value(grant.tokens).access_token),
-          "app-ui-discovery",
-        );
+        )(configurationFile.content);
+        expect(configuration.source.url).toBe(`${target.metadata.origin}/openapi.json`);
+        expect(configuration.baseUrl).toBe(target.metadata.origin);
+        expect(configuration.allowedOrigin).toBe(new URL(target.metadata.origin).origin);
+        expect(configuration.securitySchemes).toEqual(apiDocument.components.securitySchemes);
+      }),
+    ),
+  );
+  it.effect(scenarios.appUiMcpSearch.title, (context) =>
+    withHostedCase(
+      context,
+      Effect.gen(function* () {
+        const { tools, client } = yield* mcpSession;
         const search = yield* client.use(
           "Discover the app URL tool through MCP",
           (client, signal) =>
@@ -236,18 +213,21 @@ layer(HostedLive, { excludeTestServices: true })("Private app pages", (it) => {
             items: Schema.Array(Schema.Struct({ path: Schema.String })),
           }),
         )((yield* Schema.decodeUnknownEffect(Completed)(search.structuredContent)).execution.value);
-        expect(discovered.items.map((item) => item.path)).toContain(
-          `${tools}.queries.appUi_location`,
-        );
+        expect(discovered.items.map((item) => item.path)).toContain(`${tools}.appUi.location`);
+        expect(discovered.items.map((item) => item.path)).not.toContain(`${tools}.appUi.authorize`);
+        expect(discovered.items.map((item) => item.path)).not.toContain(`${tools}.viewer.get`);
         expect(discovered.items.map((item) => item.path)).not.toContain(
-          `${tools}.mutations.appUi_authorize`,
+          `${tools}.appData.subscribe`,
         );
-        expect(discovered.items.map((item) => item.path)).not.toContain(
-          `${tools}.queries.viewer_get`,
-        );
-        expect(discovered.items.map((item) => item.path)).not.toContain(
-          `${tools}.mutations.appData_subscribe`,
-        );
+      }).pipe(Effect.provide(Layer.mergeAll(McpOAuth.layer, McpClient.layer))),
+    ),
+  );
+  it.effect(scenarios.appUiDiscovery.title, (context) =>
+    withHostedCase(
+      context,
+      Effect.gen(function* () {
+        const { actors, app, url } = yield* appFixture;
+        const { tools, client } = yield* mcpSession;
         const lookup = yield* client.use(
           "Get the canonical app URL using the MCP grant",
           (client, signal) =>
@@ -255,7 +235,7 @@ layer(HostedLive, { excludeTestServices: true })("Private app pages", (it) => {
               {
                 name: "execute",
                 arguments: {
-                  code: `return await ${tools}.queries.appUi_location({ path: ${JSON.stringify({ organization: actors.organization.id, app: app.id })} });`,
+                  code: `return await ${tools}.appUi.location({ path: ${JSON.stringify({ organization: actors.organization.id, app: app.id })} });`,
                 },
               },
               undefined,
@@ -273,7 +253,7 @@ layer(HostedLive, { excludeTestServices: true })("Private app pages", (it) => {
               {
                 name: "execute",
                 arguments: {
-                  code: `return await ${tools}.queries.appUi_location({ path: ${JSON.stringify({ organization: "other-organization", app: app.id })} });`,
+                  code: `return await ${tools}.appUi.location({ path: ${JSON.stringify({ organization: "other-organization", app: app.id })} });`,
                 },
               },
               undefined,
@@ -287,8 +267,180 @@ layer(HostedLive, { excludeTestServices: true })("Private app pages", (it) => {
           }),
         )(denied.structuredContent);
         expect(failed.execution.ok).toBe(false);
-
-        yield* openPrivateApp(`${mcpLocation.url}/inbox/unread?filter=new#latest`);
+      }).pipe(Effect.provide(Layer.mergeAll(McpOAuth.layer, McpClient.layer))),
+    ),
+  );
+  it.effect(scenarios.appUiSignedOutOpen.title, (context) =>
+    withHostedCase(
+      context,
+      Effect.gen(function* () {
+        const { actors, browser, target, bookmark } = yield* appFixture;
+        const { timeline } = yield* recordAppOpening(
+          Effect.gen(function* () {
+            yield* browser.use("Open the app URL without an Executor session", (page) =>
+              page.goto(bookmark),
+            );
+            yield* browser.use("The app asks for the product sign-in", (page) =>
+              page
+                .getByRole("heading", {
+                  name: target.metadata.target === "cloud" ? "Sign in" : "Sign in to Executor",
+                  exact: true,
+                })
+                .waitFor(),
+            );
+            if (target.metadata.target === "self-host") {
+              yield* browser.use("Enter the owner's email", (page) =>
+                page.getByLabel("Email", { exact: true }).fill("owner@example.test"),
+              );
+              yield* browser.use("Enter the self-host password", (page) =>
+                page.getByLabel("Password", { exact: true }).fill(password),
+              );
+              yield* browser.use("Sign in", (page) =>
+                page.getByRole("button", { name: "Sign in", exact: true }).click(),
+              );
+            } else {
+              // Cloud fixture users cannot receive sign-in codes; the session arrives as a cookie
+              // and the sign-in page is reloaded to continue its return navigation.
+              // Keep the app's pending sign-in cookie; only the product session is added.
+              const cookies = yield* actors.owner.cookies;
+              yield* browser.use("Add the owner's product session", (page) =>
+                page.context().addCookies([...Redacted.value(cookies)]),
+              );
+              yield* browser.use("Continue from the sign-in page with a session", (page) =>
+                page.reload(),
+              );
+            }
+            yield* browser.use("Sign-in returns to the app and it renders", (page) =>
+              page.getByRole("status").filter({ hasText: "Ready" }).waitFor(),
+            );
+          }),
+        );
+        expect(
+          yield* browser.use("The bookmark survives sign-in", (page) =>
+            Promise.resolve(page.url()),
+          ),
+        ).toBe(bookmark);
+        expectNoSignInPages(timeline);
+      }),
+    ),
+  );
+  it.effect(scenarios.appUiDashboardOpen.title, (context) =>
+    withHostedCase(
+      context,
+      Effect.gen(function* () {
+        const { actors, browser, app, url } = yield* appFixture;
+        yield* browser.login(actors.owner);
+        yield* browser.use("Open the deployed app details", (page) =>
+          page.goto(`/org/${actors.organization.slug}/apps/${app.id}`),
+        );
+        yield* browser.use("The ready app link appears", (page) =>
+          page.getByRole("link", { name: "Open app", exact: true }).waitFor(),
+        );
+        const { result: opened, timeline } = yield* recordAppOpening(
+          browser.use("Open app opens a new tab that signs in and renders the app", (page) => {
+            const callbacks: string[] = [];
+            // Registered on the context so the new tab's first redirects are observed.
+            page.context().on("response", (response) => {
+              if (new URL(response.url()).pathname === "/_executor/auth/callback")
+                callbacks.push(response.url());
+            });
+            return Promise.all([
+              page.context().waitForEvent("page"),
+              page.getByRole("link", { name: "Open app", exact: true }).click(),
+            ]).then(([tab]) => {
+              return tab
+                .getByRole("status")
+                .filter({ hasText: "Ready" })
+                .waitFor()
+                .then(() => tab.reload())
+                .then(() => tab.getByRole("status").filter({ hasText: "Ready" }).waitFor())
+                .then(() => ({ url: tab.url(), callbacks }));
+            });
+          }),
+        );
+        expect(new URL(opened.url).origin).toBe(new URL(url).origin);
+        expectNoSignInPages(timeline);
+        expect(opened.callbacks).toHaveLength(1);
+        const callback = opened.callbacks[0] ?? "";
+        expect(
+          yield* browser.use("A used callback URL cannot sign in again", (page) =>
+            page
+              .context()
+              .request.get(callback, { maxRedirects: 0 })
+              .then((response) => response.status()),
+          ),
+        ).toBe(401);
+        expect(
+          yield* browser.use("A callback URL cannot sign in another browser", (page) =>
+            (
+              page.context().browser()?.newContext() ?? Promise.reject(new Error("No browser"))
+            ).then((other) =>
+              other.request
+                .get(callback, { maxRedirects: 0 })
+                .then((response) => response.status())
+                .finally(() => other.close()),
+            ),
+          ),
+        ).toBe(401);
+      }),
+    ),
+  );
+  it.effect(scenarios.appUi.title, (context) =>
+    withHostedCase(
+      context,
+      Effect.gen(function* () {
+        const { api, actors, browser, target, prefix, app, url, bookmark } = yield* appFixture;
+        const seeded = yield* api.request(
+          actors.owner,
+          "POST",
+          `${prefix}/apps/${app.id}/data/mutate`,
+          {
+            name: "save",
+            input: { body: "Saved from the management API" },
+          },
+        );
+        expect(seeded.status).toBe(200);
+        yield* browser.omitNetworkTrace;
+        expect(
+          (yield* browser.use("Unsigned protected assets stay private", (page) =>
+            page.context().request.get(`${url}/mark.svg`),
+          )).status(),
+        ).toBe(401);
+        expect(
+          (yield* browser.use("App origin has no management routes", (page) =>
+            page.context().request.get(`${url}/api/auth/get-session`),
+          )).status(),
+        ).toBe(404);
+        expect(
+          yield* browser.use("Reserved product roots are not app pages", (page) =>
+            Promise.all(
+              ["/api", "/mcp", "/_executor", "/.well-known"].map((path) =>
+                page
+                  .context()
+                  .request.get(`${url}${path}`, { maxRedirects: 0 })
+                  .then((response) => [path, response.status()] as const),
+              ),
+            ),
+          ),
+        ).toEqual([
+          ["/api", 404],
+          ["/mcp", 404],
+          ["/_executor", 404],
+          ["/.well-known", 404],
+        ]);
+        yield* browser.use("Direct bookmark requires the existing product login", (page) =>
+          page.goto(bookmark),
+        );
+        yield* browser.use("Sign-in return stays on the dashboard", (page) =>
+          page
+            .getByRole("heading", {
+              name: target.metadata.target === "cloud" ? "Sign in" : "Sign in to Executor",
+              exact: true,
+            })
+            .waitFor(),
+        );
+        yield* browser.login(actors.owner);
+        yield* openPrivateApp(bookmark);
         yield* browser.use("App query executes after authentication", (page) =>
           page.getByRole("status").filter({ hasText: "Ready" }).waitFor(),
         );
@@ -371,6 +523,14 @@ layer(HostedLive, { excludeTestServices: true })("Private app pages", (it) => {
         yield* browser.use("Data remains after reopening", (page) =>
           page.getByRole("listitem").filter({ hasText: "Saved through app runtime" }).waitFor(),
         );
+      }),
+    ),
+  );
+  it.effect(scenarios.appUiAccess.title, (context) =>
+    withHostedCase(
+      context,
+      Effect.gen(function* () {
+        const { api, actors, browser, prefix, app, bookmark } = yield* appFixture;
         const access = yield* body(
           Schema.Struct({ revision: Schema.String }),
           yield* api.request(actors.owner, "GET", `${prefix}/apps/${app.id}/access`),
@@ -383,7 +543,11 @@ layer(HostedLive, { excludeTestServices: true })("Private app pages", (it) => {
           }),
         );
         yield* browser.login(actors.member);
+        // Keep the live revocation watcher pending while testing the mutation's
+        // own rejection. Starting a document navigation can cancel its response.
+        const watcher = yield* holdQuery(["/_executor/version"], "continue");
         yield* openPrivateApp(bookmark);
+        yield* watcher.requested;
         yield* browser.use("Member can query the app", (page) =>
           page.getByRole("status").filter({ hasText: "Ready" }).waitFor(),
         );
@@ -395,6 +559,27 @@ layer(HostedLive, { excludeTestServices: true })("Private app pages", (it) => {
         );
         yield* browser.use("Member write succeeds", (page) =>
           page.getByRole("listitem").filter({ hasText: "Saved by a member" }).waitFor(),
+        );
+        const live = yield* browser.use("Open a member tab with live revocation", (page) =>
+          page.context().newPage(),
+        );
+        yield* Effect.addFinalizer(() =>
+          browser.use("Close the live member tab", () => live.close()).pipe(Effect.orDie),
+        );
+        const [response] = yield* Effect.all(
+          [
+            browser.use("Observe the live member subscription", () =>
+              live.waitForResponse(
+                (response) => new URL(response.url()).pathname === "/_executor/version",
+              ),
+            ),
+            browser.use("Load the live member tab", () => live.goto(bookmark)),
+          ],
+          { concurrency: "unbounded" },
+        );
+        expect(response.status()).toBe(200);
+        yield* browser.use("The live member tab is ready", () =>
+          live.getByRole("status").filter({ hasText: "Ready" }).waitFor(),
         );
         expect(
           (yield* api.request(actors.owner, "PATCH", `${prefix}/apps/${app.id}/access`, {
@@ -411,6 +596,10 @@ layer(HostedLive, { excludeTestServices: true })("Private app pages", (it) => {
         expect(
           (yield* api.request(actors.member, "GET", `${prefix}/apps/${app.id}/ui`)).status,
         ).toBe(403);
+        yield* browser.use("Revocation removes the open app from the browser", () =>
+          live.getByText("App unavailable.", { exact: true }).waitFor(),
+        );
+        yield* watcher.release;
         // Each app has its own complete DNS label, independent of the team slug length.
         const maxAppSlug = 63;
         expect(maxAppSlug).toBeGreaterThan(0);
@@ -443,7 +632,7 @@ layer(HostedLive, { excludeTestServices: true })("Private app pages", (it) => {
             name: app.name,
           })).status,
         ).toBe(200);
-      }).pipe(Effect.provide(Layer.mergeAll(McpOAuth.layer, McpClient.layer))),
+      }),
     ),
   );
 });

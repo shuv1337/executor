@@ -159,7 +159,12 @@ export const telemetryBindings = Effect.gen(function* () {
   };
 }).pipe(Effect.orDie);
 
-/** Alchemy builds this safe exporter in each Worker/DO event scope and flushes through waitUntil. */
+/**
+ * Alchemy builds this safe exporter in each Worker/DO event scope and flushes through waitUntil.
+ * Provide it once, on a Worker's initialization. Each build adds another exporter to the
+ * isolate, so a Durable Object constructor must not provide it: every later event in that
+ * isolate would export its metrics once more per constructed object.
+ */
 export const cloudTelemetry = Layer.unwrap(
   Effect.gen(function* () {
     if (!globalThis.__ALCHEMY_RUNTIME__) return Layer.empty;

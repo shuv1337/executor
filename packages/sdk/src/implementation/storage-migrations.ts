@@ -1,8 +1,14 @@
 /** Current baseline and the additive repair required by existing version 4 databases. */
 import { fumadb } from "fumadb-effect";
-import { schema } from "fumadb-effect/schema";
 import { Effect } from "effect";
-import { storageSchema } from "./storage-schema.ts";
+import { schema, type CustomMigrationFn } from "fumadb-effect/schema";
+import {
+  storageSchema,
+  version402Tables,
+  version403Tables,
+  version404Tables,
+  version4Tables,
+} from "./storage-schema.ts";
 
 /** Indexes that are part of the current storage contract, including fresh databases. */
 export const storageIndexes = [
@@ -14,14 +20,70 @@ export const storageIndexes = [
   "CREATE INDEX IF NOT EXISTS executor_scheduled_runs_owner ON executor_scheduled_runs (owner, started_at)",
 ] as const;
 
+/** A shipped version 4 layout, with the same foreign keys as the current schema. */
+const version4 = <Version extends string>(version: Version, up?: CustomMigrationFn) =>
+  schema({
+    version,
+    tables: version4Tables,
+    ...(up === undefined ? {} : { up }),
+    relations: {
+      accounts: ({ one }) => ({
+        providerDefinition: one("providers", ["provider", "id"]).foreignKey(),
+      }),
+      apps: ({ one }) => ({
+        deployment: one("deployments", ["activeDeployment", "id"], ["code", "code"]).foreignKey(),
+      }),
+    },
+  });
+
 /** Version 4 is the oldest supported layout. Append future compatible upgrades here. */
 export const storageSchemas = [
-  storageSchema,
+  version4("4.0.0"),
+  version4("4.0.1", () =>
+    Effect.succeed(storageIndexes.map((sql) => ({ type: "custom" as const, sql }))),
+  ),
+  // Additive: existing accounts start at generation 0 and the running server ignores the column.
   schema({
-    version: "4.0.1",
-    tables: storageSchema.tables,
-    up: () => Effect.succeed(storageIndexes.map((sql) => ({ type: "custom" as const, sql }))),
+    version: "4.0.2",
+    tables: version402Tables,
+    relations: {
+      accounts: ({ one }) => ({
+        providerDefinition: one("providers", ["provider", "id"]).foreignKey(),
+      }),
+      apps: ({ one }) => ({
+        deployment: one("deployments", ["activeDeployment", "id"], ["code", "code"]).foreignKey(),
+      }),
+    },
   }),
+  // Additive: a new account checks table that the running server never reads.
+  schema({
+    version: "4.0.3",
+    tables: version403Tables,
+    relations: {
+      accounts: ({ one }) => ({
+        providerDefinition: one("providers", ["provider", "id"]).foreignKey(),
+      }),
+      apps: ({ one }) => ({
+        deployment: one("deployments", ["activeDeployment", "id"], ["code", "code"]).foreignKey(),
+      }),
+    },
+  }),
+  // Additive: a nullable account description; the running server neither reads nor writes it.
+  schema({
+    version: "4.0.4",
+    tables: version404Tables,
+    relations: {
+      accounts: ({ one }) => ({
+        providerDefinition: one("providers", ["provider", "id"]).foreignKey(),
+      }),
+      apps: ({ one }) => ({
+        deployment: one("deployments", ["activeDeployment", "id"], ["code", "code"]).foreignKey(),
+      }),
+    },
+  }),
+  // Additive: a nullable column the running server never names. Existing accounts read as
+  // connected without hosts, which is how they behave before this version.
+  storageSchema,
 ] as const;
 
 /** Versioned persistence factory; constructing it does not touch a database. */

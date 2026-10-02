@@ -6,6 +6,7 @@ import { HostedAppSessions, hostedAppSessions } from "@executor-js/hosted-server
 import {
   McpAuthentication,
   mcpAuthenticationError,
+  mcpConnectionStore,
   provisionHostedOAuthResources,
   ApiAuthentication,
   apiAuthenticationError,
@@ -60,10 +61,10 @@ export const selfHostAuth = Effect.gen(function* () {
       lookupOrganizationSlug(() =>
         auth.api.getOrganization({ headers, query: { organizationId } }),
       ).pipe(Effect.withSpan("auth.organizationSlug")),
-    membership: (headers, organizationId) =>
-      lookupMembership(() =>
-        auth.api.getActiveMemberRole({ headers, query: { organizationId }, returnHeaders: true }),
-      ).pipe(Effect.withSpan("auth.membership")),
+    membership: (principal, organizationId) =>
+      lookupMembership(context.adapter, principal, organizationId).pipe(
+        Effect.withSpan("auth.membership"),
+      ),
     removeOrganization: (organizationId) =>
       deleteOrganizationRecords(context.adapter, organizationId).pipe(
         Effect.withSpan("auth.removeOrganization"),
@@ -85,6 +86,9 @@ export const selfHostAuth = Effect.gen(function* () {
       try: () => auth.api.getOAuthServerConfig(),
       catch: () => new AuthenticationUnavailable(),
     }),
+    connections: mcpConnectionStore((run) =>
+      Effect.tryPromise({ try: () => run(auth.api), catch: (cause) => cause }),
+    ),
   });
   const apiIdentity = Layer.succeed(ApiAuthentication, {
     origin: settings.url,

@@ -10,13 +10,16 @@ import { Resource } from "../support/contracts.ts";
 import { Evidence, Telemetry } from "../support/evidence.ts";
 import { WorkflowRun } from "../support/workflow-app.ts";
 import { scenarios } from "../test-plan.ts";
+import { appsManifest } from "../support/apps-release.ts";
 
-const source = `import { defineApp, defineProvider, secrets, object, string, query, workflow } from "apps";
+const source = `import { defineApp, defineProvider, secrets, object, string, query, workflow, router } from "apps";
 const service = defineProvider({ name: "Query budget fixture", auth: {
   key: secrets({ label: "API key", fields: object({ token: string() }) })
 } });
 export default defineApp({ accounts: { workspaces: service.many() } }, async ctx => ({
-  queries: { selected: query({ input: object({}) }, async () => ctx.accounts.workspaces.map(account => account.fields.token)) },
+  tools: router({
+    selected: query({ input: object({}) }, async () => ctx.accounts.workspaces.map(account => account.fields.token)),
+  }),
   workflows: { quick: workflow({ input: object({}) }, async () => "finished") }
 }));`;
 
@@ -34,7 +37,7 @@ layer(HostedLive, { excludeTestServices: true })("SDK query budgets", (it) => {
           runs: string[] = [];
         const deployed = yield* api.request(actors.owner, "POST", `${prefix}/apps/deploy`, {
           name: `Query budgets ${randomUUID().slice(0, 8)}`,
-          files: [{ path: "index.ts", content: source }],
+          files: [{ path: "index.ts", content: source }, appsManifest],
         });
         expect(deployed.status).toBe(200);
         const app = yield* body(Resource, deployed);
@@ -87,7 +90,17 @@ layer(HostedLive, { excludeTestServices: true })("SDK query budgets", (it) => {
             Effect.timeout("25 seconds"),
           );
 
+        const directoryQueries = Effect.gen(function* () {
+          const listed = yield* api.request(
+            actors.owner,
+            "GET",
+            `${prefix}/resources?view=available`,
+          );
+          expect(listed.status).toBe(200);
+          return (yield* queries(yield* traceId, "http.server GET")).length;
+        });
         const profile = yield* createProfile(actors.owner, path);
+        let firstDirectory = 0;
         for (let index = 0; index < 10; index++) {
           const pending = yield* api.request(actors.owner, "POST", `${path}/connections`, {
             requirement: "workspaces",
@@ -107,7 +120,38 @@ layer(HostedLive, { excludeTestServices: true })("SDK query budgets", (it) => {
           );
           expect(saved.status).toBe(200);
           accounts.push((yield* body(Resource, saved)).id);
+          if (index === 0) {
+            const submitTrace = yield* traceId;
+            const connectionReads = (yield* queries(submitTrace, "http.server POST")).filter(
+              ({ span }) =>
+                /^select .* from "executor_account_connections"/is.test(
+                  String(span.tags["db.query.text"] ?? ""),
+                ),
+            ).length;
+            yield* evidence.json("submit-connection-reads.json", {
+              traceId: submitTrace,
+              count: connectionReads,
+            });
+            expect
+              .soft(
+                connectionReads,
+                "Submit reads the connection to authorize it, then to claim it",
+              )
+              .toBe(3);
+            firstDirectory = yield* directoryQueries;
+          }
         }
+        const lastDirectory = yield* directoryQueries;
+        yield* evidence.json("directory-query-budget.json", {
+          oneAccount: firstDirectory,
+          tenAccounts: lastDirectory,
+        });
+        expect
+          .soft(
+            lastDirectory,
+            "The account directory reads the same statements for ten accounts as for one",
+          )
+          .toBe(firstDirectory);
         // Deliberately reverse creation order: the batch read must retain saved binding order.
         const selected = [...accounts].reverse();
         expect(
@@ -116,7 +160,8 @@ layer(HostedLive, { excludeTestServices: true })("SDK query budgets", (it) => {
         ).toBe(200);
         const called = yield* api.request(actors.owner, "POST", `${path}/tools/call`, {
           profile: profile.id,
-          tool: "queries.selected",
+          tool: "selected",
+          kind: "query",
           input: {},
         });
         expect(called.status).toBe(200);
@@ -135,6 +180,25 @@ layer(HostedLive, { excludeTestServices: true })("SDK query budgets", (it) => {
             "Ten accounts need one joined app read, one profile read and one account batch",
           )
           .toBe(3);
+        const memberReads = yield* telemetry
+          .query(invocationTrace)
+          .pipe(
+            Effect.map(
+              (result) =>
+                result.data.filter(
+                  ({ span }) =>
+                    span.operationName === "sql.execute" &&
+                    String(span.tags["db.query.text"] ?? "").includes("from member where"),
+                ).length,
+            ),
+          );
+        yield* evidence.json("invocation-member-reads.json", {
+          traceId: invocationTrace,
+          count: memberReads,
+        });
+        expect
+          .soft(memberReads, "The app, profile and ten account checks share one membership read")
+          .toBe(1);
         expect(
           (yield* selectProfileAccounts(actors.owner, path, profile.id, {
             workspaces: [...selected, ...selected],
@@ -146,7 +210,8 @@ layer(HostedLive, { excludeTestServices: true })("SDK query budgets", (it) => {
         ).toBe(200);
         const empty = yield* api.request(actors.owner, "POST", `${path}/tools/call`, {
           profile: profile.id,
-          tool: "queries.selected",
+          tool: "selected",
+          kind: "query",
           input: {},
         });
         expect(empty.status).toBe(200);

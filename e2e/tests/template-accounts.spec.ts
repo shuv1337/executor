@@ -1,4 +1,4 @@
-/** Multi-account defaults are verified through imported source and public profile/tool APIs. */
+/** Multi-account routing is verified through skill-authored source and public profile/tool APIs. */
 import { expect, layer } from "@effect/vitest";
 import { Effect, Schema } from "effect";
 import { randomUUID } from "node:crypto";
@@ -6,6 +6,7 @@ import { Actors } from "../support/actors.ts";
 import { Api, body } from "../support/api.ts";
 import { HostedLive, withHostedCase } from "../support/case.ts";
 import { App, Resource } from "../support/contracts.ts";
+import { authoredAppFiles } from "../support/authored-templates.ts";
 import { templateUpstream } from "../support/template-upstream.ts";
 import { scenarios } from "../test-plan.ts";
 
@@ -28,21 +29,10 @@ layer(HostedLive, { excludeTestServices: true })("Template accounts", (it) => {
           origin = yield* templateUpstream;
         const prefix = `/api/organizations/${actors.organization.id}`;
         for (const kind of ["openapi", "mcp", "graphql"] as const) {
-          const response = yield* api.request(actors.owner, "POST", `${prefix}/apps/import`, {
-            source:
-              kind === "openapi"
-                ? {
-                    kind,
-                    name: `Accounts ${kind} ${randomUUID().slice(0, 8)}`,
-                    url: `${origin}/openapi.json`,
-                    baseUrl: origin,
-                  }
-                : {
-                    kind,
-                    name: `Accounts ${kind} ${randomUUID().slice(0, 8)}`,
-                    url: `${origin}/${kind}`,
-                    auth: { type: "apiKey", header: "Authorization", prefix: "Bearer " },
-                  },
+          const name = `Accounts ${kind} ${randomUUID().slice(0, 8)}`;
+          const response = yield* api.request(actors.owner, "POST", `${prefix}/apps/deploy`, {
+            name,
+            files: authoredAppFiles(kind, origin, "apiKey", name),
           });
           expect(response.status, JSON.stringify(response.body)).toBe(200);
           const app = yield* body(App, response),
@@ -100,7 +90,12 @@ layer(HostedLive, { excludeTestServices: true })("Template accounts", (it) => {
           expect(profile.accounts.service).toEqual(accounts);
           const tools = yield* catalog();
           expect(tools.status, JSON.stringify(tools.body)).toBe(200);
-          const tool = kind === "graphql" ? "queries.query_identity" : "queries.identity";
+          const tool =
+            kind === "graphql"
+              ? "query_identity"
+              : kind === "openapi"
+                ? "identity.getIdentity"
+                : "identity";
           expect((yield* body(Tools, tools)).items.map((item) => item.name)).toEqual([tool]);
           if (kind === "mcp") {
             const descriptions = JSON.stringify((yield* body(Tools, tools)).items);
@@ -113,6 +108,8 @@ layer(HostedLive, { excludeTestServices: true })("Template accounts", (it) => {
             api.request(actors.owner, "POST", `${path}/tools/call`, {
               profile: profile.id,
               tool,
+              // Every template's identity operation is a read.
+              kind: "query",
               input: { accountId, input: kind === "mcp" ? { value: label } : {} },
             });
           for (const [index, label] of ["work", "personal"].entries()) {

@@ -1,4 +1,6 @@
 export { ProviderError } from "./contracts/provider-error.ts";
+export type { AppCache, CacheLoadContext, CacheGetOptions } from "./contracts/cache.ts";
+export { CacheError } from "@executor-js/app-cache/contracts";
 /**
  * Public author API. Native contracts live in contracts/; this boundary
  * exposes ordinary declarations, schema helpers and Promise operations.
@@ -8,8 +10,9 @@ import type { WebhookContext } from "./contracts/context.ts";
 import { type JsonResponse as NativeResponse, ResponseDecodeError } from "./contracts/http.ts";
 import {
   OAuth2AccessToken as NativeAccessToken,
-  type OAuth2Config,
+  type OAuth2Config as NativeOAuth2Config,
   type OAuth2Method as NativeOAuth2Method,
+  type ReservedAuthorizationParam,
   type SecretsMethod as NativeSecretsMethod,
 } from "./contracts/provider.ts";
 import type { Webhook as NativeWebhook } from "./contracts/webhooks.ts";
@@ -18,12 +21,19 @@ import { decodeJson as decodeJsonEffect } from "./implementation/http.ts";
 import { oauth2 as oauth2Effect, secrets as nativeSecrets } from "./implementation/provider.ts";
 import {
   decoderOf,
+  fieldExposure,
+  isSchema,
   type Fields,
   type Infer,
   type ObjectSchema,
   type Schema,
+  type SecretFields,
+  type SecretObject,
   wrap,
 } from "./implementation/schema.ts";
+
+const isFields = (value: unknown): value is Fields =>
+  typeof value === "object" && value !== null && Object.values(value).every(isSchema);
 
 export { type JsonObject, type JsonValue, ValidationError } from "./contracts/schema.ts";
 export {
@@ -41,39 +51,95 @@ export {
   object,
   record,
   string,
+  plain,
+  raw,
+  type SecretString,
 } from "./implementation/schema.ts";
 
 export {
+  type AccountCheckContext,
+  type AccountCheckResult,
+  type AccountInfo,
   type AccountOf,
   type AuthMethod,
   type AuthMethodData,
   type AuthMethods,
   type ManyAccounts,
-  type OAuth2Config,
   type Provider,
+  type ReservedAuthorizationParam,
 } from "./contracts/provider.ts";
-export { defineProvider } from "./implementation/provider.ts";
-export { accountOperations } from "./implementation/account-operations.ts";
+export { defineProvider, type ProviderOptions } from "./implementation/provider.ts";
+export { accountRouter } from "./implementation/account-router.ts";
+export {
+  router,
+  dynamicRouter,
+  withApprovals,
+  type RouterDeclaration,
+  type RouterChild,
+  type RouterOptions,
+} from "./implementation/router.ts";
+export type { RouterIcon } from "./contracts/router.ts";
+export { dynamicSkills } from "./implementation/dynamic-skills.ts";
+export type { HostedTool as OperationDescription } from "./contracts/host.ts";
 
+/** Account fields as app code receives them from a method declared with this schema. */
+type AccountFields<S> = S extends ObjectSchema<infer F> ? SecretFields<F> : SecretObject<Infer<S>>;
 /** A secrets declaration inferred from an author schema. */
 export type SecretsMethod<Shape extends ObjectSchema<Fields>> = NativeSecretsMethod<
-  EffectSchema.Decoder<Infer<Shape>>
+  EffectSchema.Decoder<AccountFields<Shape>>
 >;
 /** An OAuth declaration inferred from its author-facing response schema. */
 export type OAuth2Method<Response extends Schema<unknown, boolean>> = NativeOAuth2Method<
-  EffectSchema.Decoder<Infer<Response>>
+  EffectSchema.Decoder<AccountFields<Response>>
 >;
+
+/**
+ * The native decoder for account fields, typed as app code receives them. `SecretString` is a
+ * brand on `string`, so the decoder's values already satisfy it.
+ */
+const accountDecoder = <S extends Schema<unknown, boolean>>(
+  schema: S,
+): EffectSchema.Decoder<AccountFields<S>> =>
+  // SAFETY: the brand exists only in types; secret values are strings at runtime.
+  decoderOf(schema) as unknown as EffectSchema.Decoder<AccountFields<S>>;
+
+/** The `plain()` and `raw()` fields of an object schema, or none. */
+const exposureOf = (schema: Schema<unknown, boolean>) => {
+  const marked = "fields" in schema && isFields(schema.fields) ? fieldExposure(schema.fields) : {};
+  return Object.keys(marked).length === 0 ? {} : { exposure: marked };
+};
 /** Default OAuth fields visible to app code. Host-only grants and clients stay private. */
 export const OAuth2AccessToken = wrap(NativeAccessToken, false);
+
+/**
+ * OAuth options as authors write them. `authorizationParams` naming a host-owned protocol
+ * parameter such as `state` or `scope` is a type error as well as a declaration failure.
+ */
+export type OAuth2Config = WithoutReservedParams<NativeOAuth2Config>;
+type WithoutReservedParams<Config> = Config extends unknown
+  ? "authorizationParams" extends keyof Config
+    ? Config & {
+        readonly authorizationParams?: { readonly [Key in ReservedAuthorizationParam]?: never };
+      }
+    : Config
+  : never;
 
 /** Declare a secrets method without requiring an Effect schema from the author. */
 export const secrets = <const F extends Fields>(options: {
   readonly label: string;
   readonly fields: ObjectSchema<F>;
 }): SecretsMethod<ObjectSchema<F>> =>
-  nativeSecrets({ label: options.label, fields: decoderOf(options.fields) });
+  nativeSecrets({
+    label: options.label,
+    fields: accountDecoder(options.fields),
+    ...exposureOf(options.fields),
+  });
 
-/** Declare OAuth discovery/endpoints and an optional app-visible response projection. */
+/**
+ * Declare OAuth discovery/endpoints and an optional app-visible response projection.
+ * `authorizationParams` adds service-defined sign-in parameters; a declared `authorizationUrl`
+ * keeps its own query. Neither can set host-owned parameters, and each parameter appears once.
+ */
 export function oauth2(options: OAuth2Config): OAuth2Method<typeof OAuth2AccessToken>;
 export function oauth2<Response extends Schema<unknown, boolean>>(
   options: OAuth2Config & {
@@ -86,7 +152,9 @@ export function oauth2(
   },
 ): OAuth2Method<Schema<unknown, boolean>> {
   const { response = OAuth2AccessToken, ...config } = options;
-  return Effect.runSync(oauth2Effect(config, decoderOf(response)));
+  return Effect.runSync(
+    oauth2Effect(config, accountDecoder(response), exposureOf(response).exposure),
+  );
 }
 
 export type { AccountSlots } from "./contracts/app.ts";
@@ -161,6 +229,7 @@ export {
   query,
   mutation,
   withApproval,
+  toolAnnotations,
   type Operation,
   type OperationOptions,
 } from "./implementation/operations.ts";

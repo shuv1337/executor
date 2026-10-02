@@ -1,23 +1,16 @@
-import { useState } from "react";
-import { betaNoticeDismissalKey, earlyPreview } from "@executor-js/ui/contracts/early-preview";
+import { useAtom } from "@effect/atom-react";
+import { betaNoticeDismissal, earlyPreview } from "@executor-js/ui/contracts/early-preview";
+import { betaNoticeDismissedAtom } from "../../contracts/beta-notice.ts";
 import { EarlyPreviewNotice } from "@executor-js/ui/components/early-preview-notice";
 import rhysAvatar from "../assets/rhys-sullivan.jpg";
 
-/** Show the cloud beta notice on organization pages until the browser dismisses it. */
+/** Show the cloud beta notice on organization pages until this browser dismisses it. */
 export function BetaNotice() {
-  const [dismissed, setDismissed] = useState(() => {
-    try {
-      return localStorage.getItem(betaNoticeDismissalKey) === "true";
-    } catch {
-      return false;
-    }
-  });
+  const [dismissed, setDismissed] = useAtom(betaNoticeDismissedAtom);
 
   const dismiss = () => {
     setDismissed(true);
-    try {
-      localStorage.setItem(betaNoticeDismissalKey, "true");
-    } catch {}
+    document.cookie = betaNoticeDismissal(location.protocol === "https:");
   };
 
   const openPreview = () => {
@@ -44,12 +37,12 @@ export function BetaNotice() {
         >
           <div className="mx-auto flex min-h-8 w-fit max-w-full flex-wrap items-center justify-center gap-x-2 text-center text-xs leading-4">
             <strong className="font-mono font-semibold">Executor v2 Beta</strong>
-            <span>You may see bugs.</span>
+            <span className="hidden sm:inline">You may see bugs.</span>
             <button
               type="button"
               aria-haspopup="dialog"
               onClick={openPreview}
-              className="min-h-8 cursor-pointer font-semibold underline underline-offset-2 hover:text-[#765b21] focus-visible:rounded-sm focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#765b21]"
+              className="hidden sm:block min-h-8 cursor-pointer font-semibold underline underline-offset-2 hover:text-[#765b21] focus-visible:rounded-sm focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#765b21]"
             >
               Learn more
             </button>

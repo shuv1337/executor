@@ -9,6 +9,7 @@ import { Evidence } from "../support/evidence.ts";
 import { Onboarding } from "../support/onboarding.ts";
 import {
   holdOrganizationEntry,
+  trackEntryNavigations,
   trackOrganizationResources,
   waitForLastOrganization,
 } from "../support/organization-entry.ts";
@@ -67,6 +68,7 @@ layer(HostedLive, { excludeTestServices: true })("Root entry loading", (it) => {
         yield* loaded;
         yield* browser.checkpoint("Existing organization opens without team preparation");
 
+        const destination = `/org/${actors.organization.slug}/apps`;
         const restored = yield* Effect.forEach(
           [
             { name: "Desktop", width: 864, height: 720 },
@@ -78,19 +80,32 @@ layer(HostedLive, { excludeTestServices: true })("Root entry loading", (it) => {
                 yield* browser.use(`${viewport.name}: set the viewport`, (page) =>
                   page.setViewportSize({ width: viewport.width, height: viewport.height }),
                 );
+                // The server checks membership while answering `/`. A browser read of the list
+                // would stall here, so restoration completing proves nothing waits for one.
                 const list = yield* holdOrganizationEntry;
                 const resources = yield* trackOrganizationResources;
+                const paths = yield* trackEntryNavigations;
+                const entry = yield* browser.use(
+                  `${viewport.name}: request the bare root`,
+                  (page) =>
+                    page
+                      .context()
+                      .request.get("/", { maxRedirects: 0, headers: { accept: "text/html" } }),
+                );
+                expect(entry.status()).toBeGreaterThanOrEqual(300);
+                expect(entry.status()).toBeLessThan(400);
+                expect(
+                  new URL(entry.headers()["location"] ?? "", "http://entry.invalid").pathname,
+                ).toBe(destination);
                 yield* browser.use(
-                  `${viewport.name}: reopen root with the organization list held`,
+                  `${viewport.name}: reopen root with organization reads held`,
                   (page) => page.goto("/"),
                 );
-                yield* list.requested;
                 yield* browser.use(
-                  "The cookie routes immediately by stable organization ID",
-                  (page) =>
-                    page.waitForURL(`**/org/${actors.organization.id}/apps`, { timeout: 10_000 }),
+                  "The remembered organization opens at its canonical address",
+                  (page) => page.waitForURL(`**${destination}`, { timeout: 10_000 }),
                 );
-                yield* browser.use("Apps load while the organization list is still held", (page) =>
+                yield* browser.use("Apps load while organization reads are held", (page) =>
                   page.locator(".app-card").first().waitFor({ state: "visible" }),
                 );
                 expect(
@@ -100,88 +115,77 @@ layer(HostedLive, { excludeTestServices: true })("Root entry loading", (it) => {
                       .count(),
                   ),
                 ).toBe(0);
-                yield* browser.use("Type a search before the readable URL is known", (page) =>
+                yield* browser.use("Type a search in the restored page", (page) =>
                   page.getByPlaceholder("Search apps…", { exact: true }).fill("Executor"),
                 );
                 yield* browser.checkpoint(
-                  `${viewport.name}: Apps usable while organization list is held`,
+                  `${viewport.name}: Apps usable while organization reads are held`,
                 );
-                yield* list.release;
                 yield* loaded;
                 expect(
-                  yield* browser.use("Canonical navigation keeps the search draft", (page) =>
+                  yield* browser.use("The restored page keeps the search draft", (page) =>
                     page.getByPlaceholder("Search apps…", { exact: true }).inputValue(),
                   ),
                 ).toBe("Executor");
-                expect(resources).toEqual([
-                  `/api/organizations/${actors.organization.id}/resources`,
-                ]);
+                // The page never shows another address and never replaces its own URL, and its
+                // resources arrive with the document instead of being read again.
+                expect(new Set(paths)).toEqual(new Set([destination]));
+                expect(resources).toEqual([]);
+                expect(yield* list.wasRequested).toBe(false);
                 yield* browser.checkpoint(`${viewport.name}: canonical URL without a second load`);
-                return { viewport: viewport.name, resources: [...resources] };
+                yield* list.release;
+                return {
+                  viewport: viewport.name,
+                  paths: [...new Set(paths)],
+                  resources: [...resources],
+                };
               }),
             ),
         );
 
+        const fresh = [];
         for (const viewport of [
           { name: "Desktop", width: 864, height: 720 },
           { name: "Mobile", width: 390, height: 844 },
         ]) {
-          yield* Effect.scoped(
-            Effect.gen(function* () {
-              yield* browser.use("Leave the previous document", (page) => page.goto("about:blank"));
-              yield* browser.login(actors.owner);
-              yield* browser.use(`${viewport.name}: set the viewport`, (page) =>
-                page.setViewportSize({ width: viewport.width, height: viewport.height }),
-              );
-              const list = yield* holdOrganizationEntry;
-              yield* browser.use("A fresh session has no remembered organization", (page) =>
-                page.goto("/"),
-              );
-              yield* list.requested;
-              yield* browser.use("Only entry without history waits for organizations", (page) =>
-                page
-                  .getByRole("status", { name: "Loading organizations", exact: true })
-                  .waitFor({ state: "visible" }),
-              );
-              expect(yield* preparation.wasRequested).toBe(false);
-              yield* browser.checkpoint(
-                `${viewport.name}: fresh session resolves its first destination`,
-              );
-              yield* list.release;
-              yield* loaded;
-            }),
+          fresh.push(
+            yield* Effect.scoped(
+              Effect.gen(function* () {
+                yield* browser.use("Leave the previous document", (page) =>
+                  page.goto("about:blank"),
+                );
+                yield* browser.login(actors.owner);
+                yield* browser.use(`${viewport.name}: set the viewport`, (page) =>
+                  page.setViewportSize({ width: viewport.width, height: viewport.height }),
+                );
+                const list = yield* holdOrganizationEntry;
+                yield* browser.use("A fresh session has no remembered organization", (page) =>
+                  page.goto("/"),
+                );
+                // Entry without history resolves its only organization from the membership the
+                // server read for the document.
+                yield* loaded;
+                expect(yield* list.wasRequested).toBe(false);
+                yield* browser.checkpoint(
+                  `${viewport.name}: fresh session resolves its first destination`,
+                );
+                yield* list.release;
+                return { viewport: viewport.name, organizationListRequested: false };
+              }),
+            ),
           );
         }
 
-        yield* browser.use("Leave the remembered organization", (page) => page.goto("about:blank"));
-        yield* browser.login(actors.owner);
-        yield* browser.use("Make organization reads unavailable", (page) =>
-          page.route("**/api/auth/organization/list", (route) => route.abort("failed")),
-        );
-        yield* browser.use("Open root during the read failure", (page) => page.goto("/"));
-        yield* browser.use("The entry panel offers recovery", (page) =>
-          page
-            .getByRole("heading", { name: "Unable to load your organizations", exact: true })
-            .waitFor({ state: "visible" }),
-        );
-        yield* browser.checkpoint("Organization read failure retains a clear entry page");
-        yield* browser.use("Restore the real organization endpoint", (page) =>
-          page.unroute("**/api/auth/organization/list"),
-        );
-        yield* browser.use("Retry organization selection", (page) =>
-          page.getByRole("button", { name: "Try again", exact: true }).click(),
-        );
-        yield* loaded;
         yield* evidence.json("root-entry-result.json", {
           entryPath: "/",
           existingOrganizations: organizations.length,
           preparationRequested: false,
-          rememberedDestinationLoadsBeforeOrganizationList: true,
-          canonicalNavigationKeepsResourcesAndDraft: true,
+          rememberedDestinationRedirectsBeforeHtml: true,
+          canonicalAddressWithoutReplacementKeepsDraft: true,
           restored,
+          fresh,
           heldRequests: ["/api/auth/organization/list", "/api/onboarding/prepare"],
-          organizationLoadingVerified: true,
-          retryVerified: true,
+          browserOrganizationListRequests: 0,
           responseReplaced: false,
           colorScheme: "dark",
           timing: "Controlled request holds and capture pacing, not a latency benchmark",

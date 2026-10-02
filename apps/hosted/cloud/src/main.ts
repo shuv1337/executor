@@ -1,22 +1,31 @@
 import { cloudArtifactsTokensLive } from "./infrastructure/artifacts-tokens.ts";
-import { Provisioning, dispatchProvisioning } from "./infrastructure/provisioning.ts";
+import {
+  Provisioning,
+  dispatchProvisioning,
+  provisionTeamNow,
+} from "./infrastructure/provisioning.ts";
 import { previewLifetime } from "./infrastructure/test-stage-expiry.ts";
-import { executorCloudApiDocument } from "./contracts/api.ts";
+import { ExecutorCloudApi, executorCloudApiDocument } from "./contracts/api.ts";
 import { hostedAppUi, appAddresses } from "@executor-js/hosted-server/app-ui";
 import { cloudAppUiBase } from "./contracts/app-ui.ts";
-import { AppDomainCoordinatorLive, cloudAppDomains } from "./infrastructure/app-domains.ts";
+import { cloudAppDomains } from "./infrastructure/app-domains.ts";
 import { AppRepositoryRecovery, WorkflowHost } from "@executor-js/sdk/core";
 import { AppWorkflows } from "./infrastructure/workflows.ts";
-import { OrganizationRemoval } from "./infrastructure/organization-removal-workflow.ts";
-import { HostedExecutor } from "@executor-js/hosted-server";
+import { cloudDataSteps } from "./infrastructure/data-steps.ts";
+import {
+  OrganizationRemoval,
+  OrganizationRemovalHost,
+  OrganizationRemovalStart,
+  dispatchOrganizationRemovals,
+  startOrganizationRemoval,
+} from "./infrastructure/organization-removal-workflow.ts";
+import { HostedExecutor, lazyHostedApiDocument } from "@executor-js/hosted-server";
 import { BillingMeter } from "./contracts/billing-meter.ts";
-import { ExecutionAdmission } from "@executor-js/hosted-server";
 import { billingBindings } from "./infrastructure/billing.ts";
-import { registryRoutes, gitRoutes } from "@executor-js/app-management";
+import { frameworkDocumentation, registryRoutes, gitRoutes } from "@executor-js/app-management";
 import { hostedAppGitAccess } from "@executor-js/hosted-server/app-management";
 /** Cloudflare composition edge. Alchemy owns the Effect runtime and request scopes. */
-import { executorSkillFiles, publishedSkillRoutes } from "@executor-js/app-templates/executor";
-import authoring from "../.generated/executor-authoring.json" with { type: "json" };
+import { publishedSkillRoutes } from "@executor-js/app-templates/executor";
 import { hideRemovedOrganizations } from "./implementation/organization-removal.ts";
 import {
   browserTelemetry,
@@ -34,7 +43,7 @@ import * as Cloudflare from "alchemy/Cloudflare";
 import { cloudSite } from "./infrastructure/site.ts";
 import * as Output from "alchemy/Output";
 import { AlchemyContext } from "alchemy/AlchemyContext";
-import { Config, Effect, Layer, Option, Path } from "effect";
+import { Config, Effect, Layer, Option, Path, Ref } from "effect";
 import { HttpRouter, HttpServer, HttpServerResponse } from "effect/unstable/http";
 import { cloudAuth } from "./infrastructure/auth.ts";
 import { cloudOnboarding } from "./infrastructure/onboarding.ts";
@@ -42,6 +51,11 @@ import { cloudMcp, McpSessionsLive } from "./infrastructure/mcp.ts";
 import { cloudApi } from "./implementation/api.ts";
 import { billingLive } from "./implementation/billing.ts";
 import { cloudSchedules, ScheduleCoordinatorLive } from "./infrastructure/schedules.ts";
+import {
+  cloudBackgroundJobs,
+  selfBinding,
+  type BackgroundJob,
+} from "./infrastructure/background-jobs.ts";
 import { cloudEgress, cloudExecutor } from "./infrastructure/executor.ts";
 import { cloudAuthDatabase } from "./infrastructure/auth-database.ts";
 import {
@@ -54,8 +68,15 @@ import { cloudWelcomeEmails } from "./infrastructure/welcome-email.ts";
 import { cloudEntryApi, cloudEntryDocument, resolveCloudEntry } from "./implementation/entry.ts";
 import { browserReturnTo } from "@executor-js/hosted-server/browser/contracts";
 import { HttpServerRequest } from "effect/unstable/http";
-import { staticDocument } from "./implementation/homepage.ts";
 import { homepage } from "./implementation/homepage.ts";
+import { openAiAppsChallenge } from "./implementation/openai-apps-challenge.ts";
+import {
+  cloudDashboard,
+  dashboardPageRoutes,
+  organizationRoot,
+} from "./implementation/dashboard.ts";
+import { withHostPipeline } from "@executor-js/dashboard-start/in-process";
+import dashboardRoutes from "@executor-js/hosted-cloud-web/routes" with { type: "json" };
 import { postHogBindings } from "./infrastructure/posthog.ts";
 import { cloudAnalytics } from "./implementation/product-analytics.ts";
 import { sentryWorkerBuild } from "./infrastructure/sentry-build.ts";
@@ -64,10 +85,10 @@ import { sentryBindings } from "./infrastructure/sentry.ts";
 import { cloudErrorTunnel } from "./implementation/error-tunnel.ts";
 import { cloudSentry } from "./implementation/error-reporting.ts";
 import { cloudOrigin } from "./infrastructure/stage.ts";
-import { AppDataSupervisor, AppDataSupervisorLive } from "./infrastructure/app-data.ts";
+import { appDataSupervisors } from "./infrastructure/app-data.ts";
 import { cloudDevelopment } from "./contracts/development.ts";
 import { requestServices } from "@executor-js/hosted-server";
-import { requestTiming } from "@executor-js/telemetry/http";
+import { recordRequestRejections, requestTiming } from "@executor-js/telemetry/http";
 
 import { Api } from "./infrastructure/api-worker.ts";
 export { Api } from "./infrastructure/api-worker.ts";
@@ -93,6 +114,8 @@ export default Api.make(
         ...(yield* telemetryBindings),
         ...analytics.env,
         CLOUDFLARE_ACCOUNT_ID: yield* Config.String("CLOUDFLARE_ACCOUNT_ID"),
+        // Cron Triggers reach the placed fetch handler through this binding.
+        [selfBinding]: Cloudflare.Workers.Self,
         ...sentry.env,
         ...(yield* billingBindings),
       },
@@ -130,22 +153,17 @@ export default Api.make(
         // this list.
         runWorkerFirst: [
           "/",
-          "/login",
-          "/login/",
-          "/login/sso",
-          "/login/sso/",
-          "/create",
-          "/create/",
+          // The Worker renders every dashboard document; see `cloudflare-routes.ts`. Its
+          // `/org/*` rule also covers each organization's `/org/*/mcp` endpoint.
+          ...dashboardRoutes,
           "/api",
           "/api/*",
           "/health",
           "/openapi.json",
           "/mcp",
-          "/org/*/mcp",
           "/git/*",
           "/.well-known/*",
         ],
-        // Vite emits _redirects from the TanStack route tree; Alchemy reads it.
       },
     };
   }),
@@ -159,79 +177,190 @@ export default Api.make(
     const welcomeEmails = yield* cloudWelcomeEmails(email.welcome);
     yield* AppWorkflows;
     yield* Provisioning;
-    yield* OrganizationRemoval;
     const executor = yield* cloudExecutor(
-      yield* AppDataSupervisor,
+      yield* appDataSupervisors,
       yield* cloudArtifactsTokensLive,
     );
-    const schedules = yield* cloudSchedules;
-    const dispatch = dispatchProvisioning.pipe(
-      Effect.provide(executor),
-      // A request finalizer runs after its SQL pool closes. The outbox dispatch
-      // owns a fresh scope so execution memos cannot reuse that closed pool.
-      Effect.scoped,
-      Effect.catch(() => Effect.logWarning("Provisioning outbox unavailable")),
+    const billing = yield* billingLive.pipe(Effect.orDie);
+    // The removal workflow runs in this isolate and shares its services.
+    const removal = yield* OrganizationRemoval.pipe(
+      Effect.provideService(OrganizationRemovalHost, {
+        executor,
+        identity: auth.identity,
+        billing,
+      }),
     );
-    yield* Cloudflare.Workers.cron("* * * * *", () => dispatch.pipe(lifetime.background));
-    yield* Cloudflare.Workers.cron("* * * * *", () =>
-      Effect.flatten(AppRepositoryRecovery).pipe(
+    const removals = Layer.succeed(OrganizationRemovalStart, startOrganizationRemoval(removal));
+    const schedules = yield* cloudSchedules;
+    // A new team's default app is installed right after its workflow starts, in this isolate,
+    // rather than after the workflow is scheduled. The workflow finishes an install cut short
+    // here, so a failure is only logged.
+    const installTeam = (job: string) =>
+      provisionTeamNow(job).pipe(
+        Effect.timeoutOption("15 seconds"),
+        Effect.withSpan("job.provisioning.install"),
+        Effect.catch(() => Effect.logWarning("Team installation left to its workflow", { job })),
+        Effect.asVoid,
+      );
+    const dispatchWith = <R>(install: (job: string) => Effect.Effect<void, never, R>) =>
+      dispatchProvisioning(install).pipe(
         Effect.provide(executor),
-        reportErrors,
+        // A request finalizer runs after its SQL pool closes. Dispatch owns a
+        // fresh scope so execution memos cannot reuse that closed pool.
         Effect.scoped,
-        Effect.withSpan("job.repository.recover"),
-        Effect.catch(() => Effect.logWarning("App repository recovery failed")),
-        lifetime.background,
-      ),
+        Effect.withSpan("job.provisioning.dispatch"),
+        Effect.catch(() => Effect.logWarning("Provisioning outbox unavailable")),
+      );
+    // Cron only recovers lost dispatches; their workflows install any team.
+    const dispatch = dispatchWith(() => Effect.void);
+    const organizationRemovals = dispatchOrganizationRemovals.pipe(
+      Effect.provide(Layer.merge(executor, removals)),
+      Effect.scoped,
+      Effect.catch(() => Effect.logWarning("Organization removal journal unavailable")),
+    );
+    // Jobs are queued by triggers on users, teams and members. Only auth and dashboard API
+    // writes change those rows, so only their requests start the jobs at once. MCP, telemetry
+    // and the other routes skip the extra connection and query. Cron recovers any lost dispatch.
+    // The bound stays inside the 30 seconds Cloudflare allows after the response.
+    const startJobs = dispatchWith(installTeam).pipe(
+      lifetime.background,
+      Effect.timeoutOption("25 seconds"),
+      Effect.asVoid,
+    );
+    // The event scope closes through waitUntil after a complete response is sent, so it waits
+    // for the jobs and exports their telemetry. A streamed body closes that scope at EOF instead;
+    // the jobs then detach so they cannot hold EOF.
+    const dispatchAfterWrites = <E, R>(
+      handler: Effect.Effect<HttpServerResponse.HttpServerResponse, E, R>,
+    ) =>
+      Effect.gen(function* () {
+        const request = yield* HttpServerRequest.HttpServerRequest;
+        if (["GET", "HEAD", "OPTIONS"].includes(request.method)) return yield* handler;
+        const execution = yield* Cloudflare.WorkerExecutionContext;
+        const streamed = yield* Ref.make(false);
+        yield* Effect.addFinalizer(() =>
+          Ref.get(streamed).pipe(
+            Effect.flatMap((detach) => (detach ? execution.waitUntil(startJobs) : startJobs)),
+          ),
+        );
+        return yield* handler.pipe(
+          Effect.tap((response) => Ref.set(streamed, response.body._tag === "Stream")),
+        );
+      });
+    const dataSteps = (yield* cloudDataSteps).pipe(
+      Effect.provide(executor),
+      reportErrors,
+      Effect.scoped,
+      Effect.catch(() => Effect.logWarning("Data steps unavailable")),
+    );
+    const repositoryRecovery = Effect.flatten(AppRepositoryRecovery).pipe(
+      Effect.provide(executor),
+      reportErrors,
+      Effect.scoped,
+      Effect.withSpan("job.repository.recover"),
+      Effect.catch(() => Effect.logWarning("App repository recovery failed")),
     );
     const appDomains = yield* cloudAppDomains;
     const appUi = hostedAppUi(
       appAddresses(auth.origin, yield* cloudAppUiBase.pipe(Effect.orDie)),
       appDomains.status,
     );
-    const mcp = yield* cloudMcp;
-    const billing = yield* billingLive.pipe(Effect.orDie);
-    const meter = yield* BillingMeter.pipe(Effect.provide(billing));
-    // One established schedule owns both independent background jobs. Each job
-    // reports its own failure so billing cannot prevent optional email delivery.
-    yield* Cloudflare.Workers.cron("*/5 * * * *", () =>
-      Effect.all(
-        [
-          welcomeEmails.deliver,
-          Effect.flatten(HostedExecutor).pipe(
-            Effect.flatMap((sdk) => sdk[WorkflowHost].reconcile),
-            Effect.provide(executor),
-            reportErrors,
-            Effect.scoped,
-            Effect.withSpan("job.workflow.reconcile"),
-            Effect.catch(() => Effect.logWarning("Workflow queue reconciliation failed")),
-          ),
-          meter.reconcileSeats.pipe(
-            reportErrors,
-            Effect.scoped,
-            Effect.withSpan("job.billing.reconcile"),
-            Effect.catch(() => Effect.logError("Billing seat reconciliation failed")),
-          ),
-        ],
-        { concurrency: 2, discard: true },
-      ).pipe(lifetime.background),
+    // Session objects run in this isolate and share its executor and MCP identity.
+    const mcp = yield* cloudMcp.pipe(
+      Effect.provide(McpSessionsLive({ executor, identity: auth.mcpIdentity })),
     );
+    const meter = yield* BillingMeter.pipe(Effect.provide(billing));
+    // Each job reports its own failure, so a workflow problem cannot prevent email delivery.
+    const workflowReconcile = Effect.flatten(HostedExecutor).pipe(
+      Effect.flatMap((sdk) => sdk[WorkflowHost].reconcile),
+      Effect.provide(executor),
+      reportErrors,
+      Effect.scoped,
+      Effect.withSpan("job.workflow.reconcile"),
+      Effect.catch(() => Effect.logWarning("Workflow queue reconciliation failed")),
+    );
+    // Membership changes sync seats through durable provisioning jobs. This daily
+    // pass only repairs what those jobs cannot see, such as edits made in Autumn.
+    const billingReconcile = meter.reconcileSeats.pipe(
+      reportErrors,
+      Effect.scoped,
+      Effect.withSpan("job.billing.reconcile"),
+      Effect.catch(() => Effect.logError("Billing seat reconciliation failed")),
+    );
+    const jobs = yield* cloudBackgroundJobs;
+    yield* jobs.schedule(
+      "* * * * *",
+      "organization-removal",
+      "provisioning",
+      "data-steps",
+      "repository-recovery",
+      "schedule-wake",
+    );
+    yield* jobs.schedule(
+      "*/5 * * * *",
+      "welcome-emails",
+      "workflow-reconcile",
+      "app-domain-heartbeat",
+    );
+    yield* jobs.schedule("17 4 * * *", "billing-reconcile");
+    const backgroundJobs = {
+      "organization-removal": organizationRemovals,
+      provisioning: dispatch,
+      "data-steps": dataSteps,
+      "repository-recovery": repositoryRecovery,
+      "schedule-wake": schedules.wake,
+      "app-domain-heartbeat": appDomains.heartbeat,
+      "welcome-emails": welcomeEmails.deliver,
+      "workflow-reconcile": workflowReconcile,
+      "billing-reconcile": billingReconcile,
+    } satisfies Record<BackgroundJob, unknown>;
 
     const onboarding = yield* cloudOnboarding.pipe(Effect.orDie);
     const egress = yield* cloudEgress;
-    const document = executorCloudApiDocument(auth.origin);
+    // Only /openapi.json and preparing the Executor catalog app read the document.
+    const document = lazyHostedApiDocument(() => executorCloudApiDocument(auth.origin));
+    // Only framework lookups and the published skills read the large authoring reference.
+    const authoring = Effect.promise(() => import("./implementation/executor-authoring.ts")).pipe(
+      Effect.map(({ executorAuthoringSkills }) => executorAuthoringSkills),
+    );
     const api = cloudApi(document).pipe(
+      Layer.provide(frameworkDocumentation(authoring)),
       Layer.provide(appUi.dashboard),
       Layer.provide(requestServices(auth.appSessions).layer),
-      HttpRouter.provideRequest(catalogLive(executorSkillFiles(authoring), document, egress)),
-      Layer.provide(schedules),
+      HttpRouter.provideRequest(catalogLive(document.document, egress)),
+      Layer.provide(schedules.layer),
       Layer.provide(billing),
-      Layer.provide(Layer.succeed(ExecutionAdmission, meter.consume)),
+      Layer.provide(removals),
       Layer.provide(onboarding),
       Layer.provide(requireUserLive),
       Layer.provide(requireOrganizationLive),
       HttpRouter.provideRequest(executor),
       Layer.provide(auth.identity),
       Layer.provide(auth.apiIdentity),
+      Layer.provide(auth.mcpIdentity),
+    );
+    const memoMap = yield* Layer.makeMemoMap;
+    // The dashboard API holds most routes and their schema decoders. MCP, auth, telemetry
+    // and document requests do not use it, so it is built on its first request and kept
+    // for the isolate. Building is synchronous: no other request can see a partial build.
+    const buildApi = api.pipe(
+      Layer.provide(HttpServer.layerServices),
+      HttpRouter.toHttpEffect,
+      Effect.provideService(Layer.CurrentMemoMap, memoMap),
+    );
+    const apiServices = yield* Effect.context<Effect.Services<typeof buildApi>>();
+    let apiHandle: Effect.Success<typeof buildApi> | undefined;
+    const apiRequest = Effect.suspend(
+      () => (apiHandle ??= Effect.runSync(Effect.provideContext(buildApi, apiServices))),
+    );
+    // Register the API's own paths here, so routing precedence is unchanged.
+    const apiRoutes = Layer.mergeAll(
+      HttpRouter.add("GET", "/openapi.json", apiRequest),
+      ...Object.values(ExecutorCloudApi.groups).flatMap((group) =>
+        Object.values(group.endpoints).map((endpoint) =>
+          HttpRouter.add(endpoint.method, endpoint.path, dispatchAfterWrites(apiRequest)),
+        ),
+      ),
     );
     const mcpRoutes = Layer.mergeAll(
       HttpRouter.add("*", "/mcp", mcp.http),
@@ -254,6 +383,7 @@ export default Api.make(
     const routes = Layer.mergeAll(
       HttpRouter.add("POST", "/api/internal/app-domains/resume", appDomains.control("resume")),
       HttpRouter.add("POST", "/api/internal/app-domains/drain", appDomains.control("drain")),
+      jobs.route((job) => backgroundJobs[job]),
       authoringRoutes,
       ...(["login", "login/sso", "create"] as const).map((page) =>
         HttpRouter.add(
@@ -268,19 +398,30 @@ export default Api.make(
                 new Headers(request.headers),
               ),
             ),
-            staticDocument("/dashboard.html"),
+            cloudDashboard,
           ),
         ).pipe(HttpRouter.provideRequest(onboarding)),
       ),
       HttpRouter.add("GET", "/api/entry", cloudEntryApi(auth.browserSession)).pipe(
         HttpRouter.provideRequest(onboarding),
       ),
-      api,
-      publishedSkillRoutes(executorSkillFiles(authoring)),
+      apiRoutes,
+      publishedSkillRoutes(authoring),
       HttpRouter.add("*", "/api/:channel/*", analytics.proxy),
       HttpRouter.add("POST", "/api/:channel/submit", errorTunnel),
       browserTelemetry.pipe(HttpRouter.provideRequest(auth.identity)),
-      HttpRouter.add("GET", "/", homepage(auth.cookiePrefix, analytics.hero)),
+      HttpRouter.add("GET", "/", homepage(auth.cookiePrefix, analytics.hero, cloudDashboard(null))),
+      HttpRouter.add("GET", "/org/:organizationSlug", organizationRoot),
+      ...dashboardPageRoutes.map((route) =>
+        route === "/app-auth"
+          ? // Resolved on the server so opening an app never renders an intermediate page.
+            HttpRouter.add("GET", route, appUi.signIn(cloudDashboard(null))).pipe(
+              Layer.provide(requestServices(auth.appSessions).layer),
+              HttpRouter.provideRequest(executor),
+              HttpRouter.provideRequest(auth.identity),
+            )
+          : HttpRouter.add("GET", route, cloudDashboard(null)),
+      ),
       HttpRouter.add("*", "/api/webhooks/:appId/:subscriptionId", hostedWebhookCallback).pipe(
         HttpRouter.provideRequest(executor),
       ),
@@ -289,12 +430,13 @@ export default Api.make(
         "/api/auth/organization/list",
         auth.handler.pipe(Effect.flatMap(hideRemovedOrganizations), Effect.provide(executor)),
       ),
-      HttpRouter.add("*", "/api/auth/*", auth.handler),
+      HttpRouter.add("*", "/api/auth/*", dispatchAfterWrites(auth.handler)),
       HttpRouter.add("*", "/api/email/unsubscribe", welcomeEmails.unsubscribe),
       HttpRouter.add("GET", "/api/oauth/callback", hostedOAuthCallback).pipe(
         HttpRouter.provideRequest(auth.identity),
       ),
       mcpRoutes,
+      HttpRouter.add("GET", "/.well-known/openai-apps-challenge", openAiAppsChallenge),
       Layer.mergeAll(
         HttpRouter.add("GET", "/api/mcp/approvals/:requestId", mcp.approvals),
         HttpRouter.add("POST", "/api/mcp/approvals/:requestId", mcp.approvals),
@@ -308,19 +450,10 @@ export default Api.make(
     const handle = yield* routes.pipe(
       Layer.provide(HttpServer.layerServices),
       HttpRouter.toHttpEffect,
-      Effect.provideService(Layer.CurrentMemoMap, yield* Layer.makeMemoMap),
+      Effect.provideService(Layer.CurrentMemoMap, memoMap),
     );
     return {
-      fetch: Effect.gen(function* () {
-        const request = yield* HttpServerRequest.HttpServerRequest;
-        // Alchemy closes this scope through waitUntil after returning the response.
-        // Cron recovers dispatch if the request ends before this finalizer runs.
-        if (!["GET", "HEAD", "OPTIONS"].includes(request.method))
-          yield* Effect.addFinalizer(() =>
-            dispatch.pipe(lifetime.background, Effect.timeoutOption("10 seconds"), Effect.asVoid),
-          );
-        return yield* handle;
-      }).pipe(
+      fetch: handle.pipe(
         Effect.tapCause(reportCloudFailure),
         Effect.catchTag("AuthenticationUnavailable", () =>
           Effect.succeed(HttpServerResponse.empty({ status: 503 })),
@@ -332,18 +465,18 @@ export default Api.make(
         // query string nor the redirect `Location` is ever recorded, on this route,
         // on the RFC 8058 POST, or on any outbound provider request.
         analytics.wrap,
+        recordRequestRejections,
         reportErrors,
         requestTiming,
+        // Server-rendered pages read the API through this complete pipeline, in-process.
+        withHostPipeline,
         lifetime.http,
       ),
     };
   }).pipe(
     Effect.provide(
       Layer.mergeAll(
-        AppDataSupervisorLive,
-        McpSessionsLive,
         ScheduleCoordinatorLive,
-        AppDomainCoordinatorLive,
         cloudAuthDatabase,
         cloudTelemetry,
         Cloudflare.Workers.CronEventSourceLive,

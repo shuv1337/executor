@@ -1,5 +1,5 @@
 /** Resolve visible account choices without selecting a session-wide default. */
-import { AppId, type App } from "@executor-js/sdk";
+import type { App, AppId } from "@executor-js/sdk";
 import { QueryResult, QueryView, useQuery } from "@executor-js/ui/dashboard/context";
 import { AppLaunch } from "@executor-js/ui/dashboard/app-launch";
 import { accountContexts } from "@executor-js/ui/dashboard/account-group";
@@ -20,14 +20,13 @@ const pending = (
 );
 /** The dashboard session lists only this subject's profiles and accessible account names. */
 export function AppLaunchPage({
-  appId,
+  appId: app,
   returnTo,
 }: {
-  readonly appId: string;
+  readonly appId: AppId;
   readonly returnTo: AppReturnPath;
 }) {
   const { organization } = useOrganizationRoute();
-  const app = AppId.make(appId);
   const metadata = useQuery(appAtom({ organization, app }));
   const profiles = useQuery(profilesAtom({ organization, app }));
   const inventory = useQuery(useDashboardAtoms().inventory);
@@ -100,7 +99,7 @@ function LaunchLocation({
             origin={location.url}
             returnTo={returnTo}
             accounts={accounts}
-            contexts={accountContexts(app, profiles)}
+            contexts={accountContexts(app, profiles, true)}
             manage={
               <Link
                 to="/org/$organizationSlug/apps/$appId"
@@ -110,6 +109,15 @@ function LaunchLocation({
                 Manage accounts
               </Link>
             }
+            review={(profile) => (
+              <Link
+                to="/org/$organizationSlug/apps/$appId"
+                params={{ organizationSlug: slug, appId: app.id }}
+                search={{ view: "accounts", profile }}
+              >
+                Review accounts
+              </Link>
+            )}
           />
         ) : (
           <p className="p-6 text-sm text-muted-foreground" role="status">

@@ -6,6 +6,7 @@ export const memoryBlobStore = (): BlobStorage => {
   const objects = new Map<BlobKey, Uint8Array>();
   return {
     get: (key) => Effect.sync(() => Option.fromNullishOr(objects.get(key)?.slice())),
+    exists: (key) => Effect.sync(() => objects.has(key)),
     put: (key, body) =>
       Effect.sync(() => {
         objects.set(key, body.slice());

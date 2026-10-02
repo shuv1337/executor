@@ -107,7 +107,7 @@ layer(HostedLive, { excludeTestServices: true })("Organization API keys", (it) =
               page.waitForResponse(
                 (response) =>
                   response.request().method() === "DELETE" &&
-                  new URL(response.url()).pathname === prefix,
+                  [prefix, `/api/organizations/${slug}`].includes(new URL(response.url()).pathname),
               ),
               page
                 .getByRole("dialog")
@@ -118,11 +118,12 @@ layer(HostedLive, { excludeTestServices: true })("Organization API keys", (it) =
         expect(status).toBe(200);
         removed = true;
         yield* evidence.step(
-          "Wait for the durable removal to delete native memberships",
-          api.request(actors.owner, "GET", "/api/auth/organization/list").pipe(
-            Effect.flatMap((response) => body(Schema.Array(Organization), response)),
+          "Wait for durable removal to delete the organization's keys",
+          // The organization list hides tombstones immediately. It cannot prove that
+          // the durable deletion workflow has reached its auth-record step.
+          list.pipe(
             Effect.flatMap((remaining) =>
-              remaining.some((item) => item.id === organization.id)
+              remaining.apiKeys.some((item) => item.metadata?.organization === organization.id)
                 ? Effect.fail(new Pending())
                 : Effect.void,
             ),
@@ -145,8 +146,17 @@ layer(HostedLive, { excludeTestServices: true })("Organization API keys", (it) =
             expect((yield* access(full, actors.organization.id)).status).toBe(200);
           }),
         );
-        yield* browser.use("Review keys from the remaining organization", (page) =>
+        yield* browser.use("Open the old organization API keys address", (page) =>
           page.goto(`/org/${actors.organization.slug}/api-keys`),
+        );
+        yield* browser.use(
+          "The old address lands on account tokens for that organization",
+          (page) =>
+            page.waitForURL(
+              (url) =>
+                url.pathname === "/account/tokens" &&
+                url.searchParams.get("organization") === actors.organization.slug,
+            ),
         );
         yield* browser.use("The remaining organization's key is visible", (page) =>
           page.getByRole("row").filter({ hasText: "Remaining organization token" }).waitFor(),

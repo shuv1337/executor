@@ -3,9 +3,16 @@ import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { Console, Effect, FileSystem, Path, Schema } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
-import { nativePlatform, platformArchive, release } from "./config.ts";
+import {
+  desktopUpdateFeed,
+  desktopUpdateFile,
+  nativePlatform,
+  platformArchive,
+  release,
+} from "./config.ts";
 import { developerIdMac, unsignedMac } from "./macos-signing.ts";
 import { installNodeRuntime } from "./node-runtime.ts";
+import { launcherAnalytics } from "./analytics.ts";
 
 const build = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
@@ -57,6 +64,9 @@ const build = Effect.gen(function* () {
         notarize,
       })
     : Effect.succeed(unsignedMac);
+  // Squirrel.Mac only installs signed updates, so unsigned macOS builds get no feed
+  // and tell the person to reinstall from the download page instead.
+  const updates = process.platform !== "darwin" || signing !== unsignedMac;
   if (yield* fs.exists(stage)) yield* fs.remove(stage, { recursive: true });
   // Rebuilding one version must not retain older installers or pre-stapling maps.
   if (yield* fs.exists(artifacts)) yield* fs.remove(artifacts, { recursive: true });
@@ -73,7 +83,7 @@ const build = Effect.gen(function* () {
     `import { packagedRuntimeEnvironment } from "./runtime-env.mjs";
 Object.assign(process.env, packagedRuntimeEnvironment(process.env));
 process.env.EXECUTOR_BUILD_VERSION = ${JSON.stringify(version)};
-await import("./runtime/desktop.mjs");
+${yield* launcherAnalytics}await import("./runtime/desktop.mjs");
 `,
   );
   yield* run("node", ["apps/local/desktop/scripts/build.mjs"], root);
@@ -134,7 +144,13 @@ await import("./runtime/desktop.mjs");
       category: "Development",
       target: ["AppImage", "deb"],
     },
-    publish: null,
+    publish: updates
+      ? {
+          provider: "generic",
+          url: desktopUpdateFeed.url,
+          channel: desktopUpdateFeed.channel(release.channel),
+        }
+      : null,
   };
   yield* fs.writeFileString(
     path.join(stage, "electron-builder.json"),
@@ -159,6 +175,11 @@ await import("./runtime/desktop.mjs");
     signing.env,
   );
   yield* signing.finalize(artifacts);
+  if (updates && !process.argv.includes("--dir")) {
+    const metadata = path.join(artifacts, desktopUpdateFile(target, release.channel));
+    if (!(yield* fs.exists(metadata)))
+      return yield* Effect.die(new Error(`electron-builder did not write ${metadata}`));
+  }
   yield* Console.log(`Desktop artifact (${signing.summary}): ${artifacts}`);
 });
 NodeRuntime.runMain(Effect.scoped(build).pipe(Effect.provide(NodeServices.layer)));

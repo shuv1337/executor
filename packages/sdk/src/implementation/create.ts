@@ -10,6 +10,7 @@ import { makeWebhooks } from "./webhooks.ts";
 import { makeAppData } from "./app-storage.ts";
 import { makeAccountConnections } from "./account-connections.ts";
 import { makeAccounts } from "./accounts.ts";
+import { makeAccountHealth } from "./account-health.ts";
 import { makeProfiles } from "./profiles.ts";
 import { makeApps } from "./apps.ts";
 import { makeOwners } from "./owners.ts";
@@ -19,6 +20,8 @@ import { makeSkills } from "./skills.ts";
 import { toEffectRuntime } from "./runtime.ts";
 import { database } from "./database.ts";
 import { makeOAuth } from "./oauth.ts";
+import { makeDeclarationCache, makeDeclarations } from "./declarations.ts";
+import { makeListings } from "./listings.ts";
 
 /** Capture host cryptography; caller owns database and platform resource lifetimes. */
 export const createExecutor = (
@@ -27,14 +30,32 @@ export const createExecutor = (
   Effect.gen(function* () {
     const crypto = yield* Crypto.Crypto;
     const db = database(options.storage);
-    const runtime = toEffectRuntime(options.runtime, options.blobs);
-    const oauth = makeOAuth(db, options.credentials, crypto, options.oauth, options.lifecycle);
+    const cache = options.declarations ?? makeDeclarationCache();
+    const runtime = toEffectRuntime(options.runtime, options.blobs, cache);
+    const oauth = makeOAuth(
+      db,
+      options.credentials,
+      crypto,
+      options.oauth,
+      options.lifecycle,
+      options.background,
+    );
+    const declarations = makeDeclarations({
+      cache,
+      durable: options.durableDeclarations,
+      background: options.background,
+      resolveAccount: oauth.resolve,
+      accountUsable: oauth.usable,
+      crypto,
+      lifecycle: options.lifecycle,
+    });
     const workflows = makeWorkflowRuns(
       options.storage,
       runtime,
       oauth.resolve,
       options.credentials,
       crypto,
+      declarations,
       options.workflows,
       options.appStorage,
       options.lifecycle,
@@ -46,6 +67,7 @@ export const createExecutor = (
       options.credentials,
       crypto,
       options.webhookOrigin,
+      declarations,
       options.appStorage,
       workflows.controls,
       options.lifecycle,
@@ -58,34 +80,51 @@ export const createExecutor = (
     };
     const tools = makeTools(
       options.storage,
-      oauth.resolve,
+      oauth,
       runtime,
       options.credentials,
       crypto,
+      makeListings({
+        cache,
+        background: options.background,
+        declarations,
+        resolveAccount: oauth.resolve,
+        lifecycle: options.lifecycle,
+        ...(options.toolListings === undefined ? {} : { policy: options.toolListings }),
+      }),
       options.appStorage,
       workflows.controls,
       options.lifecycle,
     );
+    const connections = makeAccountConnections(db, options.credentials, crypto, options.lifecycle);
+    const { checkCredentials, ...accountHealth } = makeAccountHealth(db, runtime, oauth, apps.list);
     const schedules = makeSchedules(options.storage, apps, tools, options.credentials, crypto);
     const setup = makeProfileSetup(db, crypto, apps.profiles, {
       webhooks: webhooks.webhooks,
+      webhookDefinitions: webhooks.liveDefinitions,
       schedules: schedules.operations,
       runs: workflows.runs,
+      accountNeedingReconnect: tools.accountNeedingReconnect,
     });
     return {
       [ProfileHost]: { tick: setup.tick },
       [WorkflowHost]: workflows.host,
       scheduler: schedules.dispatcher,
       schedules: schedules.operations,
-      accounts: makeAccounts(db, options.credentials, crypto, options.lifecycle),
-      accountConnections: {
-        ...makeAccountConnections(db, options.credentials, crypto, options.lifecycle),
-        ...oauth.connections,
+      accounts: {
+        ...makeAccounts(db, options.credentials, crypto, options.lifecycle, oauth.revokeRemoved),
+        ...accountHealth,
       },
-      apps: { ...apps, profiles: setup.operations },
+      accountConnections: {
+        ...connections,
+        ...oauth.connections,
+        findOAuth: (input) => Effect.flatMap(oauth.findOAuth(input), connections.get),
+      },
+      apps: { ...apps, profiles: setup.operations, checkCredentials },
       owners: makeOwners(db),
-      skills: makeSkills(apps, db, runtime, oauth.resolve, crypto, options.lifecycle),
-      ...webhooks,
+      skills: makeSkills(db, runtime, crypto, declarations, options.blobs),
+      webhooks: webhooks.webhooks,
+      webhookSetup: webhooks.webhookSetup,
       appData: makeAppData(
         options.storage,
         oauth.resolve,

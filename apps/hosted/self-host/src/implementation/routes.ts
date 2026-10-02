@@ -5,8 +5,12 @@ import {
 } from "@executor-js/hosted-server/provisioning";
 import { Schedule } from "effect";
 import { executorSelfHostApiDocument } from "../contracts/api.ts";
-import { startScheduleWorker, defaultScheduleWorkerOptions } from "@executor-js/sdk/scheduling";
-import { gitRoutes } from "@executor-js/app-management";
+import {
+  startScheduleWorker,
+  defaultScheduleWorkerOptions,
+  ScheduleObservation,
+} from "@executor-js/sdk/scheduling";
+import { frameworkDocumentation, gitRoutes } from "@executor-js/app-management";
 import { hostedAppGitAccess } from "@executor-js/hosted-server/app-management";
 /** The route map is shared by native development and the packaged Worker. */
 import {
@@ -14,6 +18,7 @@ import {
   requestServices,
   HostedExecutor,
   ScheduledAuthority,
+  ScheduleWakeup,
   hostedOAuthCallback,
   hostedWebhookCallback,
   catalogLive,
@@ -23,10 +28,12 @@ import {
   mcpAuthorizationServer,
   apiChallenge,
   apiProtectedResource,
+  lazyHostedApiDocument,
+  ProductAnalytics,
 } from "@executor-js/hosted-server";
-import { requestTiming } from "@executor-js/telemetry/http";
+import { recordRequestRejections, requestTiming } from "@executor-js/telemetry/http";
 import { appAddresses, hostedAppUi } from "@executor-js/hosted-server/app-ui";
-import { AppSignInApi, appSignInPage, appSignInScript } from "apps/ui/auth";
+import { appSignInCallbackPath } from "apps/ui/auth";
 import { AppUiApi } from "apps/ui/contracts";
 import { HttpApiBuilder } from "effect/unstable/httpapi";
 import { appUiBaseUrl } from "../contracts/config.ts";
@@ -38,9 +45,11 @@ import {
   HttpServerRequest,
   HttpServerResponse,
 } from "effect/unstable/http";
+import { withHostPipeline } from "@executor-js/dashboard-start/in-process";
 import { selfHostApi } from "./api.ts";
 import { selfHostMcp } from "../mcp.ts";
 import { selfHostAuth } from "../auth.ts";
+import { selfHostAnalytics } from "./product-analytics.ts";
 
 import type { SourceFile } from "@executor-js/sdk/core";
 import type { selfHostExecutorServices } from "./executor-services.ts";
@@ -56,36 +65,49 @@ export const selfHostRouteMap = <DashboardE, DashboardR>(options: {
   Effect.gen(function* () {
     const { skills, egress, executorServices, dashboard } = options;
     const auth = yield* selfHostAuth;
+    const analytics = yield* selfHostAnalytics;
+    /** Requests and background schedules record through this instance's sink unless it opted out. */
+    const observed = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+      analytics === undefined
+        ? effect
+        : effect.pipe(Effect.provideService(ProductAnalytics, analytics.product));
     yield* drainProvisioning(selfHostProvisioningServices).pipe(
       Effect.catch(() => Effect.logWarning("Provisioning queue processing failed")),
       Effect.repeat(Schedule.spaced("1 second")),
       Effect.provide(executorServices),
       Effect.forkScoped,
     );
-    yield* Effect.gen(function* () {
+    const scheduler = yield* Effect.gen(function* () {
       const executor = yield* Effect.flatten(HostedExecutor);
       const authorize = yield* ScheduledAuthority;
-      yield* startScheduleWorker(executor, authorize, {
+      const concurrency = yield* Config.Number("EXECUTOR_SCHEDULE_CONCURRENCY").pipe(
+        Config.withDefault(defaultScheduleWorkerOptions.concurrency),
+      );
+      const worker = startScheduleWorker(executor, authorize, {
         ...defaultScheduleWorkerOptions,
         runner: "self-host",
-        concurrency: yield* Config.Number("EXECUTOR_SCHEDULE_CONCURRENCY").pipe(
-          Config.withDefault(defaultScheduleWorkerOptions.concurrency),
-        ),
+        concurrency,
       });
+      // The worker's polling fibers inherit the observer it starts with.
+      return yield* analytics === undefined
+        ? worker
+        : worker.pipe(Effect.provideService(ScheduleObservation, analytics.schedules));
     }).pipe(Effect.provide(executorServices));
     const addresses = appAddresses(auth.origin, yield* appUiBaseUrl(auth.origin));
     const appUi = hostedAppUi(addresses);
     const mcp = yield* selfHostMcp.pipe(Effect.provide(HttpServer.layerServices));
-    const document = executorSelfHostApiDocument(auth.origin);
+    const document = lazyHostedApiDocument(() => executorSelfHostApiDocument(auth.origin));
     const api = selfHostApi(document).pipe(
+      Layer.provide(frameworkDocumentation(Effect.succeed(skills))),
       Layer.provide(appUi.dashboard),
       HttpRouter.provideRequest(auth.appSessions),
-      HttpRouter.provideRequest(catalogLive(skills, document, egress)),
+      HttpRouter.provideRequest(catalogLive(document.document, egress)),
       Layer.provide(requireUserLive),
       Layer.provide(requireOrganizationLive),
       HttpRouter.provideRequest(executorServices),
       Layer.provide(auth.identity),
       Layer.provide(auth.apiIdentity),
+      Layer.provide(auth.mcpIdentity),
     );
     const mcpRoutes = Layer.mergeAll(
       HttpRouter.add("*", "/mcp", mcp.http),
@@ -109,7 +131,7 @@ export const selfHostRouteMap = <DashboardE, DashboardR>(options: {
       Layer.provide(auth.apiIdentity),
     );
     const productRoutes = Layer.mergeAll(
-      publishedSkillRoutes(skills),
+      publishedSkillRoutes(Effect.succeed(skills)),
       authoring,
       api,
       browserTelemetry.pipe(HttpRouter.provideRequest(auth.identity)),
@@ -132,18 +154,22 @@ export const selfHostRouteMap = <DashboardE, DashboardR>(options: {
         HttpRouter.add("GET", "/api", apiChallenge),
         HttpRouter.add("GET", "/.well-known/oauth-protected-resource/api", apiProtectedResource),
       ).pipe(HttpRouter.provideRequest(auth.apiIdentity)),
+      // Resolved on the server so opening an app never renders an intermediate dashboard page.
+      HttpRouter.add("GET", "/app-auth", appUi.signIn(dashboard)).pipe(
+        HttpRouter.provideRequest(auth.appSessions),
+        HttpRouter.provideRequest(executorServices),
+        HttpRouter.provideRequest(auth.identity),
+      ),
       HttpRouter.add("GET", "*", dashboard),
     );
     const notFound = HttpServerResponse.empty({ status: 404 });
     const appServices = requestServices(Layer.mergeAll(auth.appSessions, executorServices));
     const appRoutes = Layer.mergeAll(
-      HttpApiBuilder.layer(AppSignInApi).pipe(Layer.provide(appUi.appAuth)),
       HttpApiBuilder.layer(AppUiApi).pipe(
         Layer.provide(appUi.calls),
         Layer.provide(appUi.sessionAccess.combine(appServices).layer),
       ),
-      HttpRouter.add("GET", "/_executor/auth/callback", appSignInPage()),
-      HttpRouter.add("GET", "/_executor/auth/browser.js", appSignInScript()),
+      HttpRouter.add("GET", appSignInCallbackPath, appUi.callback),
       HttpRouter.add("GET", "/_executor/assets/:deployment/*", appUi.asset),
       HttpRouter.add("GET", "/_executor/watch.js", appUi.watch),
       HttpRouter.add("GET", "/_executor/version", appUi.versions),
@@ -164,17 +190,23 @@ export const selfHostRouteMap = <DashboardE, DashboardR>(options: {
     );
     const product = yield* HttpRouter.toHttpEffect(productRoutes).pipe(
       Effect.provideService(Layer.CurrentMemoMap, yield* Layer.makeMemoMap),
+      Effect.map((handler) =>
+        handler.pipe(Effect.provideService(ScheduleWakeup, scheduler.wakeProfiles)),
+      ),
     );
     const routes = HttpRouter.add(
       "*",
       "*",
-      Effect.gen(function* () {
-        const request = yield* HttpServerRequest.HttpServerRequest;
-        if (Option.isSome(addresses.fromHost(request.headers.host)))
-          return yield* apps.pipe(requestTiming);
-        if (addresses.ownsHost(request.headers.host)) return notFound;
-        return yield* product;
-      }),
+      // Server-rendered pages read the product API through this same dispatch, in-process.
+      withHostPipeline(
+        Effect.gen(function* () {
+          const request = yield* HttpServerRequest.HttpServerRequest;
+          if (Option.isSome(addresses.fromHost(request.headers.host)))
+            return yield* observed(apps.pipe(requestTiming));
+          if (addresses.ownsHost(request.headers.host)) return notFound;
+          return yield* observed(product);
+        }).pipe(recordRequestRejections),
+      ),
     );
     return routes;
   });

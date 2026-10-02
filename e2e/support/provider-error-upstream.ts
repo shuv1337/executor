@@ -1,6 +1,9 @@
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import { Effect, Layer, Ref, Schema } from "effect";
 import {
+  HttpBody,
+  HttpClient,
+  HttpClientRequest,
   HttpRouter,
   HttpServer,
   HttpServerRequest,
@@ -14,12 +17,15 @@ export const providerSecretMarker = "synthetic-private-provider-detail";
 /** Provider behavior is controlled outside the real Executor server and app runtime. */
 const makeProviderErrorUpstream = Effect.fn(function* (healthyUpstream: typeof templateUpstream) {
   const healthy = yield* healthyUpstream;
+  const http = yield* HttpClient.HttpClient;
   type Failure = {
     readonly status: number;
     readonly phase?: "call" | "discover";
     readonly headers?: Record<string, string>;
     readonly code?: string;
     readonly accounts?: "all";
+    /** Answer the failure only after this long, as a slow or distant service does. */
+    readonly delayMs?: number;
   };
   const state = yield* Ref.make<Failure | undefined>(undefined);
   const routes = Layer.mergeAll(
@@ -70,7 +76,8 @@ const makeProviderErrorUpstream = Effect.fn(function* (healthyUpstream: typeof t
             (failure.accounts === "all" ||
               request.headers.authorization === "Bearer synthetic-personal") &&
             (failure.phase === undefined || failure.phase === phase)
-          )
+          ) {
+            if (failure.delayMs !== undefined) yield* Effect.sleep(failure.delayMs);
             return yield* HttpServerResponse.json(
               {
                 message: providerSecretMarker,
@@ -78,21 +85,20 @@ const makeProviderErrorUpstream = Effect.fn(function* (healthyUpstream: typeof t
               },
               { status: failure.status, headers: failure.headers },
             );
+          }
           if (path.startsWith("/custom/")) return yield* HttpServerResponse.json({ ok: true });
-          const response = yield* Effect.tryPromise((signal) =>
-            fetch(`${healthy}${path}`, {
-              method: request.method,
+          const response = yield* http.execute(
+            HttpClientRequest.make(request.method)(`${healthy}${path}`, {
               headers: {
                 "content-type": "application/json",
                 ...(request.headers.authorization === undefined
                   ? {}
                   : { authorization: request.headers.authorization }),
               },
-              ...(text === undefined ? {} : { body: text }),
-              signal,
+              ...(text === undefined ? {} : { body: HttpBody.text(text, "application/json") }),
             }),
           );
-          return HttpServerResponse.fromWeb(response);
+          return HttpServerResponse.fromClientResponse(response);
         }),
       ),
     ),

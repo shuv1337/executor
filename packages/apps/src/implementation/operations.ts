@@ -8,16 +8,40 @@ import type { JsonObject } from "../contracts/schema.ts";
 import { decoderOf, type Schema } from "./schema.ts";
 
 const NativeOperation = Symbol("apps.Operation");
-declare const HandlerContext: unique symbol;
-/** A server-only declaration with its category preserved for catalog validation. */
+declare const QueryHandlerContext: unique symbol;
+declare const MutationHandlerContext: unique symbol;
+/**
+ * A server-only declaration with its category preserved for catalog validation. Queries and
+ * mutations carry their handler context under different phantom keys, so a router can type a
+ * query's handler from its query context alone.
+ */
 export interface OperationDeclaration<Kind extends "query" | "mutation", Context = never> {
-  readonly [HandlerContext]?: (context: Context) => void;
+  readonly [QueryHandlerContext]?: "query" extends Kind ? (context: Context) => void : never;
+  readonly [MutationHandlerContext]?: "mutation" extends Kind ? (context: Context) => void : never;
   readonly kind: Kind;
   readonly [NativeOperation]: Omit<AppOperation<never>, "kind" | "input"> & {
     readonly kind: Kind;
     readonly input: EffectSchema.Decoder<unknown>;
   };
 }
+/**
+ * A router declaration. The phantom contexts let `defineApp` type inline handlers; protocol
+ * routers accept any context because their operations only use the framework's own capabilities.
+ * The native router is held under a private key in implementation/router.ts.
+ */
+export interface RouterDeclaration<Query = unknown, Mutation = unknown> {
+  readonly [QueryHandlerContext]?: (context: Query) => void;
+  readonly [MutationHandlerContext]?: (context: Mutation) => void;
+  readonly [NativeRouterKey]: unknown;
+}
+/** An operation or nested router under one key. Each child is typed only by its own kind's context. */
+export interface RouterChild<Query, Mutation> {
+  readonly [QueryHandlerContext]?: (context: Query) => void;
+  readonly [MutationHandlerContext]?: (context: Mutation) => void;
+}
+/** Private key for a router's native definition. */
+export const NativeRouterKey = Symbol("apps.Router");
+
 /** Typed operation handles drive browser reference inference without bundling handlers. */
 export interface Operation<
   Input,
@@ -72,18 +96,39 @@ export const operationOptions = <Input, Output>(options: OperationOptions<Input,
         }),
   };
 };
+/**
+ * Replace a native operation's approval. Property descriptors are copied so an output schema that
+ * a protocol adapter builds only when read stays lazy.
+ */
+export const approvedOperation = <Input, Native extends AppOperation<Input, unknown>>(
+  operation: Native,
+  approval: Approval<Input>,
+): Native => {
+  // SAFETY: the copy has every own property of `operation`, with only `approval` replaced below.
+  const copy = Object.defineProperties({}, Object.getOwnPropertyDescriptors(operation)) as Native;
+  return Object.defineProperty(copy, "approval", {
+    enumerable: true,
+    value: (context: Parameters<Approval<Input>>[0]) =>
+      Effect.tryPromise({ try: async () => approval(context), catch: (error) => error }),
+  });
+};
+
 /** Attach the same approval function to a generated or shared operation. */
 export const withApproval = <Input, Output, Kind extends "query" | "mutation", Context>(
   operation: Operation<Input, Output, Kind, Context>,
   approval: Approval<Input>,
 ): Operation<Input, Output, Kind, Context> => ({
   ...operation,
-  [NativeOperation]: {
-    ...operation[NativeOperation],
-    approval: (context) =>
-      Effect.tryPromise({ try: async () => approval(context), catch: (error) => error }),
-  },
+  [NativeOperation]: approvedOperation(operation[NativeOperation], approval),
 });
+
+/**
+ * The advisory hints an operation carries, such as an MCP server's `destructiveHint`. App code
+ * reads them to choose an approval; the framework never infers one from them.
+ */
+export const toolAnnotations = (
+  operation: OperationDeclaration<"query" | "mutation", never>,
+): ToolAnnotations | undefined => nativeOperation(operation)?.annotations;
 
 const make = <Input, Output, Kind extends "query" | "mutation", Context extends AppContext>(
   kind: Kind,

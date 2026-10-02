@@ -3,26 +3,23 @@ import { ProviderErrorNotice } from "@executor-js/ui/dashboard/provider-error-no
 import { ProfileStatus } from "@executor-js/ui/dashboard/profile-status";
 import { profileMutations } from "../../contracts/profiles.ts";
 import { HostedFailure } from "../components/dashboard-bindings.tsx";
-import { useAtomSet } from "@effect/atom-react";
-import { Json, type App, type Tool, type Profile, type ProfileId } from "@executor-js/sdk";
-import { Cause, Exit, Option, Schema } from "effect";
+import type { App, Profile } from "@executor-js/sdk";
+import { Cause, Option, Schema } from "effect";
 import { UnexpectedError, type UserFacingError } from "@executor-js/utils/user-facing-error";
-import { useId, useState } from "react";
-import { HugeiconsIcon } from "@hugeicons/react";
-import { ArrowLeft02Icon } from "@hugeicons/core-free-icons";
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
-import { Code } from "@executor-js/ui/dashboard/code";
 import { ToolBrowser } from "@executor-js/ui/dashboard/tools";
+import { ToolRunner, toolRunContext } from "@executor-js/ui/dashboard/tool-runner";
 import {
   appToolReadiness,
+  unfilledAccountSlots,
   type AccountSummary,
   type FailureProps,
 } from "@executor-js/ui/contracts/dashboard";
 import { ErrorNotice } from "@executor-js/ui/dashboard/error-notice";
+import { Empty } from "@executor-js/ui/dashboard/common";
 import { AppSectionHeader, AppSectionTitle } from "@executor-js/ui/dashboard/app-section-header";
-import { Button } from "@executor-js/ui/components/button";
-import { Textarea } from "@executor-js/ui/components/textarea";
-import { appError, callToolAtom, toolListAtom } from "../../contracts/apps.ts";
+import { appError, callToolAtom, toolDetailAtom, toolCatalogAtom } from "../../contracts/apps.ts";
+import type { HostedError } from "../../contracts/errors.ts";
 import { useOrganizationRoute } from "../components/organization.tsx";
 
 /** Discover and run tools using the selected profile's exact bindings and revision. */
@@ -31,11 +28,14 @@ export function AppTools({
   accounts,
   selected,
   profile,
+  label,
 }: {
   readonly app: App;
   readonly accounts: readonly AccountSummary[];
   readonly selected: string | undefined;
   readonly profile: Profile | undefined;
+  /** The selected profile's name in the page's profile picker. */
+  readonly label: string;
 }) {
   const { organization, slug: organizationSlug } = useOrganizationRoute();
   const navigate = useNavigate();
@@ -46,20 +46,29 @@ export function AppTools({
       </p>
     );
   const readiness = appToolReadiness(app, profile?.accounts ?? {}, accounts);
+  const catalog = {
+    organization,
+    app: app.id,
+    profile: profile?.id,
+    expectedProfileRevision: profile?.revision,
+    deployment: app.activeDeployment ?? undefined,
+    accounts: JSON.stringify(profile?.accounts ?? {}),
+  };
   if (readiness.state === "not-deployed")
     return <p className="p-5 text-sm text-muted-foreground">Deploy this app to load its tools.</p>;
+  const accountsLink = (
+    <Link
+      to="/org/$organizationSlug/apps/$appId"
+      params={{ organizationSlug, appId: app.id }}
+      search={{ view: "accounts", profile: profile?.id }}
+    >
+      Accounts
+    </Link>
+  );
   if (readiness.state !== "ready")
     return (
       <p className="p-5 text-sm text-muted-foreground">
-        Review the selected accounts in{" "}
-        <Link
-          to="/org/$organizationSlug/apps/$appId"
-          params={{ organizationSlug, appId: app.id }}
-          search={{ view: "accounts", profile: profile?.id }}
-        >
-          Accounts
-        </Link>{" "}
-        to load tools.
+        Review the selected accounts in {accountsLink} to load tools.
       </p>
     );
   return (
@@ -73,16 +82,17 @@ export function AppTools({
       )}
       <ToolBrowser
         key={`${app.id}:${app.activeDeployment}:${profile?.id}:${profile?.revision}:${JSON.stringify(profile?.accounts ?? {})}`}
-        query={toolListAtom({
-          organization,
-          app: app.id,
-          profile: profile?.id,
-          expectedProfileRevision: profile?.revision,
-          deployment: app.activeDeployment ?? undefined,
-          accounts: JSON.stringify(profile?.accounts ?? {}),
-        })}
+        query={toolCatalogAtom(catalog)}
+        detail={(tool) => toolDetailAtom({ ...catalog, tool: tool.name })}
         Failure={ToolsFailure}
         selected={selected}
+        empty={
+          unfilledAccountSlots(app, profile?.accounts ?? {}).length > 0 ? (
+            <Empty title="No accounts connected">
+              This app lists tools for each connected account. Connect one in {accountsLink}.
+            </Empty>
+          ) : undefined
+        }
         onSelect={(tool) => {
           void navigate({
             to: "/org/$organizationSlug/apps/$appId",
@@ -90,24 +100,24 @@ export function AppTools({
             search: { view: "tools", tool, profile: profile?.id },
           });
         }}
-        back={
-          <Link
-            className="inline-flex min-h-11 items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground"
-            to="/org/$organizationSlug/apps/$appId"
-            params={{ organizationSlug, appId: app.id }}
-            search={{ view: "tools", profile: profile?.id }}
-          >
-            <HugeiconsIcon icon={ArrowLeft02Icon} size={16} aria-hidden />
-            All tools
-          </Link>
-        }
         renderAction={(tool) => (
           <ToolRunner
             key={tool.name}
-            app={app}
-            tool={tool}
-            profile={profile?.id}
-            revision={profile?.revision}
+            tool={tool.name}
+            call={callToolAtom({
+              organization,
+              app: app.id,
+              profile: profile?.id,
+              expectedProfileRevision: profile?.revision,
+              deployment: app.activeDeployment ?? undefined,
+              tool: tool.name,
+              kind: tool.readOnly === true ? "query" : "mutation",
+            })}
+            detail={toolDetailAtom({ ...catalog, tool: tool.name })}
+            Failure={ToolCallFailure}
+            context={
+              profile === undefined ? undefined : toolRunContext(label, profile.accounts, accounts)
+            }
           />
         )}
       />
@@ -143,86 +153,11 @@ function ToolsFailure<E extends UserFacingError>({ cause, retry, retrying }: Fai
     </div>
   );
 }
-function ToolRunner({
-  app,
-  tool,
-  profile,
-  revision,
-}: {
-  readonly app: App;
-  readonly tool: Tool;
-  readonly profile?: ProfileId | undefined;
-  readonly revision?: number | undefined;
-}) {
-  const { organization } = useOrganizationRoute();
-  const call = useAtomSet(callToolAtom({ organization, app: app.id, profile, tool: tool.name }), {
-    mode: "promiseExit",
-  });
-  const [input, setInput] = useState("{}");
-  const [pending, setPending] = useState(false);
-  const [output, setOutput] = useState<string>();
-  const [error, setError] = useState<string | AppProviderFailed>();
-  const inputId = useId();
+/** Tool failures keep the hosted API's safe copy; provider failures are shared by the runner. */
+function ToolCallFailure({ cause }: FailureProps<HostedError>) {
   return (
-    <div className="tool-runner flex flex-col gap-4 mt-6 min-w-0 [&_pre]:whitespace-pre-wrap [&_pre]:wrap-anywhere [&_pre]:text-[11px] [&_pre]:bg-muted [&_pre]:p-[12px] [&_pre]:rounded-[6px]">
-      <form
-        onSubmit={async (event) => {
-          event.preventDefault();
-          setError(undefined);
-          const parsed = Schema.decodeUnknownExit(Schema.fromJsonString(Json))(input);
-          if (Exit.isFailure(parsed)) {
-            setError("Enter valid JSON.");
-            return;
-          }
-          setPending(true);
-          setOutput(undefined);
-          const result = await call({
-            input: parsed.value,
-            deployment: app.activeDeployment ?? undefined,
-            expectedProfileRevision: revision,
-          });
-          setPending(false);
-          if (Exit.isFailure(result)) {
-            const failure = Cause.findErrorOption(result.cause);
-            setError(
-              Option.isSome(failure) && Schema.is(AppProviderFailed)(failure.value)
-                ? failure.value
-                : appError(result.cause),
-            );
-          } else setOutput(JSON.stringify(result.value, null, 2));
-        }}
-      >
-        <div className="flex flex-col gap-2.25 text-[13px] font-medium">
-          <label htmlFor={inputId}>Input</label>
-          <Textarea
-            id={inputId}
-            className="font-mono text-xs min-h-40"
-            value={input}
-            onChange={(event) => setInput(event.target.value)}
-            spellCheck={false}
-            disabled={pending}
-          />
-        </div>
-        <Button className="mt-3" disabled={pending}>
-          {pending ? "Running…" : "Run tool"}
-        </Button>
-      </form>
-      {error !== undefined &&
-        (typeof error === "string" ? (
-          <p role="alert" className="auth-error text-destructive text-[13px]">
-            {error}
-          </p>
-        ) : (
-          <ProviderErrorNotice
-            error={error}
-            context={`While running tool ${tool.name}. Check whether it made changes before trying again.`}
-          />
-        ))}
-      {output !== undefined && (
-        <section aria-label="Tool result">
-          <Code code={output} copyable copyLabel="Copy result" />
-        </section>
-      )}
-    </div>
+    <p role="alert" className="text-destructive text-[13px]">
+      {appError(cause)}
+    </p>
   );
 }

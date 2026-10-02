@@ -1,12 +1,12 @@
 import { expect, layer } from "@effect/vitest";
 import { Effect, Exit, Schema, Scope } from "effect";
-import { randomBytes } from "node:crypto";
 import { HostedLive, withHostedCase } from "../support/case.ts";
+import { scenarioLifetime } from "../support/lifecycle.ts";
 import { Actors } from "../support/actors.ts";
 import { Api, body } from "../support/api.ts";
 import { Target } from "../support/platform.ts";
 import { Evidence } from "../support/evidence.ts";
-import { createScenario, populations, seedOrganization } from "../sdk/index.ts";
+import { populations, seedOrganization } from "../sdk/index.ts";
 import { scenarios } from "../test-plan.ts";
 
 const Summary = Schema.Struct({
@@ -24,11 +24,11 @@ layer(HostedLive, { excludeTestServices: true })("Testing SDK", (it) => {
           actors = yield* Actors,
           api = yield* Api,
           evidence = yield* Evidence;
-        const child = yield* Scope.fork(yield* Effect.scope);
-        const other = yield* createScenario(target, {
-          id: randomBytes(16).toString("hex"),
-          label: "Overlapping organization",
-        }).pipe(Scope.provide(child));
+        // Setup created the overlapping scenario; this case seeds, isolates and fails it.
+        const [overlap] = scenarioLifetime(context).sdkScenarios;
+        if (overlap === undefined)
+          return yield* Effect.die(new Error("The test plan declares the overlapping scenario"));
+        const { scenario: other, scope: child } = overlap;
         if (other.actors === undefined)
           return yield* Effect.die(new Error("Hosted scenario requires actors"));
         expect(other.actors.organization.id).not.toBe(actors.organization.id);
@@ -51,39 +51,51 @@ layer(HostedLive, { excludeTestServices: true })("Testing SDK", (it) => {
             actors.owner,
             "POST",
             `/api/organizations/${actors.organization.id}/apps/${app.id}/tools/call`,
-            { tool, profile: app.profile, input: {} },
+            // Both seeded tools are queries.
+            { tool, kind: "query", profile: app.profile, input: {} },
           );
-        const rows = yield* body(Summary, yield* call("queries.summary"));
+        const [rows, repository, foreign, secondRows] = yield* Effect.all(
+          [
+            call("summary").pipe(Effect.flatMap((response) => body(Summary, response))),
+            call("repository").pipe(
+              Effect.flatMap((response) =>
+                body(
+                  Schema.Struct({
+                    name: Schema.String,
+                    private: Schema.Boolean,
+                    owner: Schema.String,
+                  }),
+                  response,
+                ),
+              ),
+            ),
+            api.request(
+              actors.member,
+              "GET",
+              `/api/organizations/${other.actors.organization.id}/apps`,
+            ),
+            other.api
+              .request(
+                other.actors.owner,
+                "POST",
+                `/api/organizations/${other.actors.organization.id}/apps/${otherApp.id}/tools/call`,
+                { tool: "summary", kind: "query", profile: otherApp.profile, input: {} },
+              )
+              .pipe(Effect.flatMap((response) => body(Summary, response))),
+          ],
+          { concurrency: 4 },
+        );
         expect(rows.count).toBe(1000);
         expect(rows.open).toBe(800);
         expect(rows.closed).toBe(200);
         expect(new Set(rows.keys).size).toBe(1000);
-        expect(
-          yield* body(
-            Schema.Struct({ name: Schema.String, private: Schema.Boolean, owner: Schema.String }),
-            yield* call("queries.repository"),
-          ),
-        ).toEqual({ name: "operations", private: true, owner: "scenario-42" });
+        expect(repository).toEqual({ name: "operations", private: true, owner: "scenario-42" });
         // An actor may never read another scenario's organization, even on the shared deployment.
-        const foreign = yield* api.request(
-          actors.member,
-          "GET",
-          `/api/organizations/${other.actors.organization.id}/apps`,
-        );
         expect([403, 404]).toContain(foreign.status);
-        const secondRows = yield* body(
-          Summary,
-          yield* other.api.request(
-            other.actors.owner,
-            "POST",
-            `/api/organizations/${other.actors.organization.id}/apps/${otherApp.id}/tools/call`,
-            { tool: "queries.summary", profile: otherApp.profile, input: {} },
-          ),
-        );
         expect(secondRows.count).toBe(20);
         // A failed scenario must release its resources without touching the survivor.
         yield* Scope.close(child, Exit.fail(new Error("Deliberate scenario failure")));
-        expect((yield* body(Summary, yield* call("queries.summary"))).count).toBe(1000);
+        expect((yield* body(Summary, yield* call("summary"))).count).toBe(1000);
         if (target.metadata.target === "cloud") {
           expect([403, 404]).toContain(
             (yield* api.request(

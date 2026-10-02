@@ -34,6 +34,15 @@ const errorMessage = Match.type<HostedError>().pipe(
           "Personal accounts stay private. Connect a shared account to give your team access.",
       })[reason],
     ScheduleNotFound: () => "This schedule or run is no longer available.",
+    ConnectionNotFound: () => "This connection was revoked or no longer exists.",
+    ConnectionIdTaken: () => "This connection could not be created. Close the form and try again.",
+    ConnectionAccessInvalid: ({ reason }) =>
+      ({
+        app: "An included app is no longer available to you. Remove it and try again.",
+        profile: "A selected profile is no longer available. Choose how the app runs again.",
+        account: "A selected account is no longer available for this app. Choose another one.",
+        target: "Choose how each included app runs.",
+      })[reason],
     ScheduleConflict: () =>
       "The schedule is busy or changed. Check its current status and try again.",
     ScheduleInvalid: () => "Update the interval or calendar timing in the app source.",
@@ -50,10 +59,6 @@ const errorMessage = Match.type<HostedError>().pipe(
       })[reason],
     RegistryError: registryErrorMessage,
     AppAccessDenied: () => "You do not have permission to change this app.",
-    ExecutionLimitReached: () =>
-      "Your organization has reached its execution limit. The tool did not run. Ask an organization admin to review the limit.",
-    ExecutionAdmissionUnavailable: () =>
-      "We could not check your execution allowance. The tool did not run. Try again.",
     AppSlugTaken: () => "Another app name produces this address. Choose a different name.",
     AppNameTaken: () => "An app already uses this name. Choose another name.",
     AppDeploymentChanged: () =>
@@ -88,17 +93,20 @@ const errorMessage = Match.type<HostedError>().pipe(
       "The app’s account setup changed. Close this form and try again.",
     ProviderNotFound: () => "This provider is no longer available. Reload the app and try again.",
     OAuthReconnectRequired: () => "This account needs to sign in again.",
+    OAuthRenewalFailed: (error) => `${error.description} ${error.recovery.action}`,
     OAuthClientUnavailable: () =>
       "This provider needs an OAuth client. Enter its client details below.",
     OAuthSetupFailed: (error) => `${error.description} ${error.recovery.action}`,
-    OAuthCompletionFailed: (error) =>
-      error.reason === "invalid_client"
-        ? "The OAuth client was rejected. Update its details and try again."
-        : "Sign-in did not complete. Try connecting again.",
+    OAuthCompletionFailed: (error) => `${error.description} ${error.recovery.action}`,
     InputInvalid: () => "The input does not match this tool’s schema.",
     AppProviderFailed: (error) => `${error.description} ${error.recovery.action}`,
     AppEvaluationFailed: (error) => `${error.description} ${error.recovery.action}`,
+    ToolListingTimedOut: (error) => `${error.description} ${error.recovery.action}`,
     ToolNotFound: () => "This tool is no longer available. Reload the app’s tools and try again.",
+    FrameworkVersionMismatch: () =>
+      "This server documents a different framework version. Search again without a version.",
+    ToolKindMismatch: () =>
+      "This tool changed between a query and a mutation. Reload the app’s tools and try again.",
     ToolBlocked: () => "The tool's approval policy blocked this tool call. The tool did not run.",
     ToolApprovalRequired: () =>
       "The tool requires approval. The tool did not run. Approval handling is not available yet.",
@@ -160,6 +168,8 @@ const errorMessage = Match.type<HostedError>().pipe(
     StorageError: () => "Your data could not load. Try again.",
     AccountNotFound: () => "This account is no longer available in this organization.",
     CatalogUnavailable: () => "integrations.sh could not be reached. Try again.",
+    FeedbackUnavailable: () => "Feedback could not be sent. Try again.",
+    FeedbackDisabled: ({ message }) => message,
     HttpClientError: () => "Could not reach the server. Check your connection and try again.",
     SchemaError: () => "The server returned an unexpected response. Reload and try again.",
   }),

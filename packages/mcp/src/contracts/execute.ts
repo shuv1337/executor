@@ -4,15 +4,24 @@ import { Schema } from "effect";
 import { HttpServerRequest } from "effect/unstable/http";
 import { McpSchema, Tool as McpTool } from "effect/unstable/ai";
 import { ApiErrorResponse, ElicitationResponse } from "apps/contracts";
+import { UserFacingError } from "@executor-js/utils/user-facing-error";
 import { InteractionId, PendingInteraction, ElicitationResponseInvalid } from "./interactions.ts";
 export * from "./interactions.ts";
 import { NativeElicitationFailed } from "./elicitation.ts";
 
-/** Fixed interpreter input, live-program capacity and discovery fan-out bounds. */
+/** Fixed interpreter input, live-program capacity and discovery fan-out and time bounds. */
 export const McpRuntimeLimits = Schema.Struct({
   maxCodeChars: Schema.Int.check(Schema.isGreaterThan(0)),
   maxExecutions: Schema.Int.check(Schema.isGreaterThan(0)),
   discoveryConcurrency: Schema.Int.check(Schema.isGreaterThan(0)),
+  /** How long discovery waits for the apps a program or search needs before giving up on any. */
+  discoveryWaitMs: Schema.Int.check(Schema.isGreaterThan(0)),
+  /**
+   * After that wait, discovery gives up on the apps still listing once no listing in the
+   * execution has completed for this long. Listings share one app runtime, so a slow app is kept
+   * while others progress, and a stalled app is dropped soon after the others finish.
+   */
+  discoveryIdleMs: Schema.Int.check(Schema.isGreaterThan(0)),
 });
 export type McpRuntimeLimits = typeof McpRuntimeLimits.Type;
 /** Existing runtime defaults; execution time, output and call budgets remain in McpLimits. */
@@ -20,6 +29,9 @@ export const defaultMcpRuntimeLimits = McpRuntimeLimits.make({
   maxCodeChars: 65_536,
   maxExecutions: 64,
   discoveryConcurrency: 8,
+  // Together well inside the default 5 minute execution budget, which leaves the program time to run.
+  discoveryWaitMs: 10_000,
+  discoveryIdleMs: 5_000,
 });
 
 /** A product denied admission before a program started. The message is safe for the caller. */
@@ -27,6 +39,44 @@ export class ExecutionRejected extends Schema.TaggedError<ExecutionRejected>()(
   "ExecutionRejected",
   { message: Schema.String },
 ) {}
+
+/**
+ * An app that needs accounts exposes no tools until the caller has an enabled profile for it.
+ * The caller may have no profile, or only disabled or removed ones.
+ */
+export const AppProfileRequired = UserFacingError.define({
+  tag: "AppProfileRequired",
+  status: 409,
+  fields: { app: Schema.String },
+  title: "Set up an account profile to continue",
+  description: "This app needs an account, and you have no enabled profile for it.",
+  recovery: {
+    action:
+      "Open the app's Accounts page and connect an account or enable an existing profile, then run execute again.",
+    instructions:
+      "Tell the user this app needs an account profile before its tools can be used. They can connect an account, or enable a profile they already have, on the app's Accounts page. Never substitute another identity automatically. This execution cannot call the app's tools.",
+  },
+});
+
+/**
+ * An app was still listing its tools when discovery stopped waiting for it, such as an app whose
+ * server accepts connections and never answers.
+ */
+export const AppDiscoveryTimedOut = UserFacingError.define({
+  tag: "AppDiscoveryTimedOut",
+  status: 504,
+  fields: { app: Schema.String, elapsedMs: Schema.Number },
+  presentation: ({ elapsedMs }) => ({
+    title: "App tools did not load in time",
+    description: `This app timed out after ${elapsedMs}ms while listing its tools, so it is unavailable in this execution. Other apps are not affected.`,
+    retryable: true,
+    recovery: {
+      action: "Check that the app's upstream server is reachable, then run execute again.",
+      instructions:
+        "Tell the user this app's tools could not be listed in time; its server may be offline or overloaded. Its tools cannot be called in this execution. Other apps remain usable.",
+    },
+  }),
+});
 
 /** Generated code is bounded before it reaches the parser. */
 export const ExecuteInput = Schema.Struct({
@@ -38,17 +88,31 @@ export const UnavailableApp = Schema.Struct({
   name: Schema.String,
   reason: Schema.String,
   profile: Schema.optional(Schema.String),
+  /** Only this router's tools are missing; the rest of the app loaded. */
+  router: Schema.optional(Schema.String),
 });
+/**
+ * One admitted tool call in call order. `interrupted` calls were still running when the
+ * execution ended; the upstream may or may not have applied them. `awaiting-approval` calls
+ * were still waiting for approval when the execution ended; they never ran.
+ */
+export const McpToolCall = Schema.Struct({
+  name: Schema.String,
+  outcome: Schema.Literals(["success", "failure", "interrupted", "awaiting-approval"]),
+  durationMs: Schema.optionalKey(Schema.Number),
+});
+export type McpToolCall = typeof McpToolCall.Type;
 /** Program result plus apps that could not expose a live catalog during this execution. */
 export const ExecuteResult = Schema.Struct({
   execution: Schema.Union([
-    CodeMode.Success,
+    Schema.Struct({ ...CodeMode.Success.fields, toolCalls: Schema.Array(McpToolCall) }),
     Schema.Struct({
       ...CodeMode.Failure.fields,
       error: Schema.Struct({
         ...CodeMode.Diagnostic.fields,
         response: Schema.optionalKey(ApiErrorResponse),
       }),
+      toolCalls: Schema.Array(McpToolCall),
     }),
   ]),
   unavailableApps: Schema.Array(UnavailableApp),
@@ -84,7 +148,7 @@ export const SearchInput = Schema.Struct({
   namespace: Schema.optionalKey(
     Schema.String.annotate({
       description:
-        "App slug, such as axiom, or a target namespace such as axiom.profiles.ins_id.queries.",
+        "App slug, such as axiom, or a namespace inside it, such as axiom.profiles.ins_id or acme.issues.",
     }),
   ),
   limit: Schema.optionalKey(Schema.Int.check(Schema.isGreaterThan(0))),
@@ -109,7 +173,7 @@ export const McpLimits = Schema.Struct({
 export type McpLimits = typeof McpLimits.Type;
 /** Default interpreter budgets; each product may supply different limits. */
 export const defaultMcpLimits: McpLimits = {
-  timeoutMs: 30_000,
+  timeoutMs: 5 * 60_000,
   maxToolCalls: 100,
   maxOutputBytes: 65_536,
 };
@@ -117,7 +181,7 @@ export const defaultMcpLimits: McpLimits = {
 /** Execute programs over the host-provided app catalog. */
 export const ExecuteTool = McpTool.make("execute", {
   description:
-    "Run a JavaScript program over Executor apps. Discover and read the Executor app's app-authoring skill through the skills tool before creating apps. Start with return await tools.search({query: 'Executor'}). Search returns exact callable paths and TypeScript signatures. Each configured app has its own app-slug namespace and saved accounts. Discover again in a new execute after configuration changes. Use await, Promise.all and return only needed data. For user credentials, discover Executor's account connection tool (mutations.accountConnect_issue locally, mutations.accounts_connect on hosted) and give the user its browser link; never ask for secrets in chat or search their files for tokens. No imports, fetch, process or filesystem globals. Failed/incomplete apps are reported in unavailableApps. If approval-required or input-required is returned, show the elicitation to the user, collect its requested fields, then call resume with the returned requestId and response.action (accept, decline, or cancel). The program waits in memory; do not execute its source again. External effects are not rolled back on error or cancellation.",
+    "Run a JavaScript program over Executor apps. Discover and read the Executor app's app-authoring skill through the skills tool before creating apps. Start with return await tools.search({query: 'Executor'}). Search returns exact callable paths and TypeScript signatures. Each configured app has its own app-slug namespace and saved accounts. Discover again in a new execute after configuration changes. Use await, Promise.all and return only needed data. For user credentials, discover Executor's account connection tool (accountConnect.issue locally, accounts.connect on hosted) and give the user its browser link; never ask for secrets in chat or search their files for tokens. No imports, fetch, process or filesystem globals. Apps load when a program uses their namespace or searches them; failed/incomplete apps among those are reported in unavailableApps. If approval-required or input-required is returned, show the elicitation to the user, collect its requested fields, then call resume with the returned requestId and response.action (accept, decline, or cancel). The program waits in memory; do not execute its source again. External effects are not rolled back on error or cancellation.",
   dependencies: [HttpServerRequest.HttpServerRequest],
   parameters: ExecuteInput,
   success: McpExecutionResult,

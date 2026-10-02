@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { ArrowDown01Icon, InformationCircleIcon } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { Cause, Exit, Option, Redacted } from "effect";
@@ -69,14 +69,14 @@ export function OAuthFields<A, E>({
   manualClient = false,
   setup,
   setupAction,
-  initialLabel = "Default",
   disabled = false,
 }: {
   readonly providerName: string;
   readonly account?: Pick<Account, "label">;
   readonly redirectUri: string;
   readonly start: (input: OAuthSubmission) => Promise<Exit.Exit<A, E>>;
-  readonly onAuthorized: (value: NoInfer<A>) => void;
+  /** Report "navigating" when the browser is leaving for sign-in, so the action stays busy until it does. */
+  readonly onAuthorized: (value: NoInfer<A>) => "navigating" | "done";
   readonly requiresClient: (cause: Cause.Cause<NoInfer<E>>) => boolean;
   readonly Failure: ComponentType<FailureProps<NoInfer<E>>>;
   readonly disabled?: boolean;
@@ -86,13 +86,14 @@ export function OAuthFields<A, E>({
   readonly setup: OAuthClientSetup | "unresolved";
   /** Setup progress covers the Connect action and collapsed Advanced options. */
   readonly setupAction?: ReactNode;
-  readonly initialLabel?: string | undefined;
 }) {
-  const [label, setLabel] = useState(account?.label ?? initialLabel);
   const [customClient, setManual] = useState(manualClient);
   const manual = customClient || (setup !== "unresolved" && setup.mode === "client-required");
   const machine = setup !== "unresolved" && setup.grant === "client_credentials";
-  const needsSecret = setup !== "unresolved" && setup.tokenEndpointAuthMethod !== "none";
+  const method = setup === "unresolved" ? "none" : setup.tokenEndpointAuthMethod;
+  // An undeclared method accepts either a public client or one with a secret.
+  const acceptsSecret = method !== "none";
+  const needsSecret = method !== undefined && method !== "none";
   const [clientId, setClientId] = useState("");
   const [clientSecret, setClientSecret] = useState("");
   const [pending, setPending] = useState(false);
@@ -102,8 +103,7 @@ export function OAuthFields<A, E>({
     setupAction !== undefined ||
     setup === "unresolved" ||
     pending ||
-    !label.trim() ||
-    (manual && (!clientId.trim() || (needsSecret && !clientSecret)));
+    (manual && (!clientId.trim() || (needsSecret && !clientSecret.trim())));
   const connect = () => {
     if (blocked) return;
     setPending(true);
@@ -112,22 +112,34 @@ export function OAuthFields<A, E>({
     const client = manual
       ? {
           clientId: clientId.trim(),
-          ...(needsSecret ? { clientSecret: Redacted.make(clientSecret) } : {}),
+          ...(acceptsSecret && clientSecret.trim()
+            ? { clientSecret: Redacted.make(clientSecret.trim()) }
+            : {}),
         }
       : undefined;
-    const operation = start({ label: label.trim(), ...(client ? { client } : {}) });
+    const operation = start(client ? { client } : {});
     void operation.then((exit) => {
-      setPending(false);
-      onPendingChange?.(false);
       if (Exit.isSuccess(exit)) {
         setClientSecret("");
-        onAuthorized(exit.value);
+        if (onAuthorized(exit.value) === "navigating") return;
       } else {
         if (requiresClient(exit.cause)) setManual(true);
         setError(exit.cause);
       }
+      setPending(false);
+      onPendingChange?.(false);
     });
   };
+  // Going back from the provider can restore this page from the back-forward cache mid-redirect.
+  useEffect(() => {
+    const restored = (event: PageTransitionEvent) => {
+      if (!event.persisted) return;
+      setPending(false);
+      onPendingChange?.(false);
+    };
+    window.addEventListener("pageshow", restored);
+    return () => window.removeEventListener("pageshow", restored);
+  }, [onPendingChange]);
   return (
     <>
       {manual && (
@@ -153,7 +165,9 @@ export function OAuthFields<A, E>({
                 <li>
                   {needsSecret
                     ? "Enter its client ID and client secret here."
-                    : "Enter its client ID here."}
+                    : acceptsSecret
+                      ? "Enter its client ID here, and its client secret if it has one."
+                      : "Enter its client ID here."}
                 </li>
               </ol>
             </AlertDescription>
@@ -169,24 +183,6 @@ export function OAuthFields<A, E>({
           )}
         </>
       )}
-      {account === undefined && (
-        <label className="flex flex-col gap-2 text-[13px] font-medium">
-          Account name
-          <Input
-            autoFocus
-            value={label}
-            onChange={(event) => setLabel(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter" && !event.nativeEvent.isComposing) {
-                event.preventDefault();
-                connect();
-              }
-            }}
-            disabled={pending || disabled}
-            maxLength={120}
-          />
-        </label>
-      )}
       {manual && (
         <>
           <label className="field-label flex flex-col gap-2.25 text-[13px] font-medium [&_[data-slot='select-trigger']]:w-full">
@@ -201,9 +197,9 @@ export function OAuthFields<A, E>({
               autoComplete="off"
             />
           </label>
-          {needsSecret && (
+          {acceptsSecret && (
             <label className="field-label flex flex-col gap-2.25 text-[13px] font-medium [&_[data-slot='select-trigger']]:w-full">
-              Client secret
+              {needsSecret ? "Client secret" : "Client secret (optional)"}
               <Input
                 type="password"
                 autoComplete="off"

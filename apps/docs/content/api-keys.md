@@ -9,9 +9,13 @@ Executor API keys are personal access tokens (PATs). A token authenticates as yo
 and uses your current permissions in the organization targeted by each request.
 There are no extra permission or tool-selection settings for tokens in v1.
 
-1. Open **API keys** and select **Create token**.
+Tokens belong to your account, not to an organization. They live under
+**Account settings → Tokens** (`/account/tokens`), reached from your avatar menu,
+and the same list shows every token you own across all your organizations.
+
+1. Open **Account settings → Tokens** and select **Create token**.
 2. Give the token a name.
-3. Choose an organization, or **Full account**.
+3. Choose a scope: one organization, or **Full account**.
 4. Optionally set an expiry.
 5. Copy the token into your script's secret manager. It is shown only once.
 
@@ -26,7 +30,8 @@ Keep tokens out of browser code and source control.
 
 ## Use a token
 
-The page provides an example for the organization you are viewing:
+Each organization's **Connections** page has a **Personal access token** tab with
+the MCP and HTTP addresses for that organization. For example:
 
 ```sh
 curl '<your-origin>/api/organizations/<organization-id>/inventory' \
@@ -68,7 +73,8 @@ Use your PAT as the bearer token. The organization URL names where calls run:
 }
 ```
 
-The **API keys** page fills in your server URL and current organization. For
+The **Connections** page fills in your server URL and the organization you are
+viewing, and links to your tokens with that organization preselected. For
 self-host, use your own origin. Keep the token in your client's private config
 or secret store.
 

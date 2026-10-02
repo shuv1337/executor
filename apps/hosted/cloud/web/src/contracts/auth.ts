@@ -2,18 +2,26 @@ import { observeBrowserUsage } from "@executor-js/hosted-web/contracts/product-a
 import { BrowserAtoms } from "@executor-js/hosted-web/contracts/telemetry";
 import { passkeyClient } from "@better-auth/passkey/client";
 import { createAuthClient } from "better-auth/client";
+import { dashboardAuthClientOptions } from "@executor-js/ui/contracts/http";
 import { emailOTPClient } from "better-auth/client/plugins";
 import { authRequest } from "@executor-js/hosted-web/contracts/auth";
-import { Effect } from "effect";
-import { signInCallback } from "@executor-js/hosted-web/contracts/navigation";
+import { Effect, Schema } from "effect";
+import { Atom } from "effect/unstable/reactivity";
+import { acknowledge, acknowledgedQuery, invalidate } from "@executor-js/ui/contracts/mutations";
+import { revalidated } from "@executor-js/ui/contracts/refresh";
+import { AccountFailed } from "@executor-js/hosted-web/contracts/account";
+import { keepFragment, signInCallback } from "@executor-js/hosted-web/contracts/navigation";
 import { startSsoSignIn } from "./sso.ts";
 
 /** Keep the submitting form mounted until the server selects the next document. */
 export const finishCloudSignIn = (redirect: string) =>
-  window.location.replace(signInCallback(redirect));
+  window.location.replace(keepFragment(signInCallback(redirect)));
 
 /** Cloud-only credentials; shared session queries use the same origin and cookie. */
-export const cloudAuthClient = createAuthClient({ plugins: [passkeyClient(), emailOTPClient()] });
+export const cloudAuthClient = createAuthClient({
+  ...dashboardAuthClientOptions,
+  plugins: [passkeyClient(), emailOTPClient()],
+});
 /** Prefer verified company SSO; send a code only when the server confirms no SSO connection. */
 export const beginEmailSignInAtom = BrowserAtoms.fn(
   (input: { readonly email: string; readonly redirect: string }) =>
@@ -51,11 +59,45 @@ export const passkeySignInAtom = BrowserAtoms.fn((redirect: string) =>
     Effect.asVoid,
   ),
 );
+/** A registered passkey; the credential itself never leaves the authenticator. */
+export const PasskeySummary = Schema.Struct({
+  id: Schema.String,
+  name: Schema.optional(Schema.NullOr(Schema.String)),
+  deviceType: Schema.String,
+  backedUp: Schema.Boolean,
+  createdAt: Schema.Date,
+});
+export type PasskeySummary = typeof PasskeySummary.Type;
+const passkeysQuery = BrowserAtoms.atom(
+  authRequest((options) => cloudAuthClient.passkey.listUserPasskeys({}, options)).pipe(
+    Effect.flatMap(Schema.decodeUnknownEffect(Schema.Array(PasskeySummary))),
+    Effect.mapError(() => new AccountFailed({ message: "Unable to load your passkeys." })),
+    Effect.withSpan("ui.auth.passkeys"),
+  ),
+).pipe(revalidated);
+/** The signed-in user's passkeys, for the account security page. */
+export const passkeysAtom = acknowledgedQuery(passkeysQuery);
 /** Register with the server's configured origin and relying-party identity. */
-export const addPasskeyAtom = BrowserAtoms.fn((name: string) =>
+export const addPasskeyAtom = BrowserAtoms.fn((name: string, get) =>
   authRequest((options) => cloudAuthClient.passkey.addPasskey({ name }, options)).pipe(
     (work) => observeBrowserUsage("auth", "add_passkey", work),
+    Effect.tap(() => Effect.sync(() => invalidate(get, passkeysAtom))),
     Effect.withSpan("ui.auth.addPasskey"),
     Effect.asVoid,
+  ),
+);
+/** Remove one passkey; the row leaves the list once the server confirms. */
+export const deletePasskeyAtom = Atom.family((id: string) =>
+  BrowserAtoms.fn((_: void, get) =>
+    authRequest((options) => cloudAuthClient.passkey.deletePasskey({ id }, options)).pipe(
+      (work) => observeBrowserUsage("auth", "delete_passkey", work),
+      Effect.tap(() =>
+        Effect.sync(() =>
+          acknowledge(get, passkeysAtom, (current) => current.filter((key) => key.id !== id)),
+        ),
+      ),
+      Effect.withSpan("ui.auth.deletePasskey"),
+      Effect.asVoid,
+    ),
   ),
 );

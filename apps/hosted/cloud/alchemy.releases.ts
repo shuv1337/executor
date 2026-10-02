@@ -8,7 +8,8 @@ import { stackState } from "./src/infrastructure/state.ts";
 
 const releaseSecrets = [
   "NPM_TOKEN",
-  "PUBLIC_RELEASE_TOKEN",
+  "PUBLIC_RELEASE_APP_CLIENT_ID",
+  "PUBLIC_RELEASE_APP_PRIVATE_KEY",
   "EXECUTOR_MAC_SIGNING_KEY",
   "EXECUTOR_MAC_SIGNING_CERTIFICATE",
   "EXECUTOR_MAC_NOTARY_KEY",

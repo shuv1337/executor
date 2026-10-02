@@ -1,3 +1,5 @@
+import { hydrated } from "@executor-js/ui/contracts/http";
+import { revalidated } from "@executor-js/ui/contracts/refresh";
 import { pollingQuery } from "@executor-js/ui/contracts/polling";
 import { refreshProfiles } from "./profiles.ts";
 import { refreshResourceDirectory } from "./resource-access.ts";
@@ -5,6 +7,9 @@ import { protectedQuery } from "./protected-query.ts";
 /** Organization-specific app queries and mutations use the shared hosted API. */
 import {
   AppId,
+  AppEvaluationFailed,
+  type Tool,
+  type Cursor,
   ProfileId,
   DeploymentId,
   AccountConnectionId,
@@ -24,10 +29,10 @@ import { OrganizationReference } from "@executor-js/hosted-server/organization";
 import { AsyncResult, Atom } from "effect/unstable/reactivity";
 import { Data, Effect, Option, Schema, type Redacted } from "effect";
 import { HostedClient } from "./api.ts";
-import { acknowledge, upsert, currentQuery, invalidate } from "@executor-js/ui/contracts/mutations";
+import { acknowledge, upsert, invalidate } from "@executor-js/ui/contracts/mutations";
 import { inventoryAtom } from "./organization.ts";
 import { accountAtom, acknowledgeAccount } from "./accounts.ts";
-import { selectedIds } from "@executor-js/ui/contracts/dashboard";
+import { selectedIds, type ToolCatalog } from "@executor-js/ui/contracts/dashboard";
 
 /** App data is never reused between organizations. */
 class AppKey extends Data.Class<{
@@ -56,10 +61,7 @@ class OAuthSetupKey extends Data.Class<{
   readonly method: string;
 }> {}
 const oauthSetupQuery = Atom.family((key: OAuthSetupKey) =>
-  HostedClient.query("accounts", "oauthSetup", { params: key }).pipe(
-    Atom.setIdleTTL("5 minutes"),
-    Atom.refreshOnWindowFocus,
-  ),
+  HostedClient.query("accounts", "oauthSetup", hydrated({ params: key })).pipe(revalidated),
 );
 /** Safe client capability hints are shared across forms for the same organization, provider, and method. */
 export const oauthSetupAtom = (key: {
@@ -70,25 +72,30 @@ export const oauthSetupAtom = (key: {
 
 const appQuery = Atom.family(
   (key: { readonly organization: OrganizationReference; readonly app: AppId }) =>
-    HostedClient.query("apps", "get", { params: key }).pipe(
-      Atom.refreshOnWindowFocus,
-      protectedQuery,
-    ),
+    HostedClient.query("apps", "get", hydrated({ params: key })).pipe(revalidated, protectedQuery),
 );
 const deploymentsQuery = Atom.family((key: AppKey) =>
-  HostedClient.query("apps", "deployments", { params: key }).pipe(Atom.refreshOnWindowFocus),
+  HostedClient.query("apps", "deployments", hydrated({ params: key })).pipe(revalidated),
 );
 const sourceQuery = Atom.family((key: SourceKey) =>
-  HostedClient.query("apps", "sourceDisplay", {
-    params: { organization: key.organization, app: key.app },
-    query: { deployment: key.deployment },
-  }),
+  HostedClient.query(
+    "apps",
+    "sourceDisplay",
+    hydrated({
+      params: { organization: key.organization, app: key.app },
+      query: { deployment: key.deployment },
+    }),
+  ).pipe(Atom.setIdleTTL("5 minutes")),
 );
 const sourceFileQuery = Atom.family((key: SourceFileKey) =>
-  HostedClient.query("apps", "sourceDisplayFile", {
-    params: { organization: key.organization, app: key.app, deployment: key.deployment },
-    query: { path: key.path },
-  }).pipe(Atom.setIdleTTL("5 minutes")),
+  HostedClient.query(
+    "apps",
+    "sourceDisplayFile",
+    hydrated({
+      params: { organization: key.organization, app: key.app, deployment: key.deployment },
+      query: { path: key.path },
+    }),
+  ).pipe(Atom.setIdleTTL("5 minutes")),
 );
 /** One page evaluates the current app/account catalog. */
 class ToolKey extends Data.Class<{
@@ -99,22 +106,27 @@ class ToolKey extends Data.Class<{
   readonly expectedProfileRevision?: number | undefined;
   readonly accounts?: string | undefined;
 }> {}
+/** Browsing reads the schema-free index; one tool's schemas load when it is selected. */
 const toolsQuery = Atom.family((key: ToolKey) =>
-  HostedClient.query("tools", "list", {
-    params: key,
-    query: {
-      deployment: key.deployment,
-      profile: key.profile,
-      expectedProfileRevision: key.expectedProfileRevision,
-    },
-  }).pipe(currentQuery),
+  HostedClient.query(
+    "tools",
+    "index",
+    hydrated({
+      params: key,
+      query: {
+        deployment: key.deployment,
+        profile: key.profile,
+        expectedProfileRevision: key.expectedProfileRevision,
+      },
+    }),
+  ).pipe(revalidated),
 );
 /** Pending credentials are fetched without reading saved secrets. */
 const connectionQuery = Atom.family(
   (key: {
     readonly organization: OrganizationReference;
     readonly connection: AccountConnectionId;
-  }) => HostedClient.query("accounts", "connection", { params: key }),
+  }) => HostedClient.query("accounts", "connection", hydrated({ params: key })),
 );
 /** Catalog installation, selection, connection and execution actions. */
 const activateApp = Atom.family((key: AppKey) =>
@@ -218,7 +230,7 @@ export function appConnectionAtoms(key: {
     request,
     profile,
     submit: HostedClient.runtime.fn(
-      (payload: { method: string; label: string; fields: typeof AccountFieldsInput.Type }, get) =>
+      (payload: { method: string; fields: typeof AccountFieldsInput.Type }, get) =>
         Effect.gen(function* () {
           const pending = yield* connection(get);
           const client = yield* HostedClient;
@@ -229,7 +241,7 @@ export function appConnectionAtoms(key: {
         }),
     ),
     startOAuth: HostedClient.runtime.fn(
-      (payload: { method: string; label: string; client?: OAuthClientInput }, get) =>
+      (payload: { method: string; client?: OAuthClientInput }, get) =>
         Effect.gen(function* () {
           const pending = yield* connection(get);
           const client = yield* HostedClient;
@@ -259,7 +271,7 @@ export function appConnectionAtoms(key: {
 
 const submitConnection = Atom.family((key: ConnectionKey) =>
   HostedClient.runtime.fn(
-    (payload: { method: string; label: string; fields: typeof AccountFieldsInput.Type }, get) =>
+    (payload: { method: string; fields: typeof AccountFieldsInput.Type }, get) =>
       Effect.flatMap(HostedClient, (client) =>
         client.accounts.submit({ params: key, payload }),
       ).pipe(
@@ -292,6 +304,13 @@ const completeOAuth = Atom.family((key: ConnectionKey) =>
       ),
   ),
 );
+/** The callback's OAuth state, not the browser tab, identifies the connection it completes. */
+export const resolveOAuthCallbackAtom = HostedClient.runtime.fn(
+  (callbackUrl: Redacted.Redacted<string>) =>
+    Effect.flatMap(HostedClient, (client) =>
+      client.oauthCallback.resolve({ payload: { callbackUrl } }),
+    ),
+);
 /** Completion reconciles account and target data before the view navigates. */
 export const submitConnectionAtom = (key: {
   organization: OrganizationReference;
@@ -306,7 +325,6 @@ const startOAuth = Atom.family((key: ConnectionKey) =>
     (
       payload: {
         readonly method: string;
-        readonly label: string;
         readonly client?: OAuthClientInput;
       },
       get,
@@ -339,28 +357,23 @@ class CallKey extends Data.Class<{
   readonly organization: OrganizationReference;
   readonly app: AppId;
   readonly profile?: ProfileId | undefined;
+  readonly expectedProfileRevision?: number | undefined;
+  readonly deployment?: DeploymentId | undefined;
   readonly tool: ToolName;
+  readonly kind: "query" | "mutation";
 }> {}
-const calls = Atom.family((key: CallKey) =>
-  HostedClient.runtime.fn(
-    (input: {
-      input: Json;
-      deployment?: DeploymentId | undefined;
-      expectedProfileRevision?: number | undefined;
-    }) =>
-      Effect.flatMap(HostedClient, (client) =>
-        client.tools.call({
-          params: key,
-          payload: { ...input, tool: key.tool, profile: key.profile },
-        }),
-      ),
+const calls = Atom.family(({ organization, app, ...target }: CallKey) =>
+  HostedClient.runtime.fn((input: Json) =>
+    Effect.flatMap(HostedClient, (client) =>
+      client.tools.call({ params: { organization, app }, payload: { ...target, input } }),
+    ),
   ),
 );
 /** Each account and operation owns its invocation state. */
 export const callToolAtom = (key: ConstructorParameters<typeof CallKey>[0]) =>
   calls(new CallKey(key));
 
-/** Browser-only return context. The server verifies connection ownership and OAuth state. */
+/** Return context from the tab that started sign-in; the callback page resolves it from the server. */
 export const PendingOAuth = Schema.Struct({
   organization: OrganizationReference,
   organizationSlug: Schema.NonEmptyString,
@@ -368,7 +381,8 @@ export const PendingOAuth = Schema.Struct({
   app: Schema.NullOr(AppId),
   profile: Schema.optional(ProfileId),
   redirectUri: HttpUrl,
-  label: Schema.optionalKey(Schema.String),
+  /** A reconnect keeps its account name, so completion does not ask for one. */
+  reconnect: Schema.optionalKey(Schema.Boolean),
   manualClient: Schema.optionalKey(Schema.Boolean),
 });
 export { appError } from "./errors.ts";
@@ -458,19 +472,88 @@ function connectionSaved(
   if (app !== null) {
     const target = { organization: key.organization, app };
     refreshProfiles(get, target);
-    invalidate(get, appAtom(target));
+    get.refresh(appAtom(target));
     get.refresh(toolsAtom(target));
   }
   // The inventory response contains selected accounts, which the account response does not.
-  invalidate(get, inventoryAtom(key.organization));
+  get.refresh(inventoryAtom(key.organization));
 }
 
-const toolLists = Atom.family((key: ToolKey) =>
+const toolCatalogs = Atom.family((key: ToolKey) =>
   Atom.map(
     toolsQuery(key),
-    AsyncResult.map((page) => page.items),
+    AsyncResult.map((page): ToolCatalog => ({ tools: page.items, routers: page.routers })),
   ),
 );
-/** Shared browser view for the selected profile. */
-export const toolListAtom = (key: ConstructorParameters<typeof ToolKey>[0]) =>
-  toolLists(new ToolKey(key));
+/** Shared browser view for the selected profile, with the routers that group its tools. */
+export const toolCatalogAtom = (key: ConstructorParameters<typeof ToolKey>[0]) =>
+  toolCatalogs(new ToolKey(key));
+class ToolDetailKey extends Data.Class<
+  ConstructorParameters<typeof ToolKey>[0] & { readonly tool: ToolName }
+> {}
+const toolDetailQueries = Atom.family((key: ToolDetailKey) =>
+  HostedClient.query(
+    "tools",
+    "get",
+    hydrated({
+      params: { organization: key.organization, app: key.app, tool: key.tool },
+      query: {
+        deployment: key.deployment,
+        profile: key.profile,
+        expectedProfileRevision: key.expectedProfileRevision,
+      },
+    }),
+  ).pipe(revalidated),
+);
+const toolDetails = Atom.family((key: ToolDetailKey) =>
+  HostedClient.runtime.atom((get) =>
+    get
+      .result(toolDetailQueries(key))
+      // A tool that left the catalog since the list was read is not a failure.
+      .pipe(Effect.catchTag("ToolNotFound", () => Effect.succeed(undefined))),
+  ),
+);
+/** One tool's schemas for the same catalog identity as the list. */
+export const toolDetailAtom = (key: ConstructorParameters<typeof ToolDetailKey>[0]) =>
+  toolDetails(new ToolDetailKey(key));
+
+const connectionToolLists = Atom.family((key: ToolKey) =>
+  HostedClient.runtime
+    .atom(
+      Effect.gen(function* () {
+        const client = yield* HostedClient;
+        const tools: Tool[] = [];
+        const cursors = new Set<Cursor>();
+        let cursor: Cursor | undefined;
+        let deployment = key.deployment;
+        let revision = key.expectedProfileRevision;
+        do {
+          const page = yield* client.tools.list({
+            params: { organization: key.organization, app: key.app },
+            query: { profile: key.profile, expectedProfileRevision: revision, deployment, cursor },
+          });
+          if (
+            (deployment !== undefined && deployment !== page.deployment) ||
+            (revision !== undefined && revision !== page.profileRevision) ||
+            (page.next !== undefined && cursors.has(page.next))
+          ) {
+            return yield* new AppEvaluationFailed({
+              app: key.app,
+              deployment: page.deployment,
+              reason: "The tool catalog changed while loading. Try again.",
+            });
+          }
+          deployment = page.deployment;
+          revision = page.profileRevision;
+          tools.push(...page.items);
+          cursor = page.next;
+          if (cursor !== undefined) cursors.add(cursor);
+        } while (cursor !== undefined);
+        return tools;
+      }),
+    )
+    .pipe(Atom.setIdleTTL("5 minutes")),
+);
+/** Load the complete selected catalog on demand so connection search includes every tool. */
+export const connectionToolListAtom = (key: ConstructorParameters<typeof ToolKey>[0]) =>
+  connectionToolLists(new ToolKey(key));

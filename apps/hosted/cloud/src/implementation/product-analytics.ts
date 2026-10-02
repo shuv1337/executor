@@ -1,23 +1,18 @@
 /** Request-owned analytics and explicitly submitted feedback sent to PostHog. */
 import { heroPreviewCookie, readHeroVisitor } from "@executor-js/marketing/experiments";
 import { evaluateHeroFlag } from "./hero-experiment.ts";
-import { FeedbackUnavailable, type Feedback } from "../contracts/feedback.ts";
-import type { ToolCallResult, ToolResumeResult } from "@executor-js/sdk/core";
-import type { Executor } from "@executor-js/sdk/core";
+import { FeedbackUnavailable } from "@executor-js/telemetry/product-analytics";
 import {
-  CurrentUserId,
-  CurrentOrganization,
   ProductAnalytics,
-  recordUsage,
-  observeUsage,
-  usageFailure,
   type UsageEvent,
   type UsageProperties,
 } from "@executor-js/hosted-server";
 import { CurrentRuntimeContext } from "alchemy/RuntimeContext";
-import { Clock, Context, Effect, Exit, Option, Redacted, Schema } from "effect";
+import { Context, Effect, Option, Redacted, Schema } from "effect";
 import {
+  Cookies,
   FetchHttpClient,
+  HttpBody,
   HttpClient,
   HttpClientRequest,
   HttpServerRequest,
@@ -49,12 +44,8 @@ interface Event {
 }
 const Analytics = Context.Reference<{
   readonly add: (event: Event) => void;
-  readonly submit: (event: Event) => Effect.Effect<void, FeedbackUnavailable>;
 }>("cloud/Analytics", {
-  defaultValue: () => ({
-    add: () => {},
-    submit: () => Effect.fail(new FeedbackUnavailable()),
-  }),
+  defaultValue: () => ({ add: () => {} }),
 });
 
 /** Called only after Better Auth creates a new verified user, never on returning sign-in. */
@@ -92,21 +83,6 @@ export const recordCloudLogin = (userId: string) =>
       }),
     ),
   );
-
-/** Submit only the declared feedback text, with identity derived from the authenticated request. */
-export const submitFeedback = (feedback: Feedback) =>
-  Effect.gen(function* () {
-    const actor = yield* CurrentUserId;
-    const organization = yield* CurrentOrganization;
-    if (actor === undefined) return yield* new FeedbackUnavailable();
-    const analytics = yield* Analytics;
-    yield* analytics.submit({
-      event: "feedback_submitted",
-      distinct_id: actor,
-      timestamp: new Date().toISOString(),
-      properties: { message: feedback.message, organization_id: organization.organization },
-    });
-  });
 
 const readSettings = (read: Effect.Effect<unknown>) =>
   Effect.gen(function* () {
@@ -189,11 +165,19 @@ export const withProductAnalytics = <A, E, R>(
     );
     return yield* handler.pipe(
       Effect.provideService(Analytics, {
-        submit: (event) => send([event]).pipe(Effect.mapError(() => new FeedbackUnavailable())),
         add,
       }),
       Effect.provideService(ProductAnalytics, {
         enabled: true,
+        submitFeedback: (feedback) =>
+          send([
+            {
+              event: "feedback_submitted",
+              distinct_id: feedback.userId,
+              timestamp: new Date().toISOString(),
+              properties: { message: feedback.message, organization_id: feedback.organizationId },
+            },
+          ]).pipe(Effect.mapError(() => new FeedbackUnavailable())),
         capture: (event) =>
           add({
             event: event.event,
@@ -240,131 +224,12 @@ export const recordBackgroundUsage = (
     });
   });
 
-/** Instrument completed tool work while keeping approval pauses out of completion counts. */
-const observeTool = <A extends ToolCallResult | ToolResumeResult, E, R>(
-  properties: UsageProperties,
-  work: Effect.Effect<A, E, R>,
-) =>
-  Effect.gen(function* () {
-    const started = yield* Clock.currentTimeMillis;
-    yield* recordUsage("tool_execution_started", properties);
-    return yield* work.pipe(
-      Effect.onExit((exit) =>
-        Effect.gen(function* () {
-          const timed = {
-            ...properties,
-            duration_ms: Math.max(0, (yield* Clock.currentTimeMillis) - started),
-          };
-          if (Exit.isFailure(exit)) {
-            yield* recordUsage("tool_execution_completed", {
-              ...timed,
-              ...usageFailure(exit.cause),
-            });
-            return;
-          }
-          const status = exit.value.status;
-          if (status !== "approval-required") {
-            yield* recordUsage("tool_execution_completed", {
-              ...timed,
-              status,
-              ok: status === "completed" && exit.value.toolError !== true,
-              ...(status === "completed" && exit.value.toolError === true
-                ? { error_type: "McpToolError" }
-                : {}),
-              outcome:
-                status === "completed"
-                  ? exit.value.toolError === true
-                    ? "failure"
-                    : "success"
-                  : status === "cancelled"
-                    ? "cancelled"
-                    : "failure",
-            });
-          } else {
-            yield* recordUsage("tool_approval_requested", { ...timed, status });
-          }
-        }),
-      ),
-    );
-  }).pipe(Effect.withSpan("product.tool.execution"));
-
-/** Product host boundaries cover API/MCP work and private app queries without inspecting payloads. */
-export const withExecutorAnalytics = (executor: Executor): Executor => ({
-  ...executor,
-  tools: {
-    ...executor.tools,
-    call: (input, options) =>
-      observeTool(
-        { app_id: input.app, tool_name: input.tool },
-        executor.tools.call(input, options),
-      ),
-    resume: (input, options) =>
-      observeTool({ resumed: true }, executor.tools.resume(input, options)),
-  },
-  appData: {
-    ...executor.appData,
-    query: (input) =>
-      observeUsage(
-        "app_query_completed",
-        { app_id: input.app, operation: input.name },
-        executor.appData.query(input),
-      ),
-    mutate: (input) =>
-      observeUsage(
-        "app_mutation_completed",
-        { app_id: input.app, operation: input.name },
-        executor.appData.mutate(input),
-      ),
-    subscribe: (input) =>
-      observeUsage(
-        "app_subscription_started",
-        { app_id: input.app, operation: input.name },
-        executor.appData.subscribe(input),
-      ),
-  },
-  accountConnections: {
-    ...executor.accountConnections,
-    submit: (input) =>
-      executor.accountConnections.submit(input).pipe(
-        Effect.tap((account) =>
-          recordUsage("account_connected", {
-            method: "credentials",
-            account_id: account.id,
-            provider_id: account.provider,
-          }),
-        ),
-      ),
-    completeOAuth: (input) =>
-      executor.accountConnections.completeOAuth(input).pipe(
-        Effect.tap((account) =>
-          recordUsage("account_connected", {
-            method: "oauth",
-            account_id: account.id,
-            provider_id: account.provider,
-          }),
-        ),
-      ),
-  },
-  apps: {
-    ...executor.apps,
-    deploy: (input) =>
-      executor.apps.deploy(input).pipe(
-        Effect.tap((result) =>
-          recordUsage("app_deployed", {
-            app_id: result.app.id,
-            deployment_id: result.deployment.id,
-          }),
-        ),
-      ),
-  },
-});
-
 /** Fixed upstreams and an explicit header allowlist prevent forwarding product credentials. */
 export const postHogUpstream = (
-  request: Request,
+  request: HttpServerRequest.HttpServerRequest,
   config: Pick<Settings, "host" | "path">,
-): Request | undefined => {
-  const url = new URL(request.url);
+): HttpClientRequest.HttpClientRequest | undefined => {
+  const url = new URL(request.url, "https://posthog.internal");
   if (!url.pathname.startsWith(`${config.path}/`)) return undefined;
   const path = url.pathname.slice(config.path.length);
   if (
@@ -378,16 +243,16 @@ export const postHogUpstream = (
     upstream.hostname = upstream.hostname.replace(".i.posthog.com", "-assets.i.posthog.com");
   upstream.pathname = path === "/push" ? "/e/" : path;
   upstream.search = path === "/push" ? "?ip=0" : url.search;
-  const headers = new Headers();
+  const headers: Record<string, string> = {};
   for (const name of ["content-type", "content-encoding", "accept", "user-agent"]) {
-    const value = request.headers.get(name);
-    if (value !== null) headers.set(name, value);
+    const value = request.headers[name];
+    if (value !== undefined) headers[name] = value;
   }
-  return new Request(upstream, {
-    method: request.method,
+  return HttpClientRequest.make(request.method)(upstream, {
     headers,
-    ...(request.body ? { body: request.body, duplex: "half" } : {}),
-    redirect: "manual",
+    ...(request.method === "POST"
+      ? { body: HttpBody.stream(request.stream, headers["content-type"]) }
+      : {}),
   });
 };
 
@@ -399,18 +264,20 @@ const postHogProxy = (settings: Effect.Effect<Settings | undefined>) =>
     const request = yield* HttpServerRequest.HttpServerRequest;
     if (request.method !== "GET" && request.method !== "POST" && request.method !== "OPTIONS")
       return HttpServerResponse.empty({ status: 405 });
-    const web = yield* HttpServerRequest.toWeb(request).pipe(Effect.orDie);
-    const upstream = postHogUpstream(web, config);
+    const upstream = postHogUpstream(request, config);
     if (!upstream) return HttpServerResponse.empty({ status: 404 });
-    const response = yield* Effect.tryPromise({
-      try: (signal) => fetch(upstream, { signal }),
-      catch: () => new Error("PostHog proxy failed"),
-    }).pipe(Effect.timeout("10 seconds"), Effect.option);
+    const response = yield* HttpClient.execute(upstream).pipe(
+      // PostHog is a third party: no client span or trace headers leave with the request.
+      Effect.provideService(HttpClient.TracerDisabledWhen, () => true),
+      Effect.provideService(HttpClient.TracerPropagationEnabled, false),
+      Effect.provideService(FetchHttpClient.RequestInit, { redirect: "manual" }),
+      Effect.provide(FetchHttpClient.layer),
+      Effect.timeout("10 seconds"),
+      Effect.option,
+    );
     if (Option.isNone(response)) return HttpServerResponse.empty({ status: 502 });
-    const headers = new Headers(response.value.headers);
-    headers.delete("set-cookie");
-    return HttpServerResponse.fromWeb(
-      new Response(response.value.body, { status: response.value.status, headers }),
+    return HttpServerResponse.fromClientResponse(response.value).pipe(
+      HttpServerResponse.replaceCookies(Cookies.empty),
     );
   });
 

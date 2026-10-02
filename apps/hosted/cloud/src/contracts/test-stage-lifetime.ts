@@ -2,8 +2,6 @@
 import { Schema } from "effect";
 import { TestStageSlug } from "../infrastructure/stage.ts";
 
-/** Hyperdrive's minimum pool size, isolated to each preview's database branch. */
-export const testStageConnectionLimit = 5;
 /** Disposable CI environments have a fixed deadline, including failed deployment attempts. */
 export const testStageLifetimeMilliseconds = 3 * 60 * 60 * 1000;
 /** Start cleanup early enough to leave time for scheduled-run delays and retries. */

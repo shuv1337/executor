@@ -10,6 +10,10 @@ before writing a test. Follow the project's [engineering guidance](../../../note
 Keep verification proportional to the requested change; respect explicit prototype
 or discussion-only limits.
 
+The only tests in this repository live in `e2e/`. Unit tests are banned; never
+add a test file or `test/` directory anywhere else. Write or extend an E2E
+scenario instead.
+
 ## Choose what the test must prove
 
 Trace the changed behavior to a real user journey or public API caller. Identify
@@ -77,3 +81,20 @@ make behavioral regressions fail automatically.
 Report the commands and scenario that ran, the outcome, the saved evidence path,
 and any behavior or target left unverified. Diagnose failures within the task's
 scope; do not skip cases, loosen assertions, or call a blocked run a pass.
+
+## Select the scenarios CI runs
+
+A pull request runs only the E2E spec files its description selects in a fenced
+`e2e` block; `main` runs everything. Follow [the CI section](../../../AGENTS.md#choosing-a-prs-e2e-scenarios)
+of AGENTS.md. List every spec file that exercises the changed code's callers, not
+only the one you edited. Use `all` for cross-cutting changes and `none` only when
+no scenario can observe the change.
+
+## Remove tests that do not earn their cost
+
+Tests are not sacred. Every scenario costs CI time and can fail for reasons
+unrelated to a change. When a scenario no longer proves behavior a user or
+public API caller depends on, or another scenario already proves it, delete it
+and its `test-plan.ts` entry. Record what it covered and why that coverage is
+not needed. A flaky scenario that still guards real behavior is fixed, not
+deleted: find the race in the product or in the scenario's waits.

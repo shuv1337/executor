@@ -22,6 +22,7 @@ import {
   Effect,
   FileSystem,
   Layer,
+  Option,
   Path,
   Queue,
   Schema,
@@ -40,7 +41,8 @@ import type { Executor } from "../contracts/executor.ts";
 import { runtimeAdapter } from "./runtime.ts";
 
 import { connectedWorkerdApps, workerdHostHandler } from "./workerd-client.ts";
-import { bundleWorkerdHost } from "./workerd-bundle.ts";
+import { workerdHostModules } from "./workerd-bundle.ts";
+import { appWorkerLimit } from "./app-worker-residency.ts";
 
 /** Existing stores need an explicit migration; opening a new empty store would hide retained app data. */
 export class WorkerdMigrationRequired extends Schema.TaggedError<WorkerdMigrationRequired>()(
@@ -84,6 +86,23 @@ const publicEgressBinding: BindingHook = Effect.succeed({
   name: PUBLIC_EGRESS_BINDING,
   service: { name: PUBLIC_EGRESS_SERVICE },
 });
+/**
+ * The product's own listener, reached as a workerd external service rather than through a
+ * network service. App requests for the dashboard origin use it, so they never depend on what
+ * that origin's name resolves to.
+ */
+const SELF_ORIGIN_SERVICE = "executor:self-origin";
+class SelfOriginService extends AlchemyPlugin.Service<SelfOriginService>()(
+  "cloudflare-runtime/plugin/executor-self-origin",
+) {}
+const selfOriginService = (address: string) =>
+  Layer.succeed(SelfOriginService, {
+    services: [{ name: SELF_ORIGIN_SERVICE, external: { address, http: {} } }],
+  });
+const selfOriginBinding: BindingHook = Effect.succeed({
+  name: "SELF",
+  service: { name: SELF_ORIGIN_SERVICE },
+});
 
 const engineFailure = () => new WorkflowFailure({ reason: "engine", retryable: true });
 const protocolFailure = () => new RuntimeProtocolFailed();
@@ -101,6 +120,14 @@ export const workerdApps = (options: {
    * 127.0.0.1. Self-host leaves it off unless an operator opts in for an internal service.
    */
   readonly allowPrivateAppFetch?: boolean;
+  /**
+   * The dashboard origin and the local address that serves it. App requests for that origin
+   * go straight to the address, so the bundled Executor app works when the origin's name
+   * resolves to a private address and private app fetch is off.
+   */
+  readonly selfOrigin?: { readonly origin: string; readonly address: string };
+  /** The npm registry app builds resolve packages from. Defaults to the public registry. */
+  readonly npmRegistry?: string;
 }): Effect.Effect<
   { readonly runtime: ReturnType<typeof runtimeAdapter>; readonly workflows: WorkflowRuntime },
   RuntimeBuildFailed | WorkerdMigrationRequired | WorkflowFailure,
@@ -117,8 +144,13 @@ export const workerdApps = (options: {
     const handler = yield* workerdHostHandler(options);
     const runtimeContext = yield* Layer.build(
       layerLocalRuntime({ directory: options.directory }).pipe(
-        // Registered as a runtime plugin so its service reaches the generated workerd config.
+        // Registered as runtime plugins so their services reach the generated workerd config.
         Layer.provide(publicEgress),
+        Layer.provide(
+          options.selfOrigin === undefined
+            ? Layer.empty
+            : selfOriginService(options.selfOrigin.address),
+        ),
         Layer.provide(Layer.mergeAll(NodeServices.layer, FetchHttpClient.layer)),
         Layer.provide(
           ConfigProvider.layer(
@@ -138,7 +170,7 @@ export const workerdApps = (options: {
         compatibilityDate: "2026-07-30",
         // The trusted host worker keeps the default network. Only app isolates are restricted.
         compatibilityFlags: ["nodejs_compat"],
-        modules: yield* bundleWorkerdHost,
+        modules: yield* workerdHostModules,
         durableObjectNamespaces: [
           { className: "AppDataSupervisor", sql: true, uniqueKey: "executor-app-data" },
         ],
@@ -153,7 +185,11 @@ export const workerdApps = (options: {
           }),
           JsonBinding.local("AUTH", secret),
           JsonBinding.local("APPS_PRIVATE_FETCH", privateAppFetch),
+          JsonBinding.local("APP_WORKERS", Option.getOrNull(yield* appWorkerLimit)),
           publicEgressBinding,
+          JsonBinding.local("SELF_ORIGIN", options.selfOrigin?.origin ?? ""),
+          JsonBinding.local("NPM_REGISTRY", options.npmRegistry ?? ""),
+          ...(options.selfOrigin === undefined ? [] : [selfOriginBinding]),
           Loopback.local({ binding: "HOST", name: "executor-workflow-host", handler }),
         ],
         // Raw authored console output is not a host log. Apps return bounded telemetry through their protocol.
@@ -166,7 +202,11 @@ export const workerdApps = (options: {
       url.protocol = "ws:";
       return url.href;
     };
-    const connect = (pathname: string) => new NodeWebSocket(websocketUrl(pathname), { headers });
+    // Loopback RPC does not need compression. With permessage-deflate negotiated between
+    // ws and workerd, frames written after a large compressed invocation are sometimes never
+    // delivered to the host Worker. The session then waits forever for its result.
+    const connect = (pathname: string) =>
+      new NodeWebSocket(websocketUrl(pathname), { headers, perMessageDeflate: false });
     const rpc = <A, E>(
       work: (api: RpcStub<WorkerdAppApi>, signal: AbortSignal) => Effect.Effect<A, E>,
     ) =>
@@ -224,22 +264,27 @@ export const workerdApps = (options: {
             };
             socket.on("message", changed);
             socket.on("close", failed);
+            // Keep the error listener for the socket's whole life. Closing a socket that is
+            // still connecting emits "error" after release; with no listener, the EventEmitter
+            // throws and terminates the host process. Failing the finished queue is a no-op.
             socket.on("error", failed);
             yield* Effect.addFinalizer(() =>
               Effect.sync(() => {
                 socket.off("message", changed);
                 socket.off("close", failed);
-                socket.off("error", failed);
               }),
             );
           }),
         { bufferSize: 1, strategy: "sliding" },
       );
+    // workerd closes an idle keep-alive connection after 5 seconds, and reconciliation polls
+    // every 5 seconds. A pooled socket can then close while a request is written to it, and
+    // the fetch fails with a transport error. Each workflow request uses its own connection.
     const backend = (operation: "start" | "status" | "terminate", run: WorkflowRunId) =>
       Effect.scoped(
         Effect.gen(function* () {
           const request = yield* HttpClientRequest.post(new URL("/workflow", origin), {
-            headers,
+            headers: { ...headers, connection: "close" },
           }).pipe(HttpClientRequest.bodyJson({ operation, run }));
           const response = yield* http.execute(request);
           if (response.status !== 200) return yield* engineFailure();

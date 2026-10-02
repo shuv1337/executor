@@ -9,6 +9,7 @@ import { Browser } from "../support/browser.ts";
 import { Evidence } from "../support/evidence.ts";
 import { HostedLive, withHostedCase } from "../support/case.ts";
 import { App } from "../support/contracts.ts";
+import { appsManifest } from "../support/apps-release.ts";
 
 const Key = Schema.Struct({
   key: Schema.RedactedFromValue(Schema.NonEmptyString),
@@ -24,13 +25,14 @@ const source = [
   {
     path: "index.ts",
     content: `
-import { defineApp, mutation, object } from "apps";
+import { defineApp, mutation, object, router } from "apps";
 import { always } from "apps/operations/approval";
-export default defineApp({ accounts: {} }, async () => ({  mutations: {
-  echo: mutation({ description: "Return a receipt", input: object({}) }, async () => ({ receipt: "pat-ok" })),
+export default defineApp({ accounts: {} }, async () => ({  tools: router({
+    echo: mutation({ description: "Return a receipt", input: object({}) }, async () => ({ receipt: "pat-ok" })),
   approved: mutation({ description: "Needs approval", input: object({}), approval: always() }, async () => ({ receipt: "should-not-run" })),
-} }));`,
+  }) }));`,
   },
+  appsManifest,
 ];
 
 layer(HostedLive, { excludeTestServices: true })("Personal access tokens", (it) => {
@@ -191,7 +193,7 @@ layer(HostedLive, { excludeTestServices: true })("Personal access tokens", (it) 
           "A PAT inherits the user's current role and retains tool approvals",
           Effect.gen(function* () {
             const path = `${prefix}/apps/${app.id}/tools/call`;
-            const input = { tool: "mutations.echo", input: {} };
+            const input = { tool: "echo", kind: "mutation", input: {} };
             const response = yield* api.request(anonymous, "POST", path, input, headers(owner.key));
             expect(response.status).toBe(200);
             expect(response.body).toEqual({ receipt: "pat-ok" });
@@ -220,7 +222,7 @@ layer(HostedLive, { excludeTestServices: true })("Personal access tokens", (it) 
               anonymous,
               "POST",
               path,
-              { tool: "mutations.approved", input: {} },
+              { tool: "approved", kind: "mutation", input: {} },
               headers(owner.key),
             );
             expect(approved.status).not.toBe(200);
@@ -232,7 +234,7 @@ layer(HostedLive, { excludeTestServices: true })("Personal access tokens", (it) 
               anonymous,
               "POST",
               `${prefix}/apps/${executor.id}/tools/call`,
-              { tool: "queries.context_get", profile: profile.id, input: {} },
+              { tool: "context.get", kind: "query", profile: profile.id, input: {} },
               headers(owner.key),
             );
             expect(context.status).toBe(200);
@@ -266,7 +268,7 @@ layer(HostedLive, { excludeTestServices: true })("Personal access tokens", (it) 
                     anonymous,
                     "POST",
                     `${prefix}/apps/${app.id}/tools/call`,
-                    { tool: "mutations.echo", input: {} },
+                    { tool: "echo", kind: "mutation", input: {} },
                     headers(admin.key),
                   )
                   .pipe(
@@ -336,8 +338,35 @@ layer(HostedLive, { excludeTestServices: true })("Personal access tokens", (it) 
         );
         yield* browser.omitNetworkTrace;
         yield* browser.login(actors.owner);
-        yield* browser.use("Open API key settings", (page) =>
-          page.goto(`/org/${actors.organization.slug}/api-keys`),
+        yield* browser.use("Open the organization dashboard", (page) =>
+          page.goto(`/org/${actors.organization.slug}/apps`),
+        );
+        expect(
+          yield* browser.use("The organization navigation has no API keys page", (page) =>
+            page
+              .getByRole("link", { name: "Apps", exact: true })
+              .first()
+              .waitFor()
+              .then(() => page.getByRole("link", { name: "API keys", exact: true }).count()),
+          ),
+        ).toBe(0);
+        yield* browser.use("Open the account menu", (page) =>
+          page.getByRole("button", { name: /^Account: / }).click(),
+        );
+        yield* browser.use("Open account settings", (page) =>
+          page.getByRole("menuitem", { name: "Account settings", exact: true }).click(),
+        );
+        yield* browser.use("Account settings open on the profile", (page) =>
+          page.waitForURL((url) => url.pathname === "/account/profile"),
+        );
+        yield* browser.use("Open the account Tokens page", (page) =>
+          page.getByRole("link", { name: "Tokens", exact: true }).click(),
+        );
+        yield* browser.use("Tokens live under the account", (page) =>
+          page.waitForURL((url) => url.pathname === "/account/tokens"),
+        );
+        yield* browser.use("The organization switcher gives way to a way back", (page) =>
+          page.getByRole("link", { name: /^Back to / }).waitFor(),
         );
         yield* browser.use("Start key creation", (page) =>
           page.getByRole("button", { name: "Create token", exact: true }).click(),
@@ -405,9 +434,18 @@ layer(HostedLive, { excludeTestServices: true })("Personal access tokens", (it) 
         yield* browser.use("Select the key to revoke", (page) =>
           page.getByRole("button", { name: "Revoke Browser automation", exact: true }).click(),
         );
-        yield* browser.use("Confirm revocation", (page) =>
-          page.getByRole("button", { name: "Revoke token", exact: true }).click(),
-        );
+        expect(
+          yield* browser.use("Confirm revocation and wait for acceptance", (page) =>
+            Promise.all([
+              page.waitForResponse(
+                (response) =>
+                  response.request().method() === "POST" &&
+                  new URL(response.url()).pathname === `${lifecycle}/delete`,
+              ),
+              page.getByRole("button", { name: "Revoke token", exact: true }).click(),
+            ]).then(([response]) => response.status()),
+          ),
+        ).toBe(200);
         yield* browser.use("Revocation is visible", (page) =>
           page
             .getByRole("row")

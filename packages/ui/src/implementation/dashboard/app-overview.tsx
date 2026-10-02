@@ -1,6 +1,6 @@
 import { OverviewCatalog } from "./overview-catalog.tsx";
 import type { AccountContext } from "./account-group.tsx";
-import type { App, ToolPage } from "@executor-js/sdk";
+import type { App, ToolSummary } from "@executor-js/sdk";
 import type { AppAuthoringMetadata } from "@executor-js/app-management/contracts";
 import type { ComponentType, ReactNode } from "react";
 import { HugeiconsIcon } from "@hugeicons/react";
@@ -35,8 +35,8 @@ export function AppOverview({
   readonly entries: ReactNode;
 }) {
   const { AppLink } = useDashboard();
-  const draft = app.activeDeployment === null;
-  if (draft)
+  const undeployed = app.activeDeployment === null;
+  if (undeployed)
     return (
       <div className="p-7 max-[740px]:p-4">
         <EmptyState
@@ -52,7 +52,7 @@ export function AppOverview({
           }
         >
           {source
-            ? "Your draft is saved. Open its source to deploy the first version."
+            ? "Your source is saved. Open it to deploy the first version."
             : "The app owner needs to deploy this app before it can be used."}
         </EmptyState>
         {source && (
@@ -72,12 +72,12 @@ export function AppOverview({
         )}
       >
         <section
-          className="flex h-60 min-w-0 flex-col overflow-hidden rounded-lg border bg-background p-5"
+          className="flex h-60 min-w-0 flex-col overflow-hidden rounded-lg border bg-background p-5 max-[740px]:p-4"
           aria-label="App accounts"
         >
           <div className="mb-1 flex min-h-9 shrink-0 items-center justify-between gap-3 border-b pb-3">
             <h3 className="text-sm font-medium">Accounts</h3>
-            {!draft && (
+            {!undeployed && (
               <AppLink
                 app={app.id}
                 view="accounts"
@@ -91,7 +91,7 @@ export function AppOverview({
           <div className="flex min-h-0 flex-1 flex-col overflow-auto">{accounts}</div>
         </section>
         <section
-          className="flex h-60 min-w-0 flex-col overflow-hidden rounded-lg border bg-background p-5"
+          className="flex h-60 min-w-0 flex-col overflow-hidden rounded-lg border bg-background p-5 max-[740px]:p-4"
           aria-label="App tools preview"
         >
           {tools}
@@ -99,7 +99,7 @@ export function AppOverview({
         {entries}
         {source && (
           <section
-            className="flex h-60 min-w-0 flex-col overflow-hidden rounded-lg border bg-background p-5"
+            className="flex h-60 min-w-0 flex-col overflow-hidden rounded-lg border bg-background p-5 max-[740px]:p-4"
             aria-label="App source"
           >
             <div className="mb-1 flex min-h-9 shrink-0 items-center justify-between gap-3 border-b pb-3">
@@ -136,14 +136,17 @@ export function AppOverviewTools<E>({
   sources,
   Failure,
   empty,
+  accountsNeeded = false,
 }: {
   readonly app: App;
   readonly sources: readonly {
     readonly key: string;
-    readonly query: Query<Pick<ToolPage, "items" | "next">, E>;
+    readonly query: Query<{ readonly items: readonly ToolSummary[] }, E>;
   }[];
   readonly Failure: ComponentType<FailureProps<E>>;
   readonly empty: ReactNode;
+  /** Every source lists tools per account and has none selected, so an empty list is expected. */
+  readonly accountsNeeded?: boolean;
 }) {
   const { AppLink } = useDashboard();
   return (
@@ -161,9 +164,15 @@ export function AppOverviewTools<E>({
           Failure={Failure}
           label="Loading tools preview"
           empty={
-            <EmptyState size="card" heading="h3" title="No tools">
-              This app does not expose any tools.
-            </EmptyState>
+            accountsNeeded ? (
+              <EmptyState size="card" heading="h3" title="No accounts connected">
+                This app lists tools for each connected account.
+              </EmptyState>
+            ) : (
+              <EmptyState size="card" heading="h3" title="No tools">
+                This app does not expose any tools.
+              </EmptyState>
+            )
           }
         >
           {(tools) => (

@@ -1,5 +1,6 @@
 /** Native invocation totals include background cleanup; they are not response latency. */
 import { Effect, Option, Schema } from "effect";
+import { providerFailureCode } from "./provider-failure.ts";
 import {
   TraceContext,
   externalTrace,
@@ -10,6 +11,7 @@ import {
   CloudInvocation,
   InvocationHttp,
   InvocationPhase,
+  InvocationRpc,
 } from "../contracts/invocation-telemetry.ts";
 
 const phase = Schema.decodeUnknownOption(
@@ -46,6 +48,14 @@ export const invocationSummary = (input: unknown) =>
         "cloudflare.outcome": event.outcome,
         "cloudflare.truncated": event.truncated,
       };
+      if (event.exceptions !== undefined && event.exceptions.length > 0) {
+        attributes["cloudflare.exception.count"] = event.exceptions.length;
+        attributes["cloudflare.exception.codes"] = [
+          ...new Set(
+            event.exceptions.map(({ message }) => providerFailureCode(new Error(message))),
+          ),
+        ].join(",");
+      }
       for (const log of event.logs)
         for (const message of log.message) {
           const request = requestContext(message);
@@ -59,6 +69,9 @@ export const invocationSummary = (input: unknown) =>
             attributes[phaseAttribute[timing.value.name]] = timing.value.durationMs;
             if (timing.value.name === "alchemy.runtime.initialize")
               attributes["executor.initialization_observed"] = true;
+            // The object was constructed in this invocation, after it was evicted or hibernated.
+            if (timing.value.name === "alchemy.do.initialize")
+              attributes["executor.do_initialization_observed"] = true;
           }
         }
       if (event.eventTimestamp !== null)
@@ -66,6 +79,12 @@ export const invocationSummary = (input: unknown) =>
       if (event.scriptName !== null) attributes["cloudflare.script_name"] = event.scriptName;
       if (event.scriptVersion !== undefined)
         attributes["cloudflare.script_version.id"] = event.scriptVersion.id;
+      if (typeof event.entrypoint === "string")
+        attributes["cloudflare.entrypoint"] = event.entrypoint;
+      if (typeof event.executionModel === "string")
+        attributes["cloudflare.execution_model"] = event.executionModel;
+      const rpc = Schema.decodeUnknownOption(InvocationRpc)(event.event);
+      if (Option.isSome(rpc)) attributes["cloudflare.rpc.method"] = rpc.value.rpcMethod;
       const http = Schema.decodeUnknownOption(InvocationHttp)(event.event);
       if (Option.isSome(http)) {
         attributes["http.request.method"] = http.value.request.method;

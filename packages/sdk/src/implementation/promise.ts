@@ -18,6 +18,7 @@ import {
   SubmitAccountConnection,
   StartConnectionOAuth,
   CompleteConnectionOAuth,
+  FindConnectionOAuth,
 } from "../contracts/account-connection.ts";
 import { ScheduleInputs } from "../contracts/schedules.ts";
 import { AppInputs } from "../contracts/apps.ts";
@@ -82,6 +83,10 @@ export const promiseExecutor = (executor: Executor): PromiseExecutor => {
       replaceCredentials: (input) =>
         run(AccountInputs.replaceCredentials, input, executor.accounts.replaceCredentials),
       remove: (input) => run(AccountInputs.get, input, executor.accounts.remove),
+      health: (input) => run(AccountInputs.get, input, executor.accounts.health),
+      listHealth: (input = {}) =>
+        run(AccountInputs.listHealth, input, executor.accounts.listHealth),
+      check: (input) => run(AccountInputs.check, input, executor.accounts.check),
     },
     accountConnections: {
       oauthSetup: (input) => run(CheckOAuthSetup, input, executor.accountConnections.oauthSetup),
@@ -91,6 +96,7 @@ export const promiseExecutor = (executor: Executor): PromiseExecutor => {
       submit: (input) => run(SubmitAccountConnection, input, executor.accountConnections.submit),
       startOAuth: (input) =>
         run(StartConnectionOAuth, input, executor.accountConnections.startOAuth),
+      findOAuth: (input) => run(FindConnectionOAuth, input, executor.accountConnections.findOAuth),
       completeOAuth: (input) =>
         run(CompleteConnectionOAuth, input, executor.accountConnections.completeOAuth),
     },
@@ -125,6 +131,8 @@ export const promiseExecutor = (executor: Executor): PromiseExecutor => {
       deploy: (input) => run(AppInputs.deploy, input, executor.apps.deploy),
       get: (input) => run(AppInputs.get, input, executor.apps.get),
       list: (input = {}) => run(AppInputs.list, input, executor.apps.list),
+      checkCredentials: (input) =>
+        run(AppInputs.checkCredentials, input, executor.apps.checkCredentials),
       remove: (input) => run(AppInputs.get, input, executor.apps.remove),
       activate: (input) => run(AppInputs.activate, input, executor.apps.activate),
       rename: (input) => run(AppInputs.rename, input, executor.apps.rename),
@@ -156,6 +164,8 @@ export const promiseExecutor = (executor: Executor): PromiseExecutor => {
     },
     tools: {
       list: (input) => run(Schema.toType(ToolInputs.list), input, executor.tools.list),
+      index: (input) => run(Schema.toType(ToolInputs.index), input, executor.tools.index),
+      get: (input) => run(Schema.toType(ToolInputs.get), input, executor.tools.get),
       call: (input, options) =>
         run(ToolInputs.call, input, (value) =>
           executor.tools.call(value, invocationOptions(options)),

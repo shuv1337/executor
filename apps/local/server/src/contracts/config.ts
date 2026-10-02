@@ -63,3 +63,14 @@ export const config = Config.all({
     ),
   }),
 }).pipe(Effect.flatMap(Schema.decodeUnknownEffect(Schema.toType(ServerConfig))));
+
+/**
+ * Key storage for a new data directory. Unset uses the OS credential store and falls back to
+ * `keys.json` only when there is no store; `os` never falls back; `file` always uses `keys.json`.
+ * Bootstrap applies it before `config`, and never uses it to switch an existing directory.
+ */
+export const KeyStorage = Schema.Literals(["os", "file"]);
+export type KeyStorage = typeof KeyStorage.Type;
+export const keyStorageConfig = Config.schema(KeyStorage, "EXECUTOR_KEY_STORAGE").pipe(
+  Config.option,
+);

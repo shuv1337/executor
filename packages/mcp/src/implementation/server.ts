@@ -56,6 +56,9 @@ const observeExecution =
                 Effect.annotateCurrentSpan({
                   "executor.outcome": execution.ok ? "completed" : "failed",
                   "executor.tool_call.count": execution.toolCalls.length,
+                  "executor.tool_call.succeeded": execution.toolCalls.filter(
+                    ({ outcome }) => outcome === "success",
+                  ).length,
                   ...(execution.ok ? {} : { "error.type": execution.error.kind }),
                 }),
               ),
@@ -251,9 +254,21 @@ export const makeMcp = (options: McpOptions) =>
           Context.omit(Tracer.ParentSpan)(context),
         ),
       );
-    const model = yield* handler("model"),
-      native = yield* handler("native"),
-      browser = yield* handler("browser");
+    // Each mode's protocol server is built on its first request. A client keeps one
+    // mode, so a host does not build all three. The build replaces the request's
+    // context with this construction's: the server outlives the request, so it must
+    // never capture a caller's backend, identity or scope.
+    const context = yield* Effect.context<Effect.Services<ReturnType<typeof handler>>>();
+    const onFirstUse = (mode: ElicitationMode) =>
+      Effect.cached(
+        handler(mode).pipe(
+          Effect.updateContext<never, Effect.Services<ReturnType<typeof handler>>>(() => context),
+          Effect.uninterruptible,
+        ),
+      ).pipe(Effect.map(Effect.flatten));
+    const model = yield* onFirstUse("model"),
+      native = yield* onFirstUse("native"),
+      browser = yield* onFirstUse("browser");
     const http = Effect.flatMap(HttpServerRequest.HttpServerRequest, (request) => {
       const url = new URL(request.url, "http://mcp.internal");
       return Schema.decodeUnknownEffect(query)(HttpServerRequest.searchParamsFromURL(url)).pipe(

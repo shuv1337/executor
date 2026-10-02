@@ -1,6 +1,5 @@
 /** One parser for packaged, GitHub and well-known skill files. */
 import { Effect, Schema } from "effect";
-import { parseDocument } from "yaml";
 import {
   AppSkillMetadata,
   AppSkillName,
@@ -30,6 +29,10 @@ export const skillFromFiles = (
     );
     if (match?.[1] === undefined) return yield* invalid("frontmatter");
     const frontmatter = match[1];
+    // YAML is only needed when skills are parsed, not while a host starts. yaml is CommonJS on
+    // Node, where a dynamic import's only guaranteed export is `default`; every build of it
+    // (Node, bundled Node, and the browser build Workers use) has the full API there.
+    const { parseDocument } = (yield* Effect.promise(() => import("yaml"))).default;
     const value: unknown = yield* Effect.try({
       try: () => {
         const yaml = parseDocument(frontmatter);
@@ -64,7 +67,9 @@ export const folderSkillsEffect = (
     for (const file of files) {
       if (!file.path.startsWith(prefix)) continue;
       const [name, ...relative] = file.path.slice(prefix.length).split("/");
-      if (name === undefined || relative.length === 0 || !Schema.is(AppSkillName)(name))
+      // Loose files such as README.md beside the skill directories are not skills.
+      if (relative.length === 0) continue;
+      if (name === undefined || !Schema.is(AppSkillName)(name))
         return yield* new SkillDefinitionInvalid({ file: file.path, reason: "directory" });
       const resource = { path: relative.join("/"), content: file.content };
       const existing = directories.get(name);

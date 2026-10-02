@@ -12,8 +12,13 @@ import AppPages from "./src/app-ui.ts";
 import { cloudAppUiBase } from "./src/contracts/app-ui.ts";
 import ApiLive, { Api } from "./src/main.ts";
 import AppCompilerLive from "./src/compiler.ts";
+import AppDataLive from "./src/app-data.ts";
+import ArtifactsCredentialsLive from "./src/artifacts-credentials.ts";
+import AppDomainControllerLive from "./src/app-domains.ts";
+import { AppDomainController } from "./src/infrastructure/app-domain-controller-worker.ts";
 import InvocationTelemetryLive from "./src/invocation-telemetry.ts";
 import { databaseInfrastructure } from "./src/infrastructure/database.ts";
+import { previewPoolSize } from "./src/infrastructure/preview-database.ts";
 import { developmentWeb } from "./src/infrastructure/development.ts";
 import { authEmailInfrastructure } from "./src/infrastructure/email.ts";
 import { uploadCloudSourceMaps } from "./src/infrastructure/sentry.ts";
@@ -50,6 +55,7 @@ export default Alchemy.Stack(
   Effect.gen(function* () {
     // Provisioning settings resolve outside Worker initialization and are not bound into it.
     yield* databaseInfrastructure;
+    if (!(yield* AlchemyContext).dev) yield* previewPoolSize;
     yield* authEmailInfrastructure.pipe(Effect.orDie);
     const api = yield* Api;
     const appBase = yield* cloudAppUiBase.pipe(Effect.orDie);
@@ -57,19 +63,33 @@ export default Alchemy.Stack(
       const pages = yield* AppPages;
       yield* uploadCloudSourceMaps("app-pages", pages.hash).pipe(Effect.orDie);
       if (!(yield* AlchemyContext).dev) {
+        const controller = yield* AppDomainController;
         const lifecycle = yield* AppDomainLifecycle("AppDomains", {
           origin: yield* cloudOrigin.pipe(Effect.orDie),
           workerName: api.workerName,
           deployment: api.hash,
+          controller: controller.hash,
         });
         yield* ResumeAppDomains({
           origin: lifecycle.origin,
           secret: (yield* appDomainControlSecret).text,
           deployment: api.hash,
+          controller: controller.hash,
         });
       }
     }
     yield* uploadCloudSourceMaps("api", api.hash).pipe(Effect.orDie);
     return { url: (yield* AlchemyContext).dev ? yield* developmentWeb(api.url) : api.url };
-  }).pipe(Effect.provide(Layer.mergeAll(ApiLive, AppCompilerLive, InvocationTelemetryLive))),
+  }).pipe(
+    Effect.provide(
+      Layer.mergeAll(
+        ApiLive,
+        AppCompilerLive,
+        AppDataLive,
+        ArtifactsCredentialsLive,
+        AppDomainControllerLive,
+        InvocationTelemetryLive,
+      ),
+    ),
+  ),
 );

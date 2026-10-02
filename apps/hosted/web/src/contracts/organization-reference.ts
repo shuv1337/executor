@@ -1,19 +1,37 @@
+import { dashboardHttpClient } from "@executor-js/ui/contracts/http";
 import {
+  OrganizationAccess,
+  OrganizationId,
   OrganizationReference,
-  type OrganizationAccess,
-  type OrganizationId,
 } from "@executor-js/hosted-server/organization";
-import { Effect, Layer, Option, Schema } from "effect";
-import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/unstable/http";
+import { Effect, Equal, Layer, Option, Schema } from "effect";
+import { HttpClient, HttpClientRequest } from "effect/unstable/http";
 import { Atom } from "effect/unstable/reactivity";
 
 /** Keep this tab attached to the first verified ID even if its slug is renamed or reused. */
-export const organizationTargetAtom = Atom.family((_reference: OrganizationReference) =>
-  Atom.make<OrganizationId | undefined>(undefined).pipe(Atom.keepAlive),
+export const organizationTargetAtom = Atom.family((reference: OrganizationReference) =>
+  Atom.make<OrganizationId | undefined>(undefined).pipe(
+    Atom.serializable({
+      key: `hosted:organization-target:${reference}`,
+      schema: Schema.UndefinedOr(OrganizationId),
+    }),
+    Atom.keepAlive,
+  ),
 );
-/** Display snapshot keyed by verified identity; API middleware remains the authority for every action. */
-export const organizationPresentationAtom = Atom.family((_id: OrganizationId) =>
-  Atom.make<OrganizationAccess | undefined>(undefined).pipe(Atom.keepAlive),
+/**
+ * Display snapshot keyed by verified identity; API middleware remains the authority for every action.
+ * Every access read writes a fresh object, so compare structurally: an unchanged role must not
+ * restart dependent queries that are already refreshing.
+ */
+export const organizationPresentationAtom = Atom.family((id: OrganizationId) =>
+  Atom.make<OrganizationAccess | undefined>(undefined).pipe(
+    Atom.withEquality(Equal.equals),
+    Atom.serializable({
+      key: `hosted:organization-presentation:${id}`,
+      schema: Schema.UndefinedOr(OrganizationAccess),
+    }),
+    Atom.keepAlive,
+  ),
 );
 /** Permission changes revalidate every reference observed by this tab. */
 export const organizationAccessVersionAtom = Atom.make(0).pipe(Atom.keepAlive);
@@ -46,4 +64,4 @@ export const organizationHttpClient = (get: Atom.AtomContext) =>
         }),
       ),
     ),
-  ).pipe(Layer.provide(FetchHttpClient.layer));
+  ).pipe(Layer.provide(dashboardHttpClient));

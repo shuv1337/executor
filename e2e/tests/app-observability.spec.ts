@@ -11,15 +11,18 @@ import { HostedLive, withHostedCase } from "../support/case.ts";
 import { App } from "../support/contracts.ts";
 import { Evidence, Telemetry } from "../support/evidence.ts";
 import { Target } from "../support/platform.ts";
+import { withApps } from "../support/apps-release.ts";
 
 const files = [
   {
     path: "package.json",
-    content: JSON.stringify({ dependencies: { react: "^19.2.0", "react-dom": "^19.2.0" } }),
+    content: JSON.stringify({
+      dependencies: withApps({ react: "^19.2.0", "react-dom": "^19.2.0" }),
+    }),
   },
   {
     path: "index.ts",
-    content: `import { defineApp, defineDatabase, table, query, mutation, object, string, array } from "apps";
+    content: `import { defineApp, defineDatabase, table, query, mutation, object, string, array, router } from "apps";
 const database = defineDatabase({ items: table({ text: string() }) });
 export const list = query({ input: object({}), output: array(string()) }, async ({ db }) => {
   await new Promise(resolve => setTimeout(resolve, 75));
@@ -34,7 +37,10 @@ export const hostCache = query({ input: object({ key: string() }), output: strin
     return (await cache.match(key)) === undefined ? "isolated" : "visible";
   } catch { return "unavailable"; }
 });
-export default defineApp({ accounts: {}, database }, { queries: { list, hostCache }, mutations: { add } });`,
+export default defineApp({ accounts: {}, database }, { tools: router({
+   list, hostCache,
+   add,
+ }) });`,
   },
   {
     path: "ui/index.html",
@@ -86,29 +92,57 @@ const navigationTiming = () => {
   };
 };
 
+/** Each journey owns a deployed app, signed-in browser and fresh organization. */
+const observedApp = Effect.gen(function* () {
+  const api = yield* Api,
+    actors = yield* Actors,
+    browser = yield* Browser;
+  const telemetry = yield* Telemetry,
+    evidence = yield* Evidence;
+  const target = yield* Target;
+  const prefix = `/api/organizations/${actors.organization.id}`;
+  const deployed = yield* api.request(actors.owner, "POST", `${prefix}/apps/deploy`, {
+    name: `Observable ${randomUUID().slice(0, 8)}`,
+    files,
+  });
+  expect(deployed.status).toBe(200);
+  const app = yield* body(App, deployed);
+  yield* Effect.addFinalizer(() =>
+    api.request(actors.owner, "DELETE", `${prefix}/apps/${app.id}`).pipe(Effect.orDie),
+  );
+  const url = yield* waitForAppUrl(actors.owner, `${prefix}/apps/${app.id}/ui`);
+  yield* browser.login(actors.owner);
+  return { api, actors, browser, telemetry, evidence, target, prefix, app, url };
+});
+
+const warmPage = Effect.gen(function* () {
+  const browser = yield* Browser;
+  yield* browser.use("Observe data readiness inside the page clock", (page) =>
+    page.addInitScript(() => {
+      const observer = new MutationObserver(() => {
+        if (document.querySelector('[role="status"]')?.textContent !== "Ready") return;
+        document.documentElement.setAttribute("data-e2e-ready-ms", String(performance.now()));
+        observer.disconnect();
+      });
+      observer.observe(document, { subtree: true, childList: true, characterData: true });
+    }),
+  );
+  return (url: string) =>
+    Effect.gen(function* () {
+      yield* browser.use("Open the app before measuring warm requests", (page) => page.goto(url));
+      yield* browser.use("The initial subscription displays data", (page) =>
+        page.getByRole("status").filter({ hasText: "Ready" }).waitFor(),
+      );
+    });
+});
+
 layer(HostedLive, { excludeTestServices: true })("App observability", (it) => {
   it.effect(scenarios.appObservability.title, (context) =>
     withHostedCase(
       context,
       Effect.gen(function* () {
-        const api = yield* Api,
-          actors = yield* Actors,
-          browser = yield* Browser;
-        const telemetry = yield* Telemetry,
-          evidence = yield* Evidence;
-        const target = yield* Target;
-        const prefix = `/api/organizations/${actors.organization.id}`;
-        const deployed = yield* api.request(actors.owner, "POST", `${prefix}/apps/deploy`, {
-          name: `Observable ${randomUUID().slice(0, 8)}`,
-          files,
-        });
-        expect(deployed.status).toBe(200);
-        const app = yield* body(App, deployed);
-        yield* Effect.addFinalizer(() =>
-          api.request(actors.owner, "DELETE", `${prefix}/apps/${app.id}`).pipe(Effect.orDie),
-        );
-        const url = yield* waitForAppUrl(actors.owner, `${prefix}/apps/${app.id}/ui`);
-        yield* browser.login(actors.owner);
+        const { api, actors, browser, telemetry, evidence, target, prefix, app, url } =
+          yield* observedApp;
         yield* browser.use("Observe data readiness inside the page clock", (page) =>
           page.addInitScript(() => {
             const observer = new MutationObserver(() => {
@@ -180,7 +214,7 @@ layer(HostedLive, { excludeTestServices: true })("App observability", (it) => {
         if (assetTraceId === undefined) return yield* Effect.die("The asset has no request trace");
         if (mapName === undefined)
           return yield* Effect.die("The deployed browser entry has no source map");
-        expect(entry.cacheControl).toBe("private, no-cache, must-revalidate");
+        expect(entry.cacheControl).toBe("private, max-age=31536000, immutable");
         const etag = entry.etag;
         if (etag === undefined) return yield* Effect.die("The immutable asset has no ETag");
         const revalidated = yield* browser.use(
@@ -375,17 +409,37 @@ layer(HostedLive, { excludeTestServices: true })("App observability", (it) => {
           Effect.timeout("60 seconds"),
         );
         yield* evidence.json("app-trace-closed.json", closed);
+      }),
+    ),
+  );
+  it.effect(scenarios.appWarmQueries.title, (context) =>
+    withHostedCase(
+      context,
+      Effect.gen(function* () {
+        const { browser, telemetry, evidence, target, url } = yield* observedApp;
+        yield* (yield* warmPage)(url);
+        yield* browser.use("Close the initial stream", (page) => page.goto("about:blank"));
         for (const sample of [1, 2]) {
-          const requestHeader = yield* browser.use(`Measure normal reload ${sample}`, (page) =>
-            Promise.all([
-              page
-                .waitForRequest((request) => request.url().endsWith("/_executor/api/subscribe"))
-                .then((request) => request.headers()["traceparent"]),
-              page.goto(url),
-            ]).then(([header]) => header),
+          const [requestHeader, timing] = yield* browser.use(
+            `Measure normal reload ${sample}`,
+            (page) =>
+              Promise.all([
+                page
+                  .waitForRequest((request) => request.url().endsWith("/_executor/api/subscribe"))
+                  .then((request) => request.headers()["traceparent"]),
+                page
+                  .waitForResponse((response) =>
+                    response.url().endsWith("/_executor/api/subscribe"),
+                  )
+                  .then((response) => response.headerValue("server-timing")),
+                page.goto(url),
+              ]),
           );
           const reloadTraceId = requestHeader?.match(/^00-([a-f0-9]{32})-/)?.[1];
           if (reloadTraceId === undefined) return yield* Effect.die("Reload trace context missing");
+          const serverSpan = timing?.match(/executor-span;desc="([a-f0-9]{16})"/)?.[1];
+          if (serverSpan === undefined)
+            return yield* Effect.die("The reload did not identify its open server span");
           yield* browser.use(`Normal reload ${sample} displays data`, (page) =>
             page.getByRole("status").filter({ hasText: "Ready" }).waitFor(),
           );
@@ -395,17 +449,32 @@ layer(HostedLive, { excludeTestServices: true })("App observability", (it) => {
               page.evaluate(navigationTiming),
             ),
           );
+          // Browser and server spans reach the collector separately, and the server's request
+          // span ends only with the stream. Close it and wait for the whole trace, so the counts
+          // below include every server span, including a late repeated query.
+          yield* browser.use(`Close normal reload ${sample}`, (page) => page.goto("about:blank"));
           const reloadTrace = yield* telemetry.query(reloadTraceId).pipe(
-            Effect.flatMap((result) =>
-              result.data.some(
-                (row) =>
-                  row.span.operationName === "ui.app.first_result" &&
-                  row.span.tags["executor.milestone.reached"] === "true",
-              )
+            Effect.flatMap((result) => {
+              const spans = result.data.map((row) => row.span);
+              const ids = new Set(spans.map((span) => span.spanId));
+              return spans.some(
+                (span) =>
+                  span.operationName === "ui.app.first_result" &&
+                  span.tags["executor.milestone.reached"] === "true",
+              ) &&
+                spans.some(
+                  (span) => span.spanId === serverSpan && span.operationName === "http.server POST",
+                ) &&
+                spans.every(
+                  (span) =>
+                    !span.operationName.startsWith("[missing parent") &&
+                    (span.parentSpanId === null || ids.has(span.parentSpanId)),
+                )
                 ? Effect.succeed(result)
-                : Effect.fail(new Error("Reload timing has not reached the collector")),
-            ),
+                : Effect.fail(new Error("The reload trace has not fully reached the collector"));
+            }),
             Effect.retry({ schedule: Schedule.spaced("1 second"), times: 30 }),
+            Effect.timeout("60 seconds"),
           );
           yield* evidence.json(`app-normal-reload-${sample}.json`, reloadTrace);
           if (target.metadata.target === "cloud") {
@@ -416,17 +485,35 @@ layer(HostedLive, { excludeTestServices: true })("App observability", (it) => {
               reloadTrace.data.filter((row) => row.span.operationName === "runtime.cloud.query"),
               "Notification registration does not repeat an unchanged initial query",
             ).toHaveLength(1);
-            expect(
-              loads,
-              "A warm query does not load or transfer its retained server build",
-            ).toHaveLength(0);
+            // The managed Worker serves every request from one isolate. Real Cloudflare requests
+            // may enter a new isolate, which may decode the cached build but must not refetch it.
+            if (target.metadata.mode === "attached")
+              for (const row of loads)
+                expect(
+                  row.span.tags["executor.build.cache"],
+                  "A warm query in a new isolate decodes its cached server build",
+                ).toBe("hit");
+            else
+              expect(
+                loads,
+                "A warm query does not load or transfer its retained server build",
+              ).toHaveLength(0);
             expect(
               reloadTrace.data.some((row) => row.span.operationName === "storage.blob.get"),
               "Warm queries must not reread the server bundle from R2",
             ).toBe(false);
           }
-          yield* browser.use(`Close normal reload ${sample}`, (page) => page.goto("about:blank"));
         }
+      }),
+    ),
+  );
+  it.effect(scenarios.appRetryTraces.title, (context) =>
+    withHostedCase(
+      context,
+      Effect.gen(function* () {
+        const { browser, telemetry, evidence, target, url } = yield* observedApp;
+        yield* (yield* warmPage)(url);
+        yield* browser.use("Close the initial stream", (page) => page.goto("about:blank"));
         yield* browser.use("Fail only the next subscription attempt", (page) =>
           page.route("**/_executor/api/subscribe", (route) => route.abort("failed"), { times: 1 }),
         );
@@ -522,6 +609,29 @@ layer(HostedLive, { excludeTestServices: true })("App observability", (it) => {
           page.getByRole("status").filter({ hasText: "Ready" }).waitFor(),
         );
         yield* browser.use("Close the recovered stream", (page) => page.goto("about:blank"));
+      }),
+    ),
+  );
+  it.effect(scenarios.appStreamRevocation.title, (context) =>
+    withHostedCase(
+      context,
+      Effect.gen(function* () {
+        const { api, actors, browser, prefix, app, url } = yield* observedApp;
+        yield* (yield* warmPage)(url);
+        const scriptUrl = yield* browser.use("Locate the retained browser entry", (page) =>
+          page.locator('script[type="module"][src]').evaluate((element) => {
+            if (!(element instanceof HTMLScriptElement)) throw new Error("Browser entry missing");
+            return element.src;
+          }),
+        );
+        const etag = yield* browser.use("Read the authenticated asset validator", (page) =>
+          page
+            .context()
+            .request.get(scriptUrl)
+            .then((response) => response.headers()["etag"]),
+        );
+        if (etag === undefined) return yield* Effect.die("The retained asset has no validator");
+        yield* browser.use("Close the owner stream", (page) => page.goto("about:blank"));
         const policy = yield* body(
           Schema.Struct({ revision: Schema.String }),
           yield* api.request(actors.owner, "GET", `${prefix}/apps/${app.id}/access`),

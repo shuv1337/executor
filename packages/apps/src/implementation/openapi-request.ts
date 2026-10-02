@@ -1,5 +1,4 @@
-import "../contracts/swagger-client.ts";
-import SwaggerClient from "swagger-client";
+import { loadSwaggerClient } from "./swagger-client.ts";
 import { httpProviderError, accountProviderError } from "./provider-error.ts";
 import { ProviderError } from "../contracts/provider-error.ts";
 /** Swagger constructs requests; Effect owns HTTP policy and bounded results. */
@@ -20,6 +19,7 @@ import {
 import {
   OpenapiError,
   defaultOpenapiResponseLimits,
+  isOpenapiFileSchema,
   isOpenapiTextMedia,
   openapiMediaKind,
   type CredentialBinding,
@@ -134,15 +134,48 @@ function reservedPathValue(value: unknown): string {
     throw new Error("This path value would change the request path");
   return encoded;
 }
+/** Match the whole operation after serialization, including nonempty parameter expansions.
+ * A prefix check alone permits an empty item ID to reach a collection endpoint.
+ * Reserved resource names may span segments; ordinary values must stay in one segment.
+ */
+function operationPath(op: OpenapiOperation): RegExp {
+  const template = op.baseUrl.replace(/\/$/, "") + op.path;
+  // Keep real template parameters distinct from literal percent-encoded braces.
+  let marker = "executorPathParameter";
+  while (template.includes(marker)) marker += "_";
+  const expansions: { token: string; pattern: string }[] = [];
+  const address = template.replace(/\{[^{}]+\}/g, (placeholder) => {
+    const parameter = op.request.parameters.find(
+      (p) => p.in === "path" && p.name === placeholder.slice(1, -1),
+    );
+    if (parameter === undefined) throw new Error("A path parameter is not declared");
+    const token = `${marker}_${expansions.length}_`;
+    expansions.push({
+      token,
+      pattern: parameter.allowReserved === true && parameter.content === undefined ? ".+" : "[^/]+",
+    });
+    return token;
+  });
+  let pattern = new URL(address).pathname.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  for (const expansion of expansions)
+    pattern = pattern.replaceAll(expansion.token, expansion.pattern);
+  return new RegExp("^" + pattern + "$");
+}
 const bytes = (value: unknown) =>
   Uint8Array.from(atob(scalar(value)), (char) => char.charCodeAt(0));
+/** What decides whether an account can call an operation: its transport and security. */
+export interface OpenapiOperationAccess {
+  readonly streaming?: true;
+  readonly request: { readonly security: OpenapiOperation["request"]["security"] };
+}
+
 /** Create request helpers from credential-free generated authentication metadata. */
 export function createRequest(config: {
   readonly methods: Readonly<Record<string, readonly CredentialBinding[]>>;
   readonly oauth: readonly string[];
 }) {
   const { methods, oauth } = config;
-  function selectedCredentials(op: OpenapiOperation, account: OpenapiAccount | undefined) {
+  function selectedCredentials(op: OpenapiOperationAccess, account: OpenapiAccount | undefined) {
     if (op.streaming === true) return undefined;
     const authorized: Record<string, unknown> = {};
     if (account !== undefined) {
@@ -190,6 +223,7 @@ export function createRequest(config: {
   ) =>
     Effect.scoped(
       Effect.gen(function* () {
+        const swagger = yield* Effect.promise(loadSwaggerClient);
         const prepared = yield* Effect.try({
           try: () => {
             const args = object(input);
@@ -224,19 +258,14 @@ export function createRequest(config: {
                 for (const [name, property] of Object.entries(
                   object(media.schema?.properties ?? {}),
                 )) {
-                  const shape = object(property);
-                  if (
-                    shape.type === "string" &&
-                    shape.format === "binary" &&
-                    fields[name] !== undefined
-                  )
+                  if (isOpenapiFileSchema(object(property)) && fields[name] !== undefined)
                     fields[name] = new File([bytes(fields[name])], name);
                 }
                 body = fields;
               }
             }
             const prepared = swaggerRequest(
-              SwaggerClient.buildRequest({
+              swagger.buildRequest({
                 spec: {
                   openapi: op.openapi,
                   servers: [{ url: op.baseUrl }],
@@ -263,21 +292,22 @@ export function createRequest(config: {
             // The account is authorized for the pinned API origin only. Redirects
             // stay manual so a provider cannot forward credentials to another host.
             // Parameter values also cannot add dot segments, which Swagger leaves unescaped,
-            // or leave the operation's fixed path prefix.
+            // or remove an item segment to reach a collection endpoint.
             const pathname = prepared.url.replace(/^[^:]+:\/\/[^/]*/, "").split(/[?#]/)[0] ?? "";
             if (pathname.split("/").some((segment) => /^(?:\.|%2e){1,2}$/i.test(segment)))
               throw new Error("This path value would change the request path");
             const url = new URL(prepared.url);
-            const brace = op.path.indexOf("{");
-            const prefix = new URL(op.baseUrl + (brace < 0 ? op.path : op.path.slice(0, brace)));
+            const origin = new URL(op.baseUrl).origin;
             if (
-              url.origin !== prefix.origin ||
-              !url.pathname.startsWith(prefix.pathname) ||
+              url.origin !== origin ||
+              !operationPath(op).test(url.pathname) ||
               url.username ||
               url.password
             )
-              throw new Error("The request escaped its API origin");
+              throw new Error("The request escaped its API operation");
             const headers = new Headers(prepared.headers);
+            // GitHub requires this header; Workers do not supply one by default.
+            if (!headers.has("user-agent")) headers.set("user-agent", "Executor");
             if (prepared.body instanceof FormData) headers.delete("content-type");
             return { ...prepared, url, headers };
           },
@@ -297,11 +327,13 @@ export function createRequest(config: {
         });
         const response = yield* HttpClient.withScope(client).execute(request);
         if (response.status < 200 || response.status >= 300) {
+          // Status and header evidence (401, 429, 5xx, rate-limit or scope headers) keeps its
+          // account recovery. A bare 403 proves nothing, so a declared error body explains it.
           const provider = httpProviderError(response.status, response.headers);
-          if (provider !== undefined) return yield* provider;
+          if (provider !== undefined && provider.reason !== "rejected") return yield* provider;
           const declared = yield* responseError(response, errors);
           return yield* (
-            declared ?? new OpenapiError({ reason: "request", status: response.status })
+            declared ?? provider ?? new OpenapiError({ reason: "request", status: response.status })
           );
         }
         if (response.status === 204 || prepared.method === "HEAD") return null;
@@ -345,7 +377,7 @@ export function createRequest(config: {
       ),
     );
   return {
-    available: (op: OpenapiOperation, account: OpenapiAccount | undefined) =>
+    available: (op: OpenapiOperationAccess, account: OpenapiAccount | undefined) =>
       selectedCredentials(op, account) !== undefined,
     call,
   };

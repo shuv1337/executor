@@ -1,9 +1,18 @@
 /** Author schema facade. Internals use the native decoder retained by each value. */
-import { Effect, Schema as EffectSchema, SchemaGetter, SchemaIssue, SchemaParser } from "effect";
+import {
+  Cause,
+  Effect,
+  Exit,
+  Schema as EffectSchema,
+  SchemaGetter,
+  SchemaIssue,
+  SchemaParser,
+} from "effect";
 import { dereference, validate } from "@cfworker/json-schema";
-import { ValidationError, type JsonObject, type JsonValue } from "../contracts/schema.ts";
+import { JsonObject, ValidationError, type JsonValue } from "../contracts/schema.ts";
 
 import type { Field } from "@executor-js/app-data/contracts";
+import type { FieldExposure } from "../contracts/provider.ts";
 const StorageField = Symbol("apps.StorageField");
 
 const Decoder = Symbol("apps.Schema");
@@ -157,6 +166,73 @@ export function object<const F extends Fields>(fields: F): ObjectSchema<F> {
   return { ...wrap(decoder, false), fields: Object.freeze({ ...fields }) };
 }
 
+const Exposure: unique symbol = Symbol("apps.FieldExposure");
+
+/** A schema marked with how app code sees the field in a provider that declares hosts. */
+export type Exposed<S, E extends FieldExposure = FieldExposure> = S & { readonly [Exposure]: E };
+
+/** The marking of one account field, if any. */
+export const exposureOf = (schema: Schema<unknown, boolean>): FieldExposure | undefined =>
+  Exposure in schema && (schema[Exposure] === "plain" || schema[Exposure] === "raw")
+    ? schema[Exposure]
+    : undefined;
+
+const expose = <S extends Schema<unknown, boolean>, E extends FieldExposure>(
+  schema: S,
+  exposure: E,
+): Exposed<S, E> =>
+  // SAFETY: the copy keeps every member of S, and `optional` and `default` keep the marking.
+  ({
+    ...schema,
+    [Exposure]: exposure,
+    optional: () => expose(schema.optional(), exposure),
+    default: (value: never) => expose(schema.default(value), exposure),
+  }) as unknown as Exposed<S, E>;
+
+/**
+ * A field that is not secret, such as a subdomain or region. App code reads its real value and
+ * the connect form shows it.
+ */
+export const plain = <S extends Schema<unknown, boolean>>(schema: S): Exposed<S, "plain"> =>
+  expose(schema, "plain");
+
+/**
+ * A secret field that app code reads as its real value, for request signing and similar uses.
+ * The connect form warns that the app can read it. Prefer an unmarked field, which app code
+ * receives as a handle that only reaches the provider's declared hosts.
+ */
+export const raw = <S extends Schema<unknown, boolean>>(schema: S): Exposed<S, "raw"> =>
+  expose(schema, "raw");
+
+/** Marked fields of an account object, by name. */
+export const fieldExposure = (fields: Fields): Readonly<Record<string, FieldExposure>> =>
+  Object.fromEntries(
+    Object.entries(fields).flatMap(([name, field]) => {
+      const exposure = exposureOf(field);
+      return exposure === undefined ? [] : [[name, exposure]];
+    }),
+  );
+
+declare const Secret: unique symbol;
+/**
+ * A secret account value. In a provider that declares hosts it is a handle, which the host's
+ * outbound network replaces with the real value only on requests to those hosts. Pass it to
+ * clients and headers as an ordinary string; do not decode or transform it.
+ */
+export type SecretString = string & { readonly [Secret]: true };
+
+type Sealed<T> = T extends string ? SecretString : T;
+/** Account fields as app code receives them: unmarked string fields are secret. */
+export type SecretFields<F extends Fields> = {
+  readonly [Key in keyof ObjectValue<F>]: Key extends keyof F
+    ? F[Key] extends Exposed<unknown>
+      ? ObjectValue<F>[Key]
+      : Sealed<ObjectValue<F>[Key]>
+    : ObjectValue<F>[Key];
+};
+/** An account object without declared fields, such as a default OAuth projection. */
+export type SecretObject<T> = { readonly [Key in keyof T]: Sealed<T[Key]> };
+
 const ImportedJsonSchema = Symbol("apps.JsonSchemaDocument");
 
 /** Read the original document for an imported decoder without a lossy schema round trip. */
@@ -300,6 +376,62 @@ function interpretedDocument(value: EffectSchema.Json): EffectSchema.Json {
   return Object.fromEntries(entries);
 }
 
+// Keywords that only wrap a nested failure; the nested error carries the useful location.
+const containerKeywords = new Set([
+  "$ref",
+  "$recursiveRef",
+  "$dynamicRef",
+  "properties",
+  "patternProperties",
+  "additionalProperties",
+  "unevaluatedProperties",
+  "propertyNames",
+  "items",
+  "prefixItems",
+  "additionalItems",
+  "unevaluatedItems",
+  "contains",
+  "allOf",
+  "if",
+  "then",
+  "else",
+  "dependentSchemas",
+]);
+
+/**
+ * Locate imported JSON Schema failures without the validator's text, which can quote input
+ * values. Type failures name only the schema's expected types.
+ */
+const jsonSchemaProblems = (
+  errors: readonly { keyword: string; instanceLocation: string; error: string }[],
+) => {
+  const problems = errors.flatMap(({ keyword, instanceLocation, error }) => {
+    if (containerKeywords.has(keyword)) return [];
+    const path = instanceLocation
+      .replace(/^#\/?/, "")
+      .split("/")
+      .filter((segment) => segment !== "")
+      .map((segment) => decodeURIComponent(segment).replace(/~1/g, "/").replace(/~0/g, "~"))
+      .map((segment) => (/^\d+$/.test(segment) ? Number(segment) : segment));
+    const required = keyword === "required" ? /required property "([^"]*)"/.exec(error) : null;
+    const expected = keyword === "type" ? /Expected "([^.]*)"\.?$/.exec(error) : null;
+    const issue =
+      required !== null
+        ? { path: [...path, required[1] ?? ""], issue: "Missing key" }
+        : {
+            path,
+            issue:
+              expected !== null
+                ? `Expected ${(expected[1] ?? "").replace(/"/g, "")}`
+                : keyword === "const" || keyword === "enum"
+                  ? "Expected one of the allowed values"
+                  : `Failed the "${keyword}" constraint`,
+          };
+    return [issue];
+  });
+  return problems.length === 0 ? false : problems;
+};
+
 /** Prepare an interpreted validator. No eval or generated JavaScript runs in any host. */
 export const compileJsonSchemaDecoder = (document: JsonObject) =>
   Effect.gen(function* () {
@@ -344,7 +476,8 @@ export const compileJsonSchemaDecoder = (document: JsonObject) =>
       EffectSchema.makeFilter(
         (value) => {
           try {
-            return validator.validate(value).valid;
+            const result = validator.validate(value);
+            return result.valid || jsonSchemaProblems(result.errors);
           } catch {
             return false;
           }
@@ -358,36 +491,82 @@ export const compileJsonSchemaDecoder = (document: JsonObject) =>
 /**
  * Build the document only when a value is first decoded or the schema is described, then
  * compile its validator once. Imported apps can share definitions between many schemas
- * without making each one self-contained up front.
+ * without making each one self-contained up front. Construction runs no Effect: an app
+ * evaluation constructs one of these for every imported schema.
  */
-export const lazyJsonSchemaDecoder = (document: () => JsonObject) =>
-  Effect.gen(function* () {
-    const read = once(document);
-    // Reuse only this tool's compiled decoder. Every app evaluation still obtains
-    // fresh account-specific metadata; no catalog or credentials are cached here.
-    const compiled = yield* Effect.cached(Effect.suspend(() => compileJsonSchemaDecoder(read())));
-    const decoder = EffectSchema.declareConstructor<EffectSchema.Json>()(
-      [],
-      () => (input, _ast, options) =>
-        compiled.pipe(
-          Effect.mapError(
-            () => new SchemaIssue.InvalidValue({ message: "Unsupported JSON Schema" }),
-          ),
-          Effect.flatMap((schema) => SchemaParser.decodeUnknownEffect(schema)(input, options)),
+const lazyDecoder = (document: () => JsonObject) => {
+  const read = once(document);
+  // Reuse only this tool's compiled decoder. Every app evaluation still obtains
+  // fresh account-specific metadata; no catalog or credentials are cached here.
+  let compiled: Exit.Exit<EffectSchema.Decoder<EffectSchema.Json>, ValidationError> | undefined;
+  const compile = Effect.suspend(
+    () =>
+      compiled ??
+      compileJsonSchemaDecoder(read()).pipe(
+        // An interrupted compilation is not a result; the next decode compiles again.
+        Effect.onExit((exit) =>
+          Effect.sync(() => {
+            if (Exit.isSuccess(exit) || !Cause.hasInterrupts(exit.cause)) compiled = exit;
+          }),
         ),
-    );
-    return withLazyJsonSchemaDocument(decoder, read);
-  });
+      ),
+  );
+  const decoder = EffectSchema.declareConstructor<EffectSchema.Json>()(
+    [],
+    () => (input, _ast, options) =>
+      compile.pipe(
+        Effect.mapError(() => new SchemaIssue.InvalidValue({ message: "Unsupported JSON Schema" })),
+        Effect.flatMap((schema) => SchemaParser.decodeUnknownEffect(schema)(input, options)),
+      ),
+  );
+  return withLazyJsonSchemaDocument(decoder, read);
+};
+export const lazyJsonSchemaDecoder = (document: () => JsonObject) =>
+  Effect.sync(() => lazyDecoder(document));
+
+const isJsonValue = EffectSchema.is(EffectSchema.Json);
+
+/**
+ * A JSON Schema document: an object whose own string-keyed fields are JSON, as
+ * `Schema.Record(Schema.String, Schema.Json)` accepts. Its values are checked by one
+ * `Schema.Json` walk, which is iterative and visits a shared subtree once, instead of a
+ * decode that builds a result per field. Only the top level is copied, as that decode did.
+ */
+const jsonDocument = (input: unknown): JsonObject | undefined => {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) return undefined;
+  const keys = Object.keys(input);
+  const values = keys.map((key) => Reflect.get(input, key));
+  if (!isJsonValue(values)) return undefined;
+  const document: Record<string, EffectSchema.Json> = {};
+  keys.forEach((key, index) =>
+    Object.defineProperty(document, key, {
+      value: values[index],
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    }),
+  );
+  return document;
+};
 
 /** Preserve the JSON document; compile its validator only when a value is first decoded. */
 export const jsonSchemaDecoder = (input: unknown) =>
-  parse(EffectSchema.Record(EffectSchema.String, EffectSchema.Json), input).pipe(
-    Effect.flatMap((document) => lazyJsonSchemaDecoder(() => document)),
-  );
+  Effect.suspend(() => {
+    const document = jsonDocument(input);
+    return document === undefined
+      ? Effect.fail(new ValidationError())
+      : lazyJsonSchemaDecoder(() => document);
+  });
 
 /** Import JSON metadata now; unsupported schemas and invalid values fail when parsed. */
-export const jsonSchema = (input: unknown): Schema<EffectSchema.Json> =>
-  wrap(Effect.runSync(jsonSchemaDecoder(input)), false);
+export const jsonSchema = (input: unknown): Schema<EffectSchema.Json> => {
+  const document = jsonDocument(input);
+  if (document === undefined) throw new ValidationError();
+  return wrap(
+    lazyDecoder(() => document),
+    false,
+  );
+};
 
 /** Database declaration retained by primitive constructors; nested payload schemas are not database fields. */
 export const storageFieldOf = (schema: Schema<unknown, boolean>): Field | undefined =>
@@ -398,3 +577,15 @@ export const id = (table: string): Schema<string> =>
 /** A host user identifier, stored as a string without imposing a product auth model. */
 export const userId = (): Schema<string> =>
   wrap(EffectSchema.NonEmptyString, false, { kind: "userId" });
+
+/** Render a decoder as a JSON Schema document, keeping an imported upstream document as-is. */
+export const jsonSchemaDocument = (decoder: EffectSchema.Decoder<unknown>) => {
+  const imported = importedJsonSchema(decoder);
+  if (imported !== undefined) return EffectSchema.decodeUnknownEffect(JsonObject)(imported);
+  const document = EffectSchema.toJsonSchemaDocument(decoder);
+  return EffectSchema.decodeUnknownEffect(JsonObject)({
+    ...document.schema,
+    $defs: document.definitions,
+    $schema: "https://json-schema.org/draft/2020-12/schema",
+  });
+};

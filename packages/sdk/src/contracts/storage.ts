@@ -26,6 +26,9 @@ import type { OAuthClientId, OAuthAttemptId } from "./oauth.ts";
 export const StoredAccount = Schema.Struct({
   ...Account.fields,
   encryptedCredentials: Schema.RedactedFromValue(Schema.Uint8Array),
+  credentialGeneration: Schema.Int,
+  /** Hosts the account was connected for, or null when it was connected without hosts. */
+  allowedHosts: Schema.NullOr(Schema.Array(Schema.String)),
 });
 /** Parsed account storage record; encrypted bytes remain redacted in memory. */
 export type StoredAccount = typeof StoredAccount.Type;

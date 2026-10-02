@@ -9,6 +9,7 @@ import { App } from "../support/contracts.ts";
 import { HostedLive, withHostedCase } from "../support/case.ts";
 import { holdQuery } from "../support/query-transition.ts";
 import { scenarios } from "../test-plan.ts";
+import { withApps } from "../support/apps-release.ts";
 
 const Publication = Schema.Struct({ name: Schema.String, commit: Schema.String });
 const Files = Schema.Array(Schema.Struct({ path: Schema.String, content: Schema.String }));
@@ -35,7 +36,11 @@ layer(HostedLive, { excludeTestServices: true })("Team registry", (it) => {
           },
           {
             path: "package.json",
-            content: JSON.stringify({ name, description: "Team registry example" }),
+            content: JSON.stringify({
+              name,
+              description: "Team registry example",
+              dependencies: withApps(),
+            }),
           },
         ];
         const created = yield* api.request(actors.owner, "POST", `${prefix}/apps/deploy`, {

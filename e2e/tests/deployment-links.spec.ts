@@ -55,8 +55,8 @@ layer(HostedLive, { excludeTestServices: true })("Deployment links", (it) => {
         ).toBe("Self-host with Docker");
 
         yield* browser.login(actors.owner);
-        yield* browser.use("Open API keys", (page) =>
-          page.goto(`/org/${actors.organization.slug}/api-keys`),
+        yield* browser.use("Open account tokens", (page) =>
+          page.goto(`/account/tokens?organization=${actors.organization.slug}`),
         );
         expect(
           yield* browser.use("Read desktop dashboard Docs destination", (page) =>

@@ -3,10 +3,12 @@ import { Effect, Redacted, Schema } from "effect";
 import { randomUUID } from "node:crypto";
 import { Api, body } from "../support/api.ts";
 import { Browser } from "../support/browser.ts";
+import { committedDocuments, recordAppOpening, screens } from "../support/app-open-timeline.ts";
 import { TestLive, withCase } from "../support/case.ts";
 import { Resource } from "../support/contracts.ts";
 import { Target } from "../support/platform.ts";
 import { scenarios } from "../test-plan.ts";
+import { appsManifest } from "../support/apps-release.ts";
 const appSchema = Schema.Struct({
   app: Schema.Struct({
     id: Schema.String,
@@ -15,10 +17,12 @@ const appSchema = Schema.Struct({
     }),
   }),
 });
-const source = `import {defineApp,defineProvider,secrets,query,object,string} from "apps";
-const service=defineProvider({name:"Launch fixture",auth:{key:secrets({label:"Key",fields:object({token:string()})})}});
+const source = `import {defineApp,defineProvider,secrets,query,object,string, router, ProviderError} from "apps";
+const service=defineProvider({name:"Launch fixture",auth:{key:secrets({label:"Key",fields:object({token:string()})})},
+  async health({account}){if(account.fields.token==="rejected-launch-token")throw new ProviderError({reason:"unauthorized",status:401});
+    if(account.fields.token==="down-launch-token")throw new ProviderError({reason:"unavailable",status:503});}});
 export const who=query({input:object({})},async ctx=>ctx.accounts.service.id);
-export default defineApp({accounts:{service}},{queries:{who}});`;
+export default defineApp({accounts:{service}},{tools: router({ who })});`;
 const files = (code: string) => [
   { path: "index.ts", content: code },
   {
@@ -31,6 +35,7 @@ const files = (code: string) => [
     content:
       'import {string} from "apps";import {createAppClient,queryReference} from "apps/client";import type {who} from "../index.ts";createAppClient().query(queryReference<typeof who>("who"),{},string()).then(value=>{document.querySelector("#identity").textContent=value;});',
   },
+  appsManifest,
 ];
 layer(TestLive, { excludeTestServices: true })("Local app launch", (it) => {
   it.effect(scenarios.localAppLaunch.title, (context) =>
@@ -44,11 +49,12 @@ layer(TestLive, { excludeTestServices: true })("Local app launch", (it) => {
         const headers = { authorization: `Bearer ${Redacted.value(target.apiKey)}` };
         const send = (method: "POST" | "GET" | "DELETE", path: string, data?: unknown) =>
           session.send(method, path, data, headers);
+        const appName = `Launch ${randomUUID().slice(0, 8)}`;
         const { app } = yield* body(
           appSchema,
           yield* send("POST", "/v1/apps/deploy", {
             owner: "local",
-            name: `Launch ${randomUUID().slice(0, 8)}`,
+            name: appName,
             files: files(source),
           }),
         );
@@ -56,7 +62,7 @@ layer(TestLive, { excludeTestServices: true })("Local app launch", (it) => {
         yield* Effect.addFinalizer(() =>
           Effect.forEach(owned, (path) => send("DELETE", path)).pipe(Effect.orDie),
         );
-        const create = (label: string) =>
+        const create = (label: string, token = "synthetic-launch-token") =>
           Effect.gen(function* () {
             const account = yield* body(
               Resource,
@@ -65,7 +71,7 @@ layer(TestLive, { excludeTestServices: true })("Local app launch", (it) => {
                 provider: app.requirements.accounts.service.provider,
                 method: "key",
                 label,
-                fields: { token: "synthetic-launch-token" },
+                fields: { token },
               }),
             );
             owned.push(`/v1/accounts/${account.id}`);
@@ -97,12 +103,62 @@ layer(TestLive, { excludeTestServices: true })("Local app launch", (it) => {
         );
         if (ui === null) return yield* Effect.die(new Error("Missing app URL"));
         expect(new URL(ui).searchParams.get("profile")).toBe(personal.profile);
-        yield* browser.use("One account opens without a chooser", (page) =>
-          page.goto(new URL("/inbox?folder=unread#message", ui).href),
+        const { timeline } = yield* recordAppOpening(
+          Effect.gen(function* () {
+            yield* browser.use("One account opens without a chooser", (page) =>
+              page.goto(new URL("/inbox?folder=unread#message", ui).href),
+            );
+            yield* browser.use("Personal app data loads", (page) =>
+              page.locator("#identity").filter({ hasText: personal.account }).waitFor(),
+            );
+          }),
         );
-        yield* browser.use("Personal app data loads", (page) =>
-          page.locator("#identity").filter({ hasText: personal.account }).waitFor(),
-        );
+        // Sign-in is redirects only; no host-owned page renders before the app.
+        expect(screens(timeline)).not.toContain("Opening app…");
+        expect(
+          committedDocuments(timeline)
+            .map((url) => url.pathname)
+            .filter((path) => path.startsWith("/_executor/auth/")),
+        ).toEqual([]);
+        const appOrigin = new URL(ui).origin;
+        // Chromium maps *.localhost to loopback itself; Node relies on the OS resolver,
+        // which does not on every platform. Local listens on 127.0.0.1.
+        const appLoopback = new URL(ui);
+        appLoopback.hostname = "127.0.0.1";
+        expect(
+          yield* browser.use("Reserved host roots are not app pages", (page) =>
+            Promise.all(
+              (
+                [
+                  ["GET", "/_executor"],
+                  ["GET", "/dashboard"],
+                  ["GET", "/auth"],
+                  ["GET", "/v1"],
+                  ["GET", "/mcp"],
+                  ["POST", "/v1"],
+                  ["POST", "/mcp"],
+                ] as const
+              ).map(([method, path]) =>
+                page
+                  .context()
+                  .request.fetch(`${appLoopback.origin}${path}`, {
+                    method,
+                    headers: { host: new URL(ui).host, origin: appOrigin },
+                    maxRedirects: 0,
+                  })
+                  .then((response) => [method, path, response.status()] as const),
+              ),
+            ),
+          ),
+        ).toEqual([
+          ["GET", "/_executor", 404],
+          ["GET", "/dashboard", 404],
+          ["GET", "/auth", 404],
+          ["GET", "/v1", 404],
+          ["GET", "/mcp", 404],
+          ["POST", "/v1", 404],
+          ["POST", "/mcp", 404],
+        ]);
         expect(
           new URL(
             yield* browser.use("Explicit local app context", (page) => Promise.resolve(page.url())),
@@ -127,6 +183,85 @@ layer(TestLive, { excludeTestServices: true })("Local app launch", (it) => {
         expect(launched.searchParams.get("folder")).toBe("unread");
         expect(launched.hash).toBe("#message");
         yield* browser.checkpoint("Local authored app has explicit account context");
+        const removed = yield* create("Removed");
+        yield* send("DELETE", `/v1/accounts/${removed.account}`);
+        owned.splice(owned.indexOf(`/v1/accounts/${removed.account}`), 1);
+        const rejected = yield* create("Rejected", "rejected-launch-token");
+        yield* send("POST", `/v1/accounts/${rejected.account}/health`, { apps: [app.id] });
+        yield* browser.use("Blocked profiles appear in the chooser", (page) =>
+          page.goto(new URL("/inbox", ui).href),
+        );
+        const choice = (name: string) =>
+          browser.use(`Read ${name} choice`, (page) =>
+            page
+              .getByRole("group", { name, exact: true })
+              .waitFor()
+              .then(() => page.getByRole("group", { name, exact: true }).innerText()),
+          );
+        expect(yield* choice("Removed")).toContain(
+          "Launch fixture account was removed or is no longer shared",
+        );
+        expect(yield* choice("Rejected")).toContain("Rejected: sign-in rejected at last check");
+        expect(
+          yield* browser.use("Blocked profiles cannot open, ready ones can", (page) =>
+            page
+              .getByRole("link")
+              .filter({ hasText: /^(Personal|Work|Removed|Rejected)/ })
+              .allInnerTexts(),
+          ),
+        ).toEqual(["Personal", "Work"]);
+        const review = yield* browser.use("Read the rejected profile's account link", (page) =>
+          page
+            .getByRole("group", { name: "Rejected", exact: true })
+            .getByRole("link", { name: "Review accounts", exact: true })
+            .getAttribute("href"),
+        );
+        expect(review).toContain(`profile=${rejected.profile}`);
+        yield* browser.checkpoint("Blocked profiles explain why they cannot open");
+        const blocked = (profile: string) =>
+          Effect.gen(function* () {
+            yield* browser.use("Open a blocked profile's app page", (page) =>
+              page.goto(new URL(`/inbox?profile=${profile}`, ui).href),
+            );
+            yield* browser.use("A full page replaces the app", (page) =>
+              page.getByRole("heading", { name: `${appName} can't open`, exact: true }).waitFor(),
+            );
+            return yield* browser.use("Read the blocked page", (page) =>
+              Promise.all([
+                page.locator("main").innerText(),
+                page.getByRole("link", { name: "Fix accounts", exact: true }).getAttribute("href"),
+                page.locator("#identity").count(),
+              ]),
+            );
+          });
+        const [removedPage, removedFix, removedApp] = yield* blocked(removed.profile);
+        expect(removedPage).toContain("Launch fixture account was removed or is no longer shared");
+        expect(removedFix).toContain(`profile=${removed.profile}`);
+        expect(removedApp).toBe(0);
+        const [rejectedPage] = yield* blocked(rejected.profile);
+        expect(rejectedPage).toContain("Rejected (Launch fixture): sign-in rejected at last check");
+        const advisory = yield* create("Advisory", "down-launch-token");
+        yield* send("POST", `/v1/accounts/${advisory.account}/health`, { apps: [app.id] });
+        yield* browser.use("Open the advisory profile's app page", (page) =>
+          page.goto(new URL(`/inbox?profile=${advisory.profile}`, ui).href),
+        );
+        yield* browser.use("Advisory app data still loads", (page) =>
+          page.locator("#identity").filter({ hasText: advisory.account }).waitFor(),
+        );
+        expect(
+          yield* browser.use("Read the advisory card", (page) =>
+            page.getByRole("status", { name: "Account warning" }).innerText(),
+          ),
+        ).toContain("Advisory (Launch fixture): service unavailable at last check");
+        yield* browser.use("Dismiss the advisory card", (page) =>
+          page.getByRole("button", { name: "Dismiss", exact: true }).click(),
+        );
+        expect(
+          yield* browser.use("Advisory card is gone", (page) =>
+            page.getByRole("status", { name: "Account warning" }).count(),
+          ),
+        ).toBe(0);
+        yield* browser.checkpoint("App pages explain account problems when they open");
         const plain = yield* body(
           Schema.Struct({ app: Resource }),
           yield* send("POST", "/v1/apps/deploy", {

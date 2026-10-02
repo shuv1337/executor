@@ -46,6 +46,15 @@ export const filesystemBlobStore = (options: { readonly directory: string }): Bl
         Effect.mapError(() => new BlobStoreError({ operation: "get" })),
         Effect.provide(NodeServices.layer),
       ),
+    exists: (key) =>
+      Effect.gen(function* () {
+        const found = yield* location(key, false);
+        if (found === undefined) return false;
+        return yield* found.fs.exists(found.target);
+      }).pipe(
+        Effect.mapError(() => new BlobStoreError({ operation: "exists" })),
+        Effect.provide(NodeServices.layer),
+      ),
     put: (key, body) =>
       Effect.scoped(
         Effect.gen(function* () {

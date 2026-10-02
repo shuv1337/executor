@@ -9,6 +9,27 @@ export const UiContext = Schema.Struct({
   profile: Schema.optional(Schema.NonEmptyString),
   expectedProfileRevision: Schema.optional(Schema.Int),
 });
+/** A problem with one of the page profile's accounts, from stored state. Labels are the owner's own names. */
+export type UiAccountProblem =
+  | { readonly provider: string; readonly reason: "missing" | "removed" | "incompatible" }
+  | {
+      readonly provider: string;
+      readonly account: string;
+      readonly reason:
+        | "credentials_rejected"
+        | "forbidden"
+        | "upstream_unavailable"
+        | "check_failed";
+    };
+/** Account problems found when the page opened, with dashboard links that resolve them. */
+export interface UiAccountNotice {
+  readonly app: string;
+  readonly problems: readonly UiAccountProblem[];
+  /** The profile's accounts in the dashboard. */
+  readonly fix: string;
+  /** The dashboard chooser, returning to this page. */
+  readonly choose: string;
+}
 /** Retained browser bytes. Hosts authorize access before reading or rendering them. */
 export interface AppUiAsset {
   readonly body: Uint8Array;
