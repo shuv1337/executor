@@ -1,5 +1,5 @@
 import { BrowserSession } from "@executor-js/hosted-server/browser/contracts";
-import { HostedAppSessions, hostedAppSessions } from "@executor-js/hosted-server/app-ui";
+import { HostedAppSessions } from "@executor-js/hosted-server/app-ui";
 import { authObservability } from "../implementation/auth-observability.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { APIError } from "better-auth/api";
@@ -36,7 +36,7 @@ import { Context, Effect, Layer, Option, Redacted, Schema, type Scope } from "ef
 import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http";
 import type { SendAuthEmail } from "../contracts/email.ts";
 import { cloudSecrets } from "./secrets.ts";
-import { AuthDatabase, boundAuthAdapter } from "./auth-database.ts";
+import { AuthDatabase, appSessionsPerCall, boundAuthAdapter } from "./auth-database.ts";
 
 /** Bind during initialization; database calls capture the current invocation only. */
 export const cloudAuth = (send: SendAuthEmail) =>
@@ -268,20 +268,15 @@ export const cloudAuth = (send: SendAuthEmail) =>
         });
       }),
     );
-    const appSessions = Layer.effect(
+    const appSessions = Layer.succeed(
       HostedAppSessions,
-      Effect.all([authContext, database.bind]).pipe(
-        Effect.map(([context, bind]) =>
-          hostedAppSessions(
-            {
-              internalAdapter: boundAuthAdapter(context.internalAdapter, bind),
-              adapter: boundAuthAdapter(context.adapter, bind),
-            },
-            globalThis.crypto,
-          ),
+      appSessionsPerCall(
+        Effect.all([authContext, database.bind]).pipe(
+          Effect.map(([context, bind]) => ({
+            internalAdapter: boundAuthAdapter(context.internalAdapter, bind),
+            adapter: boundAuthAdapter(context.adapter, bind),
+          })),
         ),
-        Effect.provide(RuntimeContext.phantom),
-        Effect.withSpan("auth.app_sessions.initialize"),
       ),
     );
     const requestHandler = Effect.gen(function* () {

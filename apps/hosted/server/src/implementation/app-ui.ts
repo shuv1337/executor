@@ -535,7 +535,7 @@ export const hostedAppUi = <R = never>(
             ),
         ),
         (item) =>
-          checkAccounts(executor, current.access.owner, item.accounts).pipe(
+          checkAccounts(current.access.owner, item.accounts).pipe(
             Effect.as(true),
             Effect.catchTags({
               OrganizationForbidden: () => Effect.succeed(false),

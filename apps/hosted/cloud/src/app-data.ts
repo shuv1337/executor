@@ -84,42 +84,41 @@ export default AppData.make(
     const credentials = yield* appCredentialOutbound;
     const databases = yield* appDataSupervisors;
     const environment = yield* Cloudflare.WorkerEnvironment;
-    // The shared runner, built on first use. Credentials and the Worker environment are read per
-    // invocation, never retained here.
-    const runner = yield* Effect.cached(
-      Effect.gen(function* () {
-        const { waitUntil } = yield* Effect.promise(() => import("cloudflare:workers"));
-        return serveAppRunner(
-          makeAppRunner({
-            loader: yield* Schema.decodeUnknownEffect(NativeLoader)(environment.AppDataLoader).pipe(
-              Effect.orDie,
-            ),
-            outbound: yield* credentials.outbound,
-            credentialKey: credentials.key,
-            data: (app) => {
-              const target = databases.getByName(app);
-              return {
-                invoke: (input, load, elicit, controls) =>
-                  target
-                    .invoke(input, load, elicit, controls)
-                    .pipe(Effect.provide(RuntimeContext.phantom)),
-                cancel: (id) => target.cancel(id).pipe(Effect.provide(RuntimeContext.phantom)),
-                cache: (namespace, command) =>
-                  Schema.decodeUnknownEffect(CacheCommand)(command).pipe(
-                    Effect.tap((parsed) =>
-                      Effect.annotateCurrentSpan("cache.operation", parsed.operation),
-                    ),
-                    Effect.flatMap((parsed) => target.cache(namespace, parsed)),
-                    Effect.provide(RuntimeContext.phantom),
-                    Effect.withSpan("runtime.cloud.cache"),
+    // Built for each call, never shared across requests: a fiber woken by another request's
+    // shared Effect continues in that request's I/O context, so concurrent calls waiting on one
+    // shared build would count their Dynamic Workers against the first caller's limit.
+    const runner = Effect.gen(function* () {
+      const { waitUntil } = yield* Effect.promise(() => import("cloudflare:workers"));
+      return serveAppRunner(
+        makeAppRunner({
+          loader: yield* Schema.decodeUnknownEffect(NativeLoader)(environment.AppDataLoader).pipe(
+            Effect.orDie,
+          ),
+          outbound: yield* credentials.outbound,
+          credentialKey: credentials.key,
+          data: (app) => {
+            const target = databases.getByName(app);
+            return {
+              invoke: (input, load, elicit, controls) =>
+                target
+                  .invoke(input, load, elicit, controls)
+                  .pipe(Effect.provide(RuntimeContext.phantom)),
+              cancel: (id) => target.cancel(id).pipe(Effect.provide(RuntimeContext.phantom)),
+              cache: (namespace, command) =>
+                Schema.decodeUnknownEffect(CacheCommand)(command).pipe(
+                  Effect.tap((parsed) =>
+                    Effect.annotateCurrentSpan("cache.operation", parsed.operation),
                   ),
-              };
-            },
-            waitUntil,
-          }),
-        );
-      }),
-    );
+                  Effect.flatMap((parsed) => target.cache(namespace, parsed)),
+                  Effect.provide(RuntimeContext.phantom),
+                  Effect.withSpan("runtime.cloud.cache"),
+                ),
+            };
+          },
+          waitUntil,
+        }),
+      );
+    });
     return {
       // Only app isolates' outbound requests reach this Worker's fetch; nothing routes to it.
       fetch: credentials.serve(Effect.succeed(HttpServerResponse.empty({ status: 404 }))),

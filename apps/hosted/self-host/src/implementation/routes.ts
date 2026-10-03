@@ -1,3 +1,4 @@
+import { localSourceFormatter } from "@executor-js/app-management/source-format";
 import { publishedSkillRoutes } from "@executor-js/app-templates/executor";
 import {
   drainProvisioning,
@@ -99,6 +100,7 @@ export const selfHostRouteMap = <DashboardE, DashboardR>(options: {
     const document = lazyHostedApiDocument(() => executorSelfHostApiDocument(auth.origin));
     const api = selfHostApi(document).pipe(
       Layer.provide(frameworkDocumentation(Effect.succeed(skills))),
+      HttpRouter.provideRequest(localSourceFormatter),
       Layer.provide(appUi.dashboard),
       HttpRouter.provideRequest(auth.appSessions),
       HttpRouter.provideRequest(catalogLive(document.document, egress)),

@@ -1,5 +1,6 @@
 /** Evaluated app declarations and tool listings are metadata, served stale-while-revalidate. */
-import type { Deferred, Effect } from "effect";
+import type { Effect } from "effect";
+import type { Handoff } from "../implementation/handoff.ts";
 
 /**
  * Ages count from when the read that produced a result began, which is no earlier than the
@@ -108,10 +109,14 @@ export interface PendingLoad {
    * bound; later readers with a bound are told at once rather than wait for it again.
    */
   overdue: boolean;
-  /** Completes when the last reader stops waiting, for an evaluation that may then be stopped. */
-  readonly unwatched: Deferred.Deferred<void>;
-  /** Completes with what the evaluation left for its readers, however it ended. */
-  readonly done: Deferred.Deferred<unknown>;
+  /**
+   * Settles when the last reader stops waiting, for an evaluation that may then be stopped.
+   * Readers and the evaluation may belong to different requests, so these are handoffs, which
+   * resume each waiter in its own request, never Effect Deferreds.
+   */
+  readonly unwatched: Handoff<void>;
+  /** Settles with what the evaluation left for its readers, however it ended. */
+  readonly done: Handoff<unknown>;
 }
 
 /**
