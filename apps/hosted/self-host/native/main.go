@@ -628,11 +628,29 @@ const workerdIdleTimeout = 5 * time.Second
 // sends a request on a connection workerd is closing. Go replays only requests
 // that are safe to repeat, so losing that race failed POSTs such as workflow runs.
 
+// forwardedProto is the scheme the browser used: the first value a reverse proxy in front
+// reported, or else the scheme of the connection this host accepted.
+func forwardedProto(in *http.Request) string {
+	if value := in.Header.Get("X-Forwarded-Proto"); value != "" {
+		if proto := strings.TrimSpace(strings.Split(value, ",")[0]); proto == "https" || proto == "http" {
+			return proto
+		}
+	}
+	if in.TLS != nil {
+		return "https"
+	}
+	return "http"
+}
+
 func productProxy(socket string, upstreamIdleTimeout time.Duration) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
 		Rewrite: func(request *httputil.ProxyRequest) {
 			request.SetURL(&url.URL{Scheme: "http", Host: "product.internal"})
 			request.Out.Host = request.In.Host
+			// Rewrite strips the inbound X-Forwarded-* headers. The product compares the browser's
+			// Origin with the scheme it believes it serves on, so forward the scheme the HTTPS
+			// reverse proxy in front reported, or the one this listener received.
+			request.Out.Header.Set("X-Forwarded-Proto", forwardedProto(request.In))
 			address, _, err := net.SplitHostPort(request.In.RemoteAddr)
 			if err != nil {
 				address = request.In.RemoteAddr

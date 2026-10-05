@@ -24,6 +24,8 @@ type fakeWorkerd struct {
 	dropFirst bool
 	received  atomic.Int32
 	handled   atomic.Int32
+	// proto records the X-Forwarded-Proto header of the last request read.
+	proto atomic.Value
 }
 
 func (f *fakeWorkerd) serve(t *testing.T, socket string) {
@@ -62,6 +64,7 @@ func (f *fakeWorkerd) connection(conn net.Conn) {
 			return
 		}
 		f.received.Add(1)
+		f.proto.Store(request.Header.Get("X-Forwarded-Proto"))
 		if f.dropFirst && first {
 			return
 		}
@@ -137,5 +140,49 @@ func TestProxyReportsStartingUntilWorkerdListens(t *testing.T) {
 
 	if status, body := post(t, front.URL); status != http.StatusServiceUnavailable || body != "Executor is starting" {
 		t.Fatalf("POST before workerd listens: %d %q", status, body)
+	}
+}
+
+func TestProxyForwardsTheSchemeTheBrowserUsed(t *testing.T) {
+	socket := socketPath(t)
+	upstream := &fakeWorkerd{idleTimeout: time.Minute}
+	upstream.serve(t, socket)
+	front := httptest.NewServer(productProxy(socket, upstream.idleTimeout))
+	defer front.Close()
+
+	send := func(proto string) string {
+		t.Helper()
+		request, err := http.NewRequest(http.MethodGet, front.URL+"/api/dashboard/batch", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if proto != "" {
+			request.Header.Set("X-Forwarded-Proto", proto)
+		}
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		if response.StatusCode != 200 {
+			t.Fatalf("status %d, want 200", response.StatusCode)
+		}
+		seen, _ := upstream.proto.Load().(string)
+		return seen
+	}
+	// An HTTPS reverse proxy in front reports the browser's scheme; the product must see it.
+	if seen := send("https"); seen != "https" {
+		t.Fatalf("X-Forwarded-Proto behind an HTTPS proxy: %q, want https", seen)
+	}
+	if seen := send("https, http"); seen != "https" {
+		t.Fatalf("X-Forwarded-Proto through a proxy chain: %q, want https", seen)
+	}
+	// Without a proxy, the scheme is the one this plain listener accepted.
+	if seen := send(""); seen != "http" {
+		t.Fatalf("X-Forwarded-Proto on a direct connection: %q, want http", seen)
+	}
+	// A value that is not a scheme does not reach the product.
+	if seen := send("javascript:"); seen != "http" {
+		t.Fatalf("X-Forwarded-Proto with an invalid value: %q, want http", seen)
 	}
 }
