@@ -4,15 +4,25 @@ import { Effect, Schema } from "effect";
 import type { DynamicRouter, RouterMeta } from "../contracts/router.ts";
 import { McpError, McpServerHeader, McpToolMetadata, McpToolsOptions } from "../contracts/mcp.ts";
 import { type JsonValue } from "../contracts/schema.ts";
-import { catalogCache, type CatalogCacheOptions } from "./catalog-cache.ts";
+import {
+  catalogCache,
+  catalogScope,
+  type CatalogAccount,
+  type CatalogCacheOptions,
+} from "./catalog-cache.ts";
 import { mcpClientEffect } from "./mcp.ts";
 import { adaptMcpTool } from "./mcp-tools.ts";
 import { protocolOperations, type OperationKinds } from "./protocol-operations.ts";
 import { nativeOperation } from "./operations.ts";
 import { routerDeclaration } from "./router.ts";
 
-/** Metadata policy for HTTP/SSE sources. A missing cache keeps discovery invocation-local. */
-export interface McpCatalogOptions extends McpToolsOptions, CatalogCacheOptions {}
+/**
+ * A server, the account whose catalog it is, and the metadata policy for HTTP/SSE sources. A
+ * missing cache keeps discovery invocation-local.
+ */
+export type McpCatalogOptions = Omit<McpToolsOptions, "accountId" | "headers"> &
+  CatalogCacheOptions &
+  CatalogAccount;
 
 /** Browsing metadata; schemas are read per tool. */
 const McpToolSummary = McpToolMetadata.mapFields(
@@ -37,22 +47,23 @@ const serverMeta = (server: McpServerHeader): RouterMeta => {
 /** Construction opens no transport unless explicit revalidation is requested. */
 export const mcpCatalog = (options: McpCatalogOptions, kinds: OperationKinds) =>
   Effect.gen(function* () {
-    // Header names are case-insensitive. Hash all request identity, including credentials,
-    // before persistence; custom callers cannot accidentally share two authentication scopes.
-    const parsed = yield* Schema.decodeUnknownEffect(McpToolsOptions)(options).pipe(
-      Effect.mapError(() => new McpError({ phase: "connect", reason: "invalid_input" })),
-    );
-    const headers: Record<string, string> = {};
-    new Headers(parsed.headers).forEach((value, name) => {
-      headers[name] = value;
-    });
-    const id = yield* cacheKey({ url: parsed.url, headers, accountId: parsed.accountId ?? null });
+    const invalid = () => new McpError({ phase: "connect", reason: "invalid_input" });
+    const parsed = yield* Schema.decodeUnknownEffect(McpToolsOptions)({
+      url: options.url,
+      accountId: options.account?.id,
+      headers: options.headers,
+      signal: options.signal,
+      timeoutMs: options.timeoutMs,
+    }).pipe(Effect.mapError(invalid));
+    // The account's scope separates credentials, so the server alone identifies its catalog.
+    const cache = yield* catalogScope(options, invalid);
+    const id = yield* cacheKey({ url: parsed.url });
     const key: JsonValue = ["mcp-catalog-v3", id, "current"];
-    const cache = options.cache;
     const changed = cache === undefined ? undefined : invoke(() => cache.invalidate(key));
-    const client = yield* mcpClientEffect(options, changed);
+    const client = yield* mcpClientEffect(parsed, changed);
     const catalog = yield* catalogCache({
       ...options,
+      cache,
       prefix: ["mcp-catalog-v3", id],
       schema: McpToolMetadata,
       summary: {

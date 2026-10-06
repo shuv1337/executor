@@ -14,6 +14,11 @@
       "rules": { "executor/no-module-level-mutable-state": "error" },
     },
     {
+      // Worker entry points: initialization runs once per isolate, for every request it serves.
+      "files": ["apps/hosted/cloud/src/**"],
+      "rules": { "executor/no-shared-wait-in-worker-initialization": "error" },
+    },
+    {
       // Exceptions kept here because a comment in these files changes the published apps
       // framework. openapi-source keeps an isolate-wide cache of content-addressed parts.
       "files": ["packages/apps/src/implementation/openapi-source.ts"],
@@ -50,5 +55,6 @@
     "*.tsbuildinfo",
     "**/.generated/",
     "**/routeTree.gen.ts",
+    "**/browser-scripts.gen.ts",
   ],
 }

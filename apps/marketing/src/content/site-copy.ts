@@ -31,9 +31,23 @@ export const GITHUB_URL = "https://github.com/UsefulSoftwareCo/executor";
 /** One-line description of the product, used as the Markdown tagline. */
 export const tagline = "Your agents' cloud.";
 
-/** Shared introduction for the landing page and its Markdown representation. */
-export const introduction =
-  "Your connectors, skills, automations, and personal software, all in one place.";
+/** What Executor holds for an agent, in the order the hero lists them. */
+export const introductionItems = [
+  { label: "connectors" },
+  { label: "skills" },
+  { label: "automations" },
+  { label: "personal software" },
+  { label: "browser", comingSoon: true },
+  { label: "computer", comingSoon: true },
+] as const;
+
+const listItems = (labels: ReadonlyArray<string>) =>
+  `${labels.slice(0, -1).join(", ")}, and ${labels.at(-1)}`;
+
+/** Shared introduction for metadata and Markdown; lists only what ships today. */
+export const introduction = `Your ${listItems(
+  introductionItems.filter((item) => !("comingSoon" in item)).map((item) => item.label),
+)}, all in one place.`;
 
 /** Introduce personal software through a familiar starting point and a growing app. */
 export const homepageStory = {

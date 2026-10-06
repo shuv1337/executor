@@ -56,6 +56,8 @@ const cli = Effect.gen(function* () {
               env: {
                 PATH: process.env.PATH ?? "",
                 HOME: home,
+                // Release scenarios never send product analytics, even from a build with a baked key.
+                DO_NOT_TRACK: "1",
                 ...(signedIn ? { EXECUTOR_API_KEY: Redacted.value(target.apiKey) } : {}),
               },
               stdout: "pipe",

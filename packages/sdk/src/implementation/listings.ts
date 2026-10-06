@@ -1,5 +1,5 @@
 /** Evaluated tool listings, reused across requests through the declaration store. */
-import { Clock, Deferred, Effect, Exit, Fiber, Option, Schema } from "effect";
+import { Clock, Effect, Exit, Fiber, Option, Schema } from "effect";
 import {
   defaultToolListingPolicy,
   durableHeadStartMillis,
@@ -20,6 +20,7 @@ import {
 import { ProfileRevision } from "../contracts/profiles.ts";
 import { DeploymentId, ProfileId } from "../contracts/shared.ts";
 import type { Declarations } from "./declarations.ts";
+import { makeHandoff } from "./handoff.ts";
 import type { makeOAuth } from "./oauth.ts";
 import { resolve, type InvocationSnapshot } from "./tools.ts";
 
@@ -104,7 +105,7 @@ export const makeListings = (options: {
   readonly cache: DeclarationCache;
   readonly background: BackgroundWork | undefined;
   readonly declarations: Declarations;
-  readonly resolveAccount: ReturnType<typeof makeOAuth>["resolve"];
+  readonly resolveAccount: ReturnType<typeof makeOAuth>["resolveSelected"];
   readonly lifecycle: ResourceLifecycle | undefined;
   readonly policy?: ToolListingPolicy;
 }) => {
@@ -134,8 +135,8 @@ export const makeListings = (options: {
           started,
           waiters: 0,
           overdue: false,
-          unwatched: Deferred.makeUnsafe(),
-          done: Deferred.makeUnsafe(),
+          unwatched: makeHandoff(),
+          done: makeHandoff(),
         });
 
         /** Keep a listing, or a slow failure unless a listing that may still be served exists. */
@@ -198,7 +199,7 @@ export const makeListings = (options: {
         const unwatched = (load: PendingLoad) =>
           Effect.gen(function* () {
             yield* Effect.sleep(policy.loadMillis);
-            if (load.waiters > 0) yield* Deferred.await(load.unwatched);
+            if (load.waiters > 0) yield* load.unwatched.await;
             const at = yield* Clock.currentTimeMillis;
             return new Failed(timedOut(at - load.started, false), at) as Outcome;
           });
@@ -220,13 +221,13 @@ export const makeListings = (options: {
             Effect.onExit((exit) =>
               Effect.gen(function* () {
                 cache.end(id, load);
-                if (Exit.isSuccess(exit)) return yield* Deferred.succeed(load.done, exit.value);
+                if (Exit.isSuccess(exit)) return yield* load.done.settle(exit.value);
                 // A host that ends background work before `loadMillis` stops a stalled listing
                 // here; one stopped after running that long is remembered like a timeout.
                 const at = yield* Clock.currentTimeMillis;
                 if (at - load.started >= policy.loadMillis)
                   yield* keep(new Failed(timedOut(at - load.started, false), at), load);
-                yield* Deferred.succeed(load.done, new Stopped(at - load.started));
+                yield* load.done.settle(new Stopped(at - load.started));
               }),
             ),
             // In the evaluation's own fiber: background work that offered the write as new
@@ -244,7 +245,7 @@ export const makeListings = (options: {
             cache.begin(id, load);
             if (yield* background(run(load))) return;
             cache.end(id, load);
-            yield* Deferred.succeed(load.done, new Stopped(0));
+            yield* load.done.settle(new Stopped(0));
           }),
         );
         const outcome = (value: unknown) =>
@@ -266,7 +267,7 @@ export const makeListings = (options: {
           Effect.gen(function* () {
             load.waiters += 1;
             const bound = read.reportRunningAfterMillis;
-            const done = yield* Deferred.await(load.done).pipe(
+            const done = yield* load.done.await.pipe(
               Effect.onInterrupt(() =>
                 Clock.currentTimeMillis.pipe(
                   Effect.map((at) => {
@@ -281,7 +282,7 @@ export const makeListings = (options: {
                     ? Clock.currentTimeMillis.pipe(
                         Effect.flatMap((at) =>
                           at - load.started >= policy.loadMillis
-                            ? Deferred.succeed(load.unwatched, undefined)
+                            ? load.unwatched.settle(undefined)
                             : Effect.void,
                         ),
                       )
@@ -424,7 +425,7 @@ export const makeListings = (options: {
         // Without background work the evaluation belongs to this reader and stops with it.
         load.waiters = 1;
         yield* run(load);
-        return yield* outcome(yield* Deferred.await(load.done));
+        return yield* outcome(yield* load.done.await);
       }).pipe(
         Effect.withSpan("sdk.tools.listing", {
           attributes: { "executor.app.id": state.app.id },

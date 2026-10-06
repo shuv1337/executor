@@ -137,7 +137,7 @@ export default defineApp({ accounts: { service: provider.many() } }, async ({ ac
           ? "identity.getIdentity"
           : "identity";
     const catalog = () => api.request(actors.owner, "GET", `${path}/tools?profile=${profile.id}`);
-    // The dashboard's index evaluates on every read.
+    // The dashboard's index reads the same kept listing as the catalog.
     const index = () =>
       api.request(actors.owner, "GET", `${path}/tools/index?profile=${profile.id}`);
     const call = () =>
@@ -201,11 +201,21 @@ export default defineApp({ accounts: { service: provider.many() } }, async ({ ac
     if (kind === "custom") {
       yield* upstream.configure({ status: 402 });
       // This factory fetches its upstream without the app cache, so nothing tells Executor
-      // that its listing changed: the full listing evaluated above is reused within its
-      // window, while the index shows the new failure.
+      // that its listing changed: the catalog and the index both reuse the listing evaluated
+      // above within its window.
       const kept = yield* catalog();
       expect(kept.status, JSON.stringify(kept.body)).toBe(200);
       expect(kept.body).toMatchObject({ items: [{ name: "identity" }] });
+      const keptIndex = yield* index();
+      expect(keptIndex.status, JSON.stringify(keptIndex.body)).toBe(200);
+      expect(keptIndex.body).toMatchObject({ items: [{ name: "identity" }] });
+      // A new profile revision has no kept listing, so its first read evaluates the app and
+      // reports the new failure. A failed evaluation is not kept for the index: the next read
+      // evaluates again and reports whatever the service says then.
+      expect(
+        (yield* selectProfileAccounts(actors.owner, path, profile.id, { service: accounts }))
+          .status,
+      ).toBe(200);
       const forged = yield* body(Failure, yield* index());
       expect(forged.account).toBeUndefined();
       yield* upstream.configure({ status: 400 });

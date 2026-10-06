@@ -11,6 +11,7 @@ import { App } from "../support/contracts.ts";
 import { Evidence } from "../support/evidence.ts";
 import { scenarios } from "../test-plan.ts";
 import { appsManifest } from "../support/apps-release.ts";
+import { batchedReads, batchPath, type BatchedRead } from "../support/read-batches.ts";
 
 /** Reads mounted on every app tab; each one used to repeat every five seconds. */
 const shared = ["app", "profiles", "inventory"] as const;
@@ -66,7 +67,8 @@ export default defineApp({ accounts: {} }, async () => ({
         );
         // Reads may use the URL slug or the verified organization ID.
         const references = [actors.organization.slug, actors.organization.id];
-        const classify = (pathname: string) => {
+        type Kind = (typeof shared)[number];
+        const classify = (pathname: string): Kind | undefined => {
           for (const reference of references) {
             const base = `/api/organizations/${reference}`;
             if (pathname === `${base}/apps/${app.id}`) return "app";
@@ -75,15 +77,30 @@ export default defineApp({ accounts: {} }, async () => ({
           }
           return undefined;
         };
+        /** A batched read names its endpoint instead of a path. */
+        const classifyRead = (read: BatchedRead): Kind | undefined => {
+          if (read.group === "apps" && read.endpoint === "get" && read.params.app === app.id)
+            return "app";
+          if (read.group === "profiles" && read.endpoint === "list" && read.params.app === app.id)
+            return "profiles";
+          if (read.group === "organization" && read.endpoint === "inventory") return "inventory";
+          return undefined;
+        };
         const reads = { app: 0, profiles: 0, inventory: 0 };
         let inFlight = 0;
         const observe = (page: Page) => {
           const tracked = new Set<unknown>();
           page.on("request", (request) => {
-            if (request.method() !== "GET") return;
-            const kind = classify(new URL(request.url()).pathname);
-            if (kind === undefined) return;
-            reads[kind] += 1;
+            const url = new URL(request.url());
+            // The dashboard sends reads that start together as one batch; each counts as a read.
+            const kinds: ReadonlyArray<Kind> =
+              request.method() === "POST" && url.pathname === batchPath
+                ? batchedReads(request.postData()).flatMap((read) => classifyRead(read) ?? [])
+                : request.method() === "GET"
+                  ? [classify(url.pathname)].flatMap((kind) => kind ?? [])
+                  : [];
+            if (kinds.length === 0) return;
+            for (const kind of kinds) reads[kind] += 1;
             inFlight += 1;
             tracked.add(request);
           });

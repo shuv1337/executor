@@ -156,7 +156,11 @@ docker compose -f apps/hosted/self-host/compose.yaml down
 The supplied Compose file binds port 4400 to the host's loopback interface.
 For remote access, put an HTTPS reverse proxy in front of it and set
 `BETTER_AUTH_URL` to the exact public dashboard origin, such as
-`https://executor.example.com`.
+`https://executor.example.com`. The proxy must pass the original `Host` header
+and send `X-Forwarded-Proto: https`, as Caddy, nginx's `proxy_set_header`,
+Traefik and Cloudflare Tunnel do. The dashboard compares each browser request's
+origin with that scheme and host; without them the dashboard page loads but its
+reads fail with "Could not reach the server".
 
 Localhost derives app UI addresses automatically. For a public installation,
 set `EXECUTOR_APP_UI_BASE_URL` to a separate HTTPS base such as

@@ -332,11 +332,33 @@ export const scenarios = {
     fixtures: "actors",
     file: "tools-index-cache.spec.ts",
     managementProfiles: ["owner", "admin"],
-    title: "A new organization's first Tools index loads its catalog without redundant cache trips",
+    title:
+      "A new organization's first Tools index loads its catalog without redundant cache trips, and later browsing reuses the kept listing",
     targets: {
       "self-host": scheduled,
       cloud: scheduled,
       local: na("Hosted management app catalog; the Node cache adapter shares the SQLite store"),
+    },
+  },
+  concurrentAppReads: {
+    fixtures: "actors",
+    file: "concurrent-app-reads.spec.ts",
+    title: "Concurrent reads of one app share its evaluation and each completes with its own I/O",
+    targets: {
+      "self-host": scheduled,
+      cloud: scheduled,
+      local: na("Hosted organization routes; the shared evaluation path is covered on self-host"),
+    },
+  },
+  dashboardReadBatches: {
+    fixtures: "actors",
+    file: "dashboard-read-batches.spec.ts",
+    title:
+      "Batched dashboard reads answer through their endpoints under the page's identity, each as it finishes",
+    targets: {
+      "self-host": scheduled,
+      cloud: scheduled,
+      local: na("The local dashboard does not batch its reads; most of them are live streams"),
     },
   },
   appCacheStalledLoader: {
@@ -1347,6 +1369,16 @@ export const scenarios = {
       cloud: scheduled,
       "self-host": na("This scenario exercises the Cloud compiler dependency resolver."),
       local: na("This scenario exercises the Cloud compiler dependency resolver."),
+    },
+  },
+  cloudCompilerConcurrency: {
+    fixtures: "actors",
+    file: "cloud-compiler.spec.ts",
+    title: "Concurrent Cloud deploys that install npm packages all compile",
+    targets: {
+      cloud: { status: "scheduled", runtime: "attached" },
+      "self-host": na("This scenario requires Cloudflare's compiler Worker memory limit."),
+      local: na("This scenario requires Cloudflare's compiler Worker memory limit."),
     },
   },
   cloudCompilerDeadline: {

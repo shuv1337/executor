@@ -76,10 +76,11 @@ import {
   organizationRoot,
 } from "./implementation/dashboard.ts";
 import { withHostPipeline } from "@executor-js/dashboard-start/in-process";
+import { dashboardBatchPath } from "@executor-js/dashboard-start/batch";
 import dashboardRoutes from "@executor-js/hosted-cloud-web/routes" with { type: "json" };
 import { postHogBindings } from "./infrastructure/posthog.ts";
 import { cloudAnalytics } from "./implementation/product-analytics.ts";
-import { sentryWorkerBuild } from "./infrastructure/sentry-build.ts";
+import { workerBuild } from "./infrastructure/worker-build.ts";
 import { reportCloudFailure } from "./implementation/error-reporting.ts";
 import { sentryBindings } from "./infrastructure/sentry.ts";
 import { cloudErrorTunnel } from "./implementation/error-tunnel.ts";
@@ -91,6 +92,8 @@ import { requestServices } from "@executor-js/hosted-server";
 import { recordRequestRejections, requestTiming } from "@executor-js/telemetry/http";
 
 import { Api } from "./infrastructure/api-worker.ts";
+import { Dashboard } from "./infrastructure/dashboard-worker.ts";
+import { cloudSourceFormatter } from "./infrastructure/source-formatter.ts";
 export { Api } from "./infrastructure/api-worker.ts";
 
 export default Api.make(
@@ -119,7 +122,7 @@ export default Api.make(
         ...sentry.env,
         ...(yield* billingBindings),
       },
-      build: sentryWorkerBuild("api"),
+      build: workerBuild("api"),
       // Auth callbacks and the dashboard share the configured canonical origin.
       ...(origin === undefined ? {} : { domain: origin.hostname }),
       // Opt in per deployment; the database's cloud region is a proximity hint,
@@ -197,6 +200,8 @@ export default Api.make(
     // here, so a failure is only logged.
     const installTeam = (job: string) =>
       provisionTeamNow(job).pipe(
+        // The installation saves default profiles; their setup starts at once, not on a later wake.
+        Effect.provide(schedules.layer),
         Effect.timeoutOption("15 seconds"),
         Effect.withSpan("job.provisioning.install"),
         Effect.catch(() => Effect.logWarning("Team installation left to its workflow", { job })),
@@ -261,6 +266,7 @@ export default Api.make(
       Effect.catch(() => Effect.logWarning("App repository recovery failed")),
     );
     const appDomains = yield* cloudAppDomains;
+    const dashboard = cloudDashboard(yield* Cloudflare.Workers.bindWorker(Dashboard));
     const appUi = hostedAppUi(
       appAddresses(auth.origin, yield* cloudAppUiBase.pipe(Effect.orDie)),
       appDomains.status,
@@ -325,6 +331,7 @@ export default Api.make(
     );
     const api = cloudApi(document).pipe(
       Layer.provide(frameworkDocumentation(authoring)),
+      HttpRouter.provideRequest(yield* cloudSourceFormatter),
       Layer.provide(appUi.dashboard),
       Layer.provide(requestServices(auth.appSessions).layer),
       HttpRouter.provideRequest(catalogLive(document.document, egress)),
@@ -353,15 +360,18 @@ export default Api.make(
     const apiRequest = Effect.suspend(
       () => (apiHandle ??= Effect.runSync(Effect.provideContext(buildApi, apiServices))),
     );
-    // Register the API's own paths here, so routing precedence is unchanged.
-    const apiRoutes = Layer.mergeAll(
-      HttpRouter.add("GET", "/openapi.json", apiRequest),
+    // Register the API's own paths here, so routing precedence is unchanged. One layer adds
+    // them all: a layer per endpoint cost a fresh isolate's first request a layer build each.
+    const apiRoutes = HttpRouter.addAll([
+      HttpRouter.route("GET", "/openapi.json", apiRequest),
+      // A page's reads, started together in the browser, run here in one isolate.
+      HttpRouter.route("POST", dashboardBatchPath, apiRequest),
       ...Object.values(ExecutorCloudApi.groups).flatMap((group) =>
         Object.values(group.endpoints).map((endpoint) =>
-          HttpRouter.add(endpoint.method, endpoint.path, dispatchAfterWrites(apiRequest)),
+          HttpRouter.route(endpoint.method, endpoint.path, dispatchAfterWrites(apiRequest)),
         ),
       ),
-    );
+    ]);
     const mcpRoutes = Layer.mergeAll(
       HttpRouter.add("*", "/mcp", mcp.http),
       HttpRouter.add("*", "/org/:organization/mcp", mcp.http),
@@ -398,7 +408,7 @@ export default Api.make(
                 new Headers(request.headers),
               ),
             ),
-            cloudDashboard,
+            dashboard,
           ),
         ).pipe(HttpRouter.provideRequest(onboarding)),
       ),
@@ -410,17 +420,17 @@ export default Api.make(
       HttpRouter.add("*", "/api/:channel/*", analytics.proxy),
       HttpRouter.add("POST", "/api/:channel/submit", errorTunnel),
       browserTelemetry.pipe(HttpRouter.provideRequest(auth.identity)),
-      HttpRouter.add("GET", "/", homepage(auth.cookiePrefix, analytics.hero, cloudDashboard(null))),
+      HttpRouter.add("GET", "/", homepage(auth.cookiePrefix, analytics.hero, dashboard(null))),
       HttpRouter.add("GET", "/org/:organizationSlug", organizationRoot),
       ...dashboardPageRoutes.map((route) =>
         route === "/app-auth"
           ? // Resolved on the server so opening an app never renders an intermediate page.
-            HttpRouter.add("GET", route, appUi.signIn(cloudDashboard(null))).pipe(
+            HttpRouter.add("GET", route, appUi.signIn(dashboard(null))).pipe(
               Layer.provide(requestServices(auth.appSessions).layer),
               HttpRouter.provideRequest(executor),
               HttpRouter.provideRequest(auth.identity),
             )
-          : HttpRouter.add("GET", route, cloudDashboard(null)),
+          : HttpRouter.add("GET", route, dashboard(null)),
       ),
       HttpRouter.add("*", "/api/webhooks/:appId/:subscriptionId", hostedWebhookCallback).pipe(
         HttpRouter.provideRequest(executor),
