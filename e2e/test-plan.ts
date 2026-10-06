@@ -4072,7 +4072,9 @@ export const scenarios = {
     file: "registry-failures.spec.ts",
     title: "Public app catalog refuses registry redirects and reports distinct registry failures",
     targets: {
-      "self-host": scheduled,
+      "self-host": na(
+        "This fork's self-host serves an organization-only registry from its own database, not a remote origin.",
+      ),
       cloud: na("Cloud serves the registry from its own database instead of a remote origin."),
       local: na(
         "Local uses the same registry client; only self-host starts a scenario-owned server.",
