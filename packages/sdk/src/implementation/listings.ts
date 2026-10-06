@@ -1,5 +1,5 @@
 /** Evaluated tool listings, reused across requests through the declaration store. */
-import { Clock, Effect, Exit, Fiber, Option, Schema } from "effect";
+import { Cause, Clock, Effect, Exit, Fiber, Option, Schema } from "effect";
 import {
   defaultToolListingPolicy,
   durableHeadStartMillis,
@@ -94,7 +94,8 @@ type Outcome = Listed | Failed | Unkept | Stopped;
  * background evaluation replaces it; past `maxStaleMillis` the read evaluates first. Readers of a
  * key share one evaluation. A first evaluation runs in the background when the host allows it,
  * so a reader that stops waiting, such as MCP discovery giving up on a stalled app, leaves it
- * running until `loadMillis`, and its listing is kept when it finishes. A reader that passes
+ * running until `loadMillis` or until the host ends its background work, whichever is first, and
+ * its listing is kept when it finishes. Either stop is remembered as a timeout. A reader that passes
  * `reportRunningAfterMillis` is told at once about an evaluation that has run longer than that,
  * or that such a reader already gave up on; other readers wait for it. A slow failure is reported
  * at once to such a reader for `freshMillis` after it failed, while one background evaluation at a
@@ -203,8 +204,14 @@ export const makeListings = (options: {
             const at = yield* Clock.currentTimeMillis;
             return new Failed(timedOut(at - load.started, false), at) as Outcome;
           });
-        /** Evaluate once for every reader of this key, keeping the listing or its failure. */
-        const run = (load: PendingLoad) =>
+        /**
+         * Evaluate once for every reader of this key, keeping the listing or its failure. The
+         * host interrupts an evaluation it runs as background work only when its background
+         * lifetime ends, after the evaluation had all the time the host gives such work, so that
+         * stop is remembered as a timeout, like one after `loadMillis`. A reader that owns the
+         * evaluation stops it by leaving, which says nothing about how long the listing takes.
+         */
+        const run = (load: PendingLoad, owner: "host" | "reader") =>
           evaluated.pipe(
             Effect.map((listing): Outcome => new Listed(listing)),
             Effect.catch((error) =>
@@ -220,13 +227,19 @@ export const makeListings = (options: {
             Effect.tap((outcome) => keep(outcome, load)),
             Effect.onExit((exit) =>
               Effect.gen(function* () {
-                cache.end(id, load);
-                if (Exit.isSuccess(exit)) return yield* load.done.settle(exit.value);
-                // A host that ends background work before `loadMillis` stops a stalled listing
-                // here; one stopped after running that long is remembered like a timeout.
+                if (Exit.isSuccess(exit)) {
+                  cache.end(id, load);
+                  return yield* load.done.settle(exit.value);
+                }
+                // Remembered before it leaves `pending`, like an outcome kept above, so a reader
+                // always finds one of them.
                 const at = yield* Clock.currentTimeMillis;
-                if (at - load.started >= policy.loadMillis)
+                if (
+                  (owner === "host" && Cause.hasInterruptsOnly(exit.cause)) ||
+                  at - load.started >= policy.loadMillis
+                )
                   yield* keep(new Failed(timedOut(at - load.started, false), at), load);
+                cache.end(id, load);
                 yield* load.done.settle(new Stopped(at - load.started));
               }),
             ),
@@ -243,7 +256,7 @@ export const makeListings = (options: {
             if (background === undefined || cache.pending(id) !== undefined) return;
             const load = pendingLoad(yield* Clock.currentTimeMillis);
             cache.begin(id, load);
-            if (yield* background(run(load))) return;
+            if (yield* background(run(load, "host"))) return;
             cache.end(id, load);
             yield* load.done.settle(new Stopped(0));
           }),
@@ -420,11 +433,13 @@ export const makeListings = (options: {
         cache.begin(id, load);
         yield* Effect.annotateCurrentSpan("executor.declarations.cache", "miss");
         const detached =
-          background === undefined ? false : yield* Effect.uninterruptible(background(run(load)));
+          background === undefined
+            ? false
+            : yield* Effect.uninterruptible(background(run(load, "host")));
         if (detached) return yield* orRecalled(join(load));
         // Without background work the evaluation belongs to this reader and stops with it.
         load.waiters = 1;
-        yield* run(load);
+        yield* run(load, "reader");
         return yield* outcome(yield* load.done.await);
       }).pipe(
         Effect.withSpan("sdk.tools.listing", {

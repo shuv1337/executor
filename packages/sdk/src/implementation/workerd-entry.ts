@@ -143,10 +143,13 @@ const credentials = (env: Environment) => credentialKey(env.AUTH);
  */
 export class AppOutbound extends WorkerEntrypoint<Environment> {
   async fetch(request: Request): Promise<Response> {
-    const self = URL.parse(this.env.SELF_ORIGIN)?.origin;
+    const self = this.env.SELF === undefined ? undefined : URL.parse(this.env.SELF_ORIGIN)?.origin;
     return credentialFetch(request, {
       app: Schema.decodeUnknownSync(OutboundProps)(this.ctx.props).app,
       key: await Effect.runPromise(credentials(this.env)),
+      // Refuse a private destination by name, before the public-only network refuses its
+      // address with an error app code cannot tell apart from any other connection failure.
+      egress: { refusePrivateAddresses: !this.env.APPS_PRIVATE_FETCH, selfOrigin: self },
       send: (request) => {
         if (this.env.SELF !== undefined && new URL(request.url).origin === self)
           return this.env.SELF.fetch(request);

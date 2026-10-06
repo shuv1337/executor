@@ -5,7 +5,7 @@ import { makeWorkflowRuns } from "./workflows.ts";
 /** Compose native operations once for in-process and HTTP callers. */
 import { Crypto, Effect } from "effect";
 import type { Executor, ExecutorOptions, RemoteExecutorOptions } from "../contracts/executor.ts";
-import { NotImplemented } from "../contracts/shared.ts";
+import { NotImplemented, type AppId } from "../contracts/shared.ts";
 import { makeWebhooks } from "./webhooks.ts";
 import { makeAppData } from "./app-storage.ts";
 import { makeAccountConnections } from "./account-connections.ts";
@@ -103,9 +103,24 @@ export const createExecutor = (
       webhooks: webhooks.webhooks,
       webhookDefinitions: webhooks.liveDefinitions,
       schedules: schedules.operations,
+      reconcileSchedules: schedules.reconcile,
       runs: workflows.runs,
       accountNeedingReconnect: tools.accountNeedingReconnect,
     });
+    // App source defines schedules. Each activation removes saved settings for schedules the new
+    // deployment no longer declares. The activation has committed, so a deployment that cannot be
+    // evaluated keeps them and the activation still succeeds. Profiles reconcile in setup.
+    const activated = (app: AppId) =>
+      schedules
+        .activated(app)
+        .pipe(
+          Effect.catch((error) =>
+            Effect.logWarning(
+              "Kept saved schedules: the activated deployment was not evaluated",
+              error,
+            ),
+          ),
+        );
     return {
       [ProfileHost]: { tick: setup.tick },
       [WorkflowHost]: workflows.host,
@@ -120,7 +135,20 @@ export const createExecutor = (
         ...oauth.connections,
         findOAuth: (input) => Effect.flatMap(oauth.findOAuth(input), connections.get),
       },
-      apps: { ...apps, profiles: setup.operations, checkCredentials },
+      apps: {
+        ...apps,
+        deploy: (input) =>
+          apps
+            .deploy(input)
+            .pipe(
+              Effect.tap(({ app, deployment }) =>
+                app.activeDeployment === deployment.id ? activated(app.id) : Effect.void,
+              ),
+            ),
+        activate: (input) => apps.activate(input).pipe(Effect.tap((app) => activated(app.id))),
+        profiles: setup.operations,
+        checkCredentials,
+      },
       owners: makeOwners(db),
       skills: makeSkills(db, runtime, crypto, declarations, options.blobs),
       webhooks: webhooks.webhooks,

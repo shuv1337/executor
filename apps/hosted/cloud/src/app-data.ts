@@ -15,7 +15,7 @@ import { AppDataSupervisor, appDataSupervisors } from "./infrastructure/app-data
 import { RuntimeContext } from "alchemy";
 import { CacheCommand } from "@executor-js/app-cache/contracts";
 import { makeAppRunner, serveAppRunner, type RemoteCapabilities } from "@executor-js/sdk/workerd";
-import { appCredentialOutbound } from "./infrastructure/app-outbound.ts";
+import { appCredentialOutbound, appOutboundBindings } from "./infrastructure/app-outbound.ts";
 import { HttpServerResponse } from "effect/unstable/http";
 import {
   cloudObservability,
@@ -77,7 +77,7 @@ export default AppData.make(
       ...(yield* cloudObservability),
       workersDev: false,
       compatibility: { date: "2026-09-08", flags: ["nodejs_compat"] },
-      env: yield* telemetryBindings,
+      env: { ...(yield* telemetryBindings), ...(yield* appOutboundBindings) },
     };
   }),
   Effect.gen(function* () {

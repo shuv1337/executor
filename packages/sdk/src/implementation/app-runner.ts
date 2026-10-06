@@ -8,7 +8,7 @@
  * request and reply passes through the adapter of the protocol the build's framework speaks.
  */
 import type { Fetcher, WorkerLoader } from "@cloudflare/workers-types";
-import { Clock, Effect, Exit, Option, Redacted, Schema, Semaphore } from "effect";
+import { Clock, Effect, Exit, Option, Redacted, Result, Schema, Semaphore } from "effect";
 import {
   ElicitationReply,
   type HostRequest,
@@ -26,7 +26,7 @@ import {
   type FacetBundle,
   type FacetInvocation,
 } from "@executor-js/app-data/cloudflare";
-import { workerModules } from "@executor-js/app-data/worker-bundle";
+import { reachableModules, workerModules } from "@executor-js/app-data/worker-bundle";
 import {
   CacheCommand,
   CacheError,
@@ -133,6 +133,17 @@ const releaseLimit = "35 seconds";
  * from resuming another request's I/O, so they are never shared across calls.
  */
 const cacheLanes = 2;
+
+/** A cold start's modules: only those its entry can import, out of the build's `total`. */
+const loadedModules = <Module>(main: string, modules: Readonly<Record<string, Module>>) => ({
+  modules: reachableModules(main, modules),
+  total: Object.keys(modules).length,
+});
+const annotateLoaded = ({ modules, total }: ReturnType<typeof loadedModules>) =>
+  Effect.annotateCurrentSpan({
+    "executor.worker.modules": Object.keys(modules).length,
+    "executor.worker.modules_total": total,
+  });
 
 /** One call's cache channel and the leases it owns until the call's release has finished. */
 interface CacheSession {
@@ -311,14 +322,27 @@ export const makeAppRunner = (host: AppRunnerHost) => {
             : yield* Effect.acquireRelease(residency.hold(host.loader, name), (unhold) =>
                 held ? Effect.void : unhold,
               );
+        const services = yield* Effect.context<never>();
         const load = async () => {
-          const bundle = await code();
+          // Recorded when the Worker Loader runs its cold-start callback, inside runtime.app.rpc.start.
+          const read = await Effect.runPromiseWith(services)(
+            Effect.tryPromise({ try: code, catch: (cause) => cause }).pipe(
+              Effect.map((bundle) =>
+                loadedModules("__executor_rpc.js", {
+                  ...workerModules(bundle.modules),
+                  "__executor_rpc.js": appRpcBridge(bundle.mainModule),
+                }),
+              ),
+              Effect.tap(annotateLoaded),
+              Effect.withSpan("runtime.app.cold_start.load"),
+              Effect.result,
+            ),
+          );
+          // The loader reports the original failure; see loadWorker.
+          if (Result.isFailure(read)) throw read.failure;
           return {
             mainModule: "__executor_rpc.js",
-            modules: {
-              ...workerModules(bundle.modules),
-              "__executor_rpc.js": appRpcBridge(bundle.mainModule),
-            },
+            modules: read.success.modules,
             compatibilityDate,
             compatibilityFlags: ["nodejs_compat"],
             globalOutbound: options.globalOutbound,
@@ -471,10 +495,10 @@ export const makeAppRunner = (host: AppRunnerHost) => {
             const bundle = await load();
             return {
               mainModule: "__executor_facet.js",
-              modules: {
+              modules: reachableModules("__executor_facet.js", {
                 ...bundle.modules,
                 "__executor_facet.js": appFacetBridge(bundle.mainModule),
-              },
+              }),
             };
           },
           capabilities.elicit,

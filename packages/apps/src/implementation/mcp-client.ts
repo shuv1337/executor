@@ -1,11 +1,16 @@
 import type { ProviderError } from "../contracts/provider-error.ts";
+import type { NetworkRefused } from "../contracts/network.ts";
 /** Shared MCP pagination, wire parsing and calls. Transport owns connection lifetime. */
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import type {
   JsonSchemaType,
   jsonSchemaValidator,
 } from "@modelcontextprotocol/sdk/validation/types.js";
-import { ListToolsResultSchema } from "@modelcontextprotocol/sdk/types.js";
+import {
+  ErrorCode,
+  ListToolsResultSchema,
+  McpError as ProtocolError,
+} from "@modelcontextprotocol/sdk/types.js";
 import { Effect, Exit, Option, Schema } from "effect";
 import {
   defaultMcpClientLimits,
@@ -14,10 +19,35 @@ import {
   McpToolMetadata,
   type McpToolContext,
 } from "../contracts/mcp.ts";
+import type { UpstreamError } from "../contracts/failure.ts";
 import { RouterIcon } from "../contracts/router.ts";
 import type { JsonObject } from "../effect.ts";
 import { mcpCall } from "./mcp-call.ts";
 import { jsonSchemaDecoder } from "./schema.ts";
+import { bodyUpstreamError } from "./upstream-error.ts";
+
+/** Codes the MCP SDK raises itself, for a request it stopped waiting for or a closed connection. */
+const clientCodes: ReadonlySet<number> = new Set([
+  ErrorCode.RequestTimeout,
+  ErrorCode.ConnectionClosed,
+]);
+
+/**
+ * The JSON-RPC error a server answered a request with, if `error` is one. The SDK formats its
+ * message as `MCP error <code>: <message>`; the server's own message follows that prefix.
+ */
+export const answeredError = (error: unknown): UpstreamError | undefined => {
+  if (!(error instanceof ProtocolError) || clientCodes.has(error.code)) return undefined;
+  const prefix = `MCP error ${error.code}: `;
+  return bodyUpstreamError({
+    error: {
+      code: error.code,
+      message: error.message.startsWith(prefix)
+        ? error.message.slice(prefix.length)
+        : error.message,
+    },
+  });
+};
 
 /** Use the framework-owned interpreter at the MCP SDK's synchronous validation boundary. */
 export const mcpJsonSchemaValidator: jsonSchemaValidator = {
@@ -43,13 +73,13 @@ export interface WithMcpClient {
   <A, E>(
     mode: "discover" | "call",
     use: (client: Client) => Effect.Effect<A, E>,
-  ): Effect.Effect<A, E | McpError | ProviderError>;
+  ): Effect.Effect<A, E | McpError | ProviderError | NetworkRefused>;
 }
 /** Shared client operations never cache catalogs or account credentials. */
 export function mcpClient(
   withClient: WithMcpClient,
   timeoutMs: number,
-  failure: (phase: McpError["phase"], error: unknown) => McpError | ProviderError,
+  failure: (phase: McpError["phase"], error: unknown) => McpError | ProviderError | NetworkRefused,
 ) {
   /**
    * Follow the complete live catalog, rejecting duplicate tools and cursor loops. The server's
@@ -117,13 +147,35 @@ export function mcpClient(
     }),
   ).pipe(Effect.withSpan("provider.mcp.discover"));
 
+  /**
+   * Initialize a session and read the first page of tools, which servers that accept anonymous
+   * initialization still authenticate. Nothing is retained. `mcpHealth` runs it with and without
+   * the account's credentials.
+   */
+  const check = withClient("discover", (client) =>
+    Effect.tryPromise({
+      try: (signal) =>
+        client.request({ method: "tools/list", params: {} }, ListToolsResultSchema, {
+          signal,
+          timeout: timeoutMs,
+        }),
+      catch: (error) => failure("discover", error),
+    }).pipe(
+      Effect.asVoid,
+      Effect.withSpan("provider.mcp.request", {
+        kind: "client",
+        attributes: { "rpc.system.name": "jsonrpc", "rpc.method": "tools/list" },
+      }),
+    ),
+  ).pipe(Effect.withSpan("provider.mcp.check"));
+
   /** Call once with one account, retaining content and MCP tool-error results. */
   const call = (name: string, input: JsonObject, context: McpToolContext) =>
     withClient("call", (client) => mcpCall(client, name, input, context, timeoutMs, failure)).pipe(
       Effect.withSpan("provider.mcp.call", { attributes: { "mcp.tool.name": name } }),
     );
 
-  return { list, call };
+  return { list, check, call };
 }
 
 /** Transport-independent operations consumed by the app tool adapter. */

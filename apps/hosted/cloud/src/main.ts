@@ -32,8 +32,7 @@ import {
   hostedOAuthCallback,
   hostedWebhookCallback,
   catalogLive,
-  requireUserLive,
-  requireOrganizationLive,
+  hostedMiddlewareLive,
   mcpProtectedResource,
   mcpAuthorizationServer,
   apiChallenge,
@@ -47,7 +46,7 @@ import { Config, Effect, Layer, Option, Path, Ref } from "effect";
 import { HttpRouter, HttpServer, HttpServerResponse } from "effect/unstable/http";
 import { cloudAuth } from "./infrastructure/auth.ts";
 import { cloudOnboarding } from "./infrastructure/onboarding.ts";
-import { cloudMcp, McpSessionsLive } from "./infrastructure/mcp.ts";
+import { cloudMcp } from "./infrastructure/mcp.ts";
 import { cloudApi } from "./implementation/api.ts";
 import { billingLive } from "./implementation/billing.ts";
 import { cloudSchedules, ScheduleCoordinatorLive } from "./infrastructure/schedules.ts";
@@ -69,6 +68,7 @@ import { cloudEntryApi, cloudEntryDocument, resolveCloudEntry } from "./implemen
 import { browserReturnTo } from "@executor-js/hosted-server/browser/contracts";
 import { HttpServerRequest } from "effect/unstable/http";
 import { homepage } from "./implementation/homepage.ts";
+import { withNotFoundDocument } from "./implementation/not-found.ts";
 import { openAiAppsChallenge } from "./implementation/openai-apps-challenge.ts";
 import {
   cloudDashboard,
@@ -77,7 +77,7 @@ import {
 } from "./implementation/dashboard.ts";
 import { withHostPipeline } from "@executor-js/dashboard-start/in-process";
 import { dashboardBatchPath } from "@executor-js/dashboard-start/batch";
-import dashboardRoutes from "@executor-js/hosted-cloud-web/routes" with { type: "json" };
+import { workerFirstRoutes } from "./contracts/worker-first-routes.ts";
 import { postHogBindings } from "./infrastructure/posthog.ts";
 import { cloudAnalytics } from "./implementation/product-analytics.ts";
 import { workerBuild } from "./infrastructure/worker-build.ts";
@@ -85,7 +85,7 @@ import { reportCloudFailure } from "./implementation/error-reporting.ts";
 import { sentryBindings } from "./infrastructure/sentry.ts";
 import { cloudErrorTunnel } from "./implementation/error-tunnel.ts";
 import { cloudSentry } from "./implementation/error-reporting.ts";
-import { cloudOrigin } from "./infrastructure/stage.ts";
+import { cloudOrigin, customDomain } from "./infrastructure/stage.ts";
 import { appDataSupervisors } from "./infrastructure/app-data.ts";
 import { cloudDevelopment } from "./contracts/development.ts";
 import { requestServices } from "@executor-js/hosted-server";
@@ -124,7 +124,7 @@ export default Api.make(
       },
       build: workerBuild("api"),
       // Auth callbacks and the dashboard share the configured canonical origin.
-      ...(origin === undefined ? {} : { domain: origin.hostname }),
+      ...(origin === undefined ? {} : { domain: yield* customDomain(origin) }),
       // Opt in per deployment; the database's cloud region is a proximity hint,
       // not a Cloudflare data center or a change to local development routing.
       ...(dev
@@ -148,25 +148,11 @@ export default Api.make(
           ? site.outdir.pipe(Output.map((directory) => path.resolve(directory)))
           : site.outdir,
         hash: site.hash.output,
+        // A miss reaches the Worker, which serves 404.html; see `not-found.ts`.
         notFoundHandling: "none",
         // Preserve TanStack paths after an internal index.html rewrite.
         htmlHandling: "none",
-        // An allowlist, so everything else is served from the assets. The
-        // documentation under /docs and /docs/* is static and must stay off
-        // this list.
-        runWorkerFirst: [
-          "/",
-          // The Worker renders every dashboard document; see `cloudflare-routes.ts`. Its
-          // `/org/*` rule also covers each organization's `/org/*/mcp` endpoint.
-          ...dashboardRoutes,
-          "/api",
-          "/api/*",
-          "/health",
-          "/openapi.json",
-          "/mcp",
-          "/git/*",
-          "/.well-known/*",
-        ],
+        runWorkerFirst: workerFirstRoutes,
       },
     };
   }),
@@ -271,10 +257,8 @@ export default Api.make(
       appAddresses(auth.origin, yield* cloudAppUiBase.pipe(Effect.orDie)),
       appDomains.status,
     );
-    // Session objects run in this isolate and share its executor and MCP identity.
-    const mcp = yield* cloudMcp.pipe(
-      Effect.provide(McpSessionsLive({ executor, identity: auth.mcpIdentity })),
-    );
+    // Session objects run in the MCP server Worker; this isolate authenticates and forwards.
+    const mcp = yield* cloudMcp;
     const meter = yield* BillingMeter.pipe(Effect.provide(billing));
     // Each job reports its own failure, so a workflow problem cannot prevent email delivery.
     const workflowReconcile = Effect.flatten(HostedExecutor).pipe(
@@ -339,8 +323,7 @@ export default Api.make(
       Layer.provide(billing),
       Layer.provide(removals),
       Layer.provide(onboarding),
-      Layer.provide(requireUserLive),
-      Layer.provide(requireOrganizationLive),
+      Layer.provide(hostedMiddlewareLive),
       HttpRouter.provideRequest(executor),
       Layer.provide(auth.identity),
       Layer.provide(auth.apiIdentity),
@@ -464,6 +447,7 @@ export default Api.make(
     );
     return {
       fetch: handle.pipe(
+        withNotFoundDocument,
         Effect.tapCause(reportCloudFailure),
         Effect.catchTag("AuthenticationUnavailable", () =>
           Effect.succeed(HttpServerResponse.empty({ status: 503 })),

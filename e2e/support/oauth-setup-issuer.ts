@@ -25,6 +25,12 @@ export type IssuedTokens = {
 };
 export type TokenShape = (tokens: IssuedTokens, refreshing: boolean) => object;
 
+/** A JSON-RPC request or notification to the served MCP server. */
+const McpMessage = Schema.Struct({
+  id: Schema.optional(Schema.Union([Schema.Number, Schema.String])),
+  method: Schema.String,
+});
+
 /** Start a loopback issuer with controllable discovery and registration metadata. */
 export const oauthSetupIssuer = Effect.gen(function* () {
   const address = yield* Deferred.make<string>();
@@ -33,6 +39,8 @@ export const oauthSetupIssuer = Effect.gen(function* () {
   let challenge = true;
   let probes = 0;
   let mcpStatus: 520 | undefined;
+  /** Answer MCP on `/mcp` for an access token this issuer issued and still accepts. */
+  let serveMcp = false;
   let expiresAt = 0;
   // 401 models RFC 7591 registration that requires an initial access token Executor lacks.
   let registrationStatus: 200 | 201 | 400 | 401 = 201;
@@ -204,6 +212,37 @@ export const oauthSetupIssuer = Effect.gen(function* () {
       scopes_supported: scopes,
     });
   });
+  /** Whether a request presents an access token this issuer issued and has not ended. */
+  const acceptedToken = (authorization: string | undefined) => {
+    const token = authorization?.replace(/^Bearer /, "");
+    return token !== undefined && issuedAccessTokens.has(token) && !expiredAccessTokens.has(token);
+  };
+  /**
+   * An OAuth-protected MCP server's answer to an accepted token: initialization, notifications and
+   * an empty tool list over plain JSON responses, with no session.
+   */
+  const mcpAnswer = Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const message = yield* request.json.pipe(
+      Effect.flatMap(Schema.decodeUnknownEffect(McpMessage)),
+    );
+    if (message.id === undefined) return HttpServerResponse.empty({ status: 202 });
+    return yield* HttpServerResponse.json({
+      jsonrpc: "2.0",
+      id: message.id,
+      ...(message.method === "initialize"
+        ? {
+            result: {
+              protocolVersion: "2025-03-26",
+              capabilities: { tools: {} },
+              serverInfo: { name: "synthetic-oauth-mcp", version: "1" },
+            },
+          }
+        : message.method === "tools/list"
+          ? { result: { tools: [] } }
+          : { error: { code: -32601, message: "Method not found" } }),
+    });
+  }).pipe(Effect.orDie);
   const routes = Layer.mergeAll(
     HttpRouter.add(
       "GET",
@@ -429,7 +468,10 @@ export const oauthSetupIssuer = Effect.gen(function* () {
       Effect.gen(function* () {
         probes++;
         if (mcpStatus !== undefined) return HttpServerResponse.empty({ status: mcpStatus });
-        if (postChallenge) return HttpServerResponse.empty({ status: 405 });
+        const request = yield* HttpServerRequest.HttpServerRequest;
+        // The served MCP server offers no standalone SSE stream.
+        if (postChallenge || (serveMcp && acceptedToken(request.headers.authorization)))
+          return HttpServerResponse.empty({ status: 405 });
         if (discovery === "no-oauth") return HttpServerResponse.empty({ status: 200 });
         const origin = yield* Deferred.await(address);
         return HttpServerResponse.empty({
@@ -446,6 +488,8 @@ export const oauthSetupIssuer = Effect.gen(function* () {
       Effect.gen(function* () {
         probes++;
         if (mcpStatus !== undefined) return HttpServerResponse.empty({ status: mcpStatus });
+        const request = yield* HttpServerRequest.HttpServerRequest;
+        if (serveMcp && acceptedToken(request.headers.authorization)) return yield* mcpAnswer;
         const origin = yield* Deferred.await(address);
         return HttpServerResponse.empty({
           status: 401,
@@ -701,6 +745,11 @@ export const oauthSetupIssuer = Effect.gen(function* () {
       readonly postChallenge?: boolean;
       readonly challenge?: boolean;
       readonly mcpStatus?: 520 | null;
+      /**
+       * Answer MCP on `/mcp` for an access token this issuer issued and has not ended, as an
+       * OAuth-protected MCP server does. Requests without one keep the challenge.
+       */
+      readonly serveMcp?: boolean;
       readonly expiresAt?: number;
       readonly discovery?: typeof discovery;
       readonly pathDiscovery?: typeof pathDiscovery;
@@ -737,6 +786,7 @@ export const oauthSetupIssuer = Effect.gen(function* () {
         if (input.tokenRequestFormat !== undefined) tokenRequestFormat = input.tokenRequestFormat;
         if (input.mcpStatus !== undefined)
           mcpStatus = input.mcpStatus === null ? undefined : input.mcpStatus;
+        if (input.serveMcp !== undefined) serveMcp = input.serveMcp;
         if (input.postChallenge !== undefined) postChallenge = input.postChallenge;
         if (input.challenge !== undefined) challenge = input.challenge;
         if (input.idTokenAlgorithms !== undefined) idTokenAlgorithms = input.idTokenAlgorithms;

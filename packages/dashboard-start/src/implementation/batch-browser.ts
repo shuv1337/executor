@@ -30,19 +30,20 @@ import {
  */
 const batchWindow = "4 millis";
 
+/**
+ * A read's answer from its batch, or none when nothing else started with it. The caller then sends
+ * the read as its own request in its own fiber, so a caller that stops waiting, such as a query
+ * refreshed while its read is in flight, cancels that request. Sent by the resolver, the request
+ * would outlive its caller, and its unread response would hold the connection until collected.
+ */
 class Read extends Request.Class<
   {
     readonly read: Omit<BatchRead, "id">;
     readonly request: HttpClientRequest.HttpClientRequest;
-    /** The read as its own request, used when nothing else starts with it. */
-    readonly direct: Effect.Effect<
-      HttpClientResponse.HttpClientResponse,
-      HttpClientError.HttpClientError
-    >;
     /** The client the read was made with, which sends its batch. */
     readonly client: HttpClient.HttpClient;
   },
-  HttpClientResponse.HttpClientResponse,
+  Option.Option<HttpClientResponse.HttpClientResponse>,
   HttpClientError.HttpClientError
 > {}
 
@@ -77,7 +78,7 @@ const send = (entries: ReadonlyArray<Request.Entry<Read>>) =>
     const [first] = entries;
     if (first === undefined) return;
     if (entries.length === 1) {
-      first.completeUnsafe(yield* Effect.exit(first.request.direct));
+      first.completeUnsafe(Exit.succeed(Option.none()));
       return;
     }
     const waiting = new Map(entries.map((entry, id) => [id, entry]));
@@ -101,7 +102,9 @@ const send = (entries: ReadonlyArray<Request.Entry<Read>>) =>
                 const entry = waiting.get(answer.id);
                 if (entry === undefined) return;
                 waiting.delete(answer.id);
-                entry.completeUnsafe(Exit.succeed(responseOf(entry.request.request, answer)));
+                entry.completeUnsafe(
+                  Exit.succeed(Option.some(responseOf(entry.request.request, answer))),
+                );
               }),
             ),
           ),
@@ -167,11 +170,10 @@ export const batchReads = <Id extends string, Groups extends HttpApiGroup.Constr
               ? { ...read, traceparent: HttpTraceContext.toHeaders(span.value)["traceparent"] }
               : read,
             request,
-            direct,
             client,
           }),
           reads,
-        ),
+        ).pipe(Effect.flatMap(Option.match({ onNone: () => direct, onSome: Effect.succeed }))),
       );
     });
 };

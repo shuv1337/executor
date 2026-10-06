@@ -1,5 +1,7 @@
 import { loadSwaggerClient } from "./swagger-client.ts";
 import { httpProviderError, accountProviderError } from "./provider-error.ts";
+import { NetworkRefused } from "../contracts/network.ts";
+import { failOnNetworkRefusal } from "./network.ts";
 import { ProviderError } from "../contracts/provider-error.ts";
 /** Swagger constructs requests; Effect owns HTTP policy and bounded results. */
 import { Effect, Encoding, Option, Schema, Stream } from "effect";
@@ -20,6 +22,7 @@ import {
   OpenapiError,
   defaultOpenapiResponseLimits,
   isOpenapiFileSchema,
+  isOpenapiJsonSequence,
   isOpenapiTextMedia,
   openapiMediaKind,
   type CredentialBinding,
@@ -163,6 +166,26 @@ function operationPath(op: OpenapiOperation): RegExp {
 }
 const bytes = (value: unknown) =>
   Uint8Array.from(atob(scalar(value)), (char) => char.charCodeAt(0));
+/**
+ * Serialize an OpenAPI 3.2 `querystring` parameter, which is the whole query string. A form
+ * value is an object of fields, each a scalar or a list of them; any other media type is the
+ * percent-encoded text of its JSON or text value. Compilation admits only these media types.
+ */
+function querystringValue(
+  parameter: OpenapiOperation["request"]["parameters"][number],
+  value: unknown,
+) {
+  const [media] = Object.keys(parameter.content ?? {});
+  if (media === undefined) throw new Error("A querystring parameter declares no media type");
+  const kind = openapiMediaKind(media);
+  if (kind === "form") {
+    const form = new URLSearchParams();
+    for (const [name, field] of Object.entries(object(value)))
+      for (const item of Array.isArray(field) ? field : [field]) form.append(name, scalar(item));
+    return form.toString();
+  }
+  return encodeURIComponent(kind === "json" ? JSON.stringify(value) : scalar(value));
+}
 /** What decides whether an account can call an operation: its transport and security. */
 export interface OpenapiOperationAccess {
   readonly streaming?: true;
@@ -233,12 +256,20 @@ export function createRequest(config: {
             const parameters: Record<string, unknown> = {};
             // Reserved path values are expanded before Swagger sees the operation.
             let path = op.path;
+            // Swagger has no `querystring` serializer, so the whole query string is added here.
+            const querystrings: string[] = [];
             const swaggerParameters = op.request.parameters.filter((p) => {
               const group = args[p.in === "header" ? "headers" : p.in];
               const value = group === undefined ? undefined : object(group)[p.name];
               if (p.in === "path" && p.allowReserved === true && p.content === undefined) {
                 if (value === undefined) throw new Error("A required path parameter is missing");
                 path = path.replaceAll(`{${p.name}}`, reservedPathValue(value));
+                return false;
+              }
+              if (p.in === "querystring") {
+                if (value !== undefined) querystrings.push(querystringValue(p, value));
+                else if (p.required === true)
+                  throw new Error("A required querystring parameter is missing");
                 return false;
               }
               if (group !== undefined) parameters[`${p.in}.${p.name}`] = value;
@@ -297,6 +328,10 @@ export function createRequest(config: {
             if (pathname.split("/").some((segment) => /^(?:\.|%2e){1,2}$/i.test(segment)))
               throw new Error("This path value would change the request path");
             const url = new URL(prepared.url);
+            if (querystrings.length > 0)
+              url.search = [url.search.slice(1), ...querystrings]
+                .filter((part) => part !== "")
+                .join("&");
             const origin = new URL(op.baseUrl).origin;
             if (
               url.origin !== origin ||
@@ -326,6 +361,8 @@ export function createRequest(config: {
           catch: () => new OpenapiError({ reason: "invalid_input" }),
         });
         const response = yield* HttpClient.withScope(client).execute(request);
+        // Executor's network refused the request; its reason names the host or credential at fault.
+        yield* failOnNetworkRefusal(response);
         if (response.status < 200 || response.status >= 300) {
           // Status and header evidence (401, 429, 5xx, rate-limit or scope headers) keeps its
           // account recovery. A bare 403 proves nothing, so a declared error body explains it.
@@ -356,7 +393,7 @@ export function createRequest(config: {
         if (!isOpenapiTextMedia(contentType))
           return { base64: Encoding.encodeBase64(data), contentType };
         const text = new TextDecoder().decode(data);
-        return contentType.includes("json") && !contentType.includes("ndjson")
+        return contentType.includes("json") && !isOpenapiJsonSequence(contentType)
           ? yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Json))(text)
           : text;
       }),
@@ -371,7 +408,8 @@ export function createRequest(config: {
           ? accountProviderError(error, account.id)
           : error instanceof OpenapiError ||
               error instanceof OpenapiResponseError ||
-              error instanceof ProviderError
+              error instanceof ProviderError ||
+              error instanceof NetworkRefused
             ? error
             : new OpenapiError({ reason: "request" }),
       ),

@@ -953,6 +953,8 @@ it.live("released image serves management tools at a tailnet origin with private
       const containerPort = 8080;
       const hostname = "nexus.example.ts.net";
       const origin = `http://${hostname}:${containerPort}`;
+      // A public-looking name for the same private address, which no name check catches.
+      const disguised = "intranet.example.com";
       const port = yield* Effect.scoped(
         Effect.gen(function* () {
           for (let candidate = 4431; candidate <= 4439; candidate++) {
@@ -983,6 +985,8 @@ it.live("released image serves management tools at a tailnet origin with private
         BETTER_AUTH_URL: origin,
         BETTER_AUTH_SECRET: randomBytes(32).toString("hex"),
         EXECUTOR_ENCRYPTION_KEY: randomBytes(32).toString("hex"),
+        // A synthetic registry that shares the container's network namespace.
+        EXECUTOR_REGISTRY_URL: "http://127.0.0.1:8093",
       };
       yield* Effect.acquireRelease(
         run(
@@ -998,6 +1002,8 @@ it.live("released image serves management tools at a tailnet origin with private
             address,
             "--add-host",
             `${hostname}:${address}`,
+            "--add-host",
+            `${disguised}:${address}`,
             "--publish",
             `127.0.0.1:${port}:${containerPort}`,
             // EXECUTOR_APPS_ALLOW_PRIVATE_FETCH stays unset: the default is under test.
@@ -1103,6 +1109,99 @@ it.live("released image serves management tools at a tailnet origin with private
         Schema.NonEmptyArray(Schema.Struct({ id: Schema.String })),
       )(yield* driver("organization response", () => organizations.json()));
       const prefix = `/api/organizations/${organization.id}`;
+      // workerd rejects some fetch redirect modes before sending. Each name selects one registry
+      // response, and the catalog must report it without following a redirect.
+      const appRegistry = `${id}-registry`;
+      yield* Effect.acquireRelease(
+        run([
+          "run",
+          "--detach",
+          "--name",
+          appRegistry,
+          "--network",
+          `container:${id}`,
+          "node:24-bookworm-slim",
+          "node",
+          "-e",
+          `
+const http = require("node:http");
+const paths = [];
+const list = JSON.stringify([{ name: "@fixture/example", commit: "${"a".repeat(40)}", description: "A shared example", publishedAt: "2026-01-01T00:00:00.000Z" }]);
+http.createServer((request, response) => {
+  const url = new URL(request.url, "http://registry.invalid");
+  if (url.pathname === "/stats") return response.end(JSON.stringify(paths));
+  paths.push(url.pathname + url.search);
+  const name = url.searchParams.get("name");
+  if (name === "@fixture/moved") return response.writeHead(302, { location: "/elsewhere" }).end();
+  if (name === "@fixture/down") return response.writeHead(503, { "content-type": "text/plain" }).end("unavailable");
+  if (name === "@fixture/garbled") return response.writeHead(200, { "content-type": "text/html" }).end("<html></html>");
+  if (name === "@fixture/missing")
+    return response.writeHead(400, { "content-type": "application/json" }).end(JSON.stringify({ _tag: "RegistryError", reason: "not-found" }));
+  response.writeHead(200, { "content-type": "application/json" }).end(list);
+}).listen(8093, "127.0.0.1");
+`,
+        ]),
+        () => run(["rm", "--force", appRegistry]).pipe(Effect.orDie),
+      );
+      const registryPaths = run([
+        "exec",
+        appRegistry,
+        "node",
+        "-e",
+        'fetch("http://127.0.0.1:8093/stats").then(r => r.text()).then(text => process.stdout.write(text))',
+      ]).pipe(
+        Effect.flatMap(
+          Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Array(Schema.String))),
+        ),
+      );
+      yield* registryPaths.pipe(
+        Effect.retry({ schedule: Schedule.spaced("100 millis"), times: 50 }),
+      );
+      const catalog = (name?: string) =>
+        request(
+          `${prefix}/app-publications${name === undefined ? "" : `?name=${encodeURIComponent(name)}`}`,
+          undefined,
+          cookie,
+        ).pipe(
+          Effect.flatMap((response) =>
+            driver("catalog response", () => response.json()).pipe(
+              Effect.map((body: unknown) => ({ status: response.status, body })),
+            ),
+          ),
+        );
+      expect(yield* catalog()).toEqual({
+        status: 200,
+        body: [
+          {
+            name: "@fixture/example",
+            commit: "a".repeat(40),
+            description: "A shared example",
+            publishedAt: "2026-01-01T00:00:00.000Z",
+          },
+        ],
+      });
+      const failures = {
+        "@fixture/moved": { reason: "status", status: 302 },
+        "@fixture/down": { reason: "status", status: 503 },
+        "@fixture/garbled": { reason: "invalid-response" },
+        "@fixture/missing": { reason: "not-found" },
+      };
+      for (const [name, failure] of Object.entries(failures))
+        expect(yield* catalog(name), name).toEqual({
+          status: 400,
+          body: { _tag: "RegistryError", ...failure },
+        });
+      expect(yield* registryPaths, "redirects are not followed").toEqual(
+        [undefined, ...Object.keys(failures)].map(
+          (name) =>
+            `/api/registry/apps${name === undefined ? "" : `?name=${encodeURIComponent(name)}`}`,
+        ),
+      );
+      yield* run(["kill", appRegistry]);
+      expect(yield* catalog("@fixture/example"), "an unreachable registry").toEqual({
+        status: 400,
+        body: { _tag: "RegistryError", reason: "network" },
+      });
       const deployed = yield* request(
         `${prefix}/apps/deploy`,
         {
@@ -1113,8 +1212,8 @@ it.live("released image serves management tools at a tailnet origin with private
               content: `import { defineApp, query, object, string, router } from "apps";
 export default defineApp({ accounts: {} }, async () => ({
   tools: router({
-    probe: query({ input: object({ url: string() }) }, async (_ctx, input) => {
-      try { return "reached:" + (await fetch(input.url)).status; }
+    probe: query({ input: object({ url: string() }) }, async (ctx, input) => {
+      try { return "reached:" + (await ctx.fetch(input.url)).status; }
       catch (error) { return "refused:" + (error instanceof Error ? error.message : String(error)); }
     }),
   })
@@ -1223,7 +1322,17 @@ export default defineApp({ accounts: {} }, async () => ({
       // The same listener on its private address is not the dashboard origin.
       const refused = yield* probe(`http://${address}:${containerPort}/health`);
       expect(refused.ok).toBe(true);
-      expect(refused.value, "private app fetch stays off by default").toMatch(/^refused:/);
+      // Executor refuses the address by name, before the public-only network would.
+      expect(refused.value, "private app fetch stays off by default").toMatch(
+        /^refused:Executor refused a request to 100\.64\.[\d.]+:\d+: apps on this instance can reach only public addresses/,
+      );
+      // A public name passes Executor's check, and the public-only network refuses its address.
+      const resolved = yield* probe(`http://${disguised}:${containerPort}/health`);
+      expect(resolved.ok).toBe(true);
+      expect(resolved.value, "the network refuses a public name's private address").toMatch(
+        /^refused:/,
+      );
+      expect(resolved.value).not.toMatch(/^refused:Executor refused/);
       expect(yield* probe(`${origin}/health`), "authored apps reach the dashboard origin").toEqual({
         ok: true,
         value: "reached:200",

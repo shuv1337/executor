@@ -20,7 +20,8 @@ const credentialHost = (url: string) =>
  * A remote MCP app whose connection was confirmed: public, or OAuth discovered from the server.
  * All runtime behavior is retained in editable files and public app-framework helpers, including
  * the approval rule: tools the server marks `destructiveHint: true` ask before running. An OAuth
- * provider declares the server's host, so app code holds token handles rather than real values.
+ * provider declares the server's host, so app code holds token handles rather than real values,
+ * and checks an account by connecting to the server with it.
  */
 export const generateMcpSource = (
   name: string,
@@ -39,14 +40,14 @@ export const generateMcpSource = (
       ? `import { defineApp, accountRouter, toolAnnotations, withApprovals } from "apps"
 import { mcpRouter } from "apps/mcp"
 import { always } from "apps/operations/approval"
-import { provider } from "./provider.ts"
+import { headers, provider, url } from "./provider.ts"
 
 export default defineApp({ accounts: { service: provider.many() } }, async ({ accounts, signal, cache }) => ({
   tools: await accountRouter(accounts.service, async (account) => withApprovals(await mcpRouter({
-    url: ${serialize(url)},
+    url,
     account,
     cache,
-    headers: { Authorization: "Bearer " + account.fields.access_token },
+    headers: headers(account),
     signal,
   }),${approvalRule}), { signal }),
 }))
@@ -72,6 +73,14 @@ export default defineApp({ accounts: {} }, async ({ signal, cache }) => ({
               {
                 path: "provider.ts",
                 content: `import { defineProvider, oauth2 } from "apps"
+import { mcpHealth } from "apps/mcp"
+
+export const url = ${serialize(url)}
+
+/** The headers that send an account's token to the server. */
+export const headers = (account: { fields: { access_token: string } }) => ({
+  Authorization: "Bearer " + account.fields.access_token,
+})
 
 export const provider = defineProvider({
   name: ${serialize(name)},
@@ -79,6 +88,8 @@ export const provider = defineProvider({
   auth: {
     oauth: oauth2(${serialize(oauth)})
   },
+  // Check an account by connecting to the server with it and listing its tools.
+  health: (check) => mcpHealth(check, { url, headers: headers(check.account) }),
 })
 `,
               },

@@ -51,8 +51,10 @@ export default defineApp(requirements, { tools: router({ listProjects }) });
 Declare `hosts` so app code never holds the secret values. Each unmarked string
 field then reaches the app as an opaque handle. Executor's network replaces a
 handle with the real value only on requests to a declared host, in the URL,
-headers, Basic credentials, and JSON, form or text bodies up to 1 MiB. A request
-that sends a handle anywhere else fails with status 421. Values the service
+headers, Basic credentials, and JSON, form or text bodies up to 1 MiB. Executor
+refuses a request that sends a handle anywhere else: `ctx.fetch` rejects with
+`NetworkRefused`, naming the host and the provider's allowed hosts, and the
+global `fetch` receives status 421 with the same details. Values the service
 echoes back reach the app as handles.
 
 ```ts
@@ -147,10 +149,19 @@ if (response.status === 403 && (await response.json()).error?.code === "missing_
 ```
 
 Any error or a timeout means the check could not verify the account.
-Executor never treats that as bad credentials.
+Executor never treats that as bad credentials. The check also receives `deadline`, the time in
+epoch milliseconds when Executor stops waiting for it. A check still running then fails without a
+message, so a check that waits on its own timer should end before it to say why.
 
 Account forms run the same check on entered credentials before saving them, so the user sees
 whether they work, and the name they belong to, before connecting.
+
+For an MCP server, use `mcpHealth` from `apps/mcp` instead of a REST or GraphQL
+read: `health: (check) => mcpHealth(check, { url, headers: headers(check.account) })`.
+It takes the account, `signal` and `deadline` from the check context; see
+[integrations.md](integrations.md#check-an-mcp-account). It verifies an account
+only on a server that refuses requests without credentials. On a server that
+answers anyone, it reports that it could not verify the account.
 
 Each app checks with its own `health` function, so two apps can verify the same
 account differently. Adding or editing `health` does not change the provider's
@@ -314,7 +325,9 @@ Completing a targeted request saves the account and selects it for the named pro
 one transaction. A `.many()` target appends without duplicates. Other selections
 are kept. If a single-account selection or the requirement changed during sign-in,
 completion returns `AccountConnectionTargetChanged` without saving credentials;
-inspect the profile and request a new link.
+inspect the profile and request a new link. A pending link whose app was redeployed
+with a different provider for that requirement, such as an API key instead of OAuth,
+returns the same error when read or opened. Request a new link after such a deploy.
 
 To save an account without selecting it for any app, pass `provider` instead:
 

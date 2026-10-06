@@ -6,7 +6,7 @@
 import { PgClient } from "@effect/sql-pg";
 import { makeExecutionMemo } from "alchemy/Runtime/ExecutionMemo";
 import { Context, Effect, Layer, Option } from "effect";
-import type { SqlClient, SqlError } from "effect/unstable/sql";
+import { SqlClient, type SqlError } from "effect/unstable/sql";
 import { cloudDatabaseConnection } from "./database.ts";
 import { ObjectDatabase } from "./object-database.ts";
 
@@ -45,4 +45,24 @@ export const cloudInvocationDatabase = Layer.effect(
       }).pipe(Effect.withSpan("runtime.cloud.database.initialize")),
     );
   }),
+);
+
+/**
+ * Run SQL on the client this invocation shares with Better Auth and the executor. Building it
+ * opens no connection; a malformed URL is a deployment defect.
+ */
+export const invocationSql = Effect.map(
+  InvocationDatabase,
+  (database) =>
+    <A, E>(effect: Effect.Effect<A, E, SqlClient.SqlClient>) =>
+      database.pipe(
+        Effect.orDie,
+        Effect.flatMap((services) =>
+          Effect.provideService(
+            effect,
+            SqlClient.SqlClient,
+            Context.get(services, SqlClient.SqlClient),
+          ),
+        ),
+      ),
 );

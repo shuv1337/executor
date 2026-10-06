@@ -7,7 +7,6 @@ import {
 import {
   requireAppAccess,
   requireCurrentAppAccess,
-  requireAccountAccess,
   accountAccesses,
   currentResourceAuthority,
   type ResourceAuthority,
@@ -169,9 +168,6 @@ export const appManagerOwner = (app: AppId) =>
 /** Metadata reads include separate management access, without selecting credentials. */
 export const appReaderOwner = (app: AppId) =>
   requireAppAccess(app, "read").pipe(Effect.andThen(currentOwner));
-/** Personal ownership and shared-account management are resolved by account policy. */
-export const accountManagerOwner = (account: import("@executor-js/sdk/core").AccountId) =>
-  requireAccountAccess(account, "manage").pipe(Effect.andThen(currentOwner));
 
 /** Pending approvals retain their original accounts even if current app bindings later change. */
 export const checkInvocationAccounts = (

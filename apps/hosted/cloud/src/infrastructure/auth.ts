@@ -9,7 +9,7 @@ import { billingLive } from "../implementation/billing.ts";
 import { clearHeroIdentityOnSignOut } from "../implementation/hero-experiment.ts";
 import { recordCloudSignup, recordCloudLogin } from "../implementation/product-analytics.ts";
 import { cloudAuthOptions, cloudAuthSettings } from "../implementation/auth-options.ts";
-/** Native Alchemy auth binding, shared by the HTTP Worker and MCP session objects. */
+/** Native Alchemy auth binding for the HTTP Worker; MCP session objects use `mcp-auth.ts`. */
 import {
   CurrentUsage,
   CurrentUserId,
@@ -17,16 +17,13 @@ import {
   usageFailure,
   Authentication,
   AuthenticationUnavailable,
-  McpAuthentication,
   sessionPrincipal,
   lookupMembership,
   deleteOrganizationRecords,
   lookupOrganizationSlug,
   resolveOrganizationReference,
-  mcpAuthenticationError,
-  mcpConnectionStore,
   ApiAuthentication,
-  apiAuthenticationError,
+  apiBearerAccess,
 } from "@executor-js/hosted-server";
 import { betterAuth } from "better-auth";
 import { BetterAuthApiError, isAPIErrorLike } from "@alchemy.run/better-auth";
@@ -37,6 +34,8 @@ import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http";
 import type { SendAuthEmail } from "../contracts/email.ts";
 import { cloudSecrets } from "./secrets.ts";
 import { AuthDatabase, appSessionsPerCall, boundAuthAdapter } from "./auth-database.ts";
+import { invocationSql } from "./invocation-database.ts";
+import { mcpAuthentication } from "./mcp-auth.ts";
 
 /** Bind during initialization; database calls capture the current invocation only. */
 export const cloudAuth = (send: SendAuthEmail) =>
@@ -150,6 +149,9 @@ export const cloudAuth = (send: SendAuthEmail) =>
       Effect.map(([context, bind]) => boundAuthAdapter(context.adapter, bind)),
       Effect.provide(RuntimeContext.phantom),
     );
+    // Bearer authentication reads its rows in one statement on the client this invocation
+    // shares with Better Auth and the executor.
+    const withSql = yield* invocationSql;
     const identity = Layer.effect(
       Authentication,
       Effect.gen(function* () {
@@ -203,68 +205,16 @@ export const cloudAuth = (send: SendAuthEmail) =>
         });
       }),
     );
-    const mcpIdentity = Layer.effect(
-      McpAuthentication,
-      Effect.gen(function* () {
-        return McpAuthentication.of({
-          origin: settings.url,
-          authenticate: (headers, mode, organization) =>
-            bound
-              .pipe(
-                Effect.flatMap(([instance, bind]) =>
-                  Effect.tryPromise({
-                    try: () =>
-                      bind(() =>
-                        instance.api.getMcpAccess({ headers, query: { mode, organization } }),
-                      ),
-                    catch: mcpAuthenticationError,
-                  }),
-                ),
-              )
-              .pipe(Effect.withSpan("auth.authenticate")),
-          browserGrant: (headers, id) =>
-            bound.pipe(
-              Effect.flatMap(([instance, bind]) =>
-                Effect.tryPromise({
-                  try: () =>
-                    bind(() => instance.api.getMcpBrowserAccess({ headers, body: { id } })),
-                  catch: mcpAuthenticationError,
-                }),
-              ),
-            ),
-          metadata: nativeCall((instance) => instance.api.getOAuthServerConfig()).pipe(
-            Effect.mapError(() => new AuthenticationUnavailable()),
-          ),
-          connections: mcpConnectionStore((run) =>
-            bound.pipe(
-              Effect.flatMap(([instance, bind]) =>
-                Effect.tryPromise({
-                  try: () => bind(() => run(instance.api)),
-                  catch: (cause) => cause,
-                }),
-              ),
-            ),
-          ),
-        });
-      }),
-    );
+    const mcpIdentity = mcpAuthentication(settings.url, bound, withSql);
     const apiIdentity = Layer.effect(
       ApiAuthentication,
       Effect.gen(function* () {
         return ApiAuthentication.of({
           origin: settings.url,
           authenticate: (headers, organization) =>
-            bound
-              .pipe(
-                Effect.flatMap(([instance, bind]) =>
-                  Effect.tryPromise({
-                    try: () =>
-                      bind(() => instance.api.getApiAccess({ headers, query: { organization } })),
-                    catch: apiAuthenticationError,
-                  }),
-                ),
-              )
-              .pipe(Effect.withSpan("auth.authenticate")),
+            withSql(apiBearerAccess(settings.url, { headers, organization })).pipe(
+              Effect.withSpan("auth.authenticate"),
+            ),
         });
       }),
     );

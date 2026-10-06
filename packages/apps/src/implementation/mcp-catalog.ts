@@ -14,6 +14,7 @@ import { mcpClientEffect } from "./mcp.ts";
 import { adaptMcpTool } from "./mcp-tools.ts";
 import { protocolOperations, type OperationKinds } from "./protocol-operations.ts";
 import { nativeOperation } from "./operations.ts";
+import { operationDescription } from "./router-catalog.ts";
 import { routerDeclaration } from "./router.ts";
 
 /**
@@ -98,12 +99,23 @@ export const mcpCatalog = (options: McpCatalogOptions, kinds: OperationKinds) =>
       ...(tool.title === undefined ? {} : { title: tool.title }),
       annotations: { ...tool.annotations, readOnlyHint: kindOf(tool) === "query" },
     });
-    const describe = (tool: McpToolMetadata) => ({
-      ...summarize(tool),
-      inputSchema: tool.inputSchema,
-      ...(tool.outputSchema === undefined ? {} : { outputSchema: tool.outputSchema }),
-      ...(tool._meta === undefined ? {} : { _meta: tool._meta }),
-    });
+    /** The operation a call runs; descriptions are rendered from it, so they cannot differ. */
+    const operation = (tool: McpToolMetadata) =>
+      adaptMcpTool(client, tool).pipe(
+        Effect.map((adapted) =>
+          nativeOperation(
+            protocolOperations({ selected: adapted }, { selected: kindOf(tool) }).selected,
+          ),
+        ),
+      );
+    const describe = (tool: McpToolMetadata) =>
+      operation(tool).pipe(
+        Effect.flatMap((selected) =>
+          selected === undefined
+            ? Effect.succeed(undefined)
+            : operationDescription(tool.name, "", selected),
+        ),
+      );
     const router: DynamicRouter = {
       kind: "dynamic",
       meta: () =>
@@ -115,20 +127,28 @@ export const mcpCatalog = (options: McpCatalogOptions, kinds: OperationKinds) =>
           ),
           Effect.map(serverMeta),
         ),
-      list: () => catalog.list().pipe(Effect.map((tools) => tools.map(describe))),
+      list: () =>
+        catalog.list().pipe(
+          Effect.flatMap((tools) => Effect.forEach(tools, describe)),
+          Effect.map((tools) => tools.filter((tool) => tool !== undefined)),
+        ),
       summaries: () => catalog.summaries().pipe(Effect.map((tools) => tools.map(summarize))),
       describe: (name) =>
         catalog
           .resolve(name)
-          .pipe(Effect.map((tool) => (tool === undefined ? undefined : describe(tool)))),
+          .pipe(
+            Effect.flatMap((tool) =>
+              tool === undefined ? Effect.succeed(undefined) : describe(tool),
+            ),
+          ),
       resolve: (name) =>
-        Effect.gen(function* () {
-          const tool = yield* catalog.resolve(name);
-          if (tool === undefined) return undefined;
-          const adapted = yield* adaptMcpTool(client, tool);
-          const operations = protocolOperations({ selected: adapted }, { selected: kindOf(tool) });
-          return nativeOperation(operations.selected);
-        }),
+        catalog
+          .resolve(name)
+          .pipe(
+            Effect.flatMap((tool) =>
+              tool === undefined ? Effect.succeed(undefined) : operation(tool),
+            ),
+          ),
     };
     return routerDeclaration(router);
   });

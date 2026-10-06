@@ -49,6 +49,7 @@ executor apps commit --app <app-id> --files ./hello \
 executor apps deploy --app <app-id> --commit <new-commit>
 ```
 
+The commit prints the new revision; its `commit` is the next `--expected`.
 `--expected` is the commit your edits are based on. If someone else saved in
 between, the commit is rejected. Read the source again and reconcile before
 retrying. A commit alone does not change the running app.
@@ -291,6 +292,37 @@ App code runs as trusted code in the host Node process. It receives usable
 credentials for selected accounts. Forward `context.signal` to fetch or other
 interruptible operations. Cancellation and execution limits are cooperative;
 completed writes are not rolled back. App-owned storage persists across calls. Durable background jobs remain deferred.
+
+### Fetch from app code
+
+App code runs on workerd, Cloudflare's Workers runtime, on every host. Its fetch
+accepts the standard `RequestInit` with three exceptions, which TypeScript's
+types and a local type check do not catch:
+
+- `redirect` must be `"follow"` or `"manual"`. To reject redirects, send
+  `"manual"` and treat a 3xx response as the error.
+- `cache` must be `"no-store"` or `"no-cache"`, or omitted.
+- `integrity` must be empty or omitted.
+
+`ctx.fetch` rejects an unsupported value with `FetchOptionUnsupported`, which
+names the option and the values it accepts. Workers also send no `User-Agent`;
+some APIs, such as GitHub's, answer 403 without one, so set it yourself.
+
+App code can reach public hosts with no allowlist, so a 403 or 404 from one is
+that service's answer. Executor refuses only requests it must not send:
+
+- To a private, loopback or internal address named in the URL, on Cloud and on
+  self-host. Local allows them; a self-host operator allows them with
+  `EXECUTOR_APPS_ALLOW_PRIVATE_FETCH=true`.
+- Carrying a credential handle to a host its provider does not allow.
+
+`ctx.fetch` then rejects with `NetworkRefused`, whose `refusal.reason` and
+message name the host and the rule. The global `fetch` instead receives status
+421 with the refusal in an `x-executor-refused` header, as URI-encoded JSON, and
+in the body as JSON. A public name that resolves to a private address passes
+this check, and the network still refuses it: self-host fails the fetch with a
+network error, and Cloud answers with Cloudflare's own 403 whose body reads
+`error code: …`.
 
 Working: custom tools, API-key and OAuth providers, saved account selection,
 retained builds, configured copies, live discovery and tool calls. The local

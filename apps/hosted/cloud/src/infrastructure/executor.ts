@@ -26,7 +26,6 @@ import {
   recoverAppRepositories,
   StorageError,
   BlobStore,
-  defaultToolListingPolicy,
   makeExecutorStorage,
 } from "@executor-js/sdk/core";
 import { makeExecutionMemo } from "alchemy/Runtime/ExecutionMemo";
@@ -100,8 +99,10 @@ export const cloudExecutor = Effect.fn(function* (
       const storage = yield* makeExecutorStorage({ provider: "postgresql" }).pipe(
         Effect.provideContext(services),
       );
-      // Stale metadata refreshes beside the request, inside this event's lifetime.
-      // Work offered once the event is closing is refused, so its caller releases what it holds.
+      // Stale metadata refreshes and tool listings nobody waits for run beside the request, inside
+      // this event's lifetime: until 20 s after it closes, when the remaining work is interrupted.
+      // Work offered once the event is closing is refused, so its caller releases what it holds,
+      // and work it accepted always has those 20 s.
       const refreshes = yield* FiberSet.make();
       let closing = false;
       yield* Effect.addFinalizer(() =>
@@ -139,9 +140,8 @@ export const cloudExecutor = Effect.fn(function* (
           declarations: isolateDeclarations,
           // Every isolate reads the results each app's supervisor keeps when its own store misses.
           durableDeclarations: durableDeclarations(databases),
-          // Background work lasts at most 20 s after its event closes. A listing nobody waits for
-          // stops well inside that, so a stalled app is remembered as timed out, not interrupted.
-          toolListings: { ...defaultToolListingPolicy, loadMillis: 15_000 },
+          // A tool listing nobody waits for runs until the event's background work ends, and is
+          // remembered as timed out if it has not finished by then.
           background,
         },
       ).pipe(Effect.provideContext(services), Effect.provide(BrowserCrypto.layer));

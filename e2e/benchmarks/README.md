@@ -88,6 +88,35 @@ fixture organization `decl`, deploy that app and connect a synthetic account; se
 Cold MCP samples open a new session for each sample; they do not force a cold Worker isolate or
 an empty catalog cache. Client times include the network path from the runner to Cloudflare.
 
+### Idle supervisors
+
+```sh
+$L $P idle --control $E/stage-control.json --receipt $E/receipt.json --output $E/results/idle.json \
+  --gaps 5,20,60,120 --rounds 5
+```
+
+Each gap gets its own app in `a8f` (`--org`), so its supervisor is idle for exactly that long before
+the measured `skills` read, which is followed at once by a warm one. The report takes each read's
+first supervisor call (`storage.evaluated.read` or `runtime.cloud.cache`) from the stage trace, so
+it needs `AXIOM_TOKEN`. A supervisor idle for about ten seconds is evicted; its next call shows
+what a wake costs, including any fresh isolate.
+
+### MCP session hop
+
+```sh
+$L $P session-hop --control $E/stage-control.json --receipt $E/receipt.json \
+  --output $E/results/session-hop.json --gap 180 --rounds 8
+```
+
+Measures the API Worker's forward to the MCP session object. Each organization in `--orgs` has its
+own PAT and so its own session object. Every round waits `--gap` seconds, long enough for
+Cloudflare to evict an idle object, then opens a session (`idle`), makes `--warm` sequential
+`execute` calls (`warm`) and `--concurrent` parallel calls on the same session (`concurrent`). The
+hop is `mcp.session.forward` minus the object's `http.server` span, read from the stage trace
+(`AXIOM_TOKEN`). Each duration comes from its own isolate's clock, so the difference stays valid
+when the gateway and object clocks disagree. The hop includes object activation, transit and
+object CPU after its last I/O, which Cloudflare's I/O clock does not advance through.
+
 ## 5. Flamecharts
 
 ```sh

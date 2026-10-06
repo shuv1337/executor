@@ -30,5 +30,6 @@ export {
 export {
   credentialFetch,
   credentialKey,
+  type AppEgress,
   type CredentialOutbound,
 } from "./implementation/credential-handles.ts";

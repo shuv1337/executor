@@ -28,6 +28,7 @@ import {
   finishConnection,
   lockConnection,
 } from "./connection-state.ts";
+import { requireTargetProvider } from "./connection-target.ts";
 import { Account } from "../contracts/account.ts";
 import {
   OAuthClientUnavailable,
@@ -749,6 +750,8 @@ export const makeOAuth = (
       if (saved.state.status === "completed")
         return { status: "completed" as const, account: saved.state.account };
       const connection = yield* requireOpen(input, saved);
+      // Never discover or register a client for a provider the target app no longer requires.
+      yield* requireTargetProvider(db, connection);
       const existing =
         connection.reconnectAccount === null
           ? undefined
