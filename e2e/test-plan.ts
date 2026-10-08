@@ -52,7 +52,8 @@ export const scenarios = {
   syncroRest: {
     fixtures: "actors",
     file: "syncro-rest.spec.ts",
-    title: "Syncro REST reads preserve pagination, bearer secrets and provider failures",
+    title:
+      "Syncro REST reads preserve pagination, host-scoped bearer secrets, account checks and provider failures",
     serverEnvironment: { EXECUTOR_APPS_ALLOW_PRIVATE_FETCH: "true" },
     targets: {
       "self-host": scheduled,

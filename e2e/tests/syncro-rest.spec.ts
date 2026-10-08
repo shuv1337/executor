@@ -11,10 +11,41 @@ import { createServer } from "node:http";
 import { Actors } from "../support/actors.ts";
 import { Api, body } from "../support/api.ts";
 import { HostedLive, withHostedCase } from "../support/case.ts";
-import { App, Resource } from "../support/contracts.ts";
+import { Resource } from "../support/contracts.ts";
 import { appsManifest } from "../support/apps-release.ts";
 import { createProfile, selectProfileAccounts } from "../support/profiles.ts";
 import { scenarios } from "../test-plan.ts";
+
+const App = Schema.Struct({
+  id: Schema.String,
+  requirements: Schema.Struct({
+    accounts: Schema.Struct({ syncro: Schema.Struct({ provider: Schema.String }) }),
+  }),
+});
+const Check = Schema.Struct({
+  status: Schema.String,
+  info: Schema.NullOr(Schema.Json),
+  message: Schema.optionalKey(Schema.String),
+});
+const AccountHealth = Schema.Struct({
+  info: Schema.NullOr(Schema.Json),
+  apps: Schema.Array(
+    Schema.Struct({
+      app: Schema.String,
+      checkable: Schema.Boolean,
+      check: Schema.NullOr(Schema.Struct({ status: Schema.String })),
+    }),
+  ),
+});
+const secret = "synthetic-syncro-secret";
+const userEmail = "synthetic-syncro-user@example.test";
+const handle = /^Bearer exsec_[0-9a-f]+_$/;
+
+/** Replace one exact authored string, failing if the source no longer contains it. */
+const rewrite = (source: string, from: string, to: string) => {
+  if (!source.includes(from)) throw new Error(`Syncro source no longer contains ${from}`);
+  return source.replaceAll(from, to);
+};
 
 layer(HostedLive, { excludeTestServices: true })("Syncro REST", (it) => {
   it.effect(scenarios.syncroRest.title, (context) =>
@@ -33,25 +64,40 @@ layer(HostedLive, { excludeTestServices: true })("Syncro REST", (it) => {
               "/*",
               Effect.gen(function* () {
                 const request = yield* HttpServerRequest.HttpServerRequest;
-                received.push({
-                  url: request.url,
-                  authorization: request.headers.authorization,
-                  method: request.method,
-                });
+                const authorization = request.headers.authorization;
+                received.push({ url: request.url, authorization, method: request.method });
                 const responseStatus = yield* Ref.get(status);
                 if (responseStatus !== 200)
                   return yield* HttpServerResponse.json(
-                    { message: "synthetic-syncro-secret" },
+                    { message: secret },
                     { status: responseStatus },
                   );
                 const url = new URL(request.url, "http://fixture");
+                if (url.pathname === "/api/v1/me")
+                  return yield* HttpServerResponse.json({
+                    user_id: 1,
+                    user_email: userEmail,
+                    user_name: "Synthetic Syncro User",
+                    subdomain: "127",
+                  });
                 const page = Number(url.searchParams.get("page") ?? 1);
-                const entity = { id: page, body: "internal note", hidden: true };
+                // The service echoes the credential it received, as debug responses can.
+                const entity = { id: page, body: "internal note", hidden: true, authorization };
                 const meta = { page, total_pages: 2, per_page: 10 };
+                const number = url.searchParams.get("number");
                 const response = url.pathname.endsWith("/comments")
                   ? { comments: [entity], meta }
                   : url.pathname === "/api/v1/tickets"
-                    ? { tickets: [entity], meta }
+                    ? {
+                        tickets:
+                          number === null
+                            ? [entity]
+                            : [
+                                { id: 90, number: 4207 },
+                                { id: 91, number: 4208 },
+                              ].filter((ticket) => String(ticket.number) === number),
+                        meta,
+                      }
                     : url.pathname === "/api/v1/customers"
                       ? { customers: [entity], meta }
                       : url.pathname.startsWith("/api/v1/tickets/")
@@ -67,10 +113,14 @@ layer(HostedLive, { excludeTestServices: true })("Syncro REST", (it) => {
         );
         const server = yield* HttpServer.HttpServer.pipe(Effect.provideContext(services));
         if (!("port" in server.address)) return yield* Effect.die("Syncro fixture needs TCP");
-        // Read authored source as deployment data; only its external HTTPS origin is redirected to the owned provider.
-        const source = (yield* fs.readFileString("playground/demo-apps/syncro/index.ts")).replace(
-          "https://${subdomain}.syncromsp.com",
-          `http://127.0.0.1:${server.address.port}`,
+        const port = server.address.port;
+        // Deploy the authored source with only Syncro's domain moved to the owned provider. The
+        // wildcard keeps its one-label form: account subdomain `127` addresses 127.0.0.1.
+        const authored = yield* fs.readFileString("playground/demo-apps/syncro/index.ts");
+        const source = rewrite(
+          rewrite(authored, `"*.syncromsp.com"`, `"*.0.0.1:${port}"`),
+          "https://${fields.subdomain}.syncromsp.com",
+          `http://\${fields.subdomain}.0.0.1:${port}`,
         );
         const prefix = `/api/organizations/${actors.organization.id}`;
         const deployed = yield* api.request(actors.owner, "POST", `${prefix}/apps/deploy`, {
@@ -83,6 +133,32 @@ layer(HostedLive, { excludeTestServices: true })("Syncro REST", (it) => {
         yield* Effect.addFinalizer(() =>
           api.request(actors.owner, "DELETE", path).pipe(Effect.orDie),
         );
+
+        // The account form's check reads /me through the sealed network before saving.
+        const check = (subdomain: string) =>
+          Effect.gen(function* () {
+            const response = yield* api.request(actors.owner, "POST", `${path}/credential-checks`, {
+              provider: app.requirements.accounts.syncro.provider,
+              method: "apiKey",
+              fields: { apiKey: secret, subdomain },
+            });
+            expect(response.status, JSON.stringify(response.body)).toBe(200);
+            expect(JSON.stringify(response.body)).not.toContain(secret);
+            expect(JSON.stringify(response.body)).not.toContain(userEmail);
+            return yield* body(Check, response);
+          });
+        expect(yield* check("127")).toEqual({ status: "healthy", info: null });
+        for (const [failureStatus, outcome] of [
+          [401, "credentials_rejected"],
+          [403, "forbidden"],
+          [503, "upstream_unavailable"],
+        ] as const) {
+          yield* Ref.set(status, failureStatus);
+          expect((yield* check("127")).status).toBe(outcome);
+        }
+        yield* Ref.set(status, 200);
+        expect(received.filter((request) => request.url === "/api/v1/me")).toHaveLength(4);
+
         const profile = yield* createProfile(actors.owner, path);
         const connect = (subdomain: string) =>
           Effect.gen(function* () {
@@ -100,7 +176,7 @@ layer(HostedLive, { excludeTestServices: true })("Syncro REST", (it) => {
               {
                 method: "apiKey",
                 label: "Synthetic Syncro",
-                fields: { apiKey: "synthetic-syncro-secret", subdomain },
+                fields: { apiKey: secret, subdomain },
               },
             );
             expect(saved.status, JSON.stringify(saved.body)).toBe(200);
@@ -114,8 +190,29 @@ layer(HostedLive, { excludeTestServices: true })("Syncro REST", (it) => {
               syncro: account.id,
             });
             expect(selected.status).toBe(200);
+            return account.id;
           });
-        yield* connect("fixture");
+        const account = yield* connect("127");
+        // A saved account's check substitutes the key only for the hosts it was connected for.
+        const accountCheck = Effect.gen(function* () {
+          const response = yield* api.request(
+            actors.owner,
+            "POST",
+            `${prefix}/accounts/${account}/health`,
+          );
+          expect(response.status, JSON.stringify(response.body)).toBe(200);
+          expect(JSON.stringify(response.body)).not.toContain(userEmail);
+          return yield* body(AccountHealth, response);
+        });
+        expect(yield* accountCheck).toMatchObject({
+          info: null,
+          apps: [{ app: app.id, checkable: true, check: { status: "healthy" } }],
+        });
+        yield* Ref.set(status, 401);
+        expect(yield* accountCheck).toMatchObject({
+          apps: [{ app: app.id, check: { status: "credentials_rejected" } }],
+        });
+        yield* Ref.set(status, 200);
         const call = (tool: string, input: object) =>
           api.request(actors.owner, "POST", `${path}/tools/call`, {
             profile: profile.id,
@@ -140,14 +237,28 @@ layer(HostedLive, { excludeTestServices: true })("Syncro REST", (it) => {
           expect(last.status).toBe(200);
           expect(yield* body(Page, last)).toMatchObject({ meta: { page: 2 }, nextPage: null });
         }
-        for (const tool of ["getTicket", "getCustomer"])
-          expect((yield* call(tool, { id: 7 })).status).toBe(200);
+        const ticket = yield* call("getTicket", { id: 7 });
+        expect(ticket.status).toBe(200);
+        // The service received the real key, but the app and caller only ever held its handle.
+        const echoed = yield* body(
+          Schema.Struct({ ticket: Schema.Struct({ authorization: Schema.String }) }),
+          ticket,
+        );
+        expect(echoed.ticket.authorization).toMatch(handle);
+        expect((yield* call("getCustomer", { id: 7 })).status).toBe(200);
+
+        // The ticket number users cite is sent as Syncro's number filter.
+        const cited = yield* call("searchTickets", { number: 4207 });
+        expect(cited.status, JSON.stringify(cited.body)).toBe(200);
+        expect(cited.body).toMatchObject({ tickets: [{ id: 90, number: 4207 }] });
+        expect(received.some((request) => request.url.includes("number=4207"))).toBe(true);
+
         expect(
           received.every(
             (request) =>
               request.method === "GET" &&
-              request.authorization === "Bearer synthetic-syncro-secret" &&
-              !request.url.includes("synthetic-syncro-secret"),
+              request.authorization === `Bearer ${secret}` &&
+              !request.url.includes(secret),
           ),
         ).toBe(true);
         expect(
@@ -158,26 +269,30 @@ layer(HostedLive, { excludeTestServices: true })("Syncro REST", (it) => {
           ),
         ).toBe(true);
         expect(received.some((request) => request.url.includes("query=A+%26+B"))).toBe(true);
-        for (const failureStatus of [302, 401, 429, 503]) {
+        for (const failureStatus of [302, 401, 403, 429, 503]) {
           yield* Ref.set(status, failureStatus);
           const failed = yield* call("getTicket", { id: 7 });
           expect(failed.status).not.toBe(200);
-          expect(JSON.stringify(failed.body)).not.toContain("synthetic-syncro-secret");
+          expect(JSON.stringify(failed.body)).not.toContain(secret);
           expect(JSON.stringify(failed.body)).toContain(
             failureStatus === 302
               ? "rejected"
               : failureStatus === 401
                 ? "unauthorized"
-                : failureStatus === 429
-                  ? "rate_limited"
-                  : "unavailable",
+                : failureStatus === 403
+                  ? "forbidden"
+                  : failureStatus === 429
+                    ? "rate_limited"
+                    : "unavailable",
           );
         }
         yield* Ref.set(status, 200);
         const beforeInvalid = received.length;
         expect((yield* call("searchTickets", { page: 0 })).status).not.toBe(200);
+        expect((yield* call("searchTickets", { number: 0 })).status).not.toBe(200);
         expect((yield* call("getTicket", { id: 1.5 })).status).not.toBe(200);
         yield* connect("fixture.evil.example");
+        expect(yield* check("fixture.evil.example")).toMatchObject({ status: "check_failed" });
         expect((yield* call("getTicket", { id: 7 })).status).not.toBe(200);
         expect(received.length).toBe(beforeInvalid);
       }),

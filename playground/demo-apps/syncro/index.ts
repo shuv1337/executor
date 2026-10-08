@@ -17,13 +17,62 @@ import {
   type Schema,
 } from "apps";
 
+type Account = Context["accounts"]["syncro"];
+type Fetch = (input: URL, init: RequestInit) => Promise<Response>;
+
+/** One authenticated GET; the response body is never surfaced because it may echo credentials. */
+async function request(
+  fetch: Fetch,
+  { id, fields }: Account,
+  path: string,
+  params: Record<string, string | number | undefined>,
+  signal: AbortSignal,
+): Promise<Response> {
+  if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(fields.subdomain))
+    throw new Error(
+      "Syncro subdomain must be a lowercase DNS label, without a URL or domain suffix",
+    );
+  const url = new URL(`https://${fields.subdomain}.syncromsp.com/api/v1${path}`);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined) url.searchParams.set(key, String(value));
+  }
+  const response = await fetch(url, {
+    method: "GET",
+    redirect: "manual",
+    signal,
+    headers: { Authorization: `Bearer ${fields.apiKey}`, Accept: "application/json" },
+  });
+  if (response.ok) return response;
+  throw new ProviderError({
+    reason:
+      response.status === 401
+        ? "unauthorized"
+        : response.status === 403
+          ? "forbidden"
+          : response.status === 429
+            ? "rate_limited"
+            : response.status >= 500
+              ? "unavailable"
+              : "rejected",
+    status: response.status,
+    accountId: id,
+  });
+}
+
 const syncro = defineProvider({
   name: "Syncro REST",
+  // The API key is sealed and only substituted on requests to an account subdomain.
+  hosts: ["*.syncromsp.com"],
   auth: {
     apiKey: secrets({
       label: "API key and subdomain",
       fields: object({ apiKey: string(), subdomain: plain(string()) }),
     }),
+  },
+  // Reports no account info, so the user record /me returns is never retained.
+  async health({ account, fetch, signal }): Promise<void> {
+    const response = await request(fetch, account, "/me", {}, signal);
+    await decodeJson(response, record(json()));
   },
 });
 const requirements = { accounts: { syncro } };
@@ -46,36 +95,7 @@ async function get<T>(
   params: Record<string, string | number | undefined>,
   schema: Schema<T>,
 ): Promise<T> {
-  const account = ctx.accounts.syncro;
-  const subdomain = account.fields.subdomain;
-  if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(subdomain))
-    throw new Error(
-      "Syncro subdomain must be a lowercase DNS label, without a URL or domain suffix",
-    );
-  const url = new URL(`https://${subdomain}.syncromsp.com/api/v1${path}`);
-  for (const [key, value] of Object.entries(params)) {
-    if (value !== undefined) url.searchParams.set(key, String(value));
-  }
-  const response = await ctx.fetch(url, {
-    method: "GET",
-    redirect: "manual",
-    headers: { Authorization: `Bearer ${account.fields.apiKey}`, Accept: "application/json" },
-  });
-  if (!response.ok) {
-    // Never surface an upstream response body, which may echo credentials.
-    throw new ProviderError({
-      reason:
-        response.status === 401
-          ? "unauthorized"
-          : response.status === 429
-            ? "rate_limited"
-            : response.status >= 500
-              ? "unavailable"
-              : "rejected",
-      status: response.status,
-      accountId: account.id,
-    });
-  }
+  const response = await request(ctx.fetch, ctx.accounts.syncro, path, params, ctx.signal);
   return decodeJson(response, schema);
 }
 
@@ -99,9 +119,10 @@ export default defineApp(requirements, {
     searchTickets: query(
       {
         description:
-          "Read one page of Syncro tickets. Follow nextPage until null for complete results; comments are read separately.",
+          "Read one page of Syncro tickets. Follow nextPage until null for complete results; comments are read separately. number is the ticket number users cite (such as 4207), not the ticket id; it can match more than one ticket.",
         input: object({
           page: number().default(1),
+          number: number().optional(),
           query: string().optional(),
           status: string().optional(),
           customerId: number().optional(),
@@ -116,6 +137,8 @@ export default defineApp(requirements, {
           "/tickets",
           {
             page,
+            number:
+              input.number === undefined ? undefined : positive(input.number, "Ticket number"),
             query: input.query,
             status: input.status,
             customer_id:
