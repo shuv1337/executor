@@ -49,6 +49,17 @@ const cloudOnboarding = {
 
 /** Scenario names and applicability used by both test declarations and test selection. */
 export const scenarios = {
+  syncroRest: {
+    fixtures: "actors",
+    file: "syncro-rest.spec.ts",
+    title: "Syncro REST reads preserve pagination, bearer secrets and provider failures",
+    serverEnvironment: { EXECUTOR_APPS_ALLOW_PRIVATE_FETCH: "true" },
+    targets: {
+      "self-host": scheduled,
+      cloud: na("This app scenario owns a loopback HTTP provider."),
+      local: na("This scenario uses hosted accounts and profiles."),
+    },
+  },
   teamRegistry: {
     fixtures: "actors",
     file: "team-registry.spec.ts",
