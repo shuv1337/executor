@@ -780,6 +780,12 @@
         "apps": "workspace:*",
       },
     },
+    "playground/demo-apps/syncro": {
+      "name": "@executor-js/app-syncro",
+      "dependencies": {
+        "apps": "workspace:*",
+      },
+    },
     "playground/demo-apps/vercel": {
       "name": "@executor-js/app-vercel",
       "dependencies": {
@@ -1409,6 +1415,8 @@
     "@executor-js/app-scheduled-notes": ["@executor-js/app-scheduled-notes@workspace:playground/demo-apps/scheduled-notes"],
 
     "@executor-js/app-source": ["@executor-js/app-source@workspace:packages/app-source"],
+
+    "@executor-js/app-syncro": ["@executor-js/app-syncro@workspace:playground/demo-apps/syncro"],
 
     "@executor-js/app-templates": ["@executor-js/app-templates@workspace:packages/app-templates"],
 
