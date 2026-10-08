@@ -19,10 +19,22 @@ import {
   resolveOrganizationReference,
   deleteOrganizationRecords,
 } from "@executor-js/hosted-server";
-import { Effect, Layer, Option, Redacted } from "effect";
+import { Effect, Layer, Option, Redacted, Schema } from "effect";
 import { SqlClient } from "effect/unstable/sql";
 import { AuthDatabase } from "./contracts/database.ts";
 import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http";
+
+const rateLimitBody = Schema.fromJsonString(
+  Schema.Struct({
+    message: Schema.String,
+    error: Schema.optional(Schema.Unknown),
+  }),
+);
+const oauthRateLimitPaths = new Set([
+  "/api/auth/oauth2/register",
+  "/api/auth/oauth2/authorize",
+  "/api/auth/oauth2/token",
+]);
 
 /** Initialize auth before listening; the database owns persistent users and sessions. */
 export const selfHostAuth = Effect.gen(function* () {
@@ -113,6 +125,35 @@ export const selfHostAuth = Effect.gen(function* () {
       try: () => auth.handler(web),
       catch: () => new AuthenticationUnavailable(),
     });
+    // Better Auth limits registration to five requests per minute. Its limiter
+    // runs before the OAuth plugin and returns a generic message plus its own
+    // cooldown header, which MCP clients cannot parse as an OAuth error.
+    if (response.status === 429 && oauthRateLimitPaths.has(new URL(web.url).pathname)) {
+      const parsed = yield* Effect.tryPromise({
+        try: () => response.clone().text(),
+        catch: () => new AuthenticationUnavailable(),
+      }).pipe(Effect.map(Schema.decodeUnknownOption(rateLimitBody)));
+      if (
+        Option.isSome(parsed) &&
+        parsed.value.error === undefined &&
+        parsed.value.message === "Too many requests. Please try again later."
+      ) {
+        const headers = new Headers(response.headers);
+        const cooldown = headers.get("retry-after") ?? headers.get("x-retry-after");
+        if (cooldown !== null) headers.set("retry-after", cooldown);
+        headers.delete("content-length");
+        headers.set("content-type", "application/json");
+        return HttpServerResponse.fromWeb(
+          new Response(
+            JSON.stringify({
+              error: "temporarily_unavailable",
+              error_description: parsed.value.message,
+            }),
+            { status: 429, headers },
+          ),
+        ).pipe(HttpServerResponse.setHeader("cache-control", "no-store"));
+      }
+    }
     return HttpServerResponse.fromWeb(response).pipe(
       HttpServerResponse.setHeader("cache-control", "no-store"),
     );

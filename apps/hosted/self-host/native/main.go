@@ -397,6 +397,10 @@ func (b *limitedOutput) Write(data []byte) (int, error) {
 }
 
 func serve(mode string) error {
+	trustedProxy, err := trustedProxyConfiguration()
+	if err != nil {
+		return err
+	}
 	directory, err := filepath.Abs(setting("EXECUTOR_DATA_DIR", "/app/data"))
 	if err != nil {
 		return err
@@ -597,7 +601,7 @@ func serve(mode string) error {
 		return exportDatabase(filepath.Join(temporary, "export.sock"), os.Args[2])
 	}
 
-	proxy := productProxy(filepath.Join(temporary, "product.sock"), workerdIdleTimeout)
+	proxy := productProxy(filepath.Join(temporary, "product.sock"), workerdIdleTimeout, trustedProxy)
 	publicListener, err := net.Listen("tcp", net.JoinHostPort(setting("HOST", "0.0.0.0"), port))
 	if err != nil {
 		command.Process.Kill()
@@ -651,7 +655,7 @@ func forwardedProto(in *http.Request) string {
 	return "http"
 }
 
-func productProxy(socket string, upstreamIdleTimeout time.Duration) *httputil.ReverseProxy {
+func productProxy(socket string, upstreamIdleTimeout time.Duration, trustedProxy *trustedProxy) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
 		Rewrite: func(request *httputil.ProxyRequest) {
 			request.SetURL(&url.URL{Scheme: "http", Host: "product.internal"})
@@ -660,11 +664,7 @@ func productProxy(socket string, upstreamIdleTimeout time.Duration) *httputil.Re
 			// Origin with the scheme it believes it serves on, so forward the scheme the HTTPS
 			// reverse proxy in front reported, or the one this listener received.
 			request.Out.Header.Set("X-Forwarded-Proto", forwardedProto(request.In))
-			address, _, err := net.SplitHostPort(request.In.RemoteAddr)
-			if err != nil {
-				address = request.In.RemoteAddr
-			}
-			request.Out.Header.Set("x-executor-client-ip", address)
+			request.Out.Header.Set("x-executor-client-ip", trustedProxy.clientIP(request.In))
 		},
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {

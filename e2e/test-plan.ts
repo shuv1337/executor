@@ -49,6 +49,20 @@ const cloudOnboarding = {
 
 /** Scenario names and applicability used by both test declarations and test selection. */
 export const scenarios = {
+  selfHostNativeAuth: {
+    file: "self-host-native-auth.spec.ts",
+    title:
+      "Native self-host OAuth rate limits isolate trusted proxy clients and reject spoofed addresses",
+    targets: {
+      "self-host": {
+        status: "not-run",
+        reason:
+          "Runs against the separately prepared Go/workerd runtime through e2e/self-host-native.config.ts; the ordinary self-host runner uses Bun.",
+      },
+      local: na("Local does not serve hosted OAuth registration."),
+      cloud: na("Cloud does not use the native self-host proxy."),
+    },
+  },
   teamRegistry: {
     fixtures: "actors",
     file: "team-registry.spec.ts",
