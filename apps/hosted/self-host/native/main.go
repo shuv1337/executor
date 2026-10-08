@@ -461,7 +461,7 @@ func serve(mode string) error {
 	if os.SameFile(productInfo, motelInfo) {
 		return errors.New("Motel and product data cannot share a datastore")
 	}
-	paths := map[string]string{"product-data": filepath.Join(directory, "product"), "legacy-data": filepath.Join(directory, "hosted.pglite"), "app-data": filepath.Join(directory, "workerd"), "workflow-data": filepath.Join(directory, "workerd", "workflows"), "builds": filepath.Join(directory, "builds"), "motel-data": motel}
+	paths := map[string]string{"product-data": filepath.Join(directory, "product"), "legacy-data": filepath.Join(directory, "hosted.pglite"), "app-data": filepath.Join(directory, "workerd"), "workflow-data": filepath.Join(directory, "workerd", "workflows"), "builds": filepath.Join(directory, "builds")}
 	if mode == "export" {
 		// Export must not wake retained workflow alarms while their product callbacks
 		// are offline. Only the product actor opens its live durable store.
@@ -567,19 +567,23 @@ func serve(mode string) error {
 		args = append(args, "--directory-path="+name+"="+path)
 	}
 	if mode == "export" {
-		args = append(args, "--socket-addr=http=unix:"+filepath.Join(temporary, "export.sock"), "--socket-addr=motel=unix:"+filepath.Join(temporary, "motel.sock"))
+		args = append(args, "--socket-addr=http=unix:"+filepath.Join(temporary, "export.sock"))
 	}
-	command := exec.Command(filepath.Join(runtime, "workerd"), args...)
-	configureChild(command)
-	command.Stdout = os.Stderr
-	command.Stderr = os.Stderr
-	command.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + temporary}
-	for _, name := range []string{"SSL_CERT_FILE", "SSL_CERT_DIR"} {
-		if value := os.Getenv(name); value != "" {
-			command.Env = append(command.Env, name+"="+value)
+	workerd := func(args ...string) *exec.Cmd {
+		command := exec.Command(filepath.Join(runtime, "workerd"), args...)
+		configureChild(command)
+		command.Stdout = os.Stderr
+		command.Stderr = os.Stderr
+		command.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + temporary}
+		for _, name := range []string{"SSL_CERT_FILE", "SSL_CERT_DIR"} {
+			if value := os.Getenv(name); value != "" {
+				command.Env = append(command.Env, name+"="+value)
+			}
 		}
+		command.Dir = runtime
+		return command
 	}
-	command.Dir = runtime
+	command := workerd(args...)
 	if err = command.Start(); err != nil {
 		return err
 	}
@@ -600,6 +604,10 @@ func serve(mode string) error {
 		}
 		return exportDatabase(filepath.Join(temporary, "export.sock"), os.Args[2])
 	}
+	telemetry := superviseCollector(func() *exec.Cmd {
+		return workerd("serve", filepath.Join(runtime, "motel.capnp"), "--directory-path=motel-data="+motel, "--directory-path=motel-assets="+filepath.Join(runtime, "motel", "web", "dist"))
+	})
+	defer telemetry.stop()
 
 	proxy := productProxy(filepath.Join(temporary, "product.sock"), workerdIdleTimeout, trustedProxy)
 	publicListener, err := net.Listen("tcp", net.JoinHostPort(setting("HOST", "0.0.0.0"), port))
@@ -630,6 +638,65 @@ func serve(mode string) error {
 	case <-time.After(15 * time.Second):
 		command.Process.Kill()
 		return <-stopped
+	}
+}
+
+// collector keeps the bundled Motel workerd running beside the product's. Telemetry is
+// disposable, so its exits never stop the product; it restarts after a short delay.
+type collector struct {
+	mutex   sync.Mutex
+	command *exec.Cmd
+	exited  chan struct{}
+	stopped bool
+}
+
+func superviseCollector(start func() *exec.Cmd) *collector {
+	c := &collector{}
+	go func() {
+		for {
+			c.mutex.Lock()
+			if c.stopped {
+				c.mutex.Unlock()
+				return
+			}
+			command := start()
+			exited := make(chan struct{})
+			err := command.Start()
+			if err == nil {
+				c.command, c.exited = command, exited
+			}
+			c.mutex.Unlock()
+			if err == nil {
+				err = command.Wait()
+				close(exited)
+			}
+			c.mutex.Lock()
+			stopped := c.stopped
+			c.mutex.Unlock()
+			if stopped {
+				return
+			}
+			fmt.Fprintln(os.Stderr, "Telemetry collector exited:", err)
+			time.Sleep(3 * time.Second)
+		}
+	}()
+	return c
+}
+
+func (c *collector) stop() {
+	c.mutex.Lock()
+	c.stopped = true
+	command, exited := c.command, c.exited
+	c.mutex.Unlock()
+	if command == nil {
+		return
+	}
+	command.Process.Signal(syscall.SIGTERM)
+	select {
+	case <-exited:
+	case <-time.After(15 * time.Second):
+		command.Process.Kill()
+		<-exited
 	}
 }
 

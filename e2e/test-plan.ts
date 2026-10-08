@@ -74,6 +74,19 @@ export const scenarios = {
       cloud: na("Cloud does not use the native self-host proxy."),
     },
   },
+  selfHostNativeTelemetry: {
+    file: "self-host-native-telemetry.spec.ts",
+    title: "Native self-host telemetry ingest does not stall product requests",
+    targets: {
+      "self-host": {
+        status: "not-run",
+        reason:
+          "Runs against the separately prepared Go/workerd runtime through e2e/self-host-native.config.ts; the ordinary self-host runner uses Bun.",
+      },
+      local: na("Local runs its collector in a separate process already."),
+      cloud: na("Cloud exports to Axiom, not a bundled collector."),
+    },
+  },
   teamRegistry: {
     fixtures: "actors",
     file: "team-registry.spec.ts",

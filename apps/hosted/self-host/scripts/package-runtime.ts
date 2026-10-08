@@ -166,8 +166,8 @@ const packageRuntime = Effect.gen(function* () {
   yield* fs.copy(path.join(root, "packages/telemetry/dist/motel"), path.join(output, "motel"), {
     overwrite: true,
   });
-  // The collector shares the product's process and memory limit. Bound what it holds for
-  // exports in flight (4 x 16 MiB) and what it stores; beyond either it refuses and counts.
+  // The collector shares the product's memory limit. Bound what it holds for exports in
+  // flight (4 x 16 MiB) and what it stores; beyond either it refuses and counts.
   const motelBounds = Object.entries({
     MOTEL_OTEL_MAX_PENDING_INGEST: 4,
     MOTEL_OTEL_MAX_INGEST_BYTES: 16 * 1024 * 1024,
@@ -205,23 +205,34 @@ const config :Workerd.Config = (
    bindings=[(name="ENGINE",durableObjectNamespace="Engine"),(name="USER_WORKFLOW",service=(name="apps",entrypoint="AppWorkflows")),(name="BINDING_NAME",json=${JSON.stringify(JSON.stringify("executor-app-workflows"))}),(name="WORKFLOW_NAME",json=${JSON.stringify(JSON.stringify("executor-app-workflows"))})],
    durableObjectNamespaces=[${workflowEngines}],durableObjectStorage=(localDisk="workflow-data")
   )),
-  (name="motel",worker=(
-   compatibilityDate="2026-09-01",compatibilityFlags=["nodejs_compat"],modules=[(name="motel.mjs",esModule=embed "@@RUNTIME@@/motel/motel.mjs")],
-   bindings=[(name="STORE",durableObjectNamespace="MotelCollector"),(name="ASSETS",service="motel-assets"),${motelBounds}],
-   durableObjectNamespaces=[(className="MotelCollector",uniqueKey="motel",enableSql=true)],durableObjectStorage=(localDisk="motel-data")
-  )),
   (name="native",external=(address="unix:/tmp/executor-native.sock",http=())),
   (name="public",network=(allow=["public"],tlsOptions=(trustBrowserCas=true,trustedCertificates=[@@EXTRA_CA_CERTIFICATES@@]))),
   (name="internet",network=(allow=["public","private","local"],tlsOptions=(trustBrowserCas=true,trustedCertificates=[@@EXTRA_CA_CERTIFICATES@@]))),
-  (name="dashboard",disk=(path="@@RUNTIME@@/web")),(name="motel-assets",disk=(path="@@RUNTIME@@/motel/web/dist")),
+  (name="dashboard",disk=(path="@@RUNTIME@@/web")),
   (name="product-data",disk=(path="/app/data/product",writable=true,allowDotfiles=true)),
   (name="legacy-data",disk=(path="/app/data/hosted.pglite",allowDotfiles=true)),
   (name="app-data",disk=(path="/app/data/workerd",writable=true,allowDotfiles=true)),
   (name="workflow-data",disk=(path="/app/data/workerd/workflows",writable=true,allowDotfiles=true)),
-  (name="builds",disk=(path="/app/data/builds",writable=true)),
+  (name="builds",disk=(path="/app/data/builds",writable=true))
+ ],
+ sockets=[(name="http",address="0.0.0.0:4400",http=(),service=@@PRODUCT_SERVICE@@)]
+);
+`;
+  // workerd runs every isolate in a process on one thread, and the collector's SQLite writes and
+  // evictions are synchronous. Its own process keeps them from stalling product requests. The
+  // same unique key opens the same stored telemetry as when it shared the product's process.
+  const motelConfig = `using Workerd = import "/workerd/workerd.capnp";
+const config :Workerd.Config = (
+ services=[
+  (name="motel",worker=(
+   compatibilityDate="2026-09-01",compatibilityFlags=["nodejs_compat"],modules=[(name="motel.mjs",esModule=embed "motel/motel.mjs")],
+   bindings=[(name="STORE",durableObjectNamespace="MotelCollector"),(name="ASSETS",service="motel-assets"),${motelBounds}],
+   durableObjectNamespaces=[(className="MotelCollector",uniqueKey="motel",enableSql=true)],durableObjectStorage=(localDisk="motel-data")
+  )),
+  (name="motel-assets",disk=(path="motel/web/dist")),
   (name="motel-data",disk=(path="/app/motel-data",writable=true,allowDotfiles=true))
  ],
- sockets=[(name="http",address="0.0.0.0:4400",http=(),service=@@PRODUCT_SERVICE@@),(name="motel",address="127.0.0.1:4318",http=(),service="motel")]
+ sockets=[(name="motel",address="127.0.0.1:4318",http=(),service="motel")]
 );
 `;
   // Retain dependency notices with the executable image, including the embedded engines.
@@ -271,6 +282,7 @@ const config :Workerd.Config = (
     inventory.sort().join("\n") + "\n",
   );
   yield* fs.writeFileString(path.join(output, "workerd.capnp"), config);
+  yield* fs.writeFileString(path.join(output, "motel.capnp"), motelConfig);
   // Count real files once, including native assets, and reject any link back to
   // the build tree. This budget covers both supported Linux architectures.
   const runtimeRoot = yield* fs.realPath(output);

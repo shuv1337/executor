@@ -71,14 +71,15 @@ export const nativeSelfHost = (environment: Readonly<Record<string, string>>) =>
       );
     const directory = path.resolve(".local/native-auth", randomBytes(8).toString("hex"));
     yield* fs.makeDirectory(directory, { recursive: true, mode: 0o700 });
-    // The packaged collector normally exposes 4318. Give this fixture its own
-    // listener without changing product code or a developer's telemetry server.
+    // The packaged collector normally exposes 4318. Give this fixture its own listener and
+    // export to it, without changing product code or a developer's telemetry server.
     const fixtureRuntime = `${directory}/runtime`;
     yield* fs.copy(runtime, fixtureRuntime);
-    const config = yield* fs.readFileString(`${fixtureRuntime}/workerd.capnp`);
+    const collector = `http://127.0.0.1:${yield* freePort}`;
+    const config = yield* fs.readFileString(`${fixtureRuntime}/motel.capnp`);
     yield* fs.writeFileString(
-      `${fixtureRuntime}/workerd.capnp`,
-      config.replace('address="127.0.0.1:4318"', `address="127.0.0.1:${yield* freePort}"`),
+      `${fixtureRuntime}/motel.capnp`,
+      config.replace('address="127.0.0.1:4318"', `address="${new URL(collector).host}"`),
     );
     yield* Effect.addFinalizer(() =>
       fs.remove(fixtureRuntime, { recursive: true, force: true }).pipe(Effect.orDie),
@@ -104,6 +105,8 @@ export const nativeSelfHost = (environment: Readonly<Record<string, string>>) =>
           EXECUTOR_DATA_DIR: `${directory}/data`,
           EXECUTOR_MOTEL_DATA_DIR: `${directory}/motel`,
           EXECUTOR_RUNTIME_DIR: fixtureRuntime,
+          OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: `${collector}/v1/traces`,
+          OTEL_EXPORTER_OTLP_LOGS_ENDPOINT: `${collector}/v1/logs`,
           ...environment,
         },
         stdout: "pipe",
@@ -161,5 +164,5 @@ export const nativeSelfHost = (environment: Readonly<Record<string, string>>) =>
           return { status: response.status, headers: response.headers, text };
         }),
       );
-    return { origin, register, oauth };
+    return { origin, collector, register, oauth };
   });
