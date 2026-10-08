@@ -631,14 +631,22 @@ func serve(mode string) error {
 			fmt.Fprintln(os.Stderr, "Native host stopped")
 		}
 	}
+	// Stop both processes together so shutdown fits one deadline, and so a collector
+	// already stopped by a terminal's process-group signal is not restarted meanwhile.
+	telemetryStopped := make(chan struct{})
+	go func() {
+		telemetry.stop()
+		close(telemetryStopped)
+	}()
 	command.Process.Signal(syscall.SIGTERM)
 	select {
-	case err := <-stopped:
-		return err
+	case err = <-stopped:
 	case <-time.After(15 * time.Second):
 		command.Process.Kill()
-		return <-stopped
+		err = <-stopped
 	}
+	<-telemetryStopped
+	return err
 }
 
 // collector keeps the bundled Motel workerd running beside the product's. Telemetry is
@@ -648,10 +656,11 @@ type collector struct {
 	command *exec.Cmd
 	exited  chan struct{}
 	stopped bool
+	done    chan struct{}
 }
 
 func superviseCollector(start func() *exec.Cmd) *collector {
-	c := &collector{}
+	c := &collector{done: make(chan struct{})}
 	go func() {
 		for {
 			c.mutex.Lock()
@@ -677,7 +686,11 @@ func superviseCollector(start func() *exec.Cmd) *collector {
 				return
 			}
 			fmt.Fprintln(os.Stderr, "Telemetry collector exited:", err)
-			time.Sleep(3 * time.Second)
+			select {
+			case <-c.done:
+				return
+			case <-time.After(3 * time.Second):
+			}
 		}
 	}()
 	return c
@@ -685,7 +698,10 @@ func superviseCollector(start func() *exec.Cmd) *collector {
 
 func (c *collector) stop() {
 	c.mutex.Lock()
-	c.stopped = true
+	if !c.stopped {
+		c.stopped = true
+		close(c.done)
+	}
 	command, exited := c.command, c.exited
 	c.mutex.Unlock()
 	if command == nil {

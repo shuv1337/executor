@@ -65,10 +65,11 @@ export const nativeSelfHost = (environment: Readonly<Record<string, string>>) =>
       Config.withDefault(path.resolve(".local/native-auth/executor-host")),
     );
     const runtime = path.resolve("apps/hosted/self-host/dist/workerd");
-    if (!(yield* fs.exists(binary)) || !(yield* fs.exists(`${runtime}/workerd.capnp`)))
-      return yield* Effect.die(
-        "Prepare the native self-host artifacts as described in e2e/README.md.",
-      );
+    for (const artifact of [binary, `${runtime}/workerd.capnp`, `${runtime}/motel.capnp`])
+      if (!(yield* fs.exists(artifact)))
+        return yield* Effect.die(
+          `Missing ${artifact}. Prepare the native self-host artifacts as described in e2e/README.md; rebuild them after source changes.`,
+        );
     const directory = path.resolve(".local/native-auth", randomBytes(8).toString("hex"));
     yield* fs.makeDirectory(directory, { recursive: true, mode: 0o700 });
     // The packaged collector normally exposes 4318. Give this fixture its own listener and
