@@ -33,9 +33,13 @@ Motel keeps seven days and targets 1 GiB. Each log file keeps four rotated
 archives at about 10 MiB each.
 
 Motel runs in workerd. In self-host Docker it shares the product's workerd
-process and keeps its SQLite files in the `motel` folder of
-`EXECUTOR_MOTEL_DATA_DIR`. This directory must be separate from `/app/data`. Replacing the container discards telemetry by
-default. Mount a separate volume at the Motel directory to retain it. The
+process and keeps its SQLite files under `EXECUTOR_MOTEL_DATA_DIR`. This directory must be separate from `/app/data`. Replacing the container discards telemetry by
+default for standalone image runs. The repository Compose configuration mounts a
+separate named `motel-data` volume and retains telemetry across replacement. For
+other installations, mount a separate volume at the Motel directory to retain it.
+Adding a mount does not import existing container telemetry: export it, or stop
+the container and copy the complete Motel directory before replacement if it
+must be kept. The
 container does not include Node or Bun.
 
 Motel also stores the log records that Executor writes. A record written

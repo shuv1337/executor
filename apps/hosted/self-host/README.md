@@ -130,8 +130,14 @@ wildcard DNS as described below.
 The named `pglite-data` volume stores the database, app source, builds, app data,
 and generated `auth-secret.key` and `encryption.key` files under `/app/data`. Keep one server instance per data volume.
 
-Motel uses a separate store at `/app/motel-data`. Container replacement discards
-telemetry by default. Mount a separate volume there only if retention is wanted.
+Motel uses a separate store at `/app/motel-data`. The Compose configuration mounts
+the named `motel-data` volume there, retaining traces when its container is replaced.
+Standalone image runs need their own separate mount to retain telemetry.
+Adding a volume does not copy telemetry from an existing container into it. If
+those traces are needed, export them or stop the container and copy its complete
+Motel directory into the new volume before replacement. Keep the product and
+Motel volumes separate; the entrypoint prepares their ownership for the non-root
+server user. Do not remove either volume during updates.
 Product upgrades do not import old Motel data. See [workerd storage and rollback](../../../notes/self-host-workerd.md)
 for the native PostgreSQL import and an export that preserves later product writes.
 
