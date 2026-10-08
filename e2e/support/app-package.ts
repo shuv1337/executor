@@ -7,7 +7,7 @@ import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
 /**
  * Published apps versions, exactly as npm serves them. beta.0 and beta.1 speak host protocol 1,
- * beta.4 protocol 2 and beta.5 protocol 3.
+ * beta.4 protocol 2, beta.5 protocol 3 and beta.35 protocol 8.
  */
 const releases = {
   "0.0.1-beta.0":
@@ -18,6 +18,8 @@ const releases = {
     "sha512-EeEOQNvUyUKyuKBXiK4cnZd4U6o4HwduPFsaGBTEqO5VorXyxWBPwmJU0Opt+3eCK4kIfmmmzBKql7SXm8j9ng==",
   "0.0.1-beta.5":
     "sha512-d9tAdBVDtm8j8ubXcqPWLEEOBwz4hDPXxMg93hxqFWjeGAfdu+5T9HHrJ4FlVhenrzeyqB/hvD8p+9D+ZNFEFw==",
+  "0.0.1-beta.35":
+    "sha512-/+dJXwxPsWcXMLpOAIUlvk7sVyP9lIbOtuhNZd1OWnLkRkGTSR8B1iI/kc2eXNAuteNiB63XnYvEgE6yjp/7jA==",
 } as const;
 type Release = keyof typeof releases;
 const RuntimePackage = Schema.Record(Schema.String, Schema.Unknown);
