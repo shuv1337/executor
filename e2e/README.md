@@ -49,6 +49,11 @@ go build -C apps/hosted/self-host/native -o ../../../../.local/native-auth/execu
 bunx vitest run --config e2e/self-host-native.config.ts --testNamePattern 'Native self-host OAuth rate limits'
 ```
 
+The same artifacts run the native telemetry scenarios (`--testNamePattern 'Native self-host
+(telemetry ingest|restarts its telemetry)'`). They need `motel.capnp` in the packaged runtime.
+They check that collector ingest does not delay product health, that a crashed collector restarts
+on its retained store, and that Ctrl-C stops it with a draining product without a restart.
+
 This needs Go and the current platform's workerd executable. The scenario owns
 its listeners, data directories and processes; logs remain in `.local/native-auth/`
 and product data is removed at cleanup. Missing artifacts fail preparation rather

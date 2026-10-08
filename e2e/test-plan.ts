@@ -87,6 +87,19 @@ export const scenarios = {
       cloud: na("Cloud exports to Axiom, not a bundled collector."),
     },
   },
+  selfHostNativeTelemetryLifecycle: {
+    file: "self-host-native-telemetry.spec.ts",
+    title: "Native self-host restarts its telemetry collector and stops it with the product",
+    targets: {
+      "self-host": {
+        status: "not-run",
+        reason:
+          "Runs against the separately prepared Go/workerd runtime through e2e/self-host-native.config.ts; the ordinary self-host runner uses Bun.",
+      },
+      local: na("Local does not supervise a bundled collector process."),
+      cloud: na("Cloud exports to Axiom, not a bundled collector."),
+    },
+  },
   teamRegistry: {
     fixtures: "actors",
     file: "team-registry.spec.ts",

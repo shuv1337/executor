@@ -165,5 +165,14 @@ export const nativeSelfHost = (environment: Readonly<Record<string, string>>) =>
           return { status: response.status, headers: response.headers, text };
         }),
       );
-    return { origin, collector, register, oauth };
+    return {
+      origin,
+      collector,
+      runtime: fixtureRuntime,
+      pid: child.pid,
+      exitCode: child.exitCode,
+      isRunning: child.isRunning,
+      register,
+      oauth,
+    };
   });
