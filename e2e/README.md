@@ -35,6 +35,28 @@ writers. Smaller runs use the same assertions. `--test-name` is a regular expres
 matched against scenario titles, without the enclosing Vitest suite name.
 Filtered cases are not counted as executed cases in the evidence view.
 
+### Native self-host authentication
+
+The ordinary self-host suite uses Bun. To exercise the packaged Go/workerd host's
+trusted-proxy boundary and public OAuth registration rate limit, prepare its
+artifacts and run the focused native scenario with the same Effect/Vitest runner:
+
+```sh
+bun run e2e:prepare
+bun run --cwd apps/hosted/self-host package:runtime
+mkdir -p .local/native-auth
+go build -C apps/hosted/self-host/native -o ../../../../.local/native-auth/executor-host .
+bunx vitest run --config e2e/self-host-native.config.ts --testNamePattern 'Native self-host OAuth rate limits'
+```
+
+This needs Go and the current platform's workerd executable. The scenario owns
+its listeners, data directories and processes; logs remain in `.local/native-auth/`
+and product data is removed at cleanup. Missing artifacts fail preparation rather
+than substituting the Bun server. Rebuild both native artifacts after source
+changes. It is registered separately in the test plan and is not run by the
+ordinary Bun self-host job or existing release configuration. No CI coverage for
+this native scenario is claimed until that job is explicitly wired.
+
 ## Dependency injection
 
 `support/platform.ts` supplies target configuration and native platform services.

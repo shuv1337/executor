@@ -168,6 +168,30 @@ Traefik and Cloudflare Tunnel do. The dashboard compares each browser request's
 origin with that scheme and host; without them the dashboard page loads but its
 reads fail with "Could not reach the server".
 
+In the Docker/native host, configure the proxy's client-IP assertion so callers
+do not share the proxy's authentication rate-limit bucket. Set both
+`EXECUTOR_TRUSTED_PROXY_HEADER` and `EXECUTOR_TRUSTED_PROXIES`, for example:
+
+```sh
+EXECUTOR_TRUSTED_PROXY_HEADER=cf-connecting-ip
+EXECUTOR_TRUSTED_PROXIES=172.18.0.3
+```
+
+Use the actual cloudflared/proxy TCP peer address, or a dedicated proxy subnet.
+The addresses are comma-separated IPv4/IPv6 addresses or CIDR ranges. The header
+is accepted only from those peers. Your proxy must replace that header with the
+real visitor address and prevent untrusted traffic from impersonating a trusted
+peer. Avoid trusting an entire shared Docker/private network.
+
+For nginx/Caddy, a replaced `x-real-ip` header works too. With `x-forwarded-for`,
+the host scans from the right and discards only configured trusted proxy hops;
+the nearest untrusted hop supplies the address. Missing or malformed assertions
+fall back to the socket address. With neither setting configured, every request
+uses its socket address. A client-supplied `x-executor-client-ip` is always
+overwritten. Invalid or incomplete proxy settings refuse startup. These settings
+apply to the packaged Go/workerd host; the Bun development server uses its own
+direct socket address.
+
 Localhost derives app UI addresses automatically. For a public installation,
 set `EXECUTOR_APP_UI_BASE_URL` to a separate HTTPS base such as
 `https://apps.example.com`. Route that base and its wildcard subdomains to the
