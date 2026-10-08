@@ -1,44 +1,56 @@
 # Existing scheduled jobs inventory
 
 Read-only inventory for [issue #4](https://github.com/shuv1337/executor/issues/4),
-checked October 8, 2026, at approximately 09:25–09:30 UTC (02:25–02:30 PDT).
+first checked October 8, 2026, at approximately 09:25–09:30 UTC (02:25–02:30 PDT),
+then expanded at 10:56–11:00 UTC (03:56–04:00 PDT) using the supplied Hermes VM location.
 No jobs were triggered, enabled, disabled, moved or deleted. No messages were
 sent, providers changed, or services restarted. This report contains no session
 files, credentials, private destination IDs or internal network addresses.
 
 ## Recommendation
 
-Keep the three configured shuvdev Hermes jobs in their current system for now.
+Keep the three live Hermes jobs on the `hermes-bots` VM in their current system.
 None is a simple scheduled API mutation: all depend on an agent producing prose
 or HTML, host files and publishing tools. Executor can schedule existing app
 mutations but does not supply a replacement for the Hermes agent by itself.
 Moving these jobs would require reauthoring their capabilities and delivery.
 
-The immediate decision is whether the existing jobs should run at all. The
-Hermes gateway is inactive, recorded next-run timestamps are stale, and the
-recap names missing template/upload paths. Restarting or repairing Hermes is
-separate work. An enabled job configuration does not prove current execution.
+The VM is the verified active location: its gateway and serve services are
+running, and all three jobs have recent execution records. The inactive shuvdev
+gateway and stale records describe a historical copy, not a stopped routine.
+Do not reactivate that copy and duplicate the VM's jobs.
+
+The immediate issue is delivery: each live VM job's latest status is
+`delivery_failed`, with a Discord media-send error: `'NoneType' object has no
+attribute 'File'`. The brief failures concern MP3 attachments; the recap failure
+concerns a PNG. These records do not establish whether accompanying text/link
+messages arrived or publishing completed. Repairing delivery is separate from
+this inventory. Recap prompts also reference absent paths.
 
 ## Hermes jobs
 
-The shuvdev host timezone is `America/Los_Angeles`; Hermes config has an empty
-timezone override, and saved run timestamps use Pacific offsets. Cadences below
-are the configured intent, not a promise that jobs are firing today.
+The VM host timezone is UTC, but its Hermes configuration explicitly sets
+`America/Los_Angeles`. The shuvdev host timezone is `America/Los_Angeles`, with
+an empty Hermes override. Saved timestamps use Pacific offsets. Recent VM records
+confirm execution; future ticks below are configured intent, not delivery proof.
 
-| Job and source                        | Configured cadence                     | Recorded state and latest run                                        | Dependencies / output                                                                                                                                                                    | Recommendation                                                                                   |
-| ------------------------------------- | -------------------------------------- | -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
-| shuvdev: daily-brief-morning          | `0 9 * * *`, daily 09:00 Pacific       | Enabled; last run October 1, 09:06 PDT, `ok`; next tick October 2    | News/RSS, article enrichment, Hacker News, X CLI credentials, model editorial selection, Python/Jinja build, local Kokoro audio, Pages deploy, git snapshot, configured Discord delivery | Keep in Hermes; defer migration                                                                  |
-| shuvdev: daily-brief-evening          | `0 21 * * *`, daily 21:00 Pacific      | Enabled; last run October 1, 21:10 PDT, `ok`; next tick October 2    | Same pipeline plus recent-edition history to avoid repeat stories                                                                                                                        | Keep in Hermes; batch any repair with morning                                                    |
-| shuvdev: weekly-github-recap          | `0 8 * * 1`, Monday 08:00 Pacific      | Enabled; last run September 28, 08:09 PDT, `ok`; next tick October 5 | Authenticated GitHub CLI, model summary, local HTML template and upload helper, configured Discord delivery                                                                              | Keep in Hermes; missing paths must be resolved before restart                                    |
-| Local Mac: HN Front Page Daily Digest | Daily 09:00; stored timestamps Pacific | Paused; last run April 16, `ok`                                      | Agent digest, Telegram delivery                                                                                                                                                          | Candidate to retire if consolidated daily brief is retained; do not delete without that decision |
-| Local Mac: x-daily-digest             | Daily 09:00; stored timestamps Pacific | Paused; last run April 16, `ok`                                      | X CLI, agent digest, Telegram delivery                                                                                                                                                   | Candidate to retire if consolidated daily brief is retained                                      |
-| Local Mac: daily-reminders            | Daily 09:00; stored timestamps Pacific | Paused; last run May 7, `ok`                                         | Reminder content and Telegram delivery                                                                                                                                                   | Keep paused until the owner confirms whether reminders remain wanted                             |
-| Local Mac: daily-brief-morning        | Daily 09:00; stored timestamps Pacific | Paused; last run May 7, `ok`                                         | Daily brief pipeline, Telegram delivery                                                                                                                                                  | Candidate to retire as superseded local copy, contingent on choosing shuvdev as owner            |
-| Local Mac: daily-brief-evening        | Daily 21:00; stored timestamps Pacific | Paused; last run May 7, `ok`                                         | Daily brief pipeline, Telegram delivery                                                                                                                                                  | Candidate to retire as superseded local copy, contingent on choosing shuvdev as owner            |
+| Job and source                        | Configured cadence                     | Recorded state and latest run                                                                       | Dependencies / output                                                                                                                                                                    | Recommendation                                                                                   |
+| ------------------------------------- | -------------------------------------- | --------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| hermes-bots: daily-brief-morning      | `0 9 * * *`, daily 09:00 Pacific       | Enabled; last run October 7, 09:05 PDT, `delivery_failed`; next tick October 8, 09:00 PDT           | News/RSS, article enrichment, Hacker News, X CLI credentials, model editorial selection, Python/Jinja build, local Kokoro audio, Pages deploy, git snapshot, configured Discord delivery | Keep in Hermes; separate delivery repair                                                         |
+| hermes-bots: daily-brief-evening      | `0 21 * * *`, daily 21:00 Pacific      | Enabled; last run October 7, 21:06 PDT, `delivery_failed`; next tick October 8, 21:00 PDT           | Same pipeline plus recent-edition history to avoid repeat stories                                                                                                                        | Keep in Hermes; batch delivery repair with morning                                               |
+| hermes-bots: weekly-github-recap      | `0 8 * * 1`, Monday 08:00 Pacific      | Enabled; last run October 5, 08:20 PDT, `delivery_failed`; next tick October 12, 08:00 PDT          | Authenticated GitHub CLI, model summary, local HTML template and upload helper, configured Discord delivery                                                                              | Keep in Hermes; separate delivery and prompt-path review                                         |
+| shuvdev: daily-brief-morning          | Daily 09:00 Pacific                    | Enabled record; inactive gateway; last run October 1, 09:06 PDT, `ok`; stale next tick October 2    | Historical daily-brief copy                                                                                                                                                              | Candidate to retire after confirming VM ownership; do not restart                                |
+| shuvdev: daily-brief-evening          | Daily 21:00 Pacific                    | Enabled record; inactive gateway; last run October 1, 21:10 PDT, `ok`; stale next tick October 2    | Historical daily-brief copy                                                                                                                                                              | Candidate to retire after confirming VM ownership; do not restart                                |
+| shuvdev: weekly-github-recap          | Monday 08:00 Pacific                   | Enabled record; inactive gateway; last run September 28, 08:09 PDT, `ok`; stale next tick October 5 | Historical recap copy                                                                                                                                                                    | Candidate to retire after confirming VM ownership; do not restart                                |
+| Local Mac: HN Front Page Daily Digest | Daily 09:00; stored timestamps Pacific | Paused; last run April 16, `ok`                                                                     | Agent digest, Telegram delivery                                                                                                                                                          | Candidate to retire if consolidated daily brief is retained; do not delete without that decision |
+| Local Mac: x-daily-digest             | Daily 09:00; stored timestamps Pacific | Paused; last run April 16, `ok`                                                                     | X CLI, agent digest, Telegram delivery                                                                                                                                                   | Candidate to retire if consolidated daily brief is retained                                      |
+| Local Mac: daily-reminders            | Daily 09:00; stored timestamps Pacific | Paused; last run May 7, `ok`                                                                        | Reminder content and Telegram delivery                                                                                                                                                   | Keep paused until the owner confirms whether reminders remain wanted                             |
+| Local Mac: daily-brief-morning        | Daily 09:00; stored timestamps Pacific | Paused; last run May 7, `ok`                                                                        | Daily brief pipeline, Telegram delivery                                                                                                                                                  | Candidate to retire as superseded local copy, contingent on confirming VM ownership              |
+| Local Mac: daily-brief-evening        | Daily 21:00; stored timestamps Pacific | Paused; last run May 7, `ok`                                                                        | Daily brief pipeline, Telegram delivery                                                                                                                                                  | Candidate to retire as superseded local copy, contingent on confirming VM ownership              |
 
-The remote daily-brief prompts still instruct Telegram replies, while their
+Both remote copies' daily-brief prompts still instruct Telegram replies, while their
 job records specify `deliver: discord`. Confirm the intended destination before
-any reactivation. No destination IDs are needed in this report.
+delivery repair. No destination IDs are needed in this report.
 
 Existing daily-brief script filenames were confirmed on shuvdev under
 `~/repos/daily-brief/scripts/`: `fetch_news.py`, `enrich_news.py`, `build.py`,
@@ -47,13 +59,13 @@ Existing daily-brief script filenames were confirmed on shuvdev under
 Jinja rendering, local scraping/enrichment, Kokoro and Wrangler/Pages publishing;
 these scripts were read, never executed.
 
-The recap prompt references these absent files on shuvdev:
+The recap prompt references these absent files on both shuvdev and the live VM:
 
 - `~/repos/shuvbot-skills/skills/creative/visual-explainer/templates/latitudes.html`
 - `~/repos/shuvbot-skills/upload/scripts/upload-html.sh`
 
-The alternate `~/repos/shuvbot-skills/skills/upload/scripts/upload-html.sh` is
-also absent. The `shuvbot-skills` repository exists, but this inventory did not
+The alternate `~/repos/shuvbot-skills/skills/upload/scripts/upload-html.sh` was
+also checked and absent on shuvdev. The `shuvbot-skills` repository exists, but this inventory did not
 invent replacements or change the prompt.
 
 ## Other shuvdev user timers
@@ -79,6 +91,41 @@ Behavior of each target script was not audited.
 | shuvbot-timemachine       | Daily 09:07 Pacific                                       |
 | shuvmon-agent (unit only) | 30 seconds after boot, then 120 seconds after activation  |
 
+## Live VM evidence and source boundaries
+
+SSH to the user-supplied exe.dev VM succeeds at `hermes-bots.exe.xyz`; the
+`.exe.dev` spelling is not its working SSH name. Read-only commands used:
+
+- Selected metadata from `~/.hermes/cron/jobs.json`: file updated October 7,
+  21:06:42 PDT; three enabled jobs, with latest execution records in the table.
+- Only the `timezone` setting from `~/.hermes/config.yaml`: `America/Los_Angeles`.
+- `XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus systemctl --user show hermes-gateway.service hermes-serve.service --property=Id --property=ActiveState --property=SubState --property=ActiveEnterTimestamp`:
+  both active/running; gateway since October 2, 05:21:31 UTC; serve since
+  October 2, 05:17:33 UTC. Process cgroups corroborate both user service owners.
+- An initial user-service query lacked the SSH session bus environment and
+  could not connect; the corrected query above establishes service state.
+  A stale gateway PID file was not treated as authoritative.
+- VM `~/repos/daily-brief/scripts/{build.py,tts.py,deploy.sh}` exist. The two
+  recap prompt paths listed above are absent. No scripts were executed.
+- Latest delivery errors were inspected with private paths/destination IDs
+  sanitized; all three share the Discord media-send error quoted above.
+
+Bounded filename discovery inspected VM `~/repos`, `~/hermes-workspace`,
+`~/.hermes/skills`, and immediate source-check/install/script directory names.
+No custom Syncro/Jotform or ticket-watch app source was located. The three live
+cron prompts contain no Syncro/Jotform/Executor calls. The VM repositories found
+are Hermes, daily-brief, shared skills and Tailscale, rather than an Executor
+checkout. An opaque installed item was not opened or assumed to be an app export.
+
+The parent team's separate read-only inspection of shuvdev `~/repos/ltc-workflows`
+found Make exports/plans and Discord TTS material, without the requested custom
+Executor app source or ticket-watch/digest routine. Existing skills/source
+references are not proof of the deployed Executor app identity. Current custom
+app source, account definition, deployed revision and routine caller remain
+unknown; they require an authorized app-source export or management read from
+Executor. No runtime database, auth/token/session file, or provider credential
+was opened to infer them.
+
 ## Evidence and limits
 
 - Local and shuvdev `~/.hermes/cron/jobs.json` were parsed using selected
@@ -95,7 +142,7 @@ Behavior of each target script was not audited.
   recap worker, excluding the inspection shell. Readable standard system cron
   directories contained no candidate references; the `crontab` executable is
   absent. This does not prove there is no indirect scheduler elsewhere.
-- This is an inventory of the named Hermes locations and shuvdev user timers,
+- This is an inventory of the named Mac/shuvdev/VM Hermes locations and shuvdev user timers,
   not every scheduled operation across all hosts, services or cloud accounts.
   Successful historical `ok` statuses do not independently prove delivery.
 
