@@ -3,7 +3,7 @@ import { expect, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { randomBytes } from "node:crypto";
 import { Effect, Fiber, Schedule, Schema } from "effect";
-import { FetchHttpClient } from "effect/unstable/http";
+import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/unstable/http";
 import { nativeSelfHost } from "../support/native-self-host.ts";
 import { driver } from "../support/platform.ts";
 import { scenarios } from "../test-plan.ts";
@@ -62,6 +62,7 @@ const DeliveredSpans = Schema.Struct({
 it.live(scenarios.selfHostNativeTelemetry.title, () =>
   Effect.scoped(
     Effect.gen(function* () {
+      const http = yield* HttpClient.HttpClient;
       const host = yield* nativeSelfHost({});
       const exports = 3;
       const spans = 12_000;
@@ -85,15 +86,21 @@ it.live(scenarios.selfHostNativeTelemetry.title, () =>
       const inserted = yield* Effect.forEach(
         Array.from({ length: exports }),
         () =>
-          driver("trace export", () =>
-            fetch(`${host.collector}/v1/traces`, {
-              method: "POST",
-              headers: { "content-type": "application/json" },
-              body,
-            }).then((response) => response.json()),
-          ).pipe(
-            Effect.flatMap(Schema.decodeUnknownEffect(Ingested)),
-            Effect.map((result) => result.insertedSpans),
+          Effect.scoped(
+            Effect.gen(function* () {
+              const response = yield* http.execute(
+                HttpClientRequest.post(`${host.collector}/v1/traces`).pipe(
+                  HttpClientRequest.bodyText(body, "application/json"),
+                ),
+              );
+              const text = yield* response.text;
+              // Motel explains a refused export in its body, such as a full ingest queue.
+              expect(response.status, text.slice(0, 500)).toBe(200);
+              const result = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Ingested))(
+                text,
+              );
+              return result.insertedSpans;
+            }),
           ),
         { concurrency: 1 },
       );
