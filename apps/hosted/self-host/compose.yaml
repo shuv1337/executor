@@ -47,8 +47,10 @@ services:
       - "127.0.0.1:4400:4400"
     volumes:
       - pglite-data:/app/data
+      - motel-data:/app/motel-data
     stop_grace_period: 30s
     restart: unless-stopped
 
 volumes:
   pglite-data:
+  motel-data:
