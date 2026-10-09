@@ -1508,8 +1508,6 @@ it.live("released image serves management tools at a tailnet origin with private
         BETTER_AUTH_URL: origin,
         BETTER_AUTH_SECRET: randomBytes(32).toString("hex"),
         EXECUTOR_ENCRYPTION_KEY: randomBytes(32).toString("hex"),
-        // A synthetic registry that shares the container's network namespace.
-        EXECUTOR_REGISTRY_URL: "http://127.0.0.1:8093",
       };
       yield* Effect.acquireRelease(
         run(

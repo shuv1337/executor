@@ -252,9 +252,10 @@ first-admin setup, an API key calls the built-in Executor app through `/mcp`. An
 authored app then checks that Executor refuses the container's private address
 by name, and that the image's public-only network refuses it behind a public
 name mapped to it, which no name check catches.
-The same case points `EXECUTOR_REGISTRY_URL` at a synthetic registry and checks
-that the public app catalog, running in workerd, refuses redirects and reports
-status, invalid-response, forwarded and network failures distinctly.
+This fork's self-host serves an organization-only registry from its own database
+and reads no remote catalog, so the case does not run upstream's remote-registry
+failure checks; the release case instead checks that a publication survives a
+restart and that `/api/registry/*` is not served.
 The runner reaches the server through a port published on `127.0.0.1` in the
 range 4431-4439. It sends each request with the tailnet `Host` header through
 `node:http`, because Node's `fetch` replaces that header. This works with Docker

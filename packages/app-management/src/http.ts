@@ -36,10 +36,17 @@ import {
   PublicationSnapshot,
   PackageName,
   type App,
+  type AppCopySnapshot,
   type Executor,
+  type PublicationReference,
   type Registry,
 } from "@executor-js/sdk/core";
 
+/** A catalog narrowed to one verified caller, which also resolves the copies that caller may make. */
+export interface NarrowedRegistry extends Registry {
+  /** The reviewed source of a listing this caller may copy, with the host's route as provenance. */
+  readonly copy: (reference: PublicationReference) => Effect.Effect<AppCopySnapshot, RegistryError>;
+}
 /** The executor and the product's authorization policy; every operation goes through the SDK. */
 export class AppManagementHost extends Context.Service<
   AppManagementHost,
@@ -55,10 +62,10 @@ export class AppManagementHost extends Context.Service<
         | undefined;
       /**
        * The catalog this verified caller may read. Without it, every caller reads the executor's
-       * whole catalog, which is public.
+       * whole catalog, which is public; with it, the anonymous registry routes refuse.
        */
       readonly registry?:
-        | ((identity: Context.Service.Shape<typeof AppIdentity>) => Registry)
+        | ((identity: Context.Service.Shape<typeof AppIdentity>) => NarrowedRegistry)
         | undefined;
       /** Who can read what this host publishes; "public" unless the product narrows it. */
       readonly publicationAudience?: "public" | "organization" | undefined;
@@ -305,12 +312,9 @@ export const appManagementHandlers = <I extends HttpApiMiddleware.AnyId, S, Id e
               ? (yield* ownedSource(host, identity, payload.from.app)).app.id
               : host.registry === undefined
                 ? payload.from
-                : // A listing this caller may not read does not exist for it. The SDK then copies
-                  // the same catalog row the check read.
-                  yield* host
-                    .registry(identity)
-                    .snapshot(payload.from.package, payload.from.commit)
-                    .pipe(Effect.as(payload.from));
+                : // The narrowed catalog resolves the files; a listing this caller may not read
+                  // does not exist for it.
+                  yield* host.registry(identity).copy(payload.from);
           return yield* host.executor.apps
             .copy({
               owner: identity.owner,
@@ -424,6 +428,12 @@ export const registryRoutes = (() => {
   );
   const publicRegistry = Effect.flatten(AppManagementHost).pipe(
     Effect.mapError(() => new RegistryError({ reason: "storage" })),
+    // A host that narrows reads to each caller has no anonymous catalog; its executor's is the
+    // unfiltered one, so these routes fail closed even when such a host mounts them.
+    Effect.filterOrFail(
+      (host) => host.registry === undefined && (host.publicationAudience ?? "public") === "public",
+      () => new RegistryError({ reason: "forbidden" }),
+    ),
   );
   // Public sites read the catalog from another origin (`executor.sh` reads `api.executor.sh`).
   // The reads carry no credentials, so any origin may read them; a preflight gets the same answer.

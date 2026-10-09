@@ -77,6 +77,10 @@ export const selfHostExecutorServices = <E, R>(
       // This fork publishes inside the organization, from the same database as its apps, rather
       // than reading the hosted public registry. `selfHostDatabaseSchema` migrated the tables.
       const registryStorage = yield* makeRegistryStorage;
+      if (Option.isSome(yield* Config.option(Config.String("EXECUTOR_REGISTRY_URL"))))
+        yield* Effect.logWarning(
+          "EXECUTOR_REGISTRY_URL is set but has no effect: this self-host serves its organization's own registry.",
+        );
       const executor = yield* createExecutor({
         database: storage,
         secret: key,
@@ -169,11 +173,18 @@ export const selfHostExecutorServices = <E, R>(
             executor: hosted,
             access: yield* hostedAppCapabilities,
             // Members read their organization's listings only; a key scoped to apps reads theirs.
+            // Copies record the organization's own source route, which `/api/registry` is not here.
             registry: (identity) =>
-              ownedRegistry(registryStorage, executor.registry, origin, {
-                owner: identity.owner,
-                ...(identity.appIds === undefined ? {} : { apps: identity.appIds }),
-              }),
+              ownedRegistry(
+                registryStorage,
+                executor.registry,
+                origin,
+                `/api/organizations/${encodeURIComponent(identity.scope)}/app-publications/source`,
+                {
+                  owner: identity.owner,
+                  ...(identity.appIds === undefined ? {} : { apps: identity.appIds }),
+                },
+              ),
             publicationAudience: "organization",
           }),
         ),
