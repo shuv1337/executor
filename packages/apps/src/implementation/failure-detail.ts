@@ -1,12 +1,15 @@
 import { Match, Option, Predicate, Redacted, Schema } from "effect";
 import { CacheError } from "@executor-js/app-cache/contracts";
-import { AppDatabaseError } from "@executor-js/app-data/contracts";
-import { AppStorageError, AppStorageUnavailable } from "../contracts/storage.ts";
 import { OpenapiError } from "../contracts/openapi.ts";
 import { OpenapiCompileError } from "../contracts/openapi-compile.ts";
 import { FetchOptionUnsupported, NetworkRefused } from "../contracts/network.ts";
-import type { ResolvedAccounts } from "../contracts/host.ts";
+import {
+  McpError as HostMcpError,
+  SkillLoadFailed as HostSkillLoadFailed,
+  type ResolvedAccounts,
+} from "../contracts/host.ts";
 import { McpCredentialsUnverified, McpError } from "../contracts/mcp.ts";
+import { SkillLoadFailed } from "../contracts/skills.ts";
 import type { ProviderError } from "../contracts/provider-error.ts";
 import { providerError } from "./provider-error.ts";
 import { isShortenedUpstream } from "./upstream-error.ts";
@@ -30,21 +33,6 @@ export interface FailureDetail {
   readonly message?: string;
   readonly fields?: FailureFields;
 }
-
-const storageMessages = {
-  schema: "The app's database schema is invalid.",
-  schema_changed: "The app's database schema changed during this operation. Retry it.",
-  table: "The operation used a table the app's database schema does not declare.",
-  index: "The operation used an index the table does not declare, or used it incorrectly.",
-  range: "The index range is invalid for the declared index.",
-  value: "A value does not match the table's declared field schema.",
-  readonly: "Queries cannot write. Move writes into a mutation.",
-  cursor: "The pagination cursor is invalid or belongs to a different query.",
-  limit: "The operation exceeded a per-invocation app data limit.",
-  closed: "The database session closed before this operation finished.",
-  storage: "App storage failed to complete the operation.",
-  replay: "A workflow step replayed with different input than its first run.",
-} satisfies Record<AppDatabaseError["reason"], string>;
 
 /** Fixed text per reason; cache keys, values and scopes never enter the message. */
 const cacheMessages = {
@@ -200,17 +188,32 @@ export const leavingProviderError = (
 export const parseMcpError = (
   error: unknown,
   secrets: readonly string[],
-): Option.Option<McpError> =>
+): Option.Option<HostMcpError> =>
   Schema.decodeUnknownOption(McpError)(error).pipe(
-    Option.map(({ phase, reason, status, upstream }) => {
+    Option.map(({ phase, reason, status, upstream, session }) => {
       const stated = redactUpstream(upstream, secrets);
-      return new McpError({
+      return new HostMcpError({
         phase,
         reason,
         ...(status === undefined ? {} : { status }),
         ...(stated === undefined ? {} : { upstream: stated }),
+        ...(session === undefined ? {} : { session }),
       });
     }),
+  );
+
+/** Rebuild only the allowlisted skill loader fields from an author-visible rejection. */
+export const parseSkillLoadFailed = (error: unknown): Option.Option<HostSkillLoadFailed> =>
+  Schema.decodeUnknownOption(SkillLoadFailed)(error).pipe(
+    Option.map(
+      ({ reason, message, status, missing }) =>
+        new HostSkillLoadFailed({
+          reason,
+          ...(message ? { message } : {}),
+          ...(status === undefined ? {} : { status }),
+          ...(missing === undefined ? {} : { missing }),
+        }),
+    ),
   );
 
 const errorName = (error: Error) => (error.name.length > 0 ? error.name : "Error").slice(0, 128);
@@ -262,6 +265,32 @@ export const describeFailure = (error: unknown) =>
       : `A non-Error ${error === null ? "null" : typeof error} value was thrown`;
 
 /**
+ * Name the failed operation by method and templated path, and an unmatched response by its
+ * status, media type and declared length. Response text never enters the message, which is also
+ * recorded in traces.
+ */
+const openapiFailureMessage = (error: OpenapiError) => {
+  const operation =
+    error.operation === undefined
+      ? "The API request"
+      : `${error.operation.method} ${error.operation.path}`;
+  if (error.reason === "invalid_definition")
+    return "The API's OpenAPI definition for this operation is invalid.";
+  if (error.reason === "invalid_input")
+    return error.operation === undefined
+      ? "The input could not be encoded as a request for this API operation."
+      : `The input could not be encoded as a request for ${operation}.`;
+  if (error.status === undefined) return `${operation} failed before a response arrived.`;
+  const shape = [error.contentType, error.bytes === undefined ? undefined : `${error.bytes} bytes`]
+    .filter((part) => part !== undefined)
+    .join(", ");
+  const response = `${operation} responded with HTTP ${error.status}${shape === "" ? "" : ` (${shape})`}`;
+  return error.status >= 200 && error.status < 300
+    ? `${response}, but its body could not be read within the response limits.`
+    : `${response}, which matches no error with a message in the API's OpenAPI document.`;
+};
+
+/**
  * Describe what an operation raised for the app's own caller. App data failures keep their
  * reason as a code, as do app cache failures and OpenAPI and MCP service failures, such as an
  * `mcpHealth` check that cannot reach its server or cannot verify the credentials; any other thrown
@@ -275,38 +304,12 @@ export const failureDetail = (error: unknown, secrets: readonly string[]): Failu
       code: error.reason,
       message: cacheMessages[error.reason],
     };
-  if (Schema.is(AppDatabaseError)(error))
-    return {
-      source: "storage",
-      errorName: "AppDatabaseError",
-      code: error.reason,
-      message: boundFailureMessage(ownMessage(error) ?? storageMessages[error.reason], secrets),
-    };
-  if (Schema.is(AppStorageUnavailable)(error))
-    return {
-      source: "storage",
-      errorName: "AppStorageUnavailable",
-      message: "App storage is not available on this host.",
-    };
-  if (Schema.is(AppStorageError)(error))
-    return {
-      source: "storage",
-      errorName: "AppStorageError",
-      message: "App storage failed to complete the operation.",
-    };
   if (Schema.is(OpenapiError)(error))
     return {
       source: "service",
       errorName: "OpenapiError",
       code: error.reason,
-      message:
-        error.reason === "request"
-          ? error.status === undefined
-            ? "The API request failed before a response arrived."
-            : `The API responded with HTTP ${error.status}, which its OpenAPI document does not declare as an error with a message.`
-          : error.reason === "invalid_input"
-            ? "The input could not be encoded as a request for this API operation."
-            : "The API's OpenAPI definition for this operation is invalid.",
+      message: boundFailureMessage(openapiFailureMessage(error), secrets),
     };
   if (Schema.is(McpError)(error))
     return {

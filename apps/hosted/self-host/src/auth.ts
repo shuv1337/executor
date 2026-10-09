@@ -5,7 +5,7 @@ import { betterAuth } from "better-auth";
 import { HostedAppSessions, hostedAppSessions } from "@executor-js/hosted-server/app-ui";
 import {
   McpAuthentication,
-  mcpAuthenticationError,
+  mcpBrowserGrantError,
   mcpConnectionStore,
   provisionHostedOAuthResources,
   ApiAuthentication,
@@ -18,11 +18,14 @@ import {
   lookupOrganizationSlug,
   resolveOrganizationReference,
   deleteOrganizationRecords,
+  grantExpiry,
+  authEndpointTemplates,
 } from "@executor-js/hosted-server";
-import { Effect, Layer, Option, Redacted } from "effect";
-import { SqlClient } from "effect/unstable/sql";
+import { routeTemplates } from "@executor-js/telemetry";
+import { Context, Effect, Layer, Option, Redacted } from "effect";
+import { SqlClient } from "effect/sql";
 import { AuthDatabase } from "./contracts/database.ts";
-import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http";
+import { HttpServerRequest, HttpServerResponse } from "effect/http";
 
 /** Initialize auth before listening; the database owns persistent users and sessions. */
 export const selfHostAuth = Effect.gen(function* () {
@@ -42,11 +45,16 @@ export const selfHostAuth = Effect.gen(function* () {
     try: () => auth.$context,
     catch: () => new AuthenticationUnavailable(),
   });
-  yield* provisionHostedOAuthResources(settings.url, context).pipe(
+  const origins = {
+    origin: settings.url,
+    resourceOrigins: settings.resourceOrigins,
+    issuer: settings.issuer,
+  };
+  yield* provisionHostedOAuthResources(origins, context).pipe(
     Effect.mapError(() => new AuthenticationUnavailable()),
   );
   const identity = Layer.succeed(Authentication, {
-    origin: settings.url,
+    ...origins,
     oauthRedirectUri: Option.getOrUndefined(settings.oauthRedirectUri),
     current: (headers) =>
       Effect.tryPromise({
@@ -74,16 +82,19 @@ export const selfHostAuth = Effect.gen(function* () {
       ),
   });
   const mcpIdentity = Layer.succeed(McpAuthentication, {
-    origin: settings.url,
+    ...origins,
     authenticate: (headers, mode, organization) =>
-      mcpBearerAccess(settings.url, { headers, mode, organization }).pipe(
+      mcpBearerAccess(origins, { headers, mode, organization }).pipe(
         Effect.provideService(SqlClient.SqlClient, sql),
+        Effect.tap(({ access }) =>
+          Effect.annotateCurrentSpan("executor.organization.id", access.organization),
+        ),
         Effect.withSpan("auth.authenticate"),
       ),
     browserGrant: (headers, id) =>
       Effect.tryPromise({
         try: () => auth.api.getMcpBrowserAccess({ headers, body: { id } }),
-        catch: mcpAuthenticationError,
+        catch: mcpBrowserGrantError,
       }),
     metadata: Effect.tryPromise({
       try: () => auth.api.getOAuthServerConfig(),
@@ -94,16 +105,21 @@ export const selfHostAuth = Effect.gen(function* () {
     ),
   });
   const apiIdentity = Layer.succeed(ApiAuthentication, {
-    origin: settings.url,
+    ...origins,
     authenticate: (headers, organization) =>
-      apiBearerAccess(settings.url, { headers, organization }).pipe(
+      apiBearerAccess(origins, { headers, organization }).pipe(
         Effect.provideService(SqlClient.SqlClient, sql),
+        Effect.tap(({ access }) =>
+          Effect.annotateCurrentSpan("executor.organization.id", access.organization),
+        ),
         Effect.withSpan("auth.authenticate"),
       ),
   });
+  const routes = routeTemplates(authEndpointTemplates(auth.api));
   const handler = Effect.gen(function* () {
     const request = yield* HttpServerRequest.HttpServerRequest;
     const incoming = yield* HttpServerRequest.toWeb(request);
+    yield* routes.record(new URL(incoming.url).pathname);
     const web = new Request(incoming, { headers: new Headers(incoming.headers) });
     // The socket address is trusted. Never accept a client-supplied forwarding header.
     web.headers.delete("x-executor-client-ip");
@@ -130,7 +146,16 @@ export const selfHostAuth = Effect.gen(function* () {
     mcpIdentity,
     apiIdentity,
     appSessions,
+    agentGrants: grantExpiry((run) =>
+      Effect.tryPromise({ try: () => run(auth.api), catch: (cause) => cause }),
+    ),
     origin: settings.url,
     handler,
   };
 });
+
+/** The one auth instance, built before startup data steps and shared with the routes. */
+export class SelfHostAuth extends Context.Service<
+  SelfHostAuth,
+  Effect.Success<typeof selfHostAuth>
+>()("self-host/Auth") {}

@@ -13,39 +13,41 @@ export {
 } from "./implementation/framework.ts";
 /** Product-authorized app authoring, release discovery, and ordinary Git access. */
 import { Context, Effect, Layer, Schema } from "effect";
-import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/unstable/http";
+import { HttpMiddleware, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 import {
   HttpApi,
   HttpApiBuilder,
   HttpApiEndpoint,
   HttpApiGroup,
   HttpApiMiddleware,
-} from "effect/unstable/httpapi";
+} from "effect/http-api";
 import { AppGitProtocol } from "./contracts/git.ts";
 import {
   AppId,
   AppSlug,
+  AppSlugTaken,
   AppNotFound,
+  RepositoryHost,
   SourceCommit,
   SourceError,
   StorageError,
-  type App,
-  type AppSourceStorage,
-  type BlobStorage,
-  type Executor,
-} from "@executor-js/sdk/core";
-import {
   RegistryError,
   Publication,
   PublicationSnapshot,
   PackageName,
-  resolvePublication,
+  type App,
+  type AppCopySnapshot,
+  type Executor,
+  type PublicationReference,
   type Registry,
-  type createAppRegistry,
-} from "@executor-js/app-registry";
-import { type RepositoryBackend } from "@executor-js/app-source/contracts";
+} from "@executor-js/sdk/core";
 
-/** Hosts retain platform resources; these operations run inside each request's scope. */
+/** A catalog narrowed to one verified caller, which also resolves the copies that caller may make. */
+export interface NarrowedRegistry extends Registry {
+  /** The reviewed source of a listing this caller may copy, with the host's route as provenance. */
+  readonly copy: (reference: PublicationReference) => Effect.Effect<AppCopySnapshot, RegistryError>;
+}
+/** The executor and the product's authorization policy; every operation goes through the SDK. */
 export class AppManagementHost extends Context.Service<
   AppManagementHost,
   Effect.Effect<
@@ -58,19 +60,35 @@ export class AppManagementHost extends Context.Service<
             identity: Context.Service.Shape<typeof AppIdentity>,
           ) => Effect.Effect<AppCapabilities, AppAccessDenied | StorageError>)
         | undefined;
-      readonly sources: AppSourceStorage;
-      readonly repositories: RepositoryBackend;
-      /** The product selects the readable registry for this verified caller. */
-      readonly registry: (identity: Context.Service.Shape<typeof AppIdentity>) => Registry;
-      /** Only hosts with anonymous source sharing supply this capability. */
-      readonly publicRegistry?: Registry;
-      readonly publicationAudience: "public" | "organization";
-      readonly blobs: BlobStorage;
-      readonly publisher: ReturnType<typeof createAppRegistry> | undefined;
+      /**
+       * The catalog this verified caller may read. Without it, every caller reads the executor's
+       * whole catalog, which is public; with it, the anonymous registry routes refuse.
+       */
+      readonly registry?:
+        | ((identity: Context.Service.Shape<typeof AppIdentity>) => NarrowedRegistry)
+        | undefined;
+      /** Who can read what this host publishes; "public" unless the product narrows it. */
+      readonly publicationAudience?: "public" | "organization" | undefined;
     },
     StorageError
   >
 >()("apps/ManagementHost") {}
+/**
+ * The origins where the host serves {@link gitRoutes}, canonical first. Clone URLs use the
+ * canonical one; the others keep earlier remotes working. A host that serves Git on the origin
+ * it was called on reads that origin from the request.
+ */
+export class AppGitOrigins extends Context.Service<
+  AppGitOrigins,
+  (request: HttpServerRequest.HttpServerRequest) => readonly [string, ...string[]]
+>()("apps/GitOrigins") {}
+/** The clone URL of an app, on the host's canonical Git origin. */
+const gitRemote = (scope: string, app: App) =>
+  Effect.gen(function* () {
+    const [origin] = (yield* AppGitOrigins)(yield* HttpServerRequest.HttpServerRequest);
+    const path = `/git/${encodeURIComponent(scope)}/${app.slug}.git`;
+    return { path, url: origin + path };
+  });
 /** Cookies never authorize Git. The host validates the explicit scoped Git credential. */
 export class AppGitAccess extends Context.Service<
   AppGitAccess,
@@ -103,6 +121,17 @@ const projectApp = <A extends App>(
   app: A,
   identity: Context.Service.Shape<typeof AppIdentity>,
 ) => capabilities(host, app, identity).pipe(Effect.as(app));
+/** The catalog reads this caller gets: the product's narrowed view, or the executor's own. */
+const readableRegistry = (
+  host: ManagementHost,
+  identity: Context.Service.Shape<typeof AppIdentity>,
+): Pick<Registry, "list" | "snapshot"> =>
+  host.registry === undefined
+    ? {
+        list: (name) => host.executor.registry.list(name === undefined ? {} : { name }),
+        snapshot: (name, commit) => host.executor.registry.snapshot({ name, commit }),
+      }
+    : host.registry(identity);
 const ownedSource = (
   host: ManagementHost,
   identity: Context.Service.Shape<typeof AppIdentity>,
@@ -134,18 +163,48 @@ const authoring = (id: AppId) =>
     const host = yield* Effect.flatten(AppManagementHost);
     const { app, access } = yield* ownedSource(host, identity, id);
     const canEdit = identity.canWrite && access.edit && !identity.protectedApps.includes(id);
+    const { publishing } = yield* host.executor.publications
+      .status()
+      .pipe(Effect.mapError(() => new StorageError()));
+    const remote = yield* gitRemote(identity.scope, app);
     return {
       app,
       host,
       metadata: {
         namespace: identity.namespace,
-        gitPath: `/git/${encodeURIComponent(identity.scope)}/${app.slug}.git`,
+        gitPath: remote.path,
+        gitUrl: remote.url,
         canEdit,
-        publicationAudience: host.publicationAudience,
-        canPublish: canEdit && host.publisher !== undefined && identity.namespace !== null,
+        publicationAudience: host.publicationAudience ?? "public",
+        canPublish: canEdit && publishing && identity.namespace !== null,
       },
     };
   });
+/**
+ * Name the app that holds a taken address, but only when the caller may see it. Hidden apps stay
+ * anonymous; the address alone was already part of the request. The conflict remains the failure
+ * when its holder cannot be read.
+ */
+const nameAddressHolder = (
+  host: ManagementHost,
+  identity: Context.Service.Shape<typeof AppIdentity>,
+  error: AppSlugTaken,
+) =>
+  Effect.gen(function* () {
+    const [holder] = yield* host.executor.apps.list({ owner: error.owner, slug: error.slug });
+    if (
+      holder === undefined ||
+      (identity.appIds !== undefined && !identity.appIds.includes(holder.id))
+    )
+      return error;
+    const access = yield* capabilities(host, holder, identity);
+    return access.visible
+      ? new AppSlugTaken({ ...error, existing: { app: holder.id, name: holder.name } })
+      : error;
+  }).pipe(
+    Effect.orElseSucceed(() => error),
+    Effect.flatMap(Effect.fail),
+  );
 /** Publication preview always checks the complete stored files, never a display listing. */
 const workspaceSource = (id: AppId) =>
   Effect.gen(function* () {
@@ -156,12 +215,11 @@ const workspaceSource = (id: AppId) =>
       ...source,
       ...fields,
       publication:
-        canPublish && host.publisher !== undefined && metadata.namespace !== null
-          ? yield* host.publisher.preview({
+        canPublish && metadata.namespace !== null
+          ? yield* host.executor.publications.preview({
               owner: app.owner,
               namespace: metadata.namespace,
               app: app.id,
-              name: app.name,
               files: source.files,
             })
           : null,
@@ -193,9 +251,10 @@ export const appManagementHandlers = <I extends HttpApiMiddleware.AnyId, S, Id e
         Effect.gen(function* () {
           const identity = yield* writeIdentity;
           const host = yield* Effect.flatten(AppManagementHost);
-          return yield* host.executor.apps
-            .create({ ...payload, owner: identity.owner })
-            .pipe(Effect.flatMap((app) => projectApp(host, app, identity)));
+          return yield* host.executor.apps.create({ ...payload, owner: identity.owner }).pipe(
+            Effect.catchTag("AppSlugTaken", (error) => nameAddressHolder(host, identity, error)),
+            Effect.flatMap((app) => projectApp(host, app, identity)),
+          );
         }),
       )
       .handle("authoring", ({ params }) =>
@@ -208,8 +267,11 @@ export const appManagementHandlers = <I extends HttpApiMiddleware.AnyId, S, Id e
       .handle("sourceDisplayFile", ({ params, query }) =>
         Effect.gen(function* () {
           const { app, host } = yield* authoring(params.app);
-          // The commit pins the listed revision; the app's own code lineage pins its repository.
-          const files = yield* host.sources.read({ code: app.code, commit: params.commit });
+          const files = yield* host.executor.apps.revision({
+            owner: app.owner,
+            app: app.id,
+            commit: params.commit,
+          });
           return yield* sourceDisplayFile(files, query.path);
         }),
       )
@@ -248,14 +310,21 @@ export const appManagementHandlers = <I extends HttpApiMiddleware.AnyId, S, Id e
           const from =
             "app" in payload.from
               ? (yield* ownedSource(host, identity, payload.from.app)).app.id
-              : yield* resolvePublication(host.registry(identity), payload.from);
+              : host.registry === undefined
+                ? payload.from
+                : // The narrowed catalog resolves the files; a listing this caller may not read
+                  // does not exist for it.
+                  yield* host.registry(identity).copy(payload.from);
           return yield* host.executor.apps
             .copy({
               owner: identity.owner,
               from,
               name: payload.name,
             })
-            .pipe(Effect.flatMap((app) => projectApp(host, app, identity)));
+            .pipe(
+              Effect.catchTag("AppSlugTaken", (error) => nameAddressHolder(host, identity, error)),
+              Effect.flatMap((app) => projectApp(host, app, identity)),
+            );
         }),
       )
       .handle("git", ({ params }) =>
@@ -263,7 +332,7 @@ export const appManagementHandlers = <I extends HttpApiMiddleware.AnyId, S, Id e
           const identity = yield* AppIdentity;
           const host = yield* Effect.flatten(AppManagementHost);
           const { app } = yield* ownedSource(host, identity, params.app);
-          return { path: `/git/${encodeURIComponent(identity.scope)}/${app.slug}.git` };
+          return yield* gitRemote(identity.scope, app);
         }),
       )
       .handle("history", ({ params }) =>
@@ -271,9 +340,7 @@ export const appManagementHandlers = <I extends HttpApiMiddleware.AnyId, S, Id e
           const identity = yield* AppIdentity;
           const host = yield* Effect.flatten(AppManagementHost);
           const { app } = yield* ownedSource(host, identity, params.app);
-          if (app.repository === null)
-            yield* host.executor.apps.workspace({ app: app.id, owner: app.owner });
-          return yield* host.repositories.history(app.code);
+          return yield* host.executor.apps.history({ owner: app.owner, app: app.id });
         }),
       )
       .handle("publish", ({ params, payload }) =>
@@ -281,46 +348,58 @@ export const appManagementHandlers = <I extends HttpApiMiddleware.AnyId, S, Id e
           const identity = yield* editIdentity(params.app);
           const host = yield* Effect.flatten(AppManagementHost);
           yield* ownedSource(host, identity, params.app, true);
-          if (host.publisher === undefined || identity.namespace === null)
+          if (identity.namespace === null)
             return yield* new AppAccessDenied({ reason: "forbidden" });
-          return yield* host.publisher.publish({
-            owner: identity.owner,
-            namespace: identity.namespace,
-            app: params.app,
-            ...payload,
-          });
+          return yield* host.executor.publications
+            .publish({
+              owner: identity.owner,
+              namespace: identity.namespace,
+              app: params.app,
+              ...payload,
+            })
+            .pipe(
+              Effect.mapError((error) =>
+                Schema.is(RegistryError)(error) && error.reason === "unsupported"
+                  ? new AppAccessDenied({ reason: "forbidden" })
+                  : error,
+              ),
+            );
         }),
       )
       .handle("catalog", ({ query }) =>
         Effect.gen(function* () {
           const identity = yield* AppIdentity;
-          return yield* (yield* Effect.flatten(AppManagementHost))
-            .registry(identity)
-            .list(query.name);
+          const host = yield* Effect.flatten(AppManagementHost);
+          return yield* readableRegistry(host, identity).list(query.name);
         }),
       )
       .handle("publicationSource", ({ query }) =>
         Effect.gen(function* () {
           const identity = yield* AppIdentity;
           const host = yield* Effect.flatten(AppManagementHost);
-          return yield* host.registry(identity).snapshot(query.name, query.commit);
+          return yield* readableRegistry(host, identity).snapshot(query.name, query.commit);
         }),
       )
       .handle("published", () =>
         Effect.gen(function* () {
           const identity = yield* AppIdentity;
           const host = yield* Effect.flatten(AppManagementHost);
-          return host.publisher === undefined ? [] : yield* host.publisher.owned(identity.owner);
+          return yield* host.executor.publications.owned({ owner: identity.owner });
         }),
       )
       .handle("unpublish", ({ payload }) =>
         Effect.gen(function* () {
           const identity = yield* writeIdentity;
           const host = yield* Effect.flatten(AppManagementHost);
-          if (host.publisher === undefined)
-            return yield* new AppAccessDenied({ reason: "forbidden" });
-          yield* host.publisher.unpublish(identity.owner, payload.package);
-          return { name: payload.package };
+          return yield* host.executor.publications
+            .unpublish({ owner: identity.owner, package: payload.package })
+            .pipe(
+              Effect.mapError((error) =>
+                Schema.is(RegistryError)(error) && error.reason === "unsupported"
+                  ? new AppAccessDenied({ reason: "forbidden" })
+                  : error,
+              ),
+            );
         }),
       ),
   );
@@ -348,28 +427,33 @@ export const registryRoutes = (() => {
     ),
   );
   const publicRegistry = Effect.flatten(AppManagementHost).pipe(
-    Effect.flatMap((host) =>
-      host.publicRegistry === undefined
-        ? Effect.fail(new RegistryError({ reason: "forbidden" }))
-        : Effect.succeed(host.publicRegistry),
-    ),
     Effect.mapError(() => new RegistryError({ reason: "storage" })),
+    // A host that narrows reads to each caller has no anonymous catalog; its executor's is the
+    // unfiltered one, so these routes fail closed even when such a host mounts them.
+    Effect.filterOrFail(
+      (host) => host.registry === undefined && (host.publicationAudience ?? "public") === "public",
+      () => new RegistryError({ reason: "forbidden" }),
+    ),
   );
-  return HttpApiBuilder.layer(api).pipe(
-    Layer.provide(
-      HttpApiBuilder.group(api, "registry", (h) =>
-        h
-          .handle("list", ({ query }) =>
-            Effect.flatMap(publicRegistry, (registry) => registry.list(query.name)),
-          )
-          .handle("snapshot", ({ query }) =>
-            Effect.flatMap(publicRegistry, (registry) =>
-              registry.snapshot(query.name, query.commit),
+  // Public sites read the catalog from another origin (`executor.sh` reads `api.executor.sh`).
+  // The reads carry no credentials, so any origin may read them; a preflight gets the same answer.
+  const anyOrigin = HttpRouter.middleware(HttpMiddleware.cors({ allowedMethods: ["GET"] })).layer;
+  return Layer.mergeAll(
+    HttpApiBuilder.layer(api).pipe(
+      Layer.provide(
+        HttpApiBuilder.group(api, "registry", (h) =>
+          h
+            .handle("list", ({ query }) =>
+              Effect.flatMap(publicRegistry, (host) => host.executor.registry.list(query)),
+            )
+            .handle("snapshot", ({ query }) =>
+              Effect.flatMap(publicRegistry, (host) => host.executor.registry.snapshot(query)),
             ),
-          ),
+        ),
       ),
     ),
-  );
+    HttpRouter.add("OPTIONS", "/api/registry/*", HttpServerResponse.empty({ status: 204 })),
+  ).pipe(Layer.provide(anyOrigin));
 })();
 
 /** Resolve readable app slugs inside the authenticated owner's inventory before opening Git source. */
@@ -400,10 +484,11 @@ export const gitRoutes = (() => {
       url.searchParams.get("service") === "git-receive-pack";
     if (write && (!identity.canWrite || !access.edit || identity.protectedApps.includes(app.id)))
       return yield* new AppAccessDenied({ reason: "forbidden" });
-    if (app.repository === null)
-      yield* host.executor.apps.workspace({ app: app.id, owner: app.owner });
     return HttpServerResponse.fromWeb(
-      yield* host.repositories.request(app.code, yield* HttpServerRequest.toWeb(request)),
+      yield* host.executor[RepositoryHost].request(
+        { owner: app.owner, app: app.id },
+        yield* HttpServerRequest.toWeb(request),
+      ),
     ).pipe(HttpServerResponse.setHeader("cache-control", "no-store"));
   }).pipe(
     Effect.catch((error) =>

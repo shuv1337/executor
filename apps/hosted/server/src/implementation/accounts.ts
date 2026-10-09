@@ -11,11 +11,14 @@ import {
 } from "./connection-policy.ts";
 import { accountDestination } from "./resource-lifecycle.ts";
 import { AccountGrants } from "./proofs/account-access.ts";
+import { AccountTargets } from "../contracts/account-grants.ts";
 import { requireAppAccess, visibleApps, visibleAccounts } from "./resource-policy.ts";
 import type { ConnectionDestination } from "../contracts/resource-access.ts";
 /** Account use cases, connection grants and OAuth routes share the same ownership checks. */
 import {
+  type AccountConnectionId,
   type AccountHealth,
+  type AccountId,
   type App,
   type AppId,
   type Executor,
@@ -23,8 +26,8 @@ import {
   StorageError,
 } from "@executor-js/sdk/core";
 import { Effect, Schema } from "effect";
-import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http";
-import { HttpApiBuilder } from "effect/unstable/httpapi";
+import { HttpServerRequest, HttpServerResponse } from "effect/http";
+import { HttpApiBuilder } from "effect/http-api";
 import { HostedApi } from "../contracts/api.ts";
 import { ApiAuthentication, Authentication, CurrentPrincipal } from "../contracts/auth.ts";
 import {
@@ -116,28 +119,12 @@ export const oauthSetup = (
     return yield* executor.accountConnections.oauthSetup({ ...input, owner });
   });
 
-/** Replace credentials on the same identity so every app keeps its selection. */
-export const reconnectAccount = Effect.gen(function* () {
-  const { owner, account, access } = yield* AccountGrants.reconnect;
-  const executor = yield* Effect.flatten(HostedExecutor);
-  const existing = yield* executor.accounts.get({ owner, account });
-  const destination =
-    access.ownership.kind === "personal" ? ({ kind: "personal" } as const) : access.ownership;
-  yield* checkDestination(destination);
-  return yield* executor.accountConnections
-    .create({
-      owner,
-      account,
-      provider: existing.provider,
-    })
-    .pipe(Effect.flatMap((connection) => recordConnection(connection, destination)));
-});
 /** Delete saved credentials and remove their selections through the transactional lifecycle hook. */
 export const disconnectAccount = Effect.gen(function* () {
   const { owner, account } = yield* AccountGrants.delete;
   const executor = yield* Effect.flatten(HostedExecutor);
   yield* executor.accounts.get({ owner, account });
-  return yield* executor.accounts.remove({ owner, account });
+  return yield* executor.accounts.remove({ owner, account, bindings: "clear" });
 });
 /** Update the label or description using the owner-filtered SDK primitive. */
 export const updateAccount = (metadata: {
@@ -149,7 +136,10 @@ export const updateAccount = (metadata: {
     const executor = yield* Effect.flatten(HostedExecutor);
     return yield* executor.accounts.update({ ...metadata, owner, account });
   });
-/** Create a sign-in request for an app requirement belonging to this organization. */
+/**
+ * Create a sign-in request for an app requirement belonging to this organization. With `account`,
+ * it replaces that account's credentials; there is no reconnect outside an app.
+ */
 export const connectAccount = (
   owner: OwnerId,
   input: {
@@ -157,6 +147,7 @@ export const connectAccount = (
     readonly requirement: string;
     readonly profile: import("@executor-js/sdk/core").ProfileId;
     readonly destination?: typeof ConnectionDestination.Type | undefined;
+    readonly account?: AccountId | undefined;
   },
 ) =>
   Effect.gen(function* () {
@@ -164,7 +155,20 @@ export const connectAccount = (
     yield* executor.apps.get({ owner, app: input.app });
     yield* executionManagerOwner(executor, input.app, input.profile);
     yield* requireAppAccess(input.app, "use");
-    yield* checkDestination(input.destination ?? { kind: "personal" });
+    // A reconnect keeps the account where it is shared; a new account goes where the caller asks.
+    const reconnect =
+      input.account === undefined
+        ? undefined
+        : yield* AccountGrants.reconnect.pipe(
+            Effect.provideService(AccountTargets.reconnect, { account: input.account }),
+          );
+    const destination =
+      reconnect === undefined
+        ? (input.destination ?? ({ kind: "personal" } as const))
+        : reconnect.access.ownership.kind === "personal"
+          ? ({ kind: "personal" } as const)
+          : reconnect.access.ownership;
+    yield* checkDestination(destination);
     return yield* executor.accountConnections
       .create({
         owner,
@@ -173,12 +177,9 @@ export const connectAccount = (
           requirement: input.requirement,
           profile: input.profile,
         },
+        ...(input.account === undefined ? {} : { account: input.account }),
       })
-      .pipe(
-        Effect.flatMap((connection) =>
-          recordConnection(connection, input.destination ?? { kind: "personal" }),
-        ),
-      );
+      .pipe(Effect.flatMap((connection) => recordConnection(connection, destination)));
   });
 /** Connection metadata never grants access to another organization's request or app. */
 export const getConnection = (
@@ -242,6 +243,17 @@ export const hostedAccountHandlers = HttpApiBuilder.group(HostedApi, "accounts",
     const auth = yield* Authentication;
     const api = yield* ApiAuthentication;
     const redirectUri = accountOAuthRedirectUri(auth);
+    /** The dashboard page where the connection's creator finishes it, under the caller's slug. */
+    const connectionUrl = (connection: AccountConnectionId) =>
+      Effect.gen(function* () {
+        const request = yield* HttpServerRequest.HttpServerRequest;
+        const headers = new Headers(request.headers);
+        const organization = yield* CurrentOrganization;
+        const slug = headers.has("authorization")
+          ? (yield* api.authenticate(headers, organization.organization)).organizationSlug
+          : yield* auth.organizationSlug(headers, organization.organization);
+        return `${auth.origin}/org/${encodeURIComponent(slug)}/connections/${encodeURIComponent(connection)}`;
+      });
     return handlers
       .handle("get", () => getAccount)
       .handle("checkCredentials", ({ params, payload }) =>
@@ -250,7 +262,6 @@ export const hostedAccountHandlers = HttpApiBuilder.group(HostedApi, "accounts",
         ),
       )
       .handle("check", () => checkAccount)
-      .handle("reconnect", () => reconnectAccount)
       .handle("disconnect", () => disconnectAccount)
       .handle("update", ({ payload }) => updateAccount(payload))
       .handle("oauthSetup", ({ params }) =>
@@ -261,17 +272,8 @@ export const hostedAccountHandlers = HttpApiBuilder.group(HostedApi, "accounts",
       .handle("connect", ({ params, payload }) =>
         Effect.gen(function* () {
           const owner = yield* currentOwner;
-          const request = yield* HttpServerRequest.HttpServerRequest;
-          const headers = new Headers(request.headers);
-          const organization = yield* CurrentOrganization;
-          const slug = headers.has("authorization")
-            ? (yield* api.authenticate(headers, organization.organization)).organizationSlug
-            : yield* auth.organizationSlug(headers, organization.organization);
           const connection = yield* connectAccount(owner, { app: params.app, ...payload });
-          return {
-            ...connection,
-            url: `${auth.origin}/org/${encodeURIComponent(slug)}/connections/${encodeURIComponent(connection.id)}`,
-          };
+          return { ...connection, url: yield* connectionUrl(connection.id) };
         }),
       )
       .handle("connection", ({ params }) =>
@@ -289,7 +291,12 @@ export const hostedAccountHandlers = HttpApiBuilder.group(HostedApi, "accounts",
             app === undefined || target === null || target === undefined
               ? undefined
               : app.requirements.accounts[target.requirement];
-          return { ...connection, redirectUri, checkable: requirement?.health === true };
+          return {
+            ...connection,
+            url: yield* connectionUrl(connection.id),
+            redirectUri,
+            checkable: requirement?.health === true,
+          };
         }),
       )
       .handle("submit", ({ params, payload }) =>

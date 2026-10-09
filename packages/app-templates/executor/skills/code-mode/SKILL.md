@@ -21,29 +21,49 @@ syntax is not portable across Executor hosts.
 return await tools.search({ query: "send email", namespace: "gmail", limit: 5 });
 ```
 
-`tools.search({ query?, namespace?, limit?, offset? })` returns `items` with the
-exact callable `path`, a `description` and a TypeScript `signature`, plus
-`remaining` and `next: { offset } | null` for paging. `limit` defaults to 10.
-`namespace` is an app slug, such as `gmail`, or a namespace inside it. Without
-it, search loads and searches every app, which is slower.
+`tools.search({ query?, namespace?, limit?, offset? })` returns one page of
+ranked matches. Each item in `items` has the exact callable `path`, the first
+line of its `description` and its `input` type on one line. A longer input type
+is cut and marked `inputTruncated: true`. A tool that several profiles expose
+with the same signature is one item, and `alsoAt` lists its other paths.
+`namespaces` lists each app, profile and titled router on the page once, with
+the profile's account labels, instead of repeating them in every item.
 
-Read a tool's signature before calling it; never guess argument names. Each
+`namespace` is an app slug, such as `gmail`, or a namespace inside it. Without
+it, search loads and searches every app, which is slower. A page holds at most
+`limit` items, 10 by default, and stops sooner at a quarter of the output limit
+(16 KB by default). `remaining` counts the matches after the page, and `next`
+is the input for the following page, or `null` after the last match: call
+`tools.search(next)` to continue.
+
+Search leaves out output types and later description lines. For full detail,
+pass up to 20 exact paths from search:
+
+```js
+return await tools.search.describe({ paths: ["<path from search>"] });
+```
+
+`describe` returns `items` with the whole `description` and the TypeScript
+`signature`, with input and output types, plus their `namespaces`. A path that
+names no tool comes back in `missing` with the closest `matches`.
+
+Read a tool's input type before calling it; never guess argument names. Use
+`describe` when the input was truncated or you need the result's shape. Each
 tool takes one object. Tools generated from an API put route parameters under
 `path`, query parameters under `query` and the request payload under `body`.
 
-To see one tool, search for its exact path: the result holds only that tool.
-Prefer that, or a narrow namespace and a small limit, over broad searches that
-return many signatures you do not need. Call paths exactly as returned.
+Prefer a narrow namespace and a small limit over broad searches, and return
+only the fields you need. Call paths exactly as returned.
 
 ## Slugs and profiles
 
 Every app has a slug, which is its namespace: `tools.<slug>`. An app without
 accounts exposes `tools.<slug>.<tool>`. An app with accounts exposes one
 namespace per account profile, `tools.<slug>.profiles["<profile-id>"].<tool>`;
-the profile selects which saved accounts its tools use. Search descriptions
-name each profile. Use the one the user means and ask when it is unclear. The
-`skills` tool takes the same slug as `app`, and needs `profile` when an app has
-several.
+the profile selects which saved accounts its tools use. Search results list
+each profile and its accounts in `namespaces`. Use the one the user means and
+ask when it is unclear. The `skills` tool takes the same slug as `app`, and
+needs `profile` when an app has several.
 
 Each execution discovers apps when the program or a search first reaches
 them. After deploying or reconfiguring an app, or connecting an account, start
@@ -53,7 +73,10 @@ a new `execute` to see the change.
 
 Every completed result lists `unavailableApps`: apps, profiles or routers that
 could not expose tools in this execution, each with a `reason`. Other apps keep
-working. Calling a tool of an unavailable app fails with that reason.
+working. Search leaves out an unavailable app's tools, `describe` reports their
+paths in `missing`, and calling one fails with that reason. An app that needs
+an account and has no profile is listed only once a search or `describe` names
+it; a call into it fails with that reason.
 
 - `AppProfileRequired`: the app needs an account and you have no enabled
   profile. Connect an account (below), then start a new execution.
@@ -74,11 +97,15 @@ arguments or source, and never search their files for tokens. The Executor app
 - Local: `accountConnect.issue`, then `accountConnections.get` to check it.
 - Hosted: `accounts.connect`, then `accounts.connection` to check it. Hosted
   management calls need the organization: call `context.get({})` first and pass
-  its `organization` as `path.organization`.
+  its `organization` as `path.organization`. For an OAuth sign-in,
+  `accounts.oauthSetup` lists the scopes it will request; tell the user.
 
-Search for the exact signatures first. Give the user the returned URL. After
-they finish, check the connection in a new execution, then start another to
-call the app's tools. Never wait or poll inside one program.
+Search for these tools and read their input types first. Give the user the
+returned `url`; hosted `accounts.connection` returns it again, with progress in
+`state.status`. To replace an account's credentials, pass its ID as `account`
+in the same request. After they finish, check the connection in a new
+execution, then start another to call the app's tools. Never wait or poll
+inside one program.
 
 ## Approvals and input
 
@@ -125,8 +152,9 @@ and for Executor errors a `response` with `code`, `status`, `message` and
 you. `toolCalls` lists every call in order with its `outcome`.
 
 - `ParseError`, `UnsupportedSyntax`: fix the program; `location` points at it.
-- `UnknownTool`: the path is wrong or its app did not load. Check
-  `unavailableApps` and search again. `suggestions` may list close paths.
+- `UnknownTool`: the path is wrong, its app did not load, or the app was
+  deployed after this execution loaded it. Check `unavailableApps` and
+  `suggestions`, then search again in a new execution.
 - `InvalidToolInput`, or a `response.code` of `InputInvalid`: the input does
   not match the signature; the message names the fields.
 - `ToolFailure`: the tool or its service failed. Follow `recovery`.
@@ -141,5 +169,5 @@ Inside a program, a caught tool error's `message` is the same JSON as
 `status: "capacity-exceeded"` means the server is running too many programs.
 Wait briefly, then retry.
 
-If Executor itself blocks you, send feedback with the Executor app's
-`feedback.submit` tool; the `executor` skill says how.
+Send feedback with the Executor app's `feedback.submit` tool when Executor gets
+in your way or something works especially well; the `executor` skill says how.

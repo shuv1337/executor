@@ -5,7 +5,8 @@ import { profileMutations } from "../../contracts/profiles.ts";
 import { HostedFailure } from "../components/dashboard-bindings.tsx";
 import type { App, Profile } from "@executor-js/sdk";
 import { Cause, Option, Schema } from "effect";
-import { UnexpectedError, type UserFacingError } from "@executor-js/utils/user-facing-error";
+import type { UserFacingError } from "@executor-js/utils/user-facing-error";
+import { undeclaredError } from "@executor-js/utils/connection-failure";
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
 import { ToolBrowser } from "@executor-js/ui/dashboard/tools";
 import { ToolRunner, toolRunContext } from "@executor-js/ui/dashboard/tool-runner";
@@ -18,7 +19,13 @@ import {
 import { ErrorNotice } from "@executor-js/ui/dashboard/error-notice";
 import { Empty } from "@executor-js/ui/dashboard/common";
 import { AppSectionHeader, AppSectionTitle } from "@executor-js/ui/dashboard/app-section-header";
-import { appError, callToolAtom, toolDetailAtom, toolCatalogAtom } from "../../contracts/apps.ts";
+import {
+  appError,
+  callToolAtom,
+  toolDetailAtom,
+  toolCatalogAtom,
+  toolRunApprovalAtoms,
+} from "../../contracts/apps.ts";
 import type { HostedError } from "../../contracts/errors.ts";
 import { useOrganizationRoute } from "../components/organization.tsx";
 
@@ -113,6 +120,7 @@ export function AppTools({
               tool: tool.name,
               kind: tool.readOnly === true ? "query" : "mutation",
             })}
+            approval={(requestId) => toolRunApprovalAtoms({ organization, app: app.id, requestId })}
             detail={toolDetailAtom({ ...catalog, tool: tool.name })}
             Failure={ToolCallFailure}
             context={
@@ -128,7 +136,7 @@ export function AppTools({
 /** Tool discovery keeps each expected error's explanation and safe recovery prompt. */
 function ToolsFailure<E extends UserFacingError>({ cause, retry, retrying }: FailureProps<E>) {
   const href = useRouterState({ select: (state) => state.location.href });
-  const error = Option.getOrElse(Cause.findErrorOption(cause), () => new UnexpectedError());
+  const error = Option.getOrElse(Cause.findErrorOption(cause), () => undeclaredError(cause));
   const props = {
     context: `While loading tools for this app and selected profile.\nPage: ${href}`,
     retry,

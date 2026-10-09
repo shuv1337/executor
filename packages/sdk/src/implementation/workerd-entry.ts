@@ -12,7 +12,6 @@ import type {
 import { RpcTarget, newWorkersRpcResponse, type RpcStub } from "capnweb";
 import { Cause, Effect, Redacted, Schema } from "effect";
 import {
-  DatabaseFieldReserved,
   DeclaredRequirements,
   HostRequirementsError,
   HostResponse,
@@ -41,6 +40,7 @@ import {
 } from "./app-worker-residency.ts";
 import { compileWorkerApp } from "../workerd-build.ts";
 import { assembleWorkerBundle } from "./worker-build-storage.ts";
+import { declarationFailed } from "./worker-source-map.ts";
 import {
   CompileWorkerApp,
   CompileWorkerResult,
@@ -120,11 +120,7 @@ interface Environment {
 const failure = () => new WorkflowFailure({ reason: "engine", retryable: true });
 /** The deployer sees the underlying failure; builds bind no accounts. */
 const buildFailed = (stage: RuntimeBuildFailed["stage"], cause: unknown) =>
-  new RuntimeBuildFailed({
-    stage,
-    message: describeBuildCause(cause),
-    ...(Schema.is(DatabaseFieldReserved)(cause) ? { declaration: cause } : {}),
-  });
+  new RuntimeBuildFailed({ stage, message: describeBuildCause(cause) });
 /** What the runner binds to one app's outbound network. App code cannot set it. */
 const OutboundProps = Schema.Struct({ app: Schema.NonEmptyString });
 type OutboundProps = typeof OutboundProps.Type;
@@ -266,7 +262,7 @@ class AppApi extends RpcTarget {
           request.files,
           this.#env.NPM_REGISTRY === "" ? {} : { registry: this.#env.NPM_REGISTRY },
         );
-        const { bundle, framework, ui } = compiled;
+        const { bundle, framework, ui, sourceMap } = compiled;
         const requirements = yield* runner(this.#env, this.#context)
           .declare({ ...assembleWorkerBundle(bundle, framework), protocol: compiled.protocol }, {})
           .pipe(
@@ -278,7 +274,13 @@ class AppApi extends RpcTarget {
                     Effect.flatMap(Effect.fail),
                   ),
             ),
-            Effect.mapError((cause) => buildFailed("declaration", cause)),
+            Effect.mapError((cause) =>
+              declarationFailed(cause, {
+                mainModule: bundle.mainModule,
+                sourceMap,
+                files: request.files,
+              }),
+            ),
           );
         return {
           ok: true as const,

@@ -3,9 +3,9 @@ import { permittedAppIds } from "@executor-js/authorization";
 import { AccountGrants } from "./proofs/account-access.ts";
 /** Sharing writes are atomic; metadata visibility and credential use remain separate. */
 import { Effect } from "effect";
-import { SqlClient } from "effect/unstable/sql";
+import { SqlClient } from "effect/sql";
 import { teamAppPending } from "./provisioning.ts";
-import { HttpApiBuilder } from "effect/unstable/httpapi";
+import { HttpApiBuilder } from "effect/http-api";
 import { StorageError, type AppId, type Provider, type ProviderId } from "@executor-js/sdk/core";
 import { HostedApi } from "../contracts/api.ts";
 import { HostedExecutor } from "../contracts/executor.ts";
@@ -109,9 +109,10 @@ export const resourceDirectory = (view: "available" | "managed" = "available") =
     );
     const pendingApp =
       policy.tools.kind === "all" && (view === "available" || actor.role !== "member")
-        ? yield* teamAppPending(actor.organization).pipe(
-            Effect.provideService(SqlClient.SqlClient, yield* policyDatabase),
-          )
+        ? yield* teamAppPending(
+            actor.organization,
+            (yield* executor.apps.list({ owner, name: "Executor" })).length > 0,
+          ).pipe(Effect.provideService(SqlClient.SqlClient, yield* policyDatabase))
         : false;
     return { apps: appEntries, accounts: accountEntries.flat(), pendingApp };
   });

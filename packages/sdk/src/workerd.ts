@@ -11,6 +11,7 @@ export {
   workerBuildAsset,
 } from "./implementation/worker-build-storage.ts";
 export { bindingWorkerdApps } from "./implementation/binding-workerd-apps.ts";
+export { declarationFailed } from "./implementation/worker-source-map.ts";
 export { workerdHostHandler } from "./implementation/workerd-client.ts";
 export {
   makeAppRunner,
@@ -33,3 +34,4 @@ export {
   type AppEgress,
   type CredentialOutbound,
 } from "./implementation/credential-handles.ts";
+export { NetworkUnreachable, networkUnreachableResponse } from "./implementation/app-network.ts";

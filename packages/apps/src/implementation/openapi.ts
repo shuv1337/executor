@@ -1,6 +1,6 @@
 /** Evaluate normalized metadata into ordinary tools, with account-specific security filtering. */
 import { Effect, JsonPointer, Schema } from "effect";
-import { FetchHttpClient } from "effect/unstable/http";
+import { FetchHttpClient } from "effect/http";
 import {
   OpenapiError,
   OpenapiToolsOptions,
@@ -188,7 +188,13 @@ export const openapiToolsEffect = (
               Schema.decodeUnknownEffect(input)(
                 fillParameterDefaults(op, config.parameterDefaults, value),
               ).pipe(
-                Effect.mapError(() => new OpenapiError({ reason: "invalid_input" })),
+                Effect.mapError(
+                  () =>
+                    new OpenapiError({
+                      reason: "invalid_input",
+                      operation: { method: op.method, path: op.path },
+                    }),
+                ),
                 Effect.flatMap((parsed) =>
                   request
                     .call(op, parsed, config.account, errors)

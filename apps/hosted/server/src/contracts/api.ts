@@ -8,8 +8,14 @@ import { CatalogEntry, CatalogUnavailable } from "@executor-js/catalog/contracts
 import { Context, Schema } from "effect";
 import { HostedGroups } from "./groups.ts";
 import { HostedMcpConnections } from "./mcp-connections.ts";
-import { HttpApi, HttpApiEndpoint, HttpApiGroup, OpenApi } from "effect/unstable/httpapi";
-import { AuthenticationUnavailable, Principal, RequireUser, Unauthorized } from "./auth.ts";
+import { HttpApi, HttpApiEndpoint, HttpApiGroup, OpenApi } from "effect/http-api";
+import {
+  AuthenticationUnavailable,
+  BrowserSessionOnly,
+  Principal,
+  RequireUser,
+  Unauthorized,
+} from "./auth.ts";
 import {
   HostedOrganization,
   OrganizationForbidden,
@@ -72,7 +78,8 @@ export const hostedApiDocument = <Id extends string, Groups extends HttpApiGroup
       if (security.has(id)) throw new Error(`Duplicate product API operation: ${id}`);
       security.set(
         id,
-        [...middleware].some((service) => service.key === RequireUser.key)
+        [...middleware].some((service) => service.key === RequireUser.key) ||
+          Context.get(mergedAnnotations, BrowserSessionOnly)
           ? [{ browserSession: [] }]
           : [...middleware].some(
                 (service) =>
@@ -179,6 +186,11 @@ export const HostedApi = HttpApi.make("executor-hosted")
           organization: OrganizationId,
           slug: Schema.NonEmptyString,
           role: OrganizationRole,
+          /**
+           * Where this host serves app Git remotes, canonical first. They may be on other origins
+           * than this API; a client signed in here uses its session for remotes on each of them.
+           */
+          gitOrigins: Schema.NonEmptyArray(Schema.String),
         }),
         error: [Unauthorized, OrganizationForbidden, AuthenticationUnavailable],
       }).annotate(OpenApi.Override, { security: [{ oauth: ["executor"] }] }),
