@@ -2,7 +2,7 @@
 import { selfHostAuthOptions, selfHostAuthSettings } from "./auth-options.ts";
 import { migrateHostedSchemas } from "@executor-js/hosted-server/migrations";
 import { makeRegistryStorage } from "@executor-js/app-registry";
-import { SqlClient } from "effect/unstable/sql";
+import { SqlClient } from "effect/sql";
 import { Effect, Layer, Redacted } from "effect";
 import { AuthDatabase } from "../contracts/database.ts";
 import { makeAuthDatabase } from "./auth-database.ts";

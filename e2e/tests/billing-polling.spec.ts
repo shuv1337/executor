@@ -110,6 +110,33 @@ layer(HostedLive, { excludeTestServices: true })("Billing polling", (it) => {
           page.getByRole("heading", { name: "Billing", exact: true }).waitFor(),
         );
         yield* settled;
+        // Billing is in the navigation, and each plan states its catalog allowances and trial.
+        expect(
+          yield* browser.use("Billing is the current navigation entry", (page) =>
+            page
+              .getByRole("navigation", { name: "Main navigation" })
+              .getByRole("link", { name: "Billing", exact: true })
+              .getAttribute("aria-current"),
+          ),
+        ).toBe("page");
+        const plan = (page: Page, name: string) =>
+          page
+            .getByRole("article")
+            .filter({ has: page.getByRole("heading", { name, exact: true }) });
+        expect(
+          yield* browser.use("Read the Free plan", (page) => plan(page, "Free").innerText()),
+        ).toMatch(/\$0 \/ month[\s\S]*Up to 3 members/u);
+        yield* browser.use("Team offers its trial", (page) =>
+          Promise.all([
+            plan(page, "Team")
+              .getByText("14-day free trial, card required", { exact: true })
+              .waitFor(),
+            plan(page, "Team")
+              .getByRole("button", { name: "Start 14-day trial", exact: true })
+              .waitFor(),
+          ]),
+        );
+        yield* browser.checkpoint("Billing plans with their allowances");
 
         const visible = yield* measure(
           "visible-idle",
@@ -118,6 +145,19 @@ layer(HostedLive, { excludeTestServices: true })("Billing polling", (it) => {
         expect(visible, "billing reconciles while visible").toBeGreaterThan(0);
         expect(visible, "billing reads while visible").toBeLessThanOrEqual(idleReadLimit);
 
+        // A poll due at the end of a clock step reads while visible, but the read waits out the
+        // page's batch window, a timer on this clock, and so starts on the next step. Hiding then
+        // would count it as a hidden read. Hide right after a visible poll's read instead: the next
+        // poll is due 30 simulated seconds after that one, several steps into the hidden window.
+        const beforePoll = reads;
+        yield* Effect.gen(function* () {
+          for (let elapsed = 0; reads === beforePoll; elapsed += step) {
+            if (elapsed >= idleMinutes * 60_000)
+              return yield* Effect.die(`No billing read in ${idleMinutes} visible minutes`);
+            yield* advance("Visible until the next poll", step);
+          }
+        });
+        yield* settled;
         yield* setHidden(true);
         const hidden = yield* measure("hidden-idle", advance("Hidden idle", idleMinutes * 60_000));
         expect(hidden, "billing reads while hidden").toBe(0);

@@ -22,6 +22,7 @@ import {
   ScheduleConflict,
   ScheduleInvalid,
 } from "../contracts/schedules.ts";
+import { InvocationRun } from "../contracts/runtime.ts";
 import { ScheduleObservation } from "../contracts/scheduler.ts";
 import type { ScheduleDispatcher } from "../contracts/scheduler.ts";
 import type { Credentials } from "../contracts/storage.ts";
@@ -306,10 +307,10 @@ export const makeSchedules = (
       yield* apps.get({ app: run.app, owner: input.owner });
       if (run.status !== "awaiting-approval" || run.requestId === null)
         return yield* new ScheduleNotFound();
-      const pending = yield* approvals
+      const { invocation, expiresAt } = yield* approvals
         .get(run.requestId, run.owner)
         .pipe(Effect.catchTag("ToolApprovalNotFound", () => new ScheduleNotFound()));
-      return { run: publicRun(run), ...pending };
+      return { run: publicRun(run), invocation, expiresAt };
     });
   const operations = {
     definitions: (input: typeof ScheduleInputs.definitions.Type) => definitions(input),
@@ -647,6 +648,7 @@ export const makeSchedules = (
                   Effect.withErrorReporting,
                   Effect.catch((error) => finish(claim, "failed", diagnostic(error))),
                   Effect.onInterrupt(() => finish(claim, "interrupted", "Interrupted")),
+                  Effect.provideService(InvocationRun, claim.id),
                   Effect.withSpan("schedule.run", {
                     attributes: {
                       "executor.run.id": claim.id,
@@ -919,6 +921,7 @@ export const makeSchedules = (
                     }),
                   ),
                   Effect.onInterrupt(() => finish(claim, "interrupted", "Interrupted")),
+                  Effect.provideService(InvocationRun, claim.id),
                   Effect.withSpan("schedule.run", {
                     attributes: {
                       "executor.run.id": claim.id,

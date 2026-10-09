@@ -1,9 +1,8 @@
 /** Host bindings exist only on the trusted product Worker, never on authored app isolates. */
 import { Effect, Option, Schema } from "effect";
-import { FetchHttpClient, HttpClient, HttpServerResponse } from "effect/unstable/http";
+import { FetchHttpClient, HttpClient, HttpServerResponse } from "effect/http";
 import { dashboardRoutes, fileHeaders } from "../web.ts";
-import { BlobKey, BlobStoreError, type BlobStorage } from "@executor-js/sdk/core";
-import { SourceError } from "@executor-js/app-source";
+import { BlobKey, BlobStoreError, SourceError, type BlobStorage } from "@executor-js/sdk/core";
 import { gitRepositories } from "@executor-js/app-source/host";
 import {
   parseDestination,
@@ -133,6 +132,28 @@ export const bindingHttpClient = (
     const client = yield* HttpClient.HttpClient.pipe(Effect.provide(FetchHttpClient.layer));
     return client.pipe(
       HttpClient.transformResponse(Effect.provideService(FetchHttpClient.Fetch, checkedFetch)),
+    );
+  });
+
+/** The bundled collector's internal origin; it names a service binding, never a network address. */
+export const collectorOrigin = "http://motel.internal";
+
+/**
+ * Telemetry exports to the bundled collector go through its service binding, which the host
+ * connects to a private Unix socket. The collector has no TCP listener, so an app's fetch cannot
+ * reach it even when private fetch is allowed. Exports to any other collector use the network.
+ */
+export const bindingTelemetryClient = (collector: HttpBinding) =>
+  Effect.gen(function* () {
+    const routedFetch: typeof fetch = (input, init) => {
+      const request = new Request(input, init);
+      return URL.parse(request.url)?.origin === collectorOrigin
+        ? collector.fetch(request)
+        : fetch(request);
+    };
+    const client = yield* HttpClient.HttpClient.pipe(Effect.provide(FetchHttpClient.layer));
+    return client.pipe(
+      HttpClient.transformResponse(Effect.provideService(FetchHttpClient.Fetch, routedFetch)),
     );
   });
 

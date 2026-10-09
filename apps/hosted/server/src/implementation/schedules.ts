@@ -3,9 +3,8 @@ import { GroupDatabase } from "../contracts/groups.ts";
 import { CurrentOrganization } from "../contracts/organization.ts";
 /** Scheduled work has a saved actor, not a retained browser session or an invented service account. */
 import { Effect, Schema } from "effect";
-import { SqlClient } from "effect/unstable/sql";
-import { HttpApiBuilder } from "effect/unstable/httpapi";
-import { HttpServerRequest } from "effect/unstable/http";
+import { SqlClient } from "effect/sql";
+import { HttpApiBuilder } from "effect/http-api";
 import {
   RequestInvalid,
   StorageError,
@@ -24,6 +23,7 @@ import {
   OrganizationId,
 } from "../contracts/organization.ts";
 import {
+  browserOnly,
   currentOwner,
   executionManagerOwner,
   ownProfile,
@@ -62,10 +62,6 @@ export const makeScheduledAuthority = (executor: Executor) =>
         );
       });
   });
-const browserOnly = Effect.gen(function* () {
-  const request = yield* HttpServerRequest.HttpServerRequest;
-  if (request.headers.authorization !== undefined) return yield* new Forbidden();
-});
 const wake = Effect.flatten(ScheduleWakeup);
 /** Shared handlers retain product ownership and reuse the existing browser approval contract. */
 export const hostedScheduleHandlers = HttpApiBuilder.group(HostedApi, "schedules", (handlers) =>

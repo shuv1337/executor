@@ -9,12 +9,7 @@
 import { expect, layer } from "@effect/vitest";
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import { Effect, Layer, Schedule, Schema } from "effect";
-import {
-  HttpRouter,
-  HttpServer,
-  HttpServerRequest,
-  HttpServerResponse,
-} from "effect/unstable/http";
+import { HttpRouter, HttpServer, HttpServerRequest, HttpServerResponse } from "effect/http";
 import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
 import { scenarios } from "../test-plan.ts";
@@ -22,7 +17,7 @@ import { Actors } from "../support/actors.ts";
 import { Api, body } from "../support/api.ts";
 import { HostedLive, withHostedCase } from "../support/case.ts";
 import { App } from "../support/contracts.ts";
-import { appsManifest, withApps } from "../support/apps-release.ts";
+import { appsManifest, withApps, mcpSdkVersion } from "../support/apps-release.ts";
 import { Evidence, Telemetry } from "../support/evidence.ts";
 
 const Rpc = Schema.Struct({
@@ -122,7 +117,7 @@ export default defineApp({ accounts: {} }, { tools: router({ ping }) });`;
 const entryApps = (origin: string) => [
   {
     entry: "mcp",
-    dependencies: { "@modelcontextprotocol/sdk": "1.30.0" },
+    dependencies: { "@modelcontextprotocol/sdk": mcpSdkVersion },
     tool: "remote.echo",
     source: `import { defineApp, router } from "apps";
 import { mcpRouter } from "apps/mcp";

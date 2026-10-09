@@ -13,7 +13,7 @@ import { Evidence } from "../support/evidence.ts";
 import { HostedLive, withHostedCase } from "../support/case.ts";
 import { McpClient } from "../support/mcp-client.ts";
 import { createProfile, selectProfileAccounts } from "../support/profiles.ts";
-import { appsManifest, withApps } from "../support/apps-release.ts";
+import { appsManifest, withApps, mcpSdkVersion } from "../support/apps-release.ts";
 
 /**
  * 28 apps of 175 tools and one imported API of 2,100 tools: 7,000 tools with about 46 MB of JSON
@@ -106,7 +106,7 @@ const Completed = Schema.Struct({
   unavailableApps: Schema.Array(Schema.Struct({ app: Schema.String, reason: Schema.String })),
 });
 const SearchValue = Schema.Struct({
-  items: Schema.Array(Schema.Struct({ path: Schema.String, signature: Schema.String })),
+  items: Schema.Array(Schema.Struct({ path: Schema.String, input: Schema.String })),
 });
 
 /**
@@ -119,18 +119,18 @@ const trivialBoundMs = 1_000;
 /** One call loads one app's catalog, 175 tools and about 1.2 MB of schemas, not all 29 apps. */
 const oneAppBoundMs = 1_500;
 /**
- * The first catalog-wide search evaluates all 29 apps and renders 7,000 signatures, 3.7–10.4 s on
- * an M-series laptop depending on its load. It must leave the program at least half of the 30 s
- * execution budget. This bound has the least headroom; a failure on a slower runner is a
- * regression to investigate, not a reason to raise it.
+ * The first catalog-wide search evaluates all 29 apps and ranks 7,000 tools, 3.7–10.4 s on an
+ * M-series laptop depending on its load when search still rendered every signature. It must leave
+ * the program at least half of the 30 s execution budget. This bound has the least headroom; a
+ * failure on a slower runner is a regression to investigate, not a reason to raise it.
  */
 const catalogSearchBoundMs = 15_000;
 /**
- * A repeated catalog-wide search reuses every kept listing and its rendered search descriptions.
- * What remains is one MCP round trip, one access-checked store read per listing and scoring 7,000
- * descriptions, tens of milliseconds on an M-series laptop. 500 ms leaves a slower runner several
- * times that, and is under a sixth of the fastest cold search (3.7 s), so any search that
- * evaluates the catalog again fails it.
+ * A repeated catalog-wide search reuses every kept listing and its search projections. What
+ * remains is one MCP round trip, one access-checked store read per listing and ranking 7,000
+ * tools, tens of milliseconds on an M-series laptop. 500 ms leaves a slower runner several times
+ * that, and is under a sixth of the fastest cold search (3.7 s), so any search that evaluates the
+ * catalog again fails it.
  */
 const warmSearchBoundMs = 500;
 /**
@@ -456,7 +456,7 @@ return { items: [...small.items, ...large.items] };`;
                 {
                   path: "package.json",
                   content: JSON.stringify({
-                    dependencies: withApps({ "@modelcontextprotocol/sdk": "1.30.0" }),
+                    dependencies: withApps({ "@modelcontextprotocol/sdk": mcpSdkVersion }),
                   }),
                 },
                 { path: "index.ts", content: stalledAppSource(origin) },
@@ -483,7 +483,7 @@ return { items: [...small.items, ...large.items] };`;
           searched.completed.execution.value,
         )).items;
         expect(items.map((item) => item.path)).toEqual(found);
-        expect(items[0]!.signature).toContain("field_10");
+        expect(items[0]!.input).toContain("field_10");
         const unavailable = searched.completed.unavailableApps;
         expect(new Set(unavailable.map((entry) => entry.app))).toEqual(new Set(stalled));
         for (const entry of unavailable) expect(entry.reason).toContain("timed out");
@@ -911,13 +911,13 @@ return { items: [...small.items, ...large.items] };`;
             return account;
           });
         /** Replace an account's stored credential; its ID and selection stay. */
-        const reconnect = (actor: Session, account: string, token: string) =>
+        const reconnect = (actor: Session, profile: string, account: string, token: string) =>
           Effect.gen(function* () {
-            const response = yield* api.request(
-              actor,
-              "POST",
-              `${prefix}/accounts/${account}/connections`,
-            );
+            const response = yield* api.request(actor, "POST", `${path}/connections`, {
+              profile,
+              requirement: "service",
+              account,
+            });
             expect(response.status).toBe(200);
             expect(yield* submit(actor, (yield* body(Resource, response)).id, token)).toBe(account);
           });
@@ -1017,7 +1017,7 @@ return { items: [...small.items, ...large.items] };`;
         );
 
         // A reconnected account: same account, new stored credential.
-        yield* reconnect(actors.owner, accounts.at(-1)!.id, "rotated");
+        yield* reconnect(actors.owner, ownerProfile, accounts.at(-1)!.id, "rotated");
         seen.push(
           yield* evaluated(
             owner,

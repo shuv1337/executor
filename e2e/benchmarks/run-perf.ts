@@ -2,8 +2,8 @@
 import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { Console, Effect, FileSystem, Layer, Schema } from "effect";
-import { Command, Flag } from "effect/unstable/cli";
-import { FetchHttpClient } from "effect/unstable/http";
+import { Command, Flag } from "effect/cli";
+import { FetchHttpClient } from "effect/http";
 import { readStageControl, serveStage } from "./perf/stage.ts";
 import { readReceipt, seedStage } from "./perf/seed.ts";
 import { makeTarget, scenarios } from "./perf/scenarios.ts";
@@ -321,6 +321,7 @@ const loadFlags = {
   executeWorkers: Flag.Int("execute-workers").pipe(Flag.withDefault(8)),
   readWorkers: Flag.Int("read-workers").pipe(Flag.withDefault(4)),
   callWorkers: Flag.Int("call-workers").pipe(Flag.withDefault(2)),
+  scheduleWorkers: Flag.Int("schedule-workers").pipe(Flag.withDefault(0)),
   probeWorkers: Flag.Int("probe-workers").pipe(Flag.withDefault(1)),
 };
 const load = Command.make(

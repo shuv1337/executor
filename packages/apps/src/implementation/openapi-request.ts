@@ -1,16 +1,18 @@
+import { owned } from "@executor-js/telemetry";
 import { loadSwaggerClient } from "./swagger-client.ts";
 import { httpProviderError, accountProviderError } from "./provider-error.ts";
 import { NetworkRefused } from "../contracts/network.ts";
 import { failOnNetworkRefusal } from "./network.ts";
 import { ProviderError } from "../contracts/provider-error.ts";
 /** Swagger constructs requests; Effect owns HTTP policy and bounded results. */
-import { Effect, Encoding, Option, Schema, Stream } from "effect";
+import { Effect, Option, Schema, Stream } from "effect";
+import { Base64 } from "effect/encoding";
 import {
   FetchHttpClient,
   HttpClient,
   HttpClientRequest,
   type HttpClientResponse,
-} from "effect/unstable/http";
+} from "effect/http";
 import {
   OpenapiResponseError,
   ApiErrorRecovery,
@@ -20,6 +22,7 @@ import {
 
 import {
   OpenapiError,
+  OpenapiMediaType,
   defaultOpenapiResponseLimits,
   isOpenapiFileSchema,
   isOpenapiJsonSequence,
@@ -32,6 +35,21 @@ import {
 } from "../contracts/openapi.ts";
 
 type DeclaredError = OpenapiErrorResponse & { readonly decoder: Schema.Decoder<Schema.Json> };
+
+const mediaType = Schema.decodeUnknownOption(OpenapiMediaType);
+/** A response's media type and declared length. Its text is never read into a failure. */
+const responseShape = (response: HttpClientResponse.HttpClientResponse) => {
+  const contentType = mediaType(
+    response.headers["content-type"]?.split(";")[0]?.trim().toLowerCase(),
+  );
+  const length = response.headers["content-length"];
+  const bytes = length === undefined || !/^\d{1,15}$/.test(length) ? undefined : Number(length);
+  return {
+    status: response.status,
+    ...(Option.isSome(contentType) ? { contentType: contentType.value } : {}),
+    ...(bytes === undefined ? {} : { bytes }),
+  };
+};
 
 // Recovery is optional for arbitrary APIs: a missing or malformed value keeps the declared error.
 const bodyRecovery = Schema.decodeUnknownOption(Schema.Struct({ recovery: ApiErrorRecovery }));
@@ -243,9 +261,12 @@ export function createRequest(config: {
     input: unknown,
     account: OpenapiAccount | undefined,
     errors: readonly DeclaredError[],
-  ) =>
-    Effect.scoped(
+  ) => {
+    // Failures name the operation by its template, never by the parameter values it received.
+    const operation = { method: op.method, path: op.path };
+    return Effect.scoped(
       Effect.gen(function* () {
+        // oxlint-disable-next-line executor/authored-code-through-adapter -- dynamic import
         const swagger = yield* Effect.promise(loadSwaggerClient);
         const prepared = yield* Effect.try({
           try: () => {
@@ -346,7 +367,7 @@ export function createRequest(config: {
             if (prepared.body instanceof FormData) headers.delete("content-type");
             return { ...prepared, url, headers };
           },
-          catch: () => new OpenapiError({ reason: "invalid_input" }),
+          catch: () => new OpenapiError({ reason: "invalid_input", operation }),
         });
         const client = yield* HttpClient.HttpClient;
         const request = yield* Effect.try({
@@ -358,7 +379,7 @@ export function createRequest(config: {
                 ...(prepared.body === undefined ? {} : { body: prepared.body }),
               }),
             ),
-          catch: () => new OpenapiError({ reason: "invalid_input" }),
+          catch: () => new OpenapiError({ reason: "invalid_input", operation }),
         });
         const response = yield* HttpClient.withScope(client).execute(request);
         // Executor's network refused the request; its reason names the host or credential at fault.
@@ -370,19 +391,30 @@ export function createRequest(config: {
           if (provider !== undefined && provider.reason !== "rejected") return yield* provider;
           const declared = yield* responseError(response, errors);
           return yield* (
-            declared ?? provider ?? new OpenapiError({ reason: "request", status: response.status })
+            declared ??
+              provider ??
+              new OpenapiError({ reason: "request", operation, ...responseShape(response) })
           );
         }
         if (response.status === 204 || prepared.method === "HEAD") return null;
+        // A success whose body cannot be read within the limits names that response.
+        const unreadable = new OpenapiError({
+          reason: "request",
+          operation,
+          ...responseShape(response),
+        });
         const contentType = response.headers["content-type"] ?? "text/plain";
         const chunks = yield* response.stream.pipe(
-          Stream.mapError(() => new OpenapiError({ reason: "request" })),
+          Stream.mapError(() => unreadable),
           Stream.limitBytes(defaultOpenapiResponseLimits.maxBodyBytes, () =>
-            Stream.fail(new OpenapiError({ reason: "request" })),
+            Stream.fail(unreadable),
           ),
           Stream.runCollect,
-          Effect.timeout(defaultOpenapiResponseLimits.readTimeoutMs),
-          Effect.withSpan("provider.http.response.read"),
+          Effect.timeoutOrElse({
+            duration: defaultOpenapiResponseLimits.readTimeoutMs,
+            orElse: () => Effect.fail(unreadable),
+          }),
+          owned("upstream", "provider.http.response.read"),
         );
         const data = new Uint8Array(chunks.reduce((size, chunk) => size + chunk.length, 0));
         let offset = 0;
@@ -390,15 +422,16 @@ export function createRequest(config: {
           data.set(chunk, offset);
           offset += chunk.length;
         }
-        if (!isOpenapiTextMedia(contentType))
-          return { base64: Encoding.encodeBase64(data), contentType };
+        if (!isOpenapiTextMedia(contentType)) return { base64: Base64.encode(data), contentType };
         const text = new TextDecoder().decode(data);
         return contentType.includes("json") && !isOpenapiJsonSequence(contentType)
-          ? yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Json))(text)
+          ? yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Json))(text).pipe(
+              Effect.mapError(() => unreadable),
+            )
           : text;
       }),
     ).pipe(
-      Effect.withSpan("provider.openapi.call", {
+      owned("upstream", "provider.openapi.call", {
         attributes: { "executor.tool.name": op.name, "http.request.method": op.method },
       }),
       Effect.provideService(FetchHttpClient.RequestInit, { redirect: "manual" }),
@@ -411,9 +444,10 @@ export function createRequest(config: {
               error instanceof ProviderError ||
               error instanceof NetworkRefused
             ? error
-            : new OpenapiError({ reason: "request" }),
+            : new OpenapiError({ reason: "request", operation }),
       ),
     );
+  };
   return {
     available: (op: OpenapiOperationAccess, account: OpenapiAccount | undefined) =>
       selectedCredentials(op, account) !== undefined,
