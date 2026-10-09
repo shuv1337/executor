@@ -77,6 +77,7 @@ import {
   ToolElicitationFailed,
   ToolBlocked,
   ToolApprovalRequired,
+  ApprovalRequestId,
   ToolPolicyFailed,
   RequestInvalid,
   type ProviderDefinition,
@@ -88,6 +89,13 @@ import {
   CatalogImport,
   CustomAppInput,
 } from "@executor-js/catalog/contracts";
+import {
+  BrowserApprovalAnswer,
+  BrowserApprovalView,
+  BrowserToolRun,
+  BrowserToolRunAnswer,
+  ToolRunApprovalRefused,
+} from "@executor-js/mcp/browser";
 import { ConnectionSignIn } from "./account-connections.ts";
 import { AuthStorageError } from "./auth.ts";
 import { Schema } from "effect";
@@ -97,7 +105,7 @@ import {
   HttpApiGroup,
   HttpApiMiddleware,
   HttpApiSchema,
-} from "effect/unstable/httpapi";
+} from "effect/http-api";
 
 /** Same callback path as Executor local, cloud and self-host; the host supplies its origin. */
 export const OAuthCallbackPath = "/api/oauth/callback";
@@ -166,6 +174,29 @@ export class AccountManagementBlocked extends Schema.TaggedError<AccountManageme
     description: "This account is managed by the local server and cannot be changed here.",
   },
 ) {}
+/**
+ * The app requirement a dashboard sign-in fills. `account` replaces that account's credentials
+ * instead of adding one; the app page is the only place credentials are entered.
+ */
+export const AppAccountTarget = Schema.Struct({
+  profile: ProfileId,
+  requirement: Schema.NonEmptyString,
+  account: Schema.optional(AccountId),
+});
+const appConnectionErrors = [
+  StorageError,
+  CredentialsError,
+  ProviderNotFound,
+  AccountNotFound,
+  AuthMethodInvalid,
+  AccountManagementBlocked,
+  ...ProfileErrors,
+  AccountConnectionNotFound,
+  AccountConnectionClosed,
+  AccountConnectionTargetChanged,
+  AppNotFound,
+  AccountSelectionInvalid,
+] as const;
 /** Local session authentication, with explicit failures carried through AtomHttpApi. */
 export class DashboardAccess extends HttpApiMiddleware.Service<DashboardAccess>()(
   "DashboardAccess",
@@ -430,7 +461,7 @@ export const DashboardApi = HttpApi.make("local-dashboard").add(
       }),
     )
     .add(
-      HttpApiEndpoint.post("callTool", "/dashboard/api/apps/:app/tools/call", {
+      HttpApiEndpoint.post("runTool", "/dashboard/api/apps/:app/tools/run", {
         params: { app: AppId },
         payload: Schema.Struct({
           tool: ToolName,
@@ -441,7 +472,7 @@ export const DashboardApi = HttpApi.make("local-dashboard").add(
           profile: Schema.optional(ProfileId),
           expectedProfileRevision: Schema.optional(ProfileRevision),
         }),
-        success: Json,
+        success: BrowserToolRun,
         error: [
           ...ProfileErrors,
           StorageError,
@@ -465,8 +496,44 @@ export const DashboardApi = HttpApi.make("local-dashboard").add(
           ToolApprovalRequired,
           ToolPolicyFailed,
           RequestInvalid,
+          DashboardForbidden,
+          DashboardUnauthorized,
         ],
       }),
+    )
+    .add(
+      HttpApiEndpoint.get("toolApproval", "/dashboard/api/apps/:app/tools/approvals/:requestId", {
+        params: { app: AppId, requestId: ApprovalRequestId },
+        success: BrowserApprovalView,
+        error: [
+          StorageError,
+          AppNotFound,
+          RequestInvalid,
+          DashboardForbidden,
+          DashboardUnauthorized,
+          ToolRunApprovalRefused,
+        ],
+      }),
+    )
+    .add(
+      HttpApiEndpoint.post(
+        "answerToolApproval",
+        "/dashboard/api/apps/:app/tools/approvals/:requestId",
+        {
+          params: { app: AppId, requestId: ApprovalRequestId },
+          payload: BrowserApprovalAnswer,
+          success: BrowserToolRunAnswer,
+          error: [
+            StorageError,
+            CredentialsError,
+            AppNotFound,
+            RequestInvalid,
+            DashboardForbidden,
+            DashboardUnauthorized,
+            ToolRunApprovalRefused,
+          ],
+        },
+      ),
     )
     .add(
       HttpApiEndpoint.get("catalog", "/dashboard/api/catalog", {
@@ -516,24 +583,6 @@ export const DashboardApi = HttpApi.make("local-dashboard").add(
       }),
     )
     .add(
-      HttpApiEndpoint.post("addAccount", "/dashboard/api/accounts", {
-        payload: Schema.Struct({
-          provider: ProviderId,
-          method: AuthMethodName,
-          label: Schema.optional(Schema.NonEmptyString),
-          fields: AccountFieldsInput,
-        }),
-        success: Account,
-        error: [
-          StorageError,
-          CredentialsError,
-          ProviderNotFound,
-          AuthMethodInvalid,
-          AccountFieldsInvalid,
-        ],
-      }),
-    )
-    .add(
       HttpApiEndpoint.get("account", "/dashboard/api/accounts/:account", {
         params: { account: AccountId },
         success: DashboardAccountDetail,
@@ -574,49 +623,6 @@ export const DashboardApi = HttpApi.make("local-dashboard").add(
       }),
     )
     .add(
-      HttpApiEndpoint.put(
-        "replaceAccountCredentials",
-        "/dashboard/api/accounts/:account/credentials",
-        {
-          params: { account: AccountId },
-          payload: Schema.Struct({ fields: AccountFieldsInput }),
-          success: Account,
-          error: [
-            StorageError,
-            CredentialsError,
-            AccountNotFound,
-            ProviderNotFound,
-            AuthMethodInvalid,
-            AccountFieldsInvalid,
-            AccountManagementBlocked,
-          ],
-        },
-      ),
-    )
-    .add(
-      HttpApiEndpoint.post("reconnectAccount", "/dashboard/api/accounts/:account/oauth/start", {
-        params: { account: AccountId },
-        payload: Schema.Struct({ client: Schema.optional(OAuthClientInput) }),
-        success: ConnectionSignIn,
-        error: [
-          StorageError,
-          CredentialsError,
-          AccountNotFound,
-          ProviderNotFound,
-          AuthMethodInvalid,
-          OAuthClientUnavailable,
-          OAuthSetupFailed,
-          AccountManagementBlocked,
-          ...ProfileErrors,
-          AccountConnectionNotFound,
-          AccountConnectionClosed,
-          AccountConnectionTargetChanged,
-          AppNotFound,
-          AccountSelectionInvalid,
-        ],
-      }),
-    )
-    .add(
       HttpApiEndpoint.delete("disconnectAccount", "/dashboard/api/accounts/:account", {
         params: { account: AccountId },
         success: Schema.Struct({ account: AccountId }),
@@ -642,29 +648,29 @@ export const DashboardApi = HttpApi.make("local-dashboard").add(
       }),
     )
     .add(
-      HttpApiEndpoint.post("startOAuth", "/dashboard/api/accounts/oauth/start", {
+      HttpApiEndpoint.post("connectAccount", "/dashboard/api/apps/:app/accounts", {
+        params: { app: AppId },
         payload: Schema.Struct({
-          provider: ProviderId,
+          ...AppAccountTarget.fields,
+          method: AuthMethodName,
+          label: Schema.optional(Schema.NonEmptyString),
+          fields: AccountFieldsInput,
+        }),
+        success: Account,
+        error: [...appConnectionErrors, AccountFieldsInvalid],
+      }),
+    )
+    .add(
+      HttpApiEndpoint.post("startOAuth", "/dashboard/api/apps/:app/oauth/start", {
+        params: { app: AppId },
+        payload: Schema.Struct({
+          ...AppAccountTarget.fields,
           method: AuthMethodName,
           label: Schema.optional(Schema.NonEmptyString),
           client: Schema.optional(OAuthClientInput),
         }),
         success: ConnectionSignIn,
-        error: [
-          StorageError,
-          CredentialsError,
-          ProviderNotFound,
-          AuthMethodInvalid,
-          OAuthClientUnavailable,
-          OAuthSetupFailed,
-          AccountNotFound,
-          ...ProfileErrors,
-          AccountConnectionNotFound,
-          AccountConnectionClosed,
-          AccountConnectionTargetChanged,
-          AppNotFound,
-          AccountSelectionInvalid,
-        ],
+        error: [...appConnectionErrors, OAuthClientUnavailable, OAuthSetupFailed],
       }),
     )
     .add(

@@ -19,14 +19,18 @@ import {
   HttpUrl,
   type App,
   type Account,
+  type AccountId,
   type AccountFieldsInput,
   type SelectedAccounts,
   type OAuthClientInput,
   type ToolName,
   type Json,
+  type ApprovalRequestId,
 } from "@executor-js/sdk";
+import { toolRunApproval } from "@executor-js/ui/contracts/browser-approval";
+import { BrowserAtoms } from "./telemetry.ts";
 import { OrganizationReference } from "@executor-js/hosted-server/organization";
-import { AsyncResult, Atom } from "effect/unstable/reactivity";
+import { AsyncResult, Atom } from "effect/reactivity";
 import { Cause, Data, Effect, Option, Schema, type Redacted } from "effect";
 import { HostedClient } from "./api.ts";
 import {
@@ -205,6 +209,8 @@ export function appConnectionAtoms(key: {
   readonly provider: ProviderId;
   readonly profile?: ProfileId | undefined;
   readonly accounts: SelectedAccounts;
+  /** Replace this selected account's credentials instead of adding an account. */
+  readonly account?: AccountId | undefined;
 }) {
   const requestKey = crypto.randomUUID();
   const profile = Atom.make<ProfileId | undefined>(key.profile);
@@ -224,7 +230,11 @@ export function appConnectionAtoms(key: {
         current ??
         (yield* client.accounts.connect({
           params: { organization: key.organization, app: key.app },
-          payload: { requirement: key.requirement, profile: selected },
+          payload: {
+            requirement: key.requirement,
+            profile: selected,
+            ...(key.account === undefined ? {} : { account: key.account }),
+          },
         }));
       if (current === undefined) get.set(request, saved);
       // Cached form definitions cannot send credentials to a different provider after an app edit.
@@ -379,13 +389,23 @@ class CallKey extends Data.Class<{
 const calls = Atom.family(({ organization, app, ...target }: CallKey) =>
   HostedClient.runtime.fn((input: Json) =>
     Effect.flatMap(HostedClient, (client) =>
-      client.tools.call({ params: { organization, app }, payload: { ...target, input } }),
+      client.tools.run({ params: { organization, app }, payload: { ...target, input } }),
     ),
   ),
 );
 /** Each account and operation owns its invocation state. */
 export const callToolAtom = (key: ConstructorParameters<typeof CallKey>[0]) =>
   calls(new CallKey(key));
+const toolRunApprovals = Atom.family((endpoint: string) => toolRunApproval(BrowserAtoms, endpoint));
+/** One pending dashboard run's review; each request owns its answer state. */
+export const toolRunApprovalAtoms = (key: {
+  readonly organization: OrganizationReference;
+  readonly app: AppId;
+  readonly requestId: ApprovalRequestId;
+}) =>
+  toolRunApprovals(
+    `/api/organizations/${encodeURIComponent(key.organization)}/apps/${encodeURIComponent(key.app)}/tools/approvals/${encodeURIComponent(key.requestId)}`,
+  );
 
 /** Return context from the tab that started sign-in; the callback page resolves it from the server. */
 export const PendingOAuth = Schema.Struct({

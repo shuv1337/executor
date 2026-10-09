@@ -1,9 +1,9 @@
 /** The packaged Go host and workerd, with private data and scoped process ownership. */
 import { randomBytes } from "node:crypto";
-import { createServer, request as proxyRequest } from "node:http";
+import { createServer, request as nodeRequest } from "node:http";
 import { Config, Effect, FileSystem, Path, Schedule, Stream } from "effect";
-import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
-import { HttpClient, HttpClientRequest } from "effect/unstable/http";
+import { ChildProcess, ChildProcessSpawner } from "effect/process";
+import { HttpClient, HttpClientRequest } from "effect/http";
 import { freePort } from "./ports.ts";
 import { driver } from "./platform.ts";
 
@@ -15,7 +15,7 @@ export const nativeClientProxy = (upstream: string) =>
         createServer((incoming, outgoing) => {
           const second = incoming.url?.startsWith("/second/") === true;
           const target = new URL(incoming.url?.replace(/^\/(first|second)/, "") ?? "/", upstream);
-          const request = proxyRequest(
+          const request = nodeRequest(
             target,
             {
               method: incoming.method,
@@ -55,6 +55,47 @@ export const nativeClientProxy = (upstream: string) =>
     return { first: `http://127.0.0.1:${port}/first`, second: `http://127.0.0.1:${port}/second` };
   });
 
+/**
+ * One request to the collector's private Unix socket. The packaged host does not publish a TCP
+ * port for Motel.
+ */
+export const collectorRequest = (socketPath: string, requestPath: string, body?: string) =>
+  Effect.tryPromise({
+    try: () =>
+      new Promise<{ readonly status: number; readonly text: string }>((resolve, reject) => {
+        const request = nodeRequest(
+          {
+            socketPath,
+            path: requestPath,
+            method: body === undefined ? "GET" : "POST",
+            headers:
+              body === undefined
+                ? {}
+                : {
+                    "content-type": "application/json",
+                    "content-length": Buffer.byteLength(body),
+                  },
+          },
+          (response) => {
+            const chunks: Buffer[] = [];
+            response.on("data", (chunk: Buffer) => {
+              chunks.push(chunk);
+            });
+            response.on("end", () =>
+              resolve({
+                status: response.statusCode ?? 0,
+                text: Buffer.concat(chunks).toString("utf8"),
+              }),
+            );
+          },
+        );
+        request.on("error", reject);
+        if (body !== undefined) request.write(body);
+        request.end();
+      }),
+    catch: () => "The collector socket did not answer",
+  });
+
 export const nativeSelfHost = (environment: Readonly<Record<string, string>>) =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
@@ -71,26 +112,15 @@ export const nativeSelfHost = (environment: Readonly<Record<string, string>>) =>
           `Missing ${artifact}. Prepare the native self-host artifacts as described in e2e/README.md; rebuild them after source changes.`,
         );
     const directory = path.resolve(".local/native-auth", randomBytes(8).toString("hex"));
+    const dataDirectory = `${directory}/data`;
+    const motelDirectory = `${directory}/motel`;
     yield* fs.makeDirectory(directory, { recursive: true, mode: 0o700 });
-    // The packaged collector normally exposes 4318. Give this fixture its own listener and
-    // export to it, without changing product code or a developer's telemetry server.
-    const fixtureRuntime = `${directory}/runtime`;
-    yield* fs.copy(runtime, fixtureRuntime);
-    const collector = `http://127.0.0.1:${yield* freePort}`;
-    const config = yield* fs.readFileString(`${fixtureRuntime}/motel.capnp`);
-    yield* fs.writeFileString(
-      `${fixtureRuntime}/motel.capnp`,
-      config.replace('address="127.0.0.1:4318"', `address="${new URL(collector).host}"`),
-    );
-    yield* Effect.addFinalizer(() =>
-      fs.remove(fixtureRuntime, { recursive: true, force: true }).pipe(Effect.orDie),
-    );
     // Logs survive failures. Product databases and secrets are never evidence.
     yield* Effect.addFinalizer(() =>
-      fs.remove(`${directory}/data`, { recursive: true, force: true }).pipe(Effect.orDie),
+      fs.remove(dataDirectory, { recursive: true, force: true }).pipe(Effect.orDie),
     );
     yield* Effect.addFinalizer(() =>
-      fs.remove(`${directory}/motel`, { recursive: true, force: true }).pipe(Effect.orDie),
+      fs.remove(motelDirectory, { recursive: true, force: true }).pipe(Effect.orDie),
     );
     const origin = `http://127.0.0.1:${yield* freePort}`;
     const child = yield* processes.spawn(
@@ -103,11 +133,11 @@ export const nativeSelfHost = (environment: Readonly<Record<string, string>>) =>
           HOST: "127.0.0.1",
           PORT: new URL(origin).port,
           BETTER_AUTH_URL: origin,
-          EXECUTOR_DATA_DIR: `${directory}/data`,
-          EXECUTOR_MOTEL_DATA_DIR: `${directory}/motel`,
-          EXECUTOR_RUNTIME_DIR: fixtureRuntime,
-          OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: `${collector}/v1/traces`,
-          OTEL_EXPORTER_OTLP_LOGS_ENDPOINT: `${collector}/v1/logs`,
+          EXECUTOR_DATA_DIR: dataDirectory,
+          EXECUTOR_MOTEL_DATA_DIR: motelDirectory,
+          EXECUTOR_RUNTIME_DIR: runtime,
+          // Leave OTEL_EXPORTER_OTLP_* unset so the product uses its MOTEL binding. Setting an
+          // endpoint would export to that URL instead of the private Unix socket.
           ...environment,
         },
         stdout: "pipe",
@@ -128,6 +158,15 @@ export const nativeSelfHost = (environment: Readonly<Record<string, string>>) =>
         response.status === 200 ? Effect.void : Effect.fail("Native self-host is starting"),
       ),
       Effect.retry({ schedule: Schedule.spaced("100 millis"), times: 100 }),
+    );
+    // The host publishes the collector socket before it accepts product traffic.
+    const collectorSocket = yield* fs.readFileString(`${dataDirectory}/.executor-telemetry`).pipe(
+      Effect.map((text) => text.trim()),
+      Effect.filterOrFail(
+        (socket) => socket.startsWith("/"),
+        () => "The telemetry record does not name a socket",
+      ),
+      Effect.retry({ schedule: Schedule.spaced("50 millis"), times: 40 }),
     );
     const register = (headers: Readonly<Record<string, string>>, via = origin) =>
       Effect.scoped(
@@ -167,8 +206,8 @@ export const nativeSelfHost = (environment: Readonly<Record<string, string>>) =>
       );
     return {
       origin,
-      collector,
-      runtime: fixtureRuntime,
+      collectorSocket,
+      motelDirectory,
       pid: child.pid,
       exitCode: child.exitCode,
       isRunning: child.isRunning,

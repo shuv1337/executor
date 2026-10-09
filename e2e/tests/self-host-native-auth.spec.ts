@@ -2,7 +2,7 @@
 import { expect, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { Effect, Schema } from "effect";
-import { FetchHttpClient } from "effect/unstable/http";
+import { FetchHttpClient } from "effect/http";
 import { nativeClientProxy, nativeSelfHost } from "../support/native-self-host.ts";
 import { scenarios } from "../test-plan.ts";
 

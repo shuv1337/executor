@@ -192,8 +192,9 @@ function errorContent(document: OpenApiDocument, response: JsonObject): Json | u
 
 /** Keep tagged errors, including response/component refs and anyOf alternatives.
  * Public text comes from a declared string message or the schema's static description.
+ * `scripts/check-api-errors.ts` applies this to Executor's own API documents.
  */
-function errorResponses(
+export function errorResponses(
   document: OpenApiDocument,
   operation: JsonObject,
   at: string,
@@ -339,6 +340,7 @@ export const compileOpenApiDocument = (
     if (input === undefined) fail("invalid_document", "This API definition was already compiled.");
     return input;
   };
+  // oxlint-disable-next-line executor/authored-code-through-adapter -- this module's own parser
   return Effect.tryPromise({
     try: async () => {
       const document = await openApiDocument(take());

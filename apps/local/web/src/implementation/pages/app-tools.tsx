@@ -1,7 +1,7 @@
-import type { SelectedAccounts } from "@executor-js/sdk";
+import type { AppId, SelectedAccounts } from "@executor-js/sdk";
 import { ProfileStatus } from "@executor-js/ui/dashboard/profile-status";
 import { profileMutations } from "../../contracts/profiles.ts";
-import { AsyncResult } from "effect/unstable/reactivity";
+import { AsyncResult } from "effect/reactivity";
 import { Failure } from "../components/common.tsx";
 import { useAtomValue } from "@effect/atom-react";
 import {
@@ -17,7 +17,13 @@ import { ToolBrowser } from "@executor-js/ui/dashboard/tools";
 import { ToolRunner, toolRunContext } from "@executor-js/ui/dashboard/tool-runner";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { Key01Icon } from "@hugeicons/core-free-icons";
-import { callToolAtom, toolDetailAtom, toolsAtom, toolCatalogAtom } from "../../contracts/api.ts";
+import {
+  callToolAtom,
+  toolDetailAtom,
+  toolsAtom,
+  toolCatalogAtom,
+  toolRunApprovalAtoms,
+} from "../../contracts/api.ts";
 import {
   appToolReadiness,
   accountSetupFailure,
@@ -80,9 +86,23 @@ function SingleAppTools(props: AppToolsProps) {
         />
       );
     case "reconnect":
-      return <AccountReconnect accounts={readiness.accounts} status="Needs sign-in" />;
+      return (
+        <AccountReconnect
+          app={props.app.id}
+          profile={props.profile}
+          accounts={readiness.accounts}
+          status="Needs sign-in"
+        />
+      );
     case "rejected":
-      return <AccountReconnect accounts={readiness.accounts} status="Sign-in rejected" />;
+      return (
+        <AccountReconnect
+          app={props.app.id}
+          profile={props.profile}
+          accounts={readiness.accounts}
+          status="Sign-in rejected"
+        />
+      );
     case "unavailable":
       return (
         <p role="alert" className="text-sm text-muted-foreground">
@@ -96,9 +116,13 @@ function SingleAppTools(props: AppToolsProps) {
 
 /** An expired sign-in is an account action, not an empty tool browser or retryable request. */
 function AccountReconnect({
+  app,
+  profile,
   accounts,
   status,
 }: {
+  readonly app: AppId;
+  readonly profile: ProfileId | undefined;
   readonly accounts: ReadonlyArray<DashboardAccount>;
   readonly status: string;
 }) {
@@ -120,7 +144,7 @@ function AccountReconnect({
             <p>Sign in again to load tools.</p>
           </div>
           <Button asChild>
-            <Link to="/accounts/$accountId/credentials" params={{ accountId: account.id }}>
+            <Link to="/apps/$appId" params={{ appId: app }} search={{ view: "accounts", profile }}>
               Reconnect
             </Link>
           </Button>
@@ -169,7 +193,14 @@ function LiveAppTools({
   if (Option.isSome(reconnect)) {
     const account = accounts.find((account) => account.id === reconnect.value.account);
     if (account !== undefined)
-      return <AccountReconnect accounts={[account]} status="Needs sign-in" />;
+      return (
+        <AccountReconnect
+          app={app.id}
+          profile={profile}
+          accounts={[account]}
+          status="Needs sign-in"
+        />
+      );
   }
   return (
     <ToolBrowser
@@ -202,6 +233,7 @@ function LiveAppTools({
             tool: tool.name,
             kind: tool.readOnly === true ? "query" : "mutation",
           })}
+          approval={(requestId) => toolRunApprovalAtoms({ app: app.id, requestId })}
           detail={toolDetailAtom({ ...catalog, tool: tool.name })}
           Failure={Failure}
           context={profile === undefined ? undefined : toolRunContext(label, selection, accounts)}

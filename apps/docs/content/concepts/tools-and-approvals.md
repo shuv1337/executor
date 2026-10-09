@@ -29,7 +29,8 @@ await tools["support-inbox"].archive({ id: "msg_1" });
 await tools.acme.issues.close({ id: "123" });
 ```
 
-`tools.search` returns that exact expression along with the input schema, so an
+`tools.search` returns that exact expression along with the input type, and
+`tools.search.describe` returns the whole signature with the output type, so an
 agent does not have to guess.
 
 Which tools are available can depend on the app's configuration. A tool needing
@@ -93,6 +94,11 @@ The call pauses. What you see next depends on the
   answer.
 - **Native**: your MCP client prompts you, and the same program continues.
 - **Browser**: you get a link to a signed-in page and decide there.
+
+When you run a tool yourself from an app's **Tools** tab, the dashboard shows
+the saved call (the tool and its arguments) and resumes it only after you approve.
+Only you can answer a run you started there. Approvals from an MCP client or a
+schedule are answered where they were requested.
 
 A tool can also ask for input rather than permission, using a form. The
 mechanism is the same.

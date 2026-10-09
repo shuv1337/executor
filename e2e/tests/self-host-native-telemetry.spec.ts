@@ -4,9 +4,9 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { randomBytes } from "node:crypto";
 import { request } from "node:http";
 import { Effect, Fiber, Schedule, Schema } from "effect";
-import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/unstable/http";
-import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
-import { nativeSelfHost } from "../support/native-self-host.ts";
+import { FetchHttpClient } from "effect/http";
+import { ChildProcess, ChildProcessSpawner } from "effect/process";
+import { collectorRequest, nativeSelfHost } from "../support/native-self-host.ts";
 import { driver } from "../support/platform.ts";
 import { scenarios } from "../test-plan.ts";
 
@@ -61,13 +61,11 @@ const DeliveredSpans = Schema.Struct({
   data: Schema.Array(Schema.Struct({ span: Schema.Struct({ serviceName: Schema.String }) })),
 });
 
-const collectorReady = (collector: string) =>
-  driver("collector health", () =>
-    fetch(`${collector}/api/health`).then((response) =>
-      response.arrayBuffer().then(() => response.ok),
+const collectorReady = (socket: string) =>
+  collectorRequest(socket, "/api/health").pipe(
+    Effect.flatMap(({ status }) =>
+      status === 200 ? Effect.void : Effect.fail("The collector is starting"),
     ),
-  ).pipe(
-    Effect.flatMap((ok) => (ok ? Effect.void : Effect.fail("The collector is starting"))),
     Effect.retry({ schedule: Schedule.spaced("100 millis"), times: 100 }),
   );
 
@@ -82,7 +80,7 @@ const productHealth = (origin: string) =>
   });
 
 /** Sends a traced product request and waits for its spans to reach the collector. */
-const deliveredProductTrace = (origin: string, collector: string) =>
+const deliveredProductTrace = (origin: string, socket: string) =>
   Effect.gen(function* () {
     const traceId = hex(16);
     const metadata = yield* driver("traced product request", () =>
@@ -91,34 +89,34 @@ const deliveredProductTrace = (origin: string, collector: string) =>
       }),
     );
     expect(metadata.status).toBe(200);
-    yield* productSpans(collector, traceId).pipe(
+    yield* productSpans(socket, traceId).pipe(
       Effect.retry({ schedule: Schedule.spaced("500 millis"), times: 40 }),
     );
     return traceId;
   });
 
-const productSpans = (collector: string, traceId: string) =>
-  driver("delivered product spans", () =>
-    fetch(`${collector}/api/traces/${traceId}/spans`).then((response) => response.json()),
-  ).pipe(
-    Effect.flatMap(Schema.decodeUnknownEffect(DeliveredSpans)),
-    Effect.flatMap((trace) =>
-      trace.data.some(({ span }) => span.serviceName === "executor-selfhost")
-        ? Effect.succeed(trace)
-        : Effect.fail("The product span has not reached the collector"),
-    ),
-  );
+const productSpans = (socket: string, traceId: string) =>
+  Effect.gen(function* () {
+    const response = yield* collectorRequest(socket, `/api/traces/${traceId}/spans`);
+    if (response.status !== 200)
+      return yield* Effect.fail(`The collector answered ${response.status}`);
+    const trace = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(DeliveredSpans))(
+      response.text,
+    ).pipe(Effect.mapError((error) => String(error)));
+    if (!trace.data.some(({ span }) => span.serviceName === "executor-selfhost"))
+      return yield* Effect.fail("The product span has not reached the collector");
+    return trace;
+  });
 
 it.live(scenarios.selfHostNativeTelemetry.title, () =>
   Effect.scoped(
     Effect.gen(function* () {
-      const http = yield* HttpClient.HttpClient;
       const host = yield* nativeSelfHost({});
       const exports = 3;
       const spans = 12_000;
       const body = traceExport(spans);
       expect(Buffer.byteLength(body)).toBeLessThan(16 * 1024 * 1024);
-      yield* collectorReady(host.collector);
+      yield* collectorReady(host.collectorSocket);
       let exporting = true;
       const health: number[] = [];
       const poll = yield* Effect.whileLoop({
@@ -137,16 +135,11 @@ it.live(scenarios.selfHostNativeTelemetry.title, () =>
         () =>
           Effect.scoped(
             Effect.gen(function* () {
-              const response = yield* http.execute(
-                HttpClientRequest.post(`${host.collector}/v1/traces`).pipe(
-                  HttpClientRequest.bodyText(body, "application/json"),
-                ),
-              );
-              const text = yield* response.text;
+              const response = yield* collectorRequest(host.collectorSocket, "/v1/traces", body);
               // Motel explains a refused export in its body, such as a full ingest queue.
-              expect(response.status, text.slice(0, 500)).toBe(200);
+              expect(response.status, response.text.slice(0, 500)).toBe(200);
               const result = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Ingested))(
-                text,
+                response.text,
               );
               return result.insertedSpans;
             }),
@@ -165,7 +158,7 @@ it.live(scenarios.selfHostNativeTelemetry.title, () =>
       expect(Math.max(...health)).toBeLessThan(750);
 
       // The product still delivers its own spans to the collector in the other process.
-      yield* deliveredProductTrace(host.origin, host.collector);
+      yield* deliveredProductTrace(host.origin, host.collectorSocket);
     }),
   ).pipe(Effect.provide(NodeServices.layer), Effect.provide(FetchHttpClient.layer)),
 );
@@ -175,8 +168,18 @@ it.live(scenarios.selfHostNativeTelemetryLifecycle.title, () =>
     Effect.gen(function* () {
       const processes = yield* ChildProcessSpawner.ChildProcessSpawner;
       const host = yield* nativeSelfHost({});
+      // The collector's command line names this fixture's motel directory. The capnp it serves
+      // lives in the host's temporary directory, not under the shared runtime. pgrep -f is an
+      // extended regex, and a pattern that starts with `-` is an option, so the flag is escaped
+      // and passed after `--`. A missing pgrep fails the scenario; no match is an empty list.
       const collectors = processes
-        .lines(ChildProcess.make("pgrep", ["-f", `${host.runtime}/motel.capnp`]))
+        .lines(
+          ChildProcess.make("pgrep", [
+            "-f",
+            "--",
+            `--directory-path=motel-data=${host.motelDirectory.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`,
+          ]),
+        )
         .pipe(Effect.map((lines) => lines.filter((line) => line.trim() !== "").map(Number)));
       const onlyCollector = collectors.pipe(
         Effect.flatMap(([pid, ...others]) =>
@@ -185,23 +188,32 @@ it.live(scenarios.selfHostNativeTelemetryLifecycle.title, () =>
             : Effect.fail(`Expected one collector process, found ${[pid, ...others].join(", ")}`),
         ),
       );
-      yield* collectorReady(host.collector);
-      const retained = yield* deliveredProductTrace(host.origin, host.collector);
+      yield* collectorReady(host.collectorSocket);
+      const retained = yield* deliveredProductTrace(host.origin, host.collectorSocket);
       const crashed = yield* onlyCollector;
 
-      // A crashed collector never takes the product down; the host restarts it on the same store.
+      // A crashed collector never takes the product down. The supervisor waits one second, then
+      // doubles up to 30s, and restarts on the same store.
       yield* Effect.sync(() => process.kill(crashed, "SIGKILL"));
-      yield* collectors.pipe(
+      const exitedAt = yield* collectors.pipe(
         Effect.flatMap((pids) =>
-          pids.includes(crashed) ? Effect.fail("The collector is still exiting") : Effect.void,
+          pids.includes(crashed)
+            ? Effect.fail("The collector is still exiting")
+            : Effect.succeed(performance.now()),
         ),
         Effect.retry({ schedule: Schedule.spaced("50 millis"), times: 40 }),
       );
+      yield* Effect.sleep("400 millis");
+      expect(yield* collectors, "the 1s restart backoff has not elapsed").toEqual([]);
       expect((yield* productHealth(host.origin)).status).toBe(200);
-      yield* collectorReady(host.collector);
+      yield* collectorReady(host.collectorSocket);
       const restarted = yield* onlyCollector;
       expect(restarted).not.toBe(crashed);
-      yield* productSpans(host.collector, retained);
+      expect(
+        performance.now() - exitedAt,
+        "restart waits out the 1s backoff",
+      ).toBeGreaterThanOrEqual(900);
+      yield* productSpans(host.collectorSocket, retained);
 
       // An unfinished request keeps the product draining after a stop signal.
       const held = yield* Effect.acquireRelease(
@@ -217,8 +229,9 @@ it.live(scenarios.selfHostNativeTelemetryLifecycle.title, () =>
         (pending) => Effect.sync(() => pending.destroy()),
       );
       yield* Effect.sleep("500 millis");
-      // Ctrl-C in a terminal signals the collector and the host together. While the product
-      // drains past the supervisor's 3 s restart delay, the collector must stay stopped.
+      // Ctrl-C in a terminal signals the collector and the host together. The host stops the
+      // supervisor immediately, so the collector stays down through the product drain, past the
+      // one-second restart backoff.
       const signalled = performance.now();
       yield* Effect.sync(() => {
         process.kill(restarted, "SIGINT");
@@ -231,13 +244,11 @@ it.live(scenarios.selfHostNativeTelemetryLifecycle.title, () =>
       yield* host.exitCode.pipe(Effect.timeout("15 seconds"));
       expect(performance.now() - signalled, "the host's single stop deadline").toBeLessThan(15_000);
       expect(yield* collectors).toEqual([]);
-      const refused = yield* driver("stopped collector", () =>
-        fetch(`${host.collector}/api/health`).then(
-          () => false,
-          () => true,
-        ),
+      const refused = yield* collectorRequest(host.collectorSocket, "/api/health").pipe(
+        Effect.as(false),
+        Effect.orElseSucceed(() => true),
       );
-      expect(refused, "the collector port is closed after shutdown").toBe(true);
+      expect(refused, "the collector socket is closed after shutdown").toBe(true);
     }),
   ).pipe(Effect.provide(NodeServices.layer), Effect.provide(FetchHttpClient.layer)),
 );

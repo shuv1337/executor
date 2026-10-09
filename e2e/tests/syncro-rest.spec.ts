@@ -1,12 +1,7 @@
 import { expect, layer } from "@effect/vitest";
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import { Effect, FileSystem, Layer, Ref, Schema } from "effect";
-import {
-  HttpRouter,
-  HttpServer,
-  HttpServerRequest,
-  HttpServerResponse,
-} from "effect/unstable/http";
+import { HttpRouter, HttpServer, HttpServerRequest, HttpServerResponse } from "effect/http";
 import { createServer } from "node:http";
 import { Actors } from "../support/actors.ts";
 import { Api, body } from "../support/api.ts";

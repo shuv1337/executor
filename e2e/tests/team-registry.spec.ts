@@ -1,12 +1,14 @@
 /** Self-host publications share a pinned snapshot only within the authenticated organization. */
 import { expect, layer } from "@effect/vitest";
-import { Effect, Schema } from "effect";
+import { Effect, Redacted, Schema } from "effect";
 import { randomUUID } from "node:crypto";
 import { Actors } from "../support/actors.ts";
 import { Api, body } from "../support/api.ts";
 import { Browser } from "../support/browser.ts";
 import { App } from "../support/contracts.ts";
 import { HostedLive, withHostedCase } from "../support/case.ts";
+import { McpOAuth } from "../support/mcp-oauth.ts";
+import { Target } from "../support/platform.ts";
 import { holdQuery } from "../support/query-transition.ts";
 import { scenarios } from "../test-plan.ts";
 import { withApps } from "../support/apps-release.ts";
@@ -17,6 +19,14 @@ const Workspace = Schema.Struct({
   revision: Schema.Struct({ commit: Schema.String }),
   files: Files,
 });
+const CopiedApp = Schema.Struct({
+  id: Schema.String,
+  copiedFrom: Schema.Struct({
+    reference: Schema.String,
+    name: Schema.String,
+    commit: Schema.String,
+  }),
+});
 
 layer(HostedLive, { excludeTestServices: true })("Team registry", (it) => {
   it.effect(scenarios.teamRegistry.title, (context) =>
@@ -25,7 +35,9 @@ layer(HostedLive, { excludeTestServices: true })("Team registry", (it) => {
       Effect.gen(function* () {
         const api = yield* Api,
           actors = yield* Actors,
-          browser = yield* Browser;
+          browser = yield* Browser,
+          oauth = yield* McpOAuth,
+          origin = (yield* Target).metadata.origin;
         const prefix = `/api/organizations/${actors.organization.id}`;
         const name = `@${actors.organization.slug}/team-${randomUUID().slice(0, 8)}`;
         const files = [
@@ -123,12 +135,17 @@ layer(HostedLive, { excludeTestServices: true })("Team registry", (it) => {
             package: name,
           })).status,
         ).toBe(403);
-        expect(
-          (yield* api.request(actors.member, "POST", `${prefix}/apps/copies`, {
-            name: "Member copy",
-            from: { package: name, commit },
-          })).status,
-        ).toBe(200);
+        const memberCopy = yield* api.request(actors.member, "POST", `${prefix}/apps/copies`, {
+          name: "Member copy",
+          from: { package: name, commit },
+        });
+        expect(memberCopy.status).toBe(200);
+        // Provenance names the organization's own source route, not the public registry's.
+        expect((yield* body(CopiedApp, memberCopy)).copiedFrom).toEqual({
+          reference: new URL(`${prefix}/app-publications/source?${query}`, origin).href,
+          name,
+          commit,
+        });
         const anonymous = yield* api.session();
         expect((yield* api.request(anonymous, "GET", `${prefix}/app-publications`)).status).toBe(
           401,
@@ -216,6 +233,38 @@ layer(HostedLive, { excludeTestServices: true })("Team registry", (it) => {
             yield* api.request(actors.owner, "GET", `${prefix}/apps/${copied.id}/workspace`),
           )).files,
         ).toEqual(files);
+        // A grant limited to particular apps discovers only publications of those apps, and
+        // never reads source: it delegates discovery and running, not reading. Narrowing can
+        // only shrink a grant, so the same grant first covers the published app, then not.
+        const grant = yield* oauth.authorizeApi;
+        const bearer = { authorization: `Bearer ${Redacted.value(grant.tokens).access_token}` };
+        const narrow = (apps: readonly string[]) =>
+          api.request(actors.owner, "POST", "/api/auth/mcp/grants/narrow", {
+            id: grant.grantId,
+            policy: {
+              kind: "tools",
+              apps: apps.map((id) => ({ app: id, tools: { kind: "all" } })),
+              approval: "client",
+            },
+          });
+        const scopedListings = () =>
+          api.request(anonymous, "GET", `${prefix}/app-publications`, undefined, bearer);
+        const scopedSource = () =>
+          api.request(
+            anonymous,
+            "GET",
+            `${prefix}/app-publications/source?${query}`,
+            undefined,
+            bearer,
+          );
+        expect((yield* narrow([app.id, copied.id])).status).toBe(200);
+        expect(yield* body(Schema.Array(Publication), yield* scopedListings())).toEqual([
+          { name, commit },
+        ]);
+        expect((yield* scopedSource()).status).toBe(403);
+        expect((yield* narrow([copied.id])).status).toBe(200);
+        expect(yield* body(Schema.Array(Publication), yield* scopedListings())).toEqual([]);
+        expect((yield* scopedSource()).status).toBe(403);
         expect(
           (yield* api.request(actors.admin, "POST", `${prefix}/app-publications/unpublish`, {
             package: name,
@@ -247,7 +296,7 @@ layer(HostedLive, { excludeTestServices: true })("Team registry", (it) => {
         expect(
           (yield* api.request(actors.member, "GET", `${prefix}/app-publications`)).status,
         ).toBe(403);
-      }),
+      }).pipe(Effect.provide(McpOAuth.layer)),
     ),
   );
 });

@@ -8,11 +8,23 @@ import appsPackage from "../../packages/apps/package.json" with { type: "json" }
 /** The version in `packages/apps/package.json`, imported as data from the checkout the suite runs in. */
 export const appsVersion: string = appsPackage.version;
 
+/** The `@modelcontextprotocol/sdk` version that `apps` is built with, which quick add pins. */
+export const mcpSdkVersion: string = appsPackage.devDependencies["@modelcontextprotocol/sdk"];
+
 /** A `package.json` that declares only the host's `apps` release. */
 export const appsManifest = {
   path: "package.json",
   content: `${JSON.stringify({ dependencies: { apps: appsVersion } }, null, 2)}\n`,
 };
+
+/** A first migration: deploying it gives an app its database. */
+export const firstMigration = {
+  path: "migrations/0001_init.sql",
+  content: "CREATE TABLE notes (id TEXT PRIMARY KEY NOT NULL);\n",
+};
+/** The files that give an app a database, or none. */
+export const databaseFiles = (database: boolean | undefined) =>
+  database === true ? [firstMigration] : [];
 
 /** Add `apps` to a fixture's own dependencies. */
 export const withApps = (dependencies: Readonly<Record<string, string>> = {}) => ({

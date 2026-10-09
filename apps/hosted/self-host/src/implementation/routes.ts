@@ -21,6 +21,9 @@ import {
   ScheduledAuthority,
   ScheduleWakeup,
   hostedOAuthCallback,
+  clientMetadataDocument,
+  clientMetadataDocumentPath,
+  clientMetadataSetting,
   hostedWebhookCallback,
   catalogLive,
   hostedMiddlewareLive,
@@ -35,20 +38,15 @@ import { recordRequestRejections, requestTiming } from "@executor-js/telemetry/h
 import { appAddresses, hostedAppUi } from "@executor-js/hosted-server/app-ui";
 import { appSignInCallbackPath } from "apps/ui/auth";
 import { AppUiApi } from "apps/ui/contracts";
-import { HttpApiBuilder } from "effect/unstable/httpapi";
+import { HttpApiBuilder } from "effect/http-api";
 import { appUiBaseUrl } from "../contracts/config.ts";
 import { type HostEgress } from "@executor-js/utils/url-policy";
 import { Config, Effect, Layer, Option } from "effect";
-import {
-  HttpRouter,
-  HttpServer,
-  HttpServerRequest,
-  HttpServerResponse,
-} from "effect/unstable/http";
+import { HttpRouter, HttpServer, HttpServerRequest, HttpServerResponse } from "effect/http";
 import { withHostPipeline } from "@executor-js/dashboard-start/in-process";
 import { selfHostApi } from "./api.ts";
 import { selfHostMcp } from "../mcp.ts";
-import { selfHostAuth } from "../auth.ts";
+import { SelfHostAuth } from "../auth.ts";
 import { selfHostAnalytics } from "./product-analytics.ts";
 
 import type { SourceFile } from "@executor-js/sdk/core";
@@ -64,19 +62,13 @@ export const selfHostRouteMap = <DashboardE, DashboardR>(options: {
 }) =>
   Effect.gen(function* () {
     const { skills, egress, executorServices, dashboard } = options;
-    const auth = yield* selfHostAuth;
+    const auth = yield* SelfHostAuth.pipe(Effect.provide(executorServices));
     const analytics = yield* selfHostAnalytics;
     /** Requests and background schedules record through this instance's sink unless it opted out. */
     const observed = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
       analytics === undefined
         ? effect
         : effect.pipe(Effect.provideService(ProductAnalytics, analytics.product));
-    yield* drainProvisioning(selfHostProvisioningServices).pipe(
-      Effect.catch(() => Effect.logWarning("Provisioning queue processing failed")),
-      Effect.repeat(Schedule.spaced("1 second")),
-      Effect.provide(executorServices),
-      Effect.forkScoped,
-    );
     const scheduler = yield* Effect.gen(function* () {
       const executor = yield* Effect.flatten(HostedExecutor);
       const authorize = yield* ScheduledAuthority;
@@ -93,6 +85,19 @@ export const selfHostRouteMap = <DashboardE, DashboardR>(options: {
         ? worker
         : worker.pipe(Effect.provideService(ScheduleObservation, analytics.schedules));
     }).pipe(Effect.provide(executorServices));
+    // A span per wake, named as Cloud's coordinator wake, shows which write asked for setup.
+    const wake = scheduler.wakeProfiles.pipe(
+      Effect.withSpan("schedule.wake", { attributes: { "executor.schedule.wake": "change" } }),
+    );
+    // Member setup saves profiles and redeploys the default Executor app; it wakes their setup.
+    yield* drainProvisioning(selfHostProvisioningServices).pipe(
+      Effect.catch(() => Effect.logWarning("Provisioning queue processing failed")),
+      Effect.repeat(Schedule.spaced("1 second")),
+      Effect.provideService(ScheduleWakeup, wake),
+      Effect.provide(executorServices),
+      Effect.forkScoped,
+    );
+    const clientMetadata = yield* clientMetadataSetting(auth.origin);
     const addresses = appAddresses(auth.origin, yield* appUiBaseUrl(auth.origin));
     const appUi = hostedAppUi(addresses);
     const mcp = yield* selfHostMcp.pipe(Effect.provide(HttpServer.layerServices));
@@ -102,8 +107,12 @@ export const selfHostRouteMap = <DashboardE, DashboardR>(options: {
       HttpRouter.provideRequest(localSourceFormatter),
       Layer.provide(appUi.dashboard),
       HttpRouter.provideRequest(auth.appSessions),
-      HttpRouter.provideRequest(catalogLive(document.document, egress)),
+      HttpRouter.provideRequest(
+        catalogLive(document.document, egress, clientMetadata, auth.origin),
+      ),
       Layer.provide(hostedMiddlewareLive),
+      // Organization middleware reads the product's removal tombstones when it is built.
+      Layer.provide(executorServices),
       HttpRouter.provideRequest(executorServices),
       Layer.provide(auth.identity),
       Layer.provide(auth.apiIdentity),
@@ -142,6 +151,11 @@ export const selfHostRouteMap = <DashboardE, DashboardR>(options: {
       HttpRouter.add("GET", "/api/oauth/callback", hostedOAuthCallback).pipe(
         HttpRouter.provideRequest(auth.identity),
       ),
+      HttpRouter.add(
+        "GET",
+        clientMetadataDocumentPath,
+        clientMetadataDocument(clientMetadata),
+      ).pipe(HttpRouter.provideRequest(auth.identity)),
       mcpRoutes,
       Layer.mergeAll(
         HttpRouter.add("GET", "/api/mcp/approvals/:requestId", mcp.approvals),
@@ -190,9 +204,7 @@ export const selfHostRouteMap = <DashboardE, DashboardR>(options: {
     );
     const product = yield* HttpRouter.toHttpEffect(productRoutes).pipe(
       Effect.provideService(Layer.CurrentMemoMap, yield* Layer.makeMemoMap),
-      Effect.map((handler) =>
-        handler.pipe(Effect.provideService(ScheduleWakeup, scheduler.wakeProfiles)),
-      ),
+      Effect.map((handler) => handler.pipe(Effect.provideService(ScheduleWakeup, wake))),
     );
     const routes = HttpRouter.add(
       "*",

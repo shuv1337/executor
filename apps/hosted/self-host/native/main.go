@@ -562,7 +562,12 @@ func serve(mode string) error {
 	if err != nil || number < 1 || number > 65535 {
 		return errors.New("PORT must be between 1 and 65535")
 	}
-	args := []string{"serve", configPath, "-I/", "--experimental", "--external-addr=native=unix:" + socket, "--socket-addr=http=unix:" + filepath.Join(temporary, "product.sock")}
+	// The collector listens only on a private Unix socket. The product reaches it through its MOTEL
+	// binding and operators through `executor-host telemetry`; no address an app can fetch reaches it.
+	// The socket lives in this host's own temporary directory, so containers that share TMPDIR and
+	// mount their product volumes at the same path never share or remove each other's collector.
+	collector := filepath.Join(temporary, "motel.sock")
+	args := []string{"serve", configPath, "-I/", "--experimental", "--external-addr=native=unix:" + socket, "--external-addr=motel=unix:" + collector, "--socket-addr=http=unix:" + filepath.Join(temporary, "product.sock")}
 	for name, path := range paths {
 		args = append(args, "--directory-path="+name+"="+path)
 	}
@@ -604,10 +609,37 @@ func serve(mode string) error {
 		}
 		return exportDatabase(filepath.Join(temporary, "export.sock"), os.Args[2])
 	}
-	telemetry := superviseCollector(func() *exec.Cmd {
-		return workerd("serve", filepath.Join(runtime, "motel.capnp"), "--directory-path=motel-data="+motel, "--directory-path=motel-assets="+filepath.Join(runtime, "motel", "web", "dist"))
-	})
-	defer telemetry.stop()
+	motelConfig, err := os.ReadFile(filepath.Join(runtime, "motel.capnp"))
+	if err != nil {
+		command.Process.Kill()
+		<-stopped
+		return err
+	}
+	motelConfigPath := filepath.Join(temporary, "motel.capnp")
+	if err = os.WriteFile(motelConfigPath, bytes.ReplaceAll(motelConfig, []byte("@@RUNTIME@@"), []byte(strings.Trim(strconv.Quote(runtime), "\""))), 0600); err != nil {
+		command.Process.Kill()
+		<-stopped
+		return err
+	}
+	forget, err := recordTelemetrySocket(directory, collector)
+	if err != nil {
+		command.Process.Kill()
+		<-stopped
+		return err
+	}
+	defer forget()
+	stopMotel := supervise(func() *exec.Cmd {
+		// A collector that exited leaves its socket file behind; the next one binds the same path.
+		os.Remove(collector)
+		command := exec.Command(filepath.Join(runtime, "workerd"), "serve", motelConfigPath, "-I/", "--experimental", "--directory-path=motel-data="+motel, "--socket-addr=motel=unix:"+collector)
+		configureChild(command)
+		command.Stdout = os.Stderr
+		command.Stderr = os.Stderr
+		command.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + temporary}
+		command.Dir = runtime
+		return command
+	}, time.Second, 30*time.Second, time.After)
+	defer stopMotel()
 
 	proxy := productProxy(filepath.Join(temporary, "product.sock"), workerdIdleTimeout, trustedProxy)
 	publicListener, err := net.Listen("tcp", net.JoinHostPort(setting("HOST", "0.0.0.0"), port))
@@ -635,7 +667,7 @@ func serve(mode string) error {
 	// already stopped by a terminal's process-group signal is not restarted meanwhile.
 	telemetryStopped := make(chan struct{})
 	go func() {
-		telemetry.stop()
+		stopMotel()
 		close(telemetryStopped)
 	}()
 	command.Process.Signal(syscall.SIGTERM)
@@ -647,73 +679,6 @@ func serve(mode string) error {
 	}
 	<-telemetryStopped
 	return err
-}
-
-// collector keeps the bundled Motel workerd running beside the product's. Telemetry is
-// disposable, so its exits never stop the product; it restarts after a short delay.
-type collector struct {
-	mutex   sync.Mutex
-	command *exec.Cmd
-	exited  chan struct{}
-	stopped bool
-	done    chan struct{}
-}
-
-func superviseCollector(start func() *exec.Cmd) *collector {
-	c := &collector{done: make(chan struct{})}
-	go func() {
-		for {
-			c.mutex.Lock()
-			if c.stopped {
-				c.mutex.Unlock()
-				return
-			}
-			command := start()
-			exited := make(chan struct{})
-			err := command.Start()
-			if err == nil {
-				c.command, c.exited = command, exited
-			}
-			c.mutex.Unlock()
-			if err == nil {
-				err = command.Wait()
-				close(exited)
-			}
-			c.mutex.Lock()
-			stopped := c.stopped
-			c.mutex.Unlock()
-			if stopped {
-				return
-			}
-			fmt.Fprintln(os.Stderr, "Telemetry collector exited:", err)
-			select {
-			case <-c.done:
-				return
-			case <-time.After(3 * time.Second):
-			}
-		}
-	}()
-	return c
-}
-
-func (c *collector) stop() {
-	c.mutex.Lock()
-	if !c.stopped {
-		c.stopped = true
-		close(c.done)
-	}
-	command, exited := c.command, c.exited
-	c.mutex.Unlock()
-	if command == nil {
-		return
-	}
-	command.Process.Signal(syscall.SIGTERM)
-	select {
-	case <-exited:
-	case <-time.After(15 * time.Second):
-		command.Process.Kill()
-		<-exited
-	}
 }
 
 // workerd serves HTTP with kj's default HttpServerSettings; its pipelineTimeout
@@ -770,6 +735,56 @@ func productProxy(socket string, upstreamIdleTimeout time.Duration, trustedProxy
 	}
 }
 
+// supervise keeps an auxiliary process running beside the product: it restarts the process
+// after an exit, waiting from minDelay up to maxDelay between attempts, and the product never
+// waits for it. A process that ran longer than maxDelay restarts after minDelay again. after
+// starts each wait. The returned function stops the process and waits for it to exit.
+func supervise(newCommand func() *exec.Cmd, minDelay, maxDelay time.Duration, after func(time.Duration) <-chan time.Time) func() {
+	done := make(chan struct{})
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		delay := minDelay
+		for {
+			command := newCommand()
+			started := time.Now()
+			if err := command.Start(); err != nil {
+				fmt.Fprintln(os.Stderr, "Telemetry collector could not start:", err)
+			} else {
+				exited := make(chan struct{})
+				go func() { command.Wait(); close(exited) }()
+				select {
+				case <-exited:
+					fmt.Fprintln(os.Stderr, "Telemetry collector stopped; restarting")
+				case <-done:
+					command.Process.Signal(syscall.SIGTERM)
+					select {
+					case <-exited:
+					case <-time.After(15 * time.Second):
+						command.Process.Kill()
+						<-exited
+					}
+					return
+				}
+			}
+			if time.Since(started) > maxDelay {
+				delay = minDelay
+			}
+			select {
+			case <-after(delay):
+			case <-done:
+				return
+			}
+			delay = min(delay*2, maxDelay)
+		}
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() { close(done) })
+		<-finished
+	}
+}
+
 func main() {
 	mode := "serve"
 	if len(os.Args) > 1 {
@@ -779,6 +794,8 @@ func main() {
 	switch mode {
 	case "serve", "export":
 		err = serve(mode)
+	case "telemetry":
+		err = queryTelemetry(os.Args[2:], os.Stdout)
 	case "health":
 		client := http.Client{Timeout: 4 * time.Second}
 		var response *http.Response
@@ -790,12 +807,74 @@ func main() {
 			}
 		}
 	default:
-		err = errors.New("expected serve, export, or health")
+		err = errors.New("expected serve, export, health, or telemetry")
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Executor:", err)
 		os.Exit(1)
 	}
+}
+
+// telemetryRecord names the file in the product volume that holds the serving host's collector
+// socket path. Only the host holding the volume lock writes or removes it.
+func telemetryRecord(directory string) string {
+	return filepath.Join(directory, ".executor-telemetry")
+}
+
+// recordTelemetrySocket publishes the collector's socket path for `executor-host telemetry` in the
+// same container. The returned function removes the record when the host stops.
+func recordTelemetrySocket(directory, socket string) (func(), error) {
+	record := telemetryRecord(directory)
+	pending := record + ".tmp"
+	if err := os.WriteFile(pending, []byte(socket), 0600); err != nil {
+		return nil, err
+	}
+	if err := os.Rename(pending, record); err != nil {
+		os.Remove(pending)
+		return nil, err
+	}
+	return func() { os.Remove(record) }, nil
+}
+
+// queryTelemetry reads the bundled collector's API for an operator in the container, for example
+// `executor-host telemetry '/api/traces?limit=20'`. It writes the response body to output.
+func queryTelemetry(args []string, output io.Writer) error {
+	if len(args) != 1 || !strings.HasPrefix(args[0], "/") {
+		return errors.New("usage: executor-host telemetry '/api/traces?limit=20'")
+	}
+	directory, err := filepath.Abs(setting("EXECUTOR_DATA_DIR", "/app/data"))
+	if err != nil {
+		return err
+	}
+	// A host stopped without cleanup leaves a record of a socket nothing serves; dialing it fails.
+	recorded, err := os.ReadFile(telemetryRecord(directory))
+	if errors.Is(err, os.ErrNotExist) {
+		return errors.New("the telemetry collector is not running")
+	}
+	if err != nil {
+		return err
+	}
+	socket := string(recorded)
+	if !filepath.IsAbs(socket) {
+		return errors.New(telemetryRecord(directory) + " does not name a socket")
+	}
+	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "unix", socket)
+	}}
+	defer transport.CloseIdleConnections()
+	client := http.Client{Transport: transport, Timeout: 30 * time.Second}
+	response, err := client.Get("http://motel.internal" + args[0])
+	if err != nil {
+		return errors.New("the telemetry collector is not running")
+	}
+	defer response.Body.Close()
+	if _, err = io.Copy(output, response.Body); err != nil {
+		return err
+	}
+	if response.StatusCode != 200 {
+		return fmt.Errorf("the telemetry collector answered %d", response.StatusCode)
+	}
+	return nil
 }
 
 // Publish a completed PostgreSQL archive without replacing an existing backup.
