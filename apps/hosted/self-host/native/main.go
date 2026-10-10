@@ -397,6 +397,10 @@ func (b *limitedOutput) Write(data []byte) (int, error) {
 }
 
 func serve(mode string) error {
+	trustedProxy, err := trustedProxyConfiguration()
+	if err != nil {
+		return err
+	}
 	directory, err := filepath.Abs(setting("EXECUTOR_DATA_DIR", "/app/data"))
 	if err != nil {
 		return err
@@ -570,17 +574,21 @@ func serve(mode string) error {
 	if mode == "export" {
 		args = append(args, "--socket-addr=http=unix:"+filepath.Join(temporary, "export.sock"))
 	}
-	command := exec.Command(filepath.Join(runtime, "workerd"), args...)
-	configureChild(command)
-	command.Stdout = os.Stderr
-	command.Stderr = os.Stderr
-	command.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + temporary}
-	for _, name := range []string{"SSL_CERT_FILE", "SSL_CERT_DIR"} {
-		if value := os.Getenv(name); value != "" {
-			command.Env = append(command.Env, name+"="+value)
+	workerd := func(args ...string) *exec.Cmd {
+		command := exec.Command(filepath.Join(runtime, "workerd"), args...)
+		configureChild(command)
+		command.Stdout = os.Stderr
+		command.Stderr = os.Stderr
+		command.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + temporary}
+		for _, name := range []string{"SSL_CERT_FILE", "SSL_CERT_DIR"} {
+			if value := os.Getenv(name); value != "" {
+				command.Env = append(command.Env, name+"="+value)
+			}
 		}
+		command.Dir = runtime
+		return command
 	}
-	command.Dir = runtime
+	command := workerd(args...)
 	if err = command.Start(); err != nil {
 		return err
 	}
@@ -633,7 +641,7 @@ func serve(mode string) error {
 	}, time.Second, 30*time.Second, time.After)
 	defer stopMotel()
 
-	proxy := productProxy(filepath.Join(temporary, "product.sock"), workerdIdleTimeout)
+	proxy := productProxy(filepath.Join(temporary, "product.sock"), workerdIdleTimeout, trustedProxy)
 	publicListener, err := net.Listen("tcp", net.JoinHostPort(setting("HOST", "0.0.0.0"), port))
 	if err != nil {
 		command.Process.Kill()
@@ -655,14 +663,22 @@ func serve(mode string) error {
 			fmt.Fprintln(os.Stderr, "Native host stopped")
 		}
 	}
+	// Stop both processes together so shutdown fits one deadline, and so a collector
+	// already stopped by a terminal's process-group signal is not restarted meanwhile.
+	telemetryStopped := make(chan struct{})
+	go func() {
+		stopMotel()
+		close(telemetryStopped)
+	}()
 	command.Process.Signal(syscall.SIGTERM)
 	select {
-	case err := <-stopped:
-		return err
+	case err = <-stopped:
 	case <-time.After(15 * time.Second):
 		command.Process.Kill()
-		return <-stopped
+		err = <-stopped
 	}
+	<-telemetryStopped
+	return err
 }
 
 // workerd serves HTTP with kj's default HttpServerSettings; its pipelineTimeout
@@ -687,7 +703,7 @@ func forwardedProto(in *http.Request) string {
 	return "http"
 }
 
-func productProxy(socket string, upstreamIdleTimeout time.Duration) *httputil.ReverseProxy {
+func productProxy(socket string, upstreamIdleTimeout time.Duration, trustedProxy *trustedProxy) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
 		Rewrite: func(request *httputil.ProxyRequest) {
 			request.SetURL(&url.URL{Scheme: "http", Host: "product.internal"})
@@ -696,11 +712,7 @@ func productProxy(socket string, upstreamIdleTimeout time.Duration) *httputil.Re
 			// Origin with the scheme it believes it serves on, so forward the scheme the HTTPS
 			// reverse proxy in front reported, or the one this listener received.
 			request.Out.Header.Set("X-Forwarded-Proto", forwardedProto(request.In))
-			address, _, err := net.SplitHostPort(request.In.RemoteAddr)
-			if err != nil {
-				address = request.In.RemoteAddr
-			}
-			request.Out.Header.Set("x-executor-client-ip", address)
+			request.Out.Header.Set("x-executor-client-ip", trustedProxy.clientIP(request.In))
 		},
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {

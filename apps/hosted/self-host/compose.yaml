@@ -17,6 +17,9 @@ services:
       SSO_CLIENT_SECRET: ${SSO_CLIENT_SECRET:-}
       SSO_ALLOWED_DOMAINS: ${SSO_ALLOWED_DOMAINS:-}
       EXECUTOR_ENCRYPTION_KEY:
+      # Optional client-IP assertion, accepted only from the configured proxy peers.
+      EXECUTOR_TRUSTED_PROXY_HEADER:
+      EXECUTOR_TRUSTED_PROXIES:
       # OAuth transport exceptions are explicit and parsed at startup.
       EXECUTOR_URL_ALLOW_LOOPBACK_HTTP:
       EXECUTOR_URL_ALLOW_HTTP_ORIGINS:
@@ -47,8 +50,10 @@ services:
       - "127.0.0.1:4400:4400"
     volumes:
       - pglite-data:/app/data
+      - motel-data:/app/motel-data
     stop_grace_period: 30s
     restart: unless-stopped
 
 volumes:
   pglite-data:
+  motel-data:

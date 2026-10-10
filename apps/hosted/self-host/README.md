@@ -132,8 +132,14 @@ wildcard DNS as described below.
 The named `pglite-data` volume stores the database, app source, builds, app data,
 and generated `auth-secret.key` and `encryption.key` files under `/app/data`. Keep one server instance per data volume.
 
-Motel uses a separate store at `/app/motel-data`. Container replacement discards
-telemetry by default. Mount a separate volume there only if retention is wanted.
+Motel uses a separate store at `/app/motel-data`. The Compose configuration mounts
+the named `motel-data` volume there, retaining traces when its container is replaced.
+Standalone image runs need their own separate mount to retain telemetry.
+Adding a volume does not copy telemetry from an existing container into it. If
+those traces are needed, export them or stop the container and copy its complete
+Motel directory into the new volume before replacement. Keep the product and
+Motel volumes separate; the entrypoint prepares their ownership for the non-root
+server user. Do not remove either volume during updates.
 Product upgrades do not import old Motel data. See [workerd storage and rollback](../../../notes/self-host-workerd.md)
 for the native PostgreSQL import and an export that preserves later product writes.
 
@@ -163,6 +169,30 @@ and send `X-Forwarded-Proto: https`, as Caddy, nginx's `proxy_set_header`,
 Traefik and Cloudflare Tunnel do. The dashboard compares each browser request's
 origin with that scheme and host; without them the dashboard page loads but its
 reads fail with "Could not reach the server".
+
+In the Docker/native host, configure the proxy's client-IP assertion so callers
+do not share the proxy's authentication rate-limit bucket. Set both
+`EXECUTOR_TRUSTED_PROXY_HEADER` and `EXECUTOR_TRUSTED_PROXIES`, for example:
+
+```sh
+EXECUTOR_TRUSTED_PROXY_HEADER=cf-connecting-ip
+EXECUTOR_TRUSTED_PROXIES=172.18.0.3
+```
+
+Use the actual cloudflared/proxy TCP peer address, or a dedicated proxy subnet.
+The addresses are comma-separated IPv4/IPv6 addresses or CIDR ranges. The header
+is accepted only from those peers. Your proxy must replace that header with the
+real visitor address and prevent untrusted traffic from impersonating a trusted
+peer. Avoid trusting an entire shared Docker/private network.
+
+For nginx/Caddy, a replaced `x-real-ip` header works too. With `x-forwarded-for`,
+the host scans from the right and discards only configured trusted proxy hops;
+the nearest untrusted hop supplies the address. Missing or malformed assertions
+fall back to the socket address. With neither setting configured, every request
+uses its socket address. A client-supplied `x-executor-client-ip` is always
+overwritten. Invalid or incomplete proxy settings refuse startup. These settings
+apply to the packaged Go/workerd host; the Bun development server uses its own
+direct socket address.
 
 Localhost derives app UI addresses automatically. For a public installation,
 set `EXECUTOR_APP_UI_BASE_URL` to a separate HTTPS base such as

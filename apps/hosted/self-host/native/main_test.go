@@ -105,7 +105,7 @@ func TestProxyDoesNotReuseConnectionsWorkerdHasTimedOut(t *testing.T) {
 	socket := socketPath(t)
 	upstream := &fakeWorkerd{idleTimeout: 300 * time.Millisecond}
 	upstream.serve(t, socket)
-	front := httptest.NewServer(productProxy(socket, upstream.idleTimeout))
+	front := httptest.NewServer(productProxy(socket, upstream.idleTimeout, nil))
 	defer front.Close()
 
 	if status, body := post(t, front.URL); status != 200 {
@@ -124,7 +124,7 @@ func TestProxyDoesNotRetryPostWorkerdMayHaveReceived(t *testing.T) {
 	socket := socketPath(t)
 	upstream := &fakeWorkerd{idleTimeout: time.Minute, dropFirst: true}
 	upstream.serve(t, socket)
-	front := httptest.NewServer(productProxy(socket, upstream.idleTimeout))
+	front := httptest.NewServer(productProxy(socket, upstream.idleTimeout, nil))
 	defer front.Close()
 
 	status, body := post(t, front.URL)
@@ -137,7 +137,7 @@ func TestProxyDoesNotRetryPostWorkerdMayHaveReceived(t *testing.T) {
 }
 
 func TestProxyReportsStartingUntilWorkerdListens(t *testing.T) {
-	front := httptest.NewServer(productProxy(socketPath(t), workerdIdleTimeout))
+	front := httptest.NewServer(productProxy(socketPath(t), workerdIdleTimeout, nil))
 	defer front.Close()
 
 	if status, body := post(t, front.URL); status != http.StatusServiceUnavailable || body != "Executor is starting" {
@@ -149,7 +149,7 @@ func TestProxyForwardsTheSchemeTheBrowserUsed(t *testing.T) {
 	socket := socketPath(t)
 	upstream := &fakeWorkerd{idleTimeout: time.Minute}
 	upstream.serve(t, socket)
-	front := httptest.NewServer(productProxy(socket, upstream.idleTimeout))
+	front := httptest.NewServer(productProxy(socket, upstream.idleTimeout, nil))
 	defer front.Close()
 
 	send := func(proto string) string {

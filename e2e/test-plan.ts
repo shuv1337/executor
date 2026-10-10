@@ -76,6 +76,58 @@ const plan = <Name extends string>(scenarios: { readonly [_ in Name]: typeof Tes
 
 /** Scenario names and applicability used by both test declarations and test selection. */
 export const scenarios = plan({
+  syncroRest: {
+    fixtures: "actors",
+    file: "syncro-rest.spec.ts",
+    title:
+      "Syncro REST reads preserve pagination, host-scoped bearer secrets, account checks and provider failures",
+    serverEnvironment: { EXECUTOR_APPS_ALLOW_PRIVATE_FETCH: "true" },
+    targets: {
+      "self-host": scheduled,
+      cloud: na("This app scenario owns a loopback HTTP provider."),
+      local: na("This scenario uses hosted accounts and profiles."),
+    },
+  },
+  selfHostNativeAuth: {
+    file: "self-host-native-auth.spec.ts",
+    title:
+      "Native self-host OAuth rate limits isolate trusted proxy clients and reject spoofed addresses",
+    targets: {
+      "self-host": {
+        status: "not-run",
+        reason:
+          "Runs against the separately prepared Go/workerd runtime through e2e/self-host-native.config.ts; the ordinary self-host runner uses Bun.",
+      },
+      local: na("Local does not serve hosted OAuth registration."),
+      cloud: na("Cloud does not use the native self-host proxy."),
+    },
+  },
+  selfHostNativeTelemetry: {
+    file: "self-host-native-telemetry.spec.ts",
+    title: "Native self-host telemetry ingest does not stall product requests",
+    targets: {
+      "self-host": {
+        status: "not-run",
+        reason:
+          "Runs against the separately prepared Go/workerd runtime through e2e/self-host-native.config.ts; the ordinary self-host runner uses Bun.",
+      },
+      local: na("Local runs its collector in a separate process already."),
+      cloud: na("Cloud exports to Axiom, not a bundled collector."),
+    },
+  },
+  selfHostNativeTelemetryLifecycle: {
+    file: "self-host-native-telemetry.spec.ts",
+    title: "Native self-host restarts its telemetry collector and stops it with the product",
+    targets: {
+      "self-host": {
+        status: "not-run",
+        reason:
+          "Runs against the separately prepared Go/workerd runtime through e2e/self-host-native.config.ts; the ordinary self-host runner uses Bun.",
+      },
+      local: na("Local does not supervise a bundled collector process."),
+      cloud: na("Cloud exports to Axiom, not a bundled collector."),
+    },
+  },
   teamRegistry: {
     fixtures: "actors",
     file: "team-registry.spec.ts",
