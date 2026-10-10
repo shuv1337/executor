@@ -89,7 +89,6 @@ export type HostedAccountConnection = typeof HostedAccountConnection.Type;
 export const HostedOAuthSignIn = Schema.Struct({
   status: Schema.Literal("redirect"),
   ...OAuthSignIn.fields,
-  redirectUri: HttpUrl,
 });
 export type HostedOAuthSignIn = typeof HostedOAuthSignIn.Type;
 /** Immediate account completion needs no browser return context. */
@@ -250,8 +249,8 @@ export const HostedOAuthCallback = Schema.Struct({
   /** Dashboard state is keyed by the organization's route reference, its slug. */
   organizationSlug: OrganizationSlug,
   connection: AccountConnectionId,
-  app: Schema.NullOr(AppId),
-  profile: Schema.optional(ProfileId),
+  app: AppId,
+  profile: ProfileId,
   redirectUri: HttpUrl,
   reconnect: Schema.Boolean,
 });

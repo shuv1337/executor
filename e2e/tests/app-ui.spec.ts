@@ -7,6 +7,7 @@ import { scenarios } from "../test-plan.ts";
 import { Actors } from "../support/actors.ts";
 import { Api, body } from "../support/api.ts";
 import { Browser } from "../support/browser.ts";
+import { readAdvice } from "../support/write-outcome.ts";
 import { openPrivateApp, waitForAppUrl } from "../support/app-pages.ts";
 import {
   committedDocuments,
@@ -113,6 +114,7 @@ const ApiFailure = Schema.Struct({
         recovery: Schema.optional(
           Schema.Struct({ action: Schema.String, instructions: Schema.String }),
         ),
+        retryable: Schema.Boolean,
       }),
     }),
   }),
@@ -307,12 +309,13 @@ return { items };`,
             .error,
         ).toEqual({
           message:
-            "AppNotDeployed (HTTP 409): The app has no active deployment to load. Recovery: Open Source and deploy the app before using its tools or accounts.",
+            "AppNotDeployed (HTTP 409): The app has no active deployment to load. Recovery: Open Source and deploy the app before using its tools or accounts. Retryable (unchanged call): no.",
           response: {
             code: "AppNotDeployed",
             status: 409,
             message: "The app has no active deployment to load.",
             recovery: expect.any(Object),
+            retryable: false,
           },
         });
         // A different name with the same generated address names the app that holds it.
@@ -321,11 +324,24 @@ return { items };`,
           `return await ${tools}.appManagement.create(${JSON.stringify({ path: organization, body: { name: name.toLowerCase().replaceAll(" ", "-"), files } })});`,
         );
         const message = `The app “${name}” (${app.id}) already uses the address “${app.slug}”, which this name also produces. Choose a different name, or deploy to that app by its ID.`;
+        // Creating an app may write, so a failed create is reported as an unknown outcome even
+        // though Executor refuses a taken address before it creates anything. Accurate copy for
+        // such definite refusals is a separate follow-up; this is the conservative, safe text.
+        const declared = {
+          action: "Read the API’s error to determine the next step.",
+          instructions:
+            "An API the app calls returned an error its OpenAPI document declares (AppSlugTaken, HTTP 409). Read its message to decide whether the input, the account's access or the API is at fault.",
+        };
+        const recovery = {
+          action:
+            "Do not automatically repeat this call or duplicate its change. Executor could not confirm its outcome.",
+          instructions: `This call may have changed data or may still complete. A safe read can show effects but cannot rule out later completion. Tell the user what is known and get their agreement before repeating the change. ${readAdvice(`${declared.action} ${declared.instructions}`)} Repairing the cause does not establish whether the earlier call completed.`,
+        };
         expect(
           (yield* Schema.decodeUnknownEffect(ApiFailure)(taken.structuredContent)).execution.error,
         ).toEqual({
-          message: `AppSlugTaken (HTTP 409): ${message}`,
-          response: { code: "AppSlugTaken", status: 409, message },
+          message: `AppSlugTaken (HTTP 409): ${message} Recovery: ${recovery.action} Retryable (unchanged call): no.`,
+          response: { code: "AppSlugTaken", status: 409, message, recovery, retryable: false },
         });
       }).pipe(Effect.provide(Layer.mergeAll(McpOAuth.layer, McpClient.layer))),
     ),

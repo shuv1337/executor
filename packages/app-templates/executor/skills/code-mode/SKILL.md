@@ -126,9 +126,30 @@ question. How you answer depends on the connection's mode:
 `resume` continues the same program and returns its next pause or its result.
 Declining makes that call fail inside the program. Never run the program's
 source again to continue it: earlier calls may already have taken effect.
-`unavailable` means the request expired, was already answered or was lost when
-the server restarted. `busy` means another `resume` is advancing the program;
-wait for it.
+`busy` means another `resume` is advancing the program; wait for it.
+
+When a resume does not give the result you expected:
+
+- `status: "unavailable"` has a `reason` and a `message`. `answered`: another
+  `resume` already claimed the request; its call may still be running and its
+  result goes only to that resume, so check that response and do not resume
+  again. `expired`: nobody answered within 15 minutes. `ended`: the program was
+  cancelled or timed out. `not-found`: the request belongs to another grant or
+  scoped connection, was forgotten after a while, or was lost when the server
+  restarted. In model mode, a new MCP session on the same grant can still
+  answer its requests.
+- An accepted call that then fails returns that call's own error, such as
+  `ToolCallFailed`, the same as without approval; follow its `recovery`. Some,
+  such as an account that no longer resolves, fail before the tool runs.
+- `response.code` `ApprovalUnavailable` means Executor did not resume the saved
+  call for this answer; its message says why. If another answer already claimed
+  it, that call may have run or still be running. The app, profile or accounts
+  changing is one reason; Executor's storage failing while it checked them is
+  another, and does not mean anything changed.
+
+Code can run before a tool asks for approval, so in every case read current
+state before calling again, and do not blame the service unless its own error
+says so.
 
 ## Limits
 
@@ -147,9 +168,13 @@ These are the defaults. The source limit is fixed; a host can change the others.
 
 A completed result has `execution.ok`. On success, `execution.value` holds what
 the program returned. On failure, `execution.error` has a `kind`, a `message`,
-and for Executor errors a `response` with `code`, `status`, `message` and
-`recovery`. `recovery.action` is for the user; `recovery.instructions` are for
-you. `toolCalls` lists every call in order with its `outcome`.
+and for Executor errors a `response` with `code`, `status`, `message`,
+`recovery` and `retryable`. `recovery.action` is for the user;
+`recovery.instructions` are for you. `retryable` means an unchanged repeat may
+help and is considered safe. It does not guarantee success. Correcting input,
+configuration or access may allow a new attempt even when `retryable` is false.
+Never rerun an entire `execute` program merely to retry one failed tool.
+`toolCalls` lists every call in order with its `outcome`.
 
 - `ParseError`, `UnsupportedSyntax`: fix the program; `location` points at it.
 - `UnknownTool`: the path is wrong, its app did not load, or the app was
@@ -162,7 +187,8 @@ you. `toolCalls` lists every call in order with its `outcome`.
   executions.
 
 Calls with outcome `success` took effect, and `interrupted` calls may have.
-Effects are never rolled back. Read the current state before retrying a write.
+Effects are never rolled back. When Executor could not confirm a failed write's
+outcome, its recovery says so: do not repeat it automatically.
 Inside a program, a caught tool error's `message` is the same JSON as
 `response`, so a program can handle expected failures itself.
 

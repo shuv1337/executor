@@ -2,7 +2,11 @@
 import { urlPolicyConfig, type HostEgress } from "@executor-js/utils/url-policy";
 import * as BrowserCrypto from "@effect/platform-browser/BrowserCrypto";
 import { makeRegistryStorage } from "@executor-js/app-registry";
-import { clientMetadataSetting, hostedOAuthClientName } from "@executor-js/hosted-server";
+import {
+  clientMetadataSetting,
+  firstPartyOAuthClients,
+  hostedOAuthClientName,
+} from "@executor-js/hosted-server";
 import { hostedResourceLifecycle } from "@executor-js/hosted-server/resource-lifecycle";
 import {
   createExecutor,
@@ -25,7 +29,7 @@ import { cloudRuntime } from "./runtime.ts";
 import { durableDeclarations } from "./durable-declarations.ts";
 import { InvocationDatabase } from "./invocation-database.ts";
 import { cloudSecrets } from "./secrets.ts";
-import { cloudOrigin, cloudResourceOrigins } from "./stage.ts";
+import { cloudHosts, cloudOrigin, cloudResourceOrigins } from "./stage.ts";
 import { accountOAuthStatePrefix } from "../contracts/edge-paths.ts";
 import type { AppDataSupervisor } from "./app-data.ts";
 
@@ -58,9 +62,11 @@ export const cloudExecutor = Effect.fn(function* (
   // New app webhooks register on the canonical API origin (`api.` once it is canonical); every
   // origin keeps delivering, so existing subscriptions keep the URL they stored.
   const webhookOrigin = (yield* cloudResourceOrigins.pipe(Effect.orDie)).api[0];
+  const accountCallbacks = (yield* cloudHosts.pipe(Effect.orDie)).accountCallbacks;
   const egress = yield* cloudEgress;
   // Deployed stages bind this to their own document; see `clientMetadataBinding`.
   const clientMetadata = yield* clientMetadataSetting(origin).pipe(Effect.orDie);
+  const firstPartyClients = yield* firstPartyOAuthClients.pipe(Effect.orDie);
   const makeRuntime = yield* cloudRuntime(origin);
   const workflows = yield* cloudWorkflows;
   const blobs = yield* cloudBlobs;
@@ -108,8 +114,13 @@ export const cloudExecutor = Effect.fn(function* (
           clientName: hostedOAuthClientName,
           urlPolicy: egress.policy,
           ...(Option.isSome(clientMetadata) ? { clientMetadataUrl: clientMetadata.value.url } : {}),
+          // Entered clients saved before sign-ins moved to `executor.sh` keep the callback they name.
+          ...(Option.isSome(accountCallbacks)
+            ? { previousRedirectUris: accountCallbacks.value.previous }
+            : {}),
           // v1's edge forwards `executor.sh/api/oauth/callback` to v2 by this state prefix.
           statePrefix: accountOAuthStatePrefix,
+          firstPartyClients,
         },
         cache: {
           // One store per isolate, shared by every executor built in it.

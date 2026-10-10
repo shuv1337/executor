@@ -15,6 +15,7 @@ import {
   makeDeclarationCache,
   declarationConfig,
   httpEventSender,
+  type DurableDeclarations,
   type Executor,
   type RepositoryBackend,
 } from "@executor-js/sdk/core";
@@ -29,6 +30,7 @@ import {
   noOrganizationRemovals,
   lazyHostedApiDocument,
   clientMetadataSetting,
+  firstPartyOAuthClients,
   hostedOAuthClientName,
   withDeploySetupWake,
   withExecutorAnalytics,
@@ -51,6 +53,8 @@ export interface SelfHostPlatform {
   readonly repositories: RepositoryBackend;
   readonly runtime: AppRuntime;
   readonly workflows: WorkflowRuntime;
+  /** Evaluated results kept in each app's data supervisor. */
+  readonly declarations: DurableDeclarations;
 }
 
 /** Private callback surface for app workflows, exposed only through a service binding. */
@@ -69,11 +73,14 @@ export const selfHostExecutorServices = <E, R>(
       const key = yield* Config.Redacted("EXECUTOR_ENCRYPTION_KEY");
       const origin = yield* Config.String("BETTER_AUTH_URL");
       const clientMetadata = yield* clientMetadataSetting(origin);
+      const firstPartyClients = yield* firstPartyOAuthClients;
       const storage = yield* makeExecutorStorage({ provider: "postgresql" });
       const evaluation = yield* declarationConfig;
       const server = yield* Scope.Scope;
       const ready = yield* Deferred.make<Executor>();
-      const { runtime, workflows, blobs, repositories } = yield* acquire(Deferred.await(ready));
+      const { runtime, workflows, declarations, blobs, repositories } = yield* acquire(
+        Deferred.await(ready),
+      );
       // This fork publishes inside the organization, from the same database as its apps, rather
       // than reading the hosted public registry. `selfHostDatabaseSchema` migrated the tables.
       const registryStorage = yield* makeRegistryStorage;
@@ -96,9 +103,12 @@ export const selfHostExecutorServices = <E, R>(
           clientName: hostedOAuthClientName,
           urlPolicy: egress.policy,
           ...(Option.isSome(clientMetadata) ? { clientMetadataUrl: clientMetadata.value.url } : {}),
+          firstPartyClients,
         },
         cache: {
           memory: makeDeclarationCache(evaluation.limits),
+          // Kept in each app's supervisor too, so a restart does not evaluate every app again.
+          durable: declarations,
           toolListings: evaluation.toolListings,
         },
         // Stale declarations refresh on the server's own lifetime.

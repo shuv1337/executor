@@ -281,16 +281,10 @@ export const hostedAccountHandlers = HttpApiBuilder.group(HostedApi, "accounts",
           const owner = yield* currentOwner;
           const connection = yield* getConnection(owner, params);
           const target = connection.target;
-          const app =
-            target === null || target === undefined
-              ? undefined
-              : yield* Effect.flatten(HostedExecutor).pipe(
-                  Effect.flatMap((executor) => executor.apps.get({ owner, app: target.app })),
-                );
-          const requirement =
-            app === undefined || target === null || target === undefined
-              ? undefined
-              : app.requirements.accounts[target.requirement];
+          const app = yield* Effect.flatten(HostedExecutor).pipe(
+            Effect.flatMap((executor) => executor.apps.get({ owner, app: target.app })),
+          );
+          const requirement = app.requirements.accounts[target.requirement];
           return {
             ...connection,
             url: yield* connectionUrl(connection.id),
@@ -307,10 +301,6 @@ export const hostedAccountHandlers = HttpApiBuilder.group(HostedApi, "accounts",
       .handle("startOAuth", ({ params, payload }) =>
         Effect.flatMap(currentOwner, (owner) =>
           startOAuth(owner, { connection: params.connection, ...payload, redirectUri }),
-        ).pipe(
-          Effect.map((result) =>
-            result.status === "redirect" ? { ...result, redirectUri } : result,
-          ),
         ),
       )
       .handle("completeOAuth", ({ params, payload }) =>
@@ -332,7 +322,6 @@ export const hostedOAuthCallbackHandlers = HttpApiBuilder.group(
   (handlers) =>
     Effect.gen(function* () {
       const auth = yield* Authentication;
-      const redirectUri = accountOAuthRedirectUri(auth);
       return handlers.handle("resolve", ({ payload }) =>
         Effect.gen(function* () {
           const principal = yield* CurrentPrincipal;
@@ -355,9 +344,10 @@ export const hostedOAuthCallbackHandlers = HttpApiBuilder.group(
           return {
             organizationSlug,
             connection: connection.id,
-            app: connection.target?.app ?? null,
-            profile: connection.target?.profile,
-            redirectUri,
+            app: connection.target.app,
+            profile: connection.target.profile,
+            // The callback this sign-in sent, which a saved client may have kept from before.
+            redirectUri: connection.redirectUri,
             reconnect: connection.reconnectAccount !== null,
           };
         }),
