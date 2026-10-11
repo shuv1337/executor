@@ -149,7 +149,8 @@ func TestProxyForwardsTheSchemeTheBrowserUsed(t *testing.T) {
 	socket := socketPath(t)
 	upstream := &fakeWorkerd{idleTimeout: time.Minute}
 	upstream.serve(t, socket)
-	front := httptest.NewServer(productProxy(socket, upstream.idleTimeout, nil))
+	// The public listener's own handler stack, compression and full duplex included.
+	front := httptest.NewServer(publicHandler(productProxy(socket, upstream.idleTimeout, nil)))
 	defer front.Close()
 
 	send := func(proto string) string {

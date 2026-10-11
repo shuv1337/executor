@@ -4,7 +4,9 @@
  */
 import * as Cloudflare from "alchemy/Cloudflare";
 import type { WorkerLoader } from "@cloudflare/workers-types";
-import { Effect, Layer, Schema } from "effect";
+import { Effect, Layer, Option, Schema } from "effect";
+import { EvaluatedSupervisor } from "@executor-js/app-data/evaluated";
+import { coloOf } from "./infrastructure/colo.ts";
 import {
   makeFacetSupervisor,
   FacetInvocation,
@@ -15,13 +17,20 @@ import { AppDataSupervisor, appDataSupervisors } from "./infrastructure/app-data
 import { RuntimeContext } from "alchemy";
 import { CacheCommand } from "@executor-js/app-cache/contracts";
 import { BlobStore } from "@executor-js/sdk/core";
-import { makeAppRunner, serveAppRunner, type RemoteCapabilities } from "@executor-js/sdk/workerd";
+import {
+  IsolateStarted,
+  makeAppRunner,
+  serveAppRunner,
+  type RemoteCapabilities,
+} from "@executor-js/sdk/workerd";
+import { withRemoteSpan } from "@executor-js/telemetry";
 import { cloudBuildReader } from "./infrastructure/blobs.ts";
 import { cloudOrigin } from "./infrastructure/stage.ts";
 import { loadCloudBuildRecord, loadCloudFramework } from "./implementation/build-storage.ts";
 import { cachedRuntimeBuilds } from "./implementation/runtime-build-cache.ts";
 import { appCredentialOutbound, appOutboundBindings } from "./infrastructure/app-outbound.ts";
 import { sentryBindings } from "./infrastructure/sentry.ts";
+import { workerBuild } from "./infrastructure/worker-build.ts";
 import { HttpServerResponse } from "effect/http";
 import {
   cloudObservability,
@@ -37,6 +46,61 @@ const NativeLoader = Schema.declare(
     typeof value.get === "function",
 );
 
+/**
+ * How the supervisor ran when it answered a cache command. Supervisors before it send none;
+ * `wokeEarlier` is absent from supervisors that did not compare traces.
+ */
+const CacheAnswered = Schema.Struct({
+  supervisor: Schema.Struct({
+    ...EvaluatedSupervisor.fields,
+    colo: Schema.String,
+    wokeEarlier: Schema.optionalKey(Schema.Boolean),
+    isolateWoke: Schema.optionalKey(Schema.Boolean),
+  }),
+});
+/**
+ * `cache.supervisor.woke` is whether this request woke the supervisor: this command, or an
+ * earlier call of the same trace, such as the evaluated listing read, which `woke_by` tells apart.
+ * A colo reads `pending` while its isolate's one lookup has not answered yet, which happens only
+ * on the first commands of a fresh isolate; see `coloOf`.
+ */
+const annotateCacheSupervisor = (reply: unknown) => {
+  const answered = Schema.decodeUnknownOption(CacheAnswered)(reply);
+  // A supervisor that predates this reports nothing, so whether it started is unknown.
+  if (Option.isNone(answered))
+    return Effect.gen(function* () {
+      (yield* IsolateStarted)("unknown");
+    });
+  const { woke, wokeEarlier, isolateWoke, instanceMs, isolateMs, colo } = answered.value.supervisor;
+  return Effect.gen(function* () {
+    // This command woke the supervisor; its isolate started too when it is the isolate's first.
+    if (woke) {
+      const started = yield* IsolateStarted;
+      started("supervisor");
+      // One that predates `isolateWoke` cannot say whether its isolate started too.
+      if (isolateWoke === undefined) started("unknown");
+      else if (isolateWoke) started("supervisor-isolate");
+    }
+    yield* Effect.annotateCurrentSpan({
+      "cache.supervisor.woke": woke || wokeEarlier === true,
+      ...(woke
+        ? { "cache.supervisor.woke_by": "command" }
+        : wokeEarlier === true
+          ? { "cache.supervisor.woke_by": "earlier" }
+          : {}),
+      "cache.supervisor.instance_ms": instanceMs,
+      "cache.supervisor.isolate_ms": isolateMs,
+      "cache.supervisor.colo": colo,
+    });
+  });
+};
+/** The current trace's ID, which a supervisor compares with the call that woke it. */
+const currentTrace = Effect.currentSpan.pipe(
+  Effect.map((span) => span.traceId),
+  Effect.option,
+  Effect.map(Option.getOrUndefined),
+);
+
 const AppDataSupervisorLive = AppDataSupervisor.make(
   Effect.gen(function* () {
     // Alchemy provisions the binding. Its current wrapper does not expose getDurableObjectClass.
@@ -50,15 +114,34 @@ const AppDataSupervisorLive = AppDataSupervisor.make(
       ).pipe(Effect.orDie);
       // Facets send through this Worker's fetch, specialized for their app.
       const supervisor = yield* makeFacetSupervisor(state.raw, loader, yield* credentials.outbound);
+      const colo = () => coloOf((lookup) => state.raw.waitUntil(Effect.runPromise(lookup)));
+      // Start this isolate's colo lookup as the instance starts, ahead of its first reply.
+      colo();
       return {
-        cache: supervisor.cache,
+        // The reply carries how the supervisor ran, for the runner's span; the runner's reply
+        // decoder ignores the extra field, so runners from before it read the reply unchanged.
+        cache: (namespace: string, command: unknown, trace?: string) =>
+          supervisor.observedCache(namespace, command, trace).pipe(
+            Effect.map(({ reply, supervisor: running, wokeEarlier, isolateWoke }) => ({
+              ...reply,
+              supervisor: { ...running, wokeEarlier, isolateWoke, colo: colo() },
+            })),
+          ),
         evaluated: supervisor.evaluated,
         invoke: (
           input: typeof FacetInvocation.Type,
           load: () => Promise<typeof FacetBundle.Type>,
           elicitation: ((input: unknown) => Promise<unknown>) | null = null,
           workflows: ((input: unknown) => Promise<unknown>) | null = null,
-        ) => supervisor.invoke(input, load, elicitation, workflows),
+        ) =>
+          supervisor.invoke(input, load, elicitation, workflows).pipe(
+            // The runner's trace context travels in the invocation's headers, so the supervisor's
+            // part of a database call joins the tool call's trace.
+            withRemoteSpan(
+              new Request("https://app-data.internal", { headers: input.headers }),
+              "runtime.app.data.invoke",
+            ),
+          ),
         cancel: (id: string) => supervisor.cancel(id),
         fetch: Effect.gen(function* () {
           const [response, socket] = yield* Cloudflare.upgrade();
@@ -83,6 +166,7 @@ export default AppData.make(
     if (globalThis.__ALCHEMY_RUNTIME__) return { main: import.meta.url };
     return {
       main: import.meta.url,
+      build: workerBuild("app-data"),
       ...(yield* cloudObservability),
       workersDev: false,
       compatibility: { date: "2026-09-08", flags: ["nodejs_compat"] },
@@ -133,6 +217,11 @@ export default AppData.make(
           credentialKey: credentials.key,
           data: (app) => {
             const target = databases.getByName(app);
+            // Commands this invocation sent its supervisor so far; the first also opens the stub.
+            let commands = 0;
+            const colo = () => coloOf((lookup) => waitUntil(Effect.runPromise(lookup)));
+            // Start this isolate's colo lookup with the invocation, ahead of its first command.
+            colo();
             return {
               invoke: (input, load, elicit, controls) =>
                 target
@@ -142,9 +231,22 @@ export default AppData.make(
               cache: (namespace, command) =>
                 Schema.decodeUnknownEffect(CacheCommand)(command).pipe(
                   Effect.tap((parsed) =>
-                    Effect.annotateCurrentSpan("cache.operation", parsed.operation),
+                    Effect.annotateCurrentSpan({
+                      "cache.operation": parsed.operation,
+                      "cache.command.index": ++commands,
+                      ...(parsed.operation === "acquire" && parsed.reads !== undefined
+                        ? { "cache.reads": parsed.reads.length }
+                        : {}),
+                    }),
                   ),
-                  Effect.flatMap((parsed) => target.cache(namespace, parsed)),
+                  Effect.flatMap((parsed) =>
+                    currentTrace.pipe(
+                      Effect.flatMap((trace) => target.cache(namespace, parsed, trace)),
+                    ),
+                  ),
+                  Effect.tap(annotateCacheSupervisor),
+                  // Read after the reply, so a fresh isolate's lookup had the round trip to answer.
+                  Effect.tap(() => Effect.annotateCurrentSpan("cache.caller.colo", colo())),
                   Effect.provide(RuntimeContext.phantom),
                   Effect.withSpan("runtime.cloud.cache"),
                 ),

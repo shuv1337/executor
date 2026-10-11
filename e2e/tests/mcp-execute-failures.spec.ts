@@ -522,6 +522,12 @@ export default defineApp({ accounts: {} }, async (ctx) => ({ tools: router({
   marker: query({ input: object({}) }, async () => (await ctx.cache.read("guarded", string())) ?? "missing"),
 }) }));`;
 
+/** An app with one tool for search to find. */
+const searchRowsAppSource = `import { defineApp, query, object, router } from "apps";
+export default defineApp({ accounts: {} }, async () => ({ tools: router({
+  findWidget: query({ description: "Find a widget by its name.", input: object({}) }, async () => "widget"),
+}) }));`;
+
 /**
  * An app whose factory saves a record each time it is evaluated. Its queries save a record and
  * then fail with an unavailable cache (`check`), or have an approval policy that saves a record
@@ -673,7 +679,7 @@ export default defineApp({ accounts: {} }, async () => ({ tools: router({
   runs: query({ input: object({}) }, async ({ sql }) => sql.exec("SELECT title, length FROM runs ORDER BY rowid").toArray()),
   ask: mutation({ input: object({}) }, async ({ elicit }) => {
     try {
-      await elicit({ mode: "form", message: "Q".repeat(70000), requestedSchema: { type: "object", properties: {} } });
+      await elicit({ mode: "form", message: "Q".repeat(110000), requestedSchema: { type: "object", properties: {} } });
       return { asked: true };
     } catch (error) {
       return { reason: error.reason };
@@ -753,6 +759,16 @@ const Completed = Schema.Struct({
     error: Schema.optional(Schema.Struct({ kind: Schema.String, message: Schema.String })),
     logs: Schema.optional(Schema.Array(Schema.String)),
   }),
+});
+
+/** A completed search, with the apps the execution reports unavailable. */
+const SearchedWithUnavailable = Schema.Struct({
+  status: Schema.Literal("completed"),
+  execution: Schema.Struct({
+    ok: Schema.Boolean,
+    value: Schema.Struct({ items: Schema.Array(Schema.Struct({ path: Schema.String })) }),
+  }),
+  unavailableApps: Schema.Array(Schema.Struct({ app: Schema.String, reason: Schema.String })),
 });
 
 const Pending = Schema.Struct({
@@ -1750,11 +1766,11 @@ return messages;`,
               .execution;
           });
 
-        // 40 KB of arguments: well inside the 64 KiB execute result, but not when it holds them twice.
+        // 60 KB of arguments: well inside the 100 KB execute result, but not when it holds them twice.
         const parked = yield* executeOnce(
           client,
-          "Ask approval for a call with 40 KB of arguments",
-          `return await ${publish("Weekly report", ascii(40_000))};`,
+          "Ask approval for a call with 60 KB of arguments",
+          `return await ${publish("Weekly report", ascii(60_000))};`,
           "large-approval.json",
         );
         expect(parked.structured).toMatchObject({ status: "approval-required" });
@@ -1763,45 +1779,45 @@ return messages;`,
         // how long it is.
         expect(pending.invocation.input).toEqual({
           title: "Weekly report",
-          body: "A".repeat(40_000),
+          body: "A".repeat(60_000),
         });
         expect(pending.elicitation.message).toContain("Approve publish?");
         expect(pending.elicitation.message).toContain('"title": "Weekly report"');
         expect(pending.elicitation.message).toContain(`"${"A".repeat(100)}`);
-        expect(pending.elicitation.message).toContain('"… (40000 characters)');
+        expect(pending.elicitation.message).toContain('"… (60000 characters)');
         expect(pending.elicitation.message).toContain(
           "Approving runs the call with the complete arguments",
         );
         expect(pending.elicitation.message.length).toBeLessThan(5_000);
         expect(
           yield* accept(
-            "Approve the call with 40 KB of arguments",
+            "Approve the call with 60 KB of arguments",
             pending.requestId,
             "large-approval-resumed.json",
           ),
-        ).toMatchObject({ ok: true, value: { title: "Weekly report", length: 40_000 } });
+        ).toMatchObject({ ok: true, value: { title: "Weekly report", length: 60_000 } });
 
-        // 60 KB of ASCII still fits once, so it is offered and runs.
+        // 95 KB of ASCII still fits once, so it is offered and runs.
         const boundary = yield* executeOnce(
           client,
-          "Ask approval for a call with 60 KB of arguments",
-          `return await ${publish("Boundary report", ascii(60_000))};`,
+          "Ask approval for a call with 95 KB of arguments",
+          `return await ${publish("Boundary report", ascii(95_000))};`,
           "boundary-approval.json",
         );
         const near = yield* Schema.decodeUnknownEffect(PublishPending)(boundary.structured);
-        expect(near.invocation.input.body).toHaveLength(60_000);
+        expect(near.invocation.input.body).toHaveLength(95_000);
         expect(
           yield* accept(
-            "Approve the call with 60 KB of arguments",
+            "Approve the call with 95 KB of arguments",
             near.requestId,
             "boundary-approval-resumed.json",
           ),
-        ).toMatchObject({ ok: true, value: { title: "Boundary report", length: 60_000 } });
+        ).toMatchObject({ ok: true, value: { title: "Boundary report", length: 95_000 } });
 
         // Arguments the execute result cannot hold once are refused with the request's size and
         // the limit, not only the error's name.
         const refusal =
-          /^ApprovalTooLarge \(HTTP 413\): The approval request for “publish” is (\d+) bytes, over the 65536-byte limit for an approval request, so Executor did not ask for approval and will not run the call\. Recovery: Make the arguments smaller/u;
+          /^ApprovalTooLarge \(HTTP 413\): The approval request for “publish” is (\d+) bytes, over the 100000-byte limit for an approval request, so Executor did not ask for approval and will not run the call\. Recovery: Make the arguments smaller/u;
         const refusedBytes = (label: string, body: string, file: string) =>
           Effect.gen(function* () {
             const refused = yield* executeOnce(
@@ -1818,23 +1834,23 @@ return messages;`,
             return { bytes: Number(measured[1]), structured: refused.structured };
           });
         const refused = yield* refusedBytes(
-          "Ask approval for a call with 70 KB of arguments",
-          ascii(70_000),
+          "Ask approval for a call with 110 KB of arguments",
+          ascii(110_000),
           "oversized-approval.json",
         );
-        expect(refused.bytes).toBeGreaterThan(70_000);
-        expect(refused.bytes).toBeLessThan(75_000);
-        // 25,000 three-byte characters: short in characters, but over the limit in UTF-8 bytes.
+        expect(refused.bytes).toBeGreaterThan(110_000);
+        expect(refused.bytes).toBeLessThan(115_000);
+        // 34,000 three-byte characters: short in characters, but over the limit in UTF-8 bytes.
         const multibyte = yield* refusedBytes(
-          "Ask approval for a call with 25,000 euro signs",
-          `"€".repeat(25_000)`,
+          "Ask approval for a call with 34,000 euro signs",
+          `"€".repeat(34_000)`,
           "oversized-multibyte-approval.json",
         );
-        expect(multibyte.bytes).toBeGreaterThan(75_000);
+        expect(multibyte.bytes).toBeGreaterThan(102_000);
         const caught = yield* executeOnce(
           client,
           "Catch the oversized approval and read its recovery",
-          `try { await ${publish("Oversized report", ascii(70_000))}; return "ran"; } catch (error) { return error.message; }`,
+          `try { await ${publish("Oversized report", ascii(110_000))}; return "ran"; } catch (error) { return error.message; }`,
           "oversized-approval-caught.json",
         );
         const recovery = yield* Schema.decodeUnknownEffect(CaughtRecovery)(
@@ -1849,8 +1865,8 @@ return messages;`,
         expect(uncaught.execution.error.response.recovery).toEqual(recovery.recovery);
         // None of the refused calls ran.
         expect(yield* runs("Read the runs after the refusals", "runs-after-refusal.json")).toEqual([
-          { title: "Weekly report", length: 40_000 },
-          { title: "Boundary report", length: 60_000 },
+          { title: "Weekly report", length: 60_000 },
+          { title: "Boundary report", length: 95_000 },
         ]);
 
         // An app's own question too large to return reaches the app as an invalid request, and
@@ -1967,8 +1983,8 @@ return messages;`,
         expect(
           yield* runs("Read the runs after the native approvals", "runs-after-native.json"),
         ).toEqual([
-          { title: "Weekly report", length: 40_000 },
-          { title: "Boundary report", length: 60_000 },
+          { title: "Weekly report", length: 60_000 },
+          { title: "Boundary report", length: 95_000 },
           { title: "Browser report", length: 40_015 },
           { title: "Native exact report", length: 40_015 },
           { title: "Native report", length: 100_000 },
@@ -2880,6 +2896,90 @@ try { return await call(); } catch (error) {
           `StorageError (HTTP 500): Executor could not read or write its saved data. Recovery: ${unknownOutcomeAction} Retryable (unchanged call): no.`,
         );
         expectNoRepeatAdvice(failed.response.recovery.instructions, "MCP");
+      }).pipe(Effect.provide(McpClient.layer)),
+    ),
+  );
+  it.effect(scenarios.mcpSearchRowsUnsaved.title, (context) =>
+    withHostedCase(
+      context,
+      Effect.gen(function* () {
+        const actors = yield* Actors;
+        // Executor's storage refuses every search listing this organization saves.
+        if (!/^[A-Za-z0-9_-]+$/.test(actors.organization.id))
+          return yield* Effect.die("Expected an organization ID");
+        yield* legacyStorage([
+          {
+            sql: `CREATE FUNCTION e2e_search_rows_fault() RETURNS trigger LANGUAGE plpgsql AS $$
+              BEGIN RAISE EXCEPTION 'Synthetic storage failure for e2e search rows'; END $$`,
+          },
+          {
+            sql: `CREATE TRIGGER e2e_search_rows_fault
+              BEFORE INSERT OR UPDATE ON executor_tool_search_listings
+              FOR EACH ROW WHEN (NEW.owner = 'organization:${actors.organization.id}')
+              EXECUTE FUNCTION e2e_search_rows_fault()`,
+          },
+        ]);
+        yield* serverControl("start");
+        const app = yield* hostedApp("Unsaved search rows", searchRowsAppSource);
+        const searched = yield* executeOnce(
+          app.client,
+          "Search for a tool whose search rows cannot be saved",
+          `return await tools.search({ query: "widget" });`,
+          "search-rows-unsaved.json",
+        );
+        const result = yield* Schema.decodeUnknownEffect(SearchedWithUnavailable)(
+          searched.structured,
+        );
+        // Search names the app as unavailable, with why, instead of a page without its tools.
+        expect(result.execution.ok).toBe(true);
+        expect(result.execution.value.items).toEqual([]);
+        const reported = result.unavailableApps.filter((entry) => entry.app === app.id);
+        expect(reported).toHaveLength(1);
+        expect(yield* Schema.decodeUnknownEffect(Diagnostic)(reported[0]!.reason)).toMatchObject({
+          code: "ToolSearchUnavailable",
+          status: 503,
+          message:
+            "Executor could not save this app's tools for search, so search cannot rank them.",
+        });
+        // The app itself still loads: its tools are callable, only searching them failed.
+        const called = yield* executeOnce(
+          app.client,
+          "Call the tool search could not rank",
+          `return await tools[${JSON.stringify(app.slug)}].findWidget({});`,
+          "search-rows-unsaved-call.json",
+        );
+        expect(yield* Schema.decodeUnknownEffect(Completed)(called.structured)).toMatchObject({
+          execution: { ok: true, value: "widget" },
+        });
+        // A program that loaded the app's tools first, by calling or describing one, still learns
+        // why the search that follows has none of them.
+        const tool = `tools[${JSON.stringify(app.slug)}].findWidget`;
+        for (const [label, first, file] of [
+          ["Call a tool, then search", `await ${tool}({});`, "search-rows-unsaved-after-call.json"],
+          [
+            "Describe a tool, then search",
+            `await tools.search.describe({ paths: [${JSON.stringify(`${app.slug}.findWidget`)}] });`,
+            "search-rows-unsaved-after-describe.json",
+          ],
+        ] as const) {
+          const after = yield* executeOnce(
+            app.client,
+            label,
+            `${first}\nreturn await tools.search({ query: "widget" });`,
+            file,
+          );
+          const searched = yield* Schema.decodeUnknownEffect(SearchedWithUnavailable)(
+            after.structured,
+          );
+          expect(searched.execution.ok, label).toBe(true);
+          expect(searched.execution.value.items, label).toEqual([]);
+          const unavailable = searched.unavailableApps.filter((entry) => entry.app === app.id);
+          expect(unavailable, label).toHaveLength(1);
+          expect(
+            yield* Schema.decodeUnknownEffect(Diagnostic)(unavailable[0]!.reason),
+            label,
+          ).toMatchObject({ code: "ToolSearchUnavailable", status: 503 });
+        }
       }).pipe(Effect.provide(McpClient.layer)),
     ),
   );

@@ -2,10 +2,13 @@
 
 Use this path when you can run shell commands and `executor apps --help` works.
 If the command is missing, or it has no `framework` subcommand, install the
-current release. It needs Node.js 24.14.0 or newer:
+current release. An older CLI can also fail against a newer host with `NotFound`
+or `UnexpectedResponse`. Install it with npm, or without Node on macOS or Linux
+with the install script:
 
 ```sh
 npm i -g executor@beta --include=optional
+curl -fsSL https://executor.sh/docs/install.sh | sh
 ```
 
 The `beta` tag is required. The `latest` tag installs the previous Executor,
@@ -15,7 +18,32 @@ so ask first if that has not been approved.
 Keep one directory per app with `index.ts` and `package.json` at its root. The
 CLI sends the whole directory, skipping `.git`, `node_modules` and `.DS_Store`.
 Keep scratch files out of it; files missing from the directory are deleted
-from the app.
+from the app. `--files` also accepts a JSON file holding an array of
+`{ "path", "content" }` objects.
+
+Code, every file outside `ui/public/`, is UTF-8 text: at most 4,096 files and
+16 MiB of file contents, on every host. Files under `ui/public/` are served as
+they are and may be binary, such as images, fonts, audio, WebAssembly or a
+prebuilt bundle: at most 10,000 files, each at most 32 MB and 1 GB in total.
+Builds never load them; each deploy copies them to the host's own storage.
+The CLI checks these limits before it uploads anything. A source over them
+fails with `SourceRejected`, which states the count or size and names the
+largest files; a binary file outside `ui/public/` fails the same way and is
+named. The host rejects a larger source with `SourceError` and HTTP 413.
+
+A directory of at most 16 MiB in total is sent as files, with binary files as
+base64. A larger one is pushed with Git: `executor apps create`, `commit` and
+`deploy --files` do this themselves, send only the files the app does not
+already hold, and split large uploads into several pushes. Deploy a directory
+in one step with `executor apps deploy --app <app-id> --files ./app`.
+
+Reading source lists a `ui/public/` file that is not UTF-8 text, or does not
+fit beside the rest of the source, as `{ "path", "object", "size" }` without
+its bytes. Send that entry back unchanged in a commit to keep the file. Through
+`appManagement.commit`, send a small binary file as
+`{ "path", "content": "<base64>", "encoding": "base64" }`. `executor apps source
+--app <app-id> --out ./copy` writes every file, binary files included, and a
+Git clone has them all.
 
 Read these docs with
 `executor apps skills --app executor --name app-authoring --file deploy.md`.
@@ -25,7 +53,33 @@ reads the local API key from `EXECUTOR_API_KEY`. If that variable is unset, ask
 the user to set it; do not search files for it. For hosted Executor, run
 `executor apps login --host https://api.executor.sh` once. It prints a link and
 a code and waits; ask the user to open the link and approve the code. Then pass
-the same `--host` to every command.
+the same `--host` to every command, or set `EXECUTOR_HOST` to it once.
+`--organization` defaults to the organization you signed in to.
+
+A command that fails exits with status 1. Its standard error states the
+message, the error code, the HTTP status when the host answered, and the
+host's recovery: `Next step` for the user and `For agents` for you. When
+standard output is not a terminal, the command also prints the same failure
+there as JSON, so scripts can read it:
+
+```json
+{
+  "error": {
+    "code": "DeploymentBuildFailed",
+    "status": 422,
+    "message": "App build failed at the declaration stage: ...",
+    "details": {
+      "stage": "declaration",
+      "location": { "file": "index.ts", "line": 3, "column": 7 }
+    }
+  }
+}
+```
+
+`recovery` holds `action` and `instructions` when the error declares them;
+follow the instructions. `details` holds the error's other fields. When a newer
+CLI release exists, `update` says so with the install command, and standard error
+ends with the same line; update the CLI before retrying.
 
 A new app is a directory with `index.ts` and a `package.json` that pins the
 exact `apps` version the host runs. `executor apps framework` prints that
@@ -83,14 +137,27 @@ between, the commit is rejected. Read the source again and reconcile before
 retrying. A commit alone does not change the running app.
 
 On hosted Executor you can also use Git. `executor apps git --app <app-id>`
-prints the clone URL. Configure the credential helper for the clone:
+prints the clone URL. Clone with the credential helper configured in the clone, so later
+pushes and fetches use it too:
 
 ```sh
-git -c credential.helper='!executor apps credential' -c credential.useHttpPath=true clone <url>
+git clone -c credential.helper= -c credential.helper='!executor apps credential' \
+  -c credential.useHttpPath=true <url>
 ```
+
+The empty `credential.helper` stops other helpers, such as the macOS keychain, from keeping
+copies of the helper's short-lived tokens. In a clone made without it, run
+`git config credential.helper ''` and then
+`git config --add credential.helper '!executor apps credential'`.
 
 Pushes save source but do not deploy it. Deploy the pushed commit with
 `executor apps deploy --app <app-id> --commit "$(git rev-parse HEAD)"`.
+Pushes stream to the repository, so Executor sets no push size limit of its own. On
+hosted Executor the repository host accepts files up to 32 MB each and repositories up
+to 1 GB, and a single push of more than about 64 MiB of packed data currently fails;
+push a larger history in several pushes. The CLI does this for you. A pushed source
+over the limits above cannot be read or deployed. The limits apply to the commit being
+read, not to the history before it.
 
 Type-check locally before deploying. A deploy compiles the app and reports
 build errors, but it does not type-check. The framework is published to npm as
@@ -243,8 +310,8 @@ their working files and remain undeployed.
 Publishing reads a scoped `name` and optional `description` from `package.json`.
 The public listing points to the selected Git commit. Normal npm `dependencies`
 are supported; `version` is optional author metadata and does not select an
-Executor release. Executor app dependencies are deferred. Include the app source
-it needs directly; do not add `executor.dependencies` or an Executor lockfile.
+Executor release. Apps cannot depend on other Executor apps; include the source
+an app needs directly.
 
 Copy a public app with `appManagement.copy`, using `from: { package, commit }`
 and a new `name`. Owned apps use the same operation with `from: { app }`. This creates an independent app and Git repository with empty

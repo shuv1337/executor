@@ -159,6 +159,8 @@ export interface DeclarationCache {
   readonly changed: (app: string, at: number) => void;
   /** Whether a result of the app evaluated from `at` predates an invalidation seen here. */
   readonly outdated: (app: string, at: number) => boolean;
+  /** What the store holds now, measured as its limits are. */
+  readonly usage: () => { readonly entries: number; readonly bytes: number };
 }
 
 /**
@@ -179,8 +181,9 @@ export interface DurableEntry {
  * as `DeclarationCache`. Values can include text derived from credentials, so a host keeps them
  * only where it already keeps the app's account-scoped cache, never in a store shared across
  * owners. An app cache invalidation must make the host forget the app's results evaluated no
- * later than then. `get` never fails: a failure or a slow store is a miss. `set` may drop a
- * result, and keeps it at most until `until`.
+ * later than then. `get` has no expected failure: a store failure or a slow store is a miss.
+ * `set` may drop a result, and keeps it at most until `until`. Defects and interruption still
+ * propagate from both.
  */
 export interface DurableDeclarations {
   readonly get: (app: string, key: string) => Effect.Effect<DurableEntry | undefined>;

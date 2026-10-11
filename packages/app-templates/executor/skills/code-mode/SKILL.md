@@ -10,10 +10,14 @@ are async functions under `tools`. One program can call several tools, combine
 their results and return a small value, so large results never pass through
 your context.
 
-The interpreter has no imports, `fetch`, `process`, filesystem or timers. A
-tool call is its only way out. Use `await` and `Promise.all` for independent
-calls. `console.log` output comes back in `logs`. Write JavaScript; TypeScript
-syntax is not portable across Executor hosts.
+The interpreter has no imports, `fetch`, `process` or filesystem, no timers
+(`setTimeout`, `setInterval`, `queueMicrotask`), and no `btoa`, `atob`,
+`TextEncoder`, `TextDecoder` or `globalThis`. A tool
+call is its only way out. Use `await` and `Promise.all` for independent calls.
+As in JavaScript, code between two awaits runs without interruption, so
+concurrent async functions can update shared variables. `console.log` output
+comes back in `logs`. Write JavaScript; TypeScript syntax is not portable across
+Executor hosts.
 
 ## Find tools and read signatures
 
@@ -162,7 +166,9 @@ These are the defaults. The source limit is fixed; a host can change the others.
   fields, a count, or one page.
 - Tool calls: 100 per execution.
 - Time: 5 minutes per execution, including discovery. Time spent waiting for
-  the user does not count.
+  the user does not count. Execute returns when the program ends or pauses for
+  approval or input. An MCP client may give up sooner, often after 60 seconds,
+  and cancel the program. Split long work into several executions.
 
 ## Read results and errors
 

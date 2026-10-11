@@ -20,6 +20,7 @@ const jobs = [
   "cloud-domains",
   "cloud-workers",
   "cloud-locks",
+  "cloud-batch",
   "cloud-isolate",
   "cloud-rate-limit",
   "cloud-rollback",
@@ -301,8 +302,9 @@ layer(NodeServices.layer)("CI E2E selection", (it) => {
     Effect.gen(function* () {
       const run = yield* select({});
       expect(run.exitCode).toBe(0);
-      expect(Object.keys(run.outputs).sort()).toEqual([...jobs, ...runnerOutputs].sort());
+      expect(Object.keys(run.outputs).sort()).toEqual([...jobs, ...runnerOutputs, "full"].sort());
       for (const job of [...jobs, ...runnerOutputs]) expect(run.outputs[job], job).not.toBe("");
+      expect(run.outputs.full).toBe("true");
       expect(run.summary).toContain("Full suite: this run is not for a pull request.");
     }),
   );
@@ -352,7 +354,7 @@ layer(NodeServices.layer)("CI E2E selection", (it) => {
           const runners = cloudRunners(run.outputs);
           expect(runners.map(({ name }) => name)).toEqual([
             "cloud, cloud-isolate",
-            "cloud-workers, cloud-locks, cloud-rollback",
+            "cloud-workers, cloud-locks, cloud-batch, cloud-rollback",
             "cloud-product, cloud-domains, cloud-rate-limit, cloud-oauth-proxy-preview",
           ]);
           // Each Cloud job's pattern is on exactly one runner, unchanged, and empty on the others.
@@ -369,7 +371,7 @@ layer(NodeServices.layer)("CI E2E selection", (it) => {
           }
         }
         expect(main.summary).toMatch(
-          /\| cloud-locks \| \d+ \| e2e-cloud \(cloud-workers, cloud-locks, cloud-rollback\) \|/,
+          /\| cloud-locks \| \d+ \| e2e-cloud \(cloud-workers, cloud-locks, cloud-batch, cloud-rollback\) \|/,
         );
 
         // A selection runs each job on one runner, and starts only the Cloud runners it needs.
@@ -838,8 +840,10 @@ layer(NodeServices.layer)("CI E2E selection", (it) => {
       );
       expect(none.exitCode).toBe(0);
       for (const job of [...jobs, ...runnerOutputs]) expect(none.outputs[job], job).toBe("");
+      expect(none.outputs.full).toBe("false");
       expect(all.exitCode).toBe(0);
       for (const job of [...jobs, ...runnerOutputs]) expect(all.outputs[job], job).not.toBe("");
+      expect(all.outputs.full).toBe("true");
       expect(all.summary).toContain("Full suite: changes the lockfile");
       expect(bareAll.exitCode).toBe(1);
       expect(skip.exitCode).toBe(0);
@@ -1010,6 +1014,7 @@ layer(NodeServices.layer)("CI E2E selection", (it) => {
         "cloud-domains",
         "cloud-workers",
         "cloud-locks",
+        "cloud-batch",
         "cloud-isolate",
         "cloud-rate-limit",
         "cloud-rollback",

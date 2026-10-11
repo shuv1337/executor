@@ -3,7 +3,7 @@ import { Effect, Option, Schema } from "effect";
 import { ApiError } from "@executor-js/utils/api-error";
 import { appSlug } from "./app-slug.ts";
 import { AppId, JsonObject, OwnerId } from "./shared.ts";
-import { SourceCommit, SourceFiles, SourceRevision } from "./source.ts";
+import { SourceCommit, SourceFilePath, SourceFiles, SourceRevision, isTextFile } from "./source.ts";
 
 /**
  * The hosted Executor API origin: the default public registry and the host the CLI and SDK call.
@@ -20,11 +20,6 @@ export type PackageName = typeof PackageName.Type;
 export const PackageManifest = Schema.Struct({
   name: PackageName,
   description: Schema.optional(Schema.String.check(Schema.isMaxLength(2000))),
-  executor: Schema.optional(
-    Schema.Struct({
-      dependencies: Schema.optional(Schema.Record(Schema.String, Schema.String)),
-    }),
-  ),
 });
 export type PackageManifest = typeof PackageManifest.Type;
 /** Derive a public name from an authenticated publishing namespace and an app label. */
@@ -42,7 +37,6 @@ export class PublicationIssue extends Schema.TaggedError<PublicationIssue>()("Pu
     "unscoped-name",
     "invalid-name",
     "invalid-metadata",
-    "unsupported-dependencies",
     "invalid-source",
     "limit",
     "forbidden-scope",
@@ -88,7 +82,6 @@ const registryFailures = {
   "invalid-source": "The app source at this commit cannot be read as a public listing.",
   "invalid-manifest":
     "The app's package.json needs a valid package name in the publisher's scope and valid metadata.",
-  "unsupported-dependencies": "The app declares dependencies that public listings do not support.",
   storage: "Executor could not read or write the public app catalog. Try again.",
   network: "Executor could not reach the public app registry. Try again.",
   status: "The public app registry returned an unexpected HTTP status.",
@@ -108,7 +101,6 @@ export const RegistryError = ApiError.define({
       "changed",
       "invalid-source",
       "invalid-manifest",
-      "unsupported-dependencies",
       "storage",
       "network",
       "status",
@@ -138,6 +130,15 @@ export interface Registry {
     name: string,
     commit: string,
   ) => Effect.Effect<PublicationSnapshot, RegistryError>;
+  /**
+   * One file of a listing's selected commit, by path, as its exact bytes. Installation reads the
+   * public files a snapshot lists by their blob this way, one at a time.
+   */
+  readonly file: (
+    name: string,
+    commit: string,
+    path: string,
+  ) => Effect.Effect<Uint8Array, RegistryError>;
 }
 
 /** A public listing has one stable URL even when its selected commit changes. */
@@ -172,7 +173,8 @@ export type RegistryOptions = Registry | { readonly storage: RegistryStorage };
 export const scopeGeneratedPackage = (files: SourceFiles, namespace: string, name: string) =>
   Effect.gen(function* () {
     const file = files.find((file) => file.path === "package.json");
-    if (file === undefined) return yield* new RegistryError({ reason: "invalid-manifest" });
+    if (file === undefined || !isTextFile(file))
+      return yield* new RegistryError({ reason: "invalid-manifest" });
     const manifest = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(JsonObject))(
       file.content,
     ).pipe(Effect.mapError(() => new RegistryError({ reason: "invalid-manifest" })));
@@ -208,4 +210,5 @@ export const PublicationInputs = {
 export const RegistryInputs = {
   list: Schema.Struct({ name: Schema.optional(PackageName) }),
   snapshot: Schema.Struct({ name: PackageName, commit: SourceCommit }),
+  file: Schema.Struct({ name: PackageName, commit: SourceCommit, path: SourceFilePath }),
 };

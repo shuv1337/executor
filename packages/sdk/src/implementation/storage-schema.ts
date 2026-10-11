@@ -13,8 +13,10 @@ import {
   OwnerId,
   ProviderId,
   JsonObject,
+  ToolName,
 } from "../contracts/shared.ts";
 import { AccountConnectionId, ApprovalRequestId } from "../contracts/shared.ts";
+import { OAuthClientId, OAuthClientSource } from "../contracts/oauth.ts";
 import { column, idColumn, schema, table } from "fumadb-effect/schema";
 import { Effect, Schema } from "effect";
 
@@ -143,6 +145,10 @@ export const version4Tables = {
   })
     .unique("executor_apps_owner_name", ["owner", "name"])
     .unique("executor_apps_owner_slug", ["owner", "slug"]),
+  /**
+   * Saved clients of versions before 4.0.10, keyed by a digest of the sign-in settings. No longer
+   * read or written once `executor_stored_oauth_clients` replaces it; a later release drops it.
+   */
   oauthClients: table("executor_oauth_clients", {
     id: idColumn("id", Schema.String, { type: "varchar(255)" }),
     encrypted: column("encrypted", Schema.Uint8Array),
@@ -393,8 +399,8 @@ export const targetlessConnectionCleanup = [
   `DELETE FROM executor_account_connections WHERE ${targetless}`,
 ] as const;
 
-/** Current ORM layout. Profiles own account selections; apps declare requirements. */
-export const storageSchema = schema({
+/** The 4.0.8 layout. Profiles own account selections; apps declare requirements. */
+export const version408Schema = schema({
   version: "4.0.8",
   tables: version408Tables,
   up: ({ auto }) =>
@@ -402,6 +408,182 @@ export const storageSchema = schema({
       Effect.map((operations) => [
         ...targetlessConnectionCleanup.map((sql) => ({ type: "custom" as const, sql })),
         ...operations,
+      ]),
+    ),
+  relations: {
+    accounts: ({ one }) => ({
+      providerDefinition: one("providers", ["provider", "id"]).foreignKey(),
+    }),
+    apps: ({ one }) => ({
+      deployment: one("deployments", ["activeDeployment", "id"], ["code", "code"]).foreignKey(),
+    }),
+  },
+});
+
+/**
+ * Version 4.0.9 keeps evaluated tool listings as search rows: one row per listing, keyed by its
+ * declaration key, one per tool with the words search ranks it by, and one per distinct `$defs`
+ * entry the listing's schemas share, which tool rows name by position as the durable listing
+ * text does. The rows are derived from listings and never read by an earlier server; losing them
+ * costs only reading a listing again.
+ */
+const toolSearchListings = table("executor_tool_search_listings", {
+  listing: idColumn("listing", Schema.String, { type: "varchar(64)" }),
+  owner: column("owner", OwnerId, { type: "varchar(255)" }),
+  app: column("app", AppId, { type: "varchar(255)" }),
+  deployment: column("deployment", DeploymentId, { type: "varchar(255)" }),
+  profile: column("profile", Schema.NullOr(ProfileId), { type: "varchar(255)" }).default(null),
+  /** When the evaluation that produced the listing started, in epoch milliseconds. */
+  at: column("at", Schema.BigInt),
+  /** Changes when any row derived from the listing would; an equal digest is not rewritten. */
+  digest: column("digest", Schema.String, { type: "varchar(64)" }),
+  routers: column("routers", Schema.Json),
+  /**
+   * When a newer listing of the same app and profile was written, in epoch milliseconds, or null
+   * while none was. Superseded rows are kept for as long as an execution may still search them.
+   */
+  superseded: column("superseded", Schema.NullOr(Schema.BigInt)).default(null),
+});
+const toolSearch = table("executor_tool_search", {
+  /** The listing and the tool's position in it, which rewriting a listing replaces as a whole. */
+  id: idColumn("id", Schema.String, { type: "varchar(80)" }),
+  listing: column("listing", Schema.String, { type: "varchar(64)" }),
+  name: column("name", ToolName),
+  readOnly: column("read_only", Schema.Boolean),
+  /** Space-separated words, as the SDK's search tokenizer produces them. */
+  terms: column("terms", Schema.String),
+  length: column("length", Schema.Int),
+  /** What makes two targets' tools of one name the same search result. */
+  signature: column("signature", Schema.String, { type: "varchar(64)" }),
+  /** The listed tool, each shared `$defs` entry replaced by its definition's position. */
+  tool: column("tool", Schema.Json),
+  /** The positions of the definitions the tool's schemas name. */
+  definitions: column("definitions", Schema.Json),
+});
+const toolSearchDefinitions = table("executor_tool_search_definitions", {
+  /** The listing and the definition's position in it. */
+  id: idColumn("id", Schema.String, { type: "varchar(80)" }),
+  listing: column("listing", Schema.String, { type: "varchar(64)" }),
+  position: column("position", Schema.Int),
+  definition: column("definition", Schema.Json),
+});
+
+/** Tables of the 4.0.9 layout. */
+export const version409Tables = {
+  ...version408Tables,
+  toolSearchListings,
+  toolSearch,
+  toolSearchDefinitions,
+};
+
+/**
+ * Indexes added with tool search in 4.0.9, created in the same step as their tables. Terms are
+ * text because FumaDB columns are portable; the GIN index is over their words.
+ */
+export const toolSearchIndexes = [
+  "CREATE INDEX IF NOT EXISTS executor_tool_search_listing ON executor_tool_search (listing)",
+  "CREATE INDEX IF NOT EXISTS executor_tool_search_terms ON executor_tool_search USING gin ((string_to_array(terms, ' ')))",
+  "CREATE INDEX IF NOT EXISTS executor_tool_search_listings_target ON executor_tool_search_listings (app, profile)",
+  "CREATE INDEX IF NOT EXISTS executor_tool_search_definitions_listing ON executor_tool_search_definitions (listing)",
+] as const;
+
+/** The 4.0.9 layout. Profiles own account selections; apps declare requirements. */
+export const version409Schema = schema({
+  version: "4.0.9",
+  tables: version409Tables,
+  up: ({ auto }) =>
+    auto.pipe(
+      Effect.map((operations) => [
+        ...operations,
+        ...toolSearchIndexes.map((sql) => ({ type: "custom" as const, sql })),
+      ]),
+    ),
+  relations: {
+    accounts: ({ one }) => ({
+      providerDefinition: one("providers", ["provider", "id"]).foreignKey(),
+    }),
+    apps: ({ one }) => ({
+      deployment: one("deployments", ["activeDeployment", "id"], ["code", "code"]).foreignKey(),
+    }),
+  },
+});
+
+/**
+ * Version 4.0.10 stores OAuth clients as resources of an owner, named by the connections that use
+ * them. A registered client is found again by its owner and `automatic_key`, a digest of the
+ * sign-in settings, callback included, it was registered for. A client entered by a person has
+ * none, unless it was moved from an earlier version's saved clients, whose keys were the same
+ * digest. The secret, and a registered client's full registration, are encrypted under the
+ * client's ID.
+ */
+/** Why a stored client no longer holds its credentials; see `executor_stored_oauth_client_credentials`. */
+export const CredentialsWithdrawal = Schema.Literals(["removed", "expired", "rejected"]);
+
+const storedOAuthClients = table("executor_stored_oauth_clients", {
+  id: idColumn("id", OAuthClientId, { type: "varchar(255)" }),
+  owner: column("owner", OwnerId, { type: "varchar(255)" }),
+  provider: column("provider", ProviderId, { type: "varchar(255)" }),
+  clientId: column("client_id", Schema.String),
+  source: column("source", OAuthClientSource, { type: "varchar(32)" }),
+  hasSecret: column("has_secret", Schema.Boolean),
+  automaticKey: column("automatic_key", Schema.NullOr(Schema.String), {
+    type: "varchar(255)",
+  }).default(null),
+  /** A sign-in has completed with this client, so a later rejection means it was revoked. */
+  confirmed: column("confirmed", Schema.Boolean).default(false),
+  encrypted: column("encrypted", Schema.Uint8Array),
+  createdAt: column("created_at", Schema.Date),
+});
+
+/**
+ * Every set of credentials a stored client holds or held, so credentials are one client wherever
+ * they are read from: a grant's copy, an entry in a connect form, or an attempt. The ID is a keyed
+ * digest (`Credentials.fingerprint`) of owner, provider, client ID and secret, so it is unique per
+ * owner and provider and two clients can never hold the same credentials. Editing a client's
+ * details adds a row and keeps the old one, so credentials it held before still resolve to it.
+ * Removing a client keeps its rows: credentials of a removed client are withdrawn, never unowned.
+ * Removing the owner removes them.
+ *
+ * `withdrawal` says why the client holding them is gone, and is null while one holds them. A
+ * sign-in pending with a client that is gone fails closed without an exchange. When the service
+ * itself refused that client (`rejected`) it reports that refusal, `registered_client_rejected`;
+ * a person removing it (`removed`), Executor discarding an expired registration (`expired`), or a
+ * row naming no reason, report `client_unavailable`.
+ */
+const storedOAuthClientCredentials = table("executor_stored_oauth_client_credentials", {
+  id: idColumn("id", Schema.String, { type: "varchar(255)" }),
+  owner: column("owner", OwnerId, { type: "varchar(255)" }),
+  provider: column("provider", ProviderId, { type: "varchar(255)" }),
+  client: column("client", OAuthClientId, { type: "varchar(255)" }),
+  withdrawal: column("withdrawal", Schema.NullOr(CredentialsWithdrawal), {
+    type: "varchar(32)",
+  }).default(null),
+  createdAt: column("created_at", Schema.Date),
+});
+
+/** Tables of the 4.0.10 layout. */
+export const version4010Tables = {
+  ...version409Tables,
+  storedOAuthClients,
+  storedOAuthClientCredentials,
+};
+
+/** Indexes added with stored OAuth clients in 4.0.10, created in the same step as their tables. */
+export const storedOAuthClientIndexes = [
+  "CREATE INDEX IF NOT EXISTS executor_stored_oauth_clients_owner_provider ON executor_stored_oauth_clients (owner, provider)",
+  "CREATE INDEX IF NOT EXISTS executor_stored_oauth_clients_owner_key ON executor_stored_oauth_clients (owner, automatic_key)",
+  "CREATE INDEX IF NOT EXISTS executor_stored_oauth_client_credentials_owner ON executor_stored_oauth_client_credentials (owner)",
+] as const;
+
+/** Current ORM layout. Profiles own account selections; apps declare requirements. */
+export const storageSchema = schema({
+  version: "4.0.10",
+  tables: version4010Tables,
+  up: ({ auto }) =>
+    auto.pipe(
+      Effect.map((operations) => [
+        ...operations,
+        ...storedOAuthClientIndexes.map((sql) => ({ type: "custom" as const, sql })),
       ]),
     ),
   relations: {

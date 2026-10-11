@@ -109,6 +109,61 @@ export const rotateKeyCommand = Command.make("rotate-key").pipe(
   ),
 );
 
+/**
+ * Install a newer release the way this copy was installed: a standalone install downloads and
+ * switches to it, and an npm-family install runs its package manager.
+ */
+export const upgradeCommand = Command.make("upgrade", {
+  version: Argument.String("version").pipe(
+    Argument.withDescription("Release to install, such as 2.0.0-beta.16. Default: the newest"),
+    Argument.optional,
+  ),
+  method: Flag.Literals("method", ["npm", "pnpm", "bun", "yarn"]).pipe(
+    Flag.withDescription("Package manager to install with, instead of the detected one"),
+    Flag.optional,
+  ),
+  yes: Flag.Boolean("yes").pipe(
+    Flag.withAlias("y"),
+    Flag.withDescription("Do not ask for confirmation; required to downgrade without a terminal"),
+    Flag.withDefault(false),
+  ),
+  rollback: Flag.Boolean("rollback").pipe(
+    Flag.withDescription(
+      "Switch a standalone install back to the version it ran before its last upgrade",
+    ),
+    Flag.withDefault(false),
+  ),
+}).pipe(
+  Command.withDescription(
+    "Install the newest Executor release on this installation's channel, or the given version. A standalone install keeps the previous version for --rollback",
+  ),
+);
+
+/**
+ * `executor upgrade` stopped. Every message says what to do next, and whether anything changed:
+ * only `install-failed` and `verify-failed` follow a package manager run, and a standalone
+ * install switches versions only after the new one has passed its checks.
+ */
+export class UpgradeFailed extends Schema.TaggedError<UpgradeFailed>()("UpgradeFailed", {
+  reason: Schema.Literals([
+    "development-build",
+    "invalid-version",
+    "registry-unavailable",
+    "unknown-release",
+    "node-too-old",
+    "unknown-install",
+    "downgrade-unconfirmed",
+    "cancelled",
+    "install-failed",
+    "verify-failed",
+    "download-failed",
+    "checksum-mismatch",
+    "no-previous-version",
+    "not-standalone",
+  ]),
+  message: Schema.String,
+}) {}
+
 /** Executor 1 commands that Executor 2 does not have. */
 export const LegacyCommandName = Schema.Literals([
   "web",
