@@ -81,13 +81,18 @@ export const makeRegistryStorage = Effect.gen(function* () {
               b.and(
                 name === undefined ? true : b("name", "=", name),
                 access === undefined ? true : b("owner", "=", access.owner),
-                access?.apps === undefined ? true : b("app", "in", access.apps),
               ),
             orderBy: ["name", "asc"],
           })
           .pipe(
             Effect.flatMap(Schema.decodeUnknownEffect(Schema.Array(StoredPublication))),
-            Effect.map((rows) => rows.map((row) => row.publication)),
+            // An app-scoped grant can name any number of apps, so filter here rather than bind
+            // one SQL parameter per app; the owner already bounds the rows to one organization.
+            Effect.map((rows) =>
+              rows
+                .filter((row) => access?.apps === undefined || access.apps.includes(row.app))
+                .map((row) => row.publication),
+            ),
           ),
       ),
     owned: (owner: OwnerId) =>

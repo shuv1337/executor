@@ -46,7 +46,10 @@ import {
 
 /** A catalog narrowed to one verified caller, which also resolves the copies that caller may make. */
 export interface NarrowedRegistry extends Registry {
-  /** The reviewed source of a listing this caller may copy, with the host's route as provenance. */
+  /**
+   * The reviewed source of a listing this caller may copy, with the host's route as provenance.
+   * It goes to the SDK's copy unchanged, so a reader it carries for stored public files is used.
+   */
   readonly copy: (reference: PublicationReference) => Effect.Effect<AppCopySnapshot, RegistryError>;
 }
 /** The executor and the product's authorization policy; every operation goes through the SDK. */

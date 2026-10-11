@@ -286,7 +286,7 @@ layer(HostedLive, { excludeTestServices: true })("Team registry", (it) => {
             yield* api.request(actors.owner, "GET", `${prefix}/apps/${copied.id}/workspace`),
           )).files,
         ).toEqual(files);
-        // A listing's binary public files are stored by blob, and a member's copy still carries them.
+        // A listing's binary public files are stored by blob, and a member's copy reads them from it.
         const assetsName = `${name}-assets`;
         const assets = yield* api.request(actors.owner, "POST", `${prefix}/apps/deploy`, {
           name: "Team assets",
@@ -300,6 +300,14 @@ layer(HostedLive, { excludeTestServices: true })("Team registry", (it) => {
               path: "ui/public/pixel.png",
               content:
                 "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+              encoding: "base64",
+            },
+            {
+              // Above the SDK's one-at-a-time size, so the copy reads it alone.
+              path: "ui/public/large.bin",
+              content: Buffer.from(
+                Uint8Array.from({ length: 1536 * 1024 }, (_, index) => index % 251),
+              ).toString("base64"),
               encoding: "base64",
             },
           ],
@@ -336,9 +344,10 @@ layer(HostedLive, { excludeTestServices: true })("Team registry", (it) => {
             `${prefix}/apps/${(yield* body(App, assetsCopy)).id}/workspace`,
           ),
         );
-        expect(copiedAssets.files.find((file) => file.path === "ui/public/pixel.png")).toEqual(
-          pixel,
-        );
+        for (const path of ["ui/public/pixel.png", "ui/public/large.bin"])
+          expect(copiedAssets.files.find((file) => file.path === path)).toEqual(
+            assetsSource.files.find((file) => file.path === path),
+          );
         // Revocation is evaluated on each request, even while the old session remains valid.
         expect(
           (yield* api.request(actors.owner, "POST", "/api/auth/organization/remove-member", {

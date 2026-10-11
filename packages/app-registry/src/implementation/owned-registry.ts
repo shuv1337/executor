@@ -2,22 +2,34 @@
 import { Effect } from "effect";
 import {
   RegistryError,
-  encodeBase64,
+  SourceError,
   type AppCopySnapshot,
   type AppId,
   type Executor,
   type OwnerId,
   type PublicationReference,
   type Registry,
-  type SourceFile,
 } from "@executor-js/sdk/core";
 import { publicationFailure, publicationSource } from "./manifest.ts";
 import type { RegistryStorage } from "./storage.ts";
 
+/**
+ * A copy snapshot with the reader for its stored public files. The SDK's copy reads `stored` for
+ * each stored file the new app's store lacks, one large file at a time, and checks the bytes
+ * against the file's Git object, as it does for its own publication copies.
+ */
+export type OwnedCopySnapshot = AppCopySnapshot & {
+  readonly stored: (file: {
+    readonly path: string;
+    readonly object: string;
+  }) => Effect.Effect<Uint8Array, SourceError>;
+};
 /** A narrowed catalog also resolves the copies its reader is allowed to make. */
 export interface OwnedRegistry extends Registry {
   /** The reviewed source of a listing this reader may copy. No app is created here. */
-  readonly copy: (reference: PublicationReference) => Effect.Effect<AppCopySnapshot, RegistryError>;
+  readonly copy: (
+    reference: PublicationReference,
+  ) => Effect.Effect<OwnedCopySnapshot, RegistryError>;
 }
 
 /**
@@ -64,23 +76,12 @@ export const ownedRegistry = (
         );
         if (manifest.name !== reference.package)
           return yield* new RegistryError({ reason: "invalid-source" });
-        // A copy carries no reader for the listing's stored public files, so inline their bytes.
-        const files = yield* Effect.forEach(
-          found.files,
-          (source): Effect.Effect<SourceFile, RegistryError> =>
-            "object" in source
-              ? file(reference.package, reference.commit, source.path).pipe(
-                  Effect.map((bytes) => ({
-                    path: source.path,
-                    content: encodeBase64(bytes),
-                    encoding: "base64" as const,
-                  })),
-                )
-              : Effect.succeed(source),
-          { concurrency: 1 },
-        );
         return {
-          files,
+          files: found.files,
+          stored: ({ path }) =>
+            file(reference.package, reference.commit, path).pipe(
+              Effect.mapError(() => new SourceError({ reason: "not-found" })),
+            ),
           origin: {
             reference: new URL(
               `${sourcePath}?name=${encodeURIComponent(reference.package)}&commit=${encodeURIComponent(reference.commit)}`,
