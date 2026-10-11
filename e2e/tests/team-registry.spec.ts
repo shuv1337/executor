@@ -286,6 +286,59 @@ layer(HostedLive, { excludeTestServices: true })("Team registry", (it) => {
             yield* api.request(actors.owner, "GET", `${prefix}/apps/${copied.id}/workspace`),
           )).files,
         ).toEqual(files);
+        // A listing's binary public files are stored by blob, and a member's copy still carries them.
+        const assetsName = `${name}-assets`;
+        const assets = yield* api.request(actors.owner, "POST", `${prefix}/apps/deploy`, {
+          name: "Team assets",
+          files: [
+            ...files.filter((file) => file.path !== "package.json"),
+            {
+              path: "package.json",
+              content: JSON.stringify({ name: assetsName, dependencies: withApps() }),
+            },
+            {
+              path: "ui/public/pixel.png",
+              content:
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+              encoding: "base64",
+            },
+          ],
+        });
+        expect(assets.status).toBe(200);
+        const assetsApp = yield* body(App, assets);
+        const StoredFiles = Schema.Struct({
+          revision: Schema.Struct({ commit: Schema.String }),
+          files: Schema.Array(
+            Schema.Struct({ path: Schema.String, object: Schema.optional(Schema.String) }),
+          ),
+        });
+        const assetsSource = yield* body(
+          StoredFiles,
+          yield* api.request(actors.owner, "GET", `${prefix}/apps/${assetsApp.id}/workspace`),
+        );
+        const pixel = assetsSource.files.find((file) => file.path === "ui/public/pixel.png");
+        expect(pixel?.object).toMatch(/^[a-f0-9]{40}$/u);
+        expect(
+          (yield* api.request(actors.owner, "POST", `${prefix}/apps/${assetsApp.id}/publication`, {
+            commit: assetsSource.revision.commit,
+          })).status,
+        ).toBe(200);
+        const assetsCopy = yield* api.request(actors.member, "POST", `${prefix}/apps/copies`, {
+          name: "Member assets copy",
+          from: { package: assetsName, commit: assetsSource.revision.commit },
+        });
+        expect(assetsCopy.status).toBe(200);
+        const copiedAssets = yield* body(
+          StoredFiles,
+          yield* api.request(
+            actors.member,
+            "GET",
+            `${prefix}/apps/${(yield* body(App, assetsCopy)).id}/workspace`,
+          ),
+        );
+        expect(copiedAssets.files.find((file) => file.path === "ui/public/pixel.png")).toEqual(
+          pixel,
+        );
         // Revocation is evaluated on each request, even while the old session remains valid.
         expect(
           (yield* api.request(actors.owner, "POST", "/api/auth/organization/remove-member", {

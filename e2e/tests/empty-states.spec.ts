@@ -175,15 +175,18 @@ layer(HostedLive, { excludeTestServices: true })("Empty states", (it) => {
           page.waitForURL(`**/org/${actors.organization.slug}/apps`),
         );
 
-        yield* browser.use("Fail the catalog read", (page) =>
-          page.route(/\/api\/catalog(?:\?|$)/, (route) => route.abort("failed")),
+        yield* browser.use("Fail the catalog reads", (page) =>
+          page.route(
+            /\/api\/(?:catalog(?:\?|$)|organizations\/[^/]+\/app-publications(?:\?|$))/,
+            (route) => route.abort("failed"),
+          ),
         );
-        // The running dashboard keeps the catalog it already loaded, so a new document reads it again.
-        yield* browser.use("Open Add app during the failure", (page) =>
-          page.goto(`/org/${actors.organization.slug}/apps/add`),
+        yield* openThroughBrowser(
+          "Open Add app during the failure",
+          `/org/${actors.organization.slug}/apps/add`,
         );
         yield* browser.use("The catalog error is visible", (page) =>
-          page.getByText("Can’t reach Executor", { exact: true }).waitFor(),
+          page.getByText("Unable to complete this request", { exact: true }).first().waitFor(),
         );
         expect(
           yield* browser.use("Failure is not a search result", (page) =>
