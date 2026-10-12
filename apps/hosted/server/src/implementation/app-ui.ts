@@ -1,11 +1,13 @@
 import { CurrentAuthorization } from "../contracts/authorization.ts";
 import { CurrentUsage, recordUsage } from "../contracts/product-analytics.ts";
-import { fullAuthority } from "@executor-js/authorization";
+import { authorizeTool } from "./authorization.ts";
+import { fullAuthority, type AuthorizationPolicy } from "@executor-js/authorization";
 import { GroupDatabase } from "../contracts/groups.ts";
 import { requireAccountAccess, requireAppAccess, requireAppUse } from "./resource-policy.ts";
 /** Hosted policy around the shared app browser protocol and retained asset renderer. */
 import {
   ProfileId,
+  ToolName,
   ProfileConflict,
   AccountRequired,
   AccountNotFound,
@@ -47,6 +49,7 @@ import { Clock, Context, Effect, Option, Redacted, Schema, Stream } from "effect
 import { HttpApiBuilder } from "effect/http-api";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 import {
+  NativeAppRedeemInput,
   AppUiUnavailable,
   HostedAppRuntime,
   HostedAppSessions,
@@ -54,7 +57,7 @@ import {
   type AppUiAddressInvalid,
   type AppUiTarget,
 } from "../contracts/app-ui.ts";
-import { Authentication, CurrentUserId, type Principal } from "../contracts/auth.ts";
+import { Authentication, CurrentUserId, Unauthorized, type Principal } from "../contracts/auth.ts";
 import { HostedExecutor } from "../contracts/executor.ts";
 import {
   CurrentOrganization,
@@ -69,6 +72,8 @@ import type { appAddresses } from "./app-addresses.ts";
 class CurrentAppUi extends Context.Service<
   CurrentAppUi,
   {
+    readonly policy: AuthorizationPolicy;
+    readonly profile?: ProfileId;
     readonly target: AppUiTarget;
     readonly app: App;
     readonly access: OrganizationAccess & { readonly userId: string };
@@ -108,11 +113,16 @@ export const hostedAppUi = <R = never>(
     const host = addresses.fromHost(request.headers.host);
     if (Option.isNone(host)) return yield* new UiForbidden();
     const safe = request.method === "GET" || request.method === "HEAD";
+    const nativePost =
+      request.method === "POST" &&
+      new URL(request.url, host.value.origin).pathname === "/_executor/native/redeem" &&
+      (request.headers.origin === undefined || request.headers.origin === "null");
     if (
-      (!safe && request.headers.origin !== host.value.origin) ||
-      (request.headers.origin !== undefined && request.headers.origin !== host.value.origin) ||
-      (request.headers["sec-fetch-site"] === "cross-site" &&
-        !(request.method === "GET" && request.headers["sec-fetch-mode"] === "navigate"))
+      !nativePost &&
+      ((!safe && request.headers.origin !== host.value.origin) ||
+        (request.headers.origin !== undefined && request.headers.origin !== host.value.origin) ||
+        (request.headers["sec-fetch-site"] === "cross-site" &&
+          !(request.method === "GET" && request.headers["sec-fetch-mode"] === "navigate")))
     )
       return yield* new UiForbidden();
     return { request, host: host.value };
@@ -189,7 +199,13 @@ export const hostedAppUi = <R = never>(
           Schema.is(OrganizationForbidden)(error) ? new UiForbidden() : unavailable(),
         ),
       );
-      return { ...resolved, access, app };
+      return {
+        ...resolved,
+        access,
+        app,
+        policy: identity.policy ?? fullAuthority,
+        ...(identity.profile === undefined ? {} : { profile: identity.profile }),
+      };
     });
   const authorize = Effect.flatMap(target, authorizeTarget);
   const assets = (version: DeploymentMetadata, path: string) =>
@@ -290,41 +306,92 @@ export const hostedAppUi = <R = never>(
       );
     });
   const dashboard = HttpApiBuilder.group(HostedAppUiApi, "appUi", (handlers) =>
-    handlers.handle("location", ({ params }) =>
-      Effect.gen(function* () {
-        const access = yield* CurrentOrganization;
-        // Missing and inaccessible apps fail alike, before the app is read.
-        yield* requireAppAccess(params.app, "use");
-        const executor = yield* Effect.flatten(HostedExecutor);
-        const app = yield* executor.apps.get({ owner: access.owner, app: params.app });
-        if (app.activeDeployment === null) return yield* new AppNotDeployed({ app: app.id });
-        const version = yield* executor.apps.deployment({
-          owner: app.owner,
-          app: app.id,
-          deployment: app.activeDeployment,
-          deploymentOwner: app.owner,
-        });
-        // The build, organization and domain reads below fail only when their records are unavailable.
-        const page = yield* assets(version, "index.html").pipe(
-          Effect.mapError(() => new AppUiUnavailable()),
-        );
-        if (page === undefined)
-          return { status: "unavailable" as const, url: null, reason: "no_ui" as const };
-        if (!addresses.enabled)
-          return { status: "unavailable" as const, url: null, reason: "no_app_domain" as const };
-        const sessions = yield* HostedAppSessions;
-        const organization = yield* sessions
-          .organization({ id: access.organization })
-          .pipe(Effect.mapError(() => new AppUiUnavailable()));
-        const url = yield* addresses
-          .origin(app, organization.slug)
-          .pipe(Effect.catchTag("UiFailed", () => Effect.fail(new AppUiUnavailable())));
-        const status = yield* domainStatus(organization).pipe(
-          Effect.catchTag("UiFailed", () => Effect.fail(new AppUiUnavailable())),
-        );
-        return status === "ready" ? { status, url } : { status, url: null };
-      }),
-    ),
+    handlers
+      .handle("nativeLaunch", ({ params, payload }) =>
+        Effect.gen(function* () {
+          const access = yield* CurrentOrganization;
+          yield* requireAppAccess(params.app, "use");
+          const executor = yield* Effect.flatten(HostedExecutor);
+          const app = yield* executor.apps.get({ owner: access.owner, app: params.app });
+          yield* selectedProfile(executor, access.owner, app.id, payload.profile).pipe(
+            Effect.mapError(() => new UiForbidden()),
+          );
+          const sessions = yield* HostedAppSessions;
+          const organization = yield* sessions.organization({ id: access.organization });
+          const origin = yield* addresses.origin(app, organization.slug);
+          const request = yield* HttpServerRequest.HttpServerRequest;
+          const launched = yield* sessions.nativeLaunch(
+            { app: app.id, organization: organization.id, slug: organization.slug, origin },
+            new Headers(request.headers),
+            payload,
+          );
+          return { ...launched, redeemUrl: `${origin}/_executor/native/redeem` };
+        }).pipe(
+          Effect.catchTags({
+            UiUnauthorized: () => Effect.fail(new Unauthorized()),
+            UiForbidden: () => Effect.fail(new OrganizationForbidden()),
+            UiFailed: () => Effect.fail(new AppUiUnavailable()),
+          }),
+        ),
+      )
+      .handle("nativeRevoke", ({ params, payload }) =>
+        Effect.gen(function* () {
+          const access = yield* CurrentOrganization;
+          const sessions = yield* HostedAppSessions;
+          const executor = yield* Effect.flatten(HostedExecutor);
+          const app = yield* executor.apps.get({ owner: access.owner, app: params.app });
+          const organization = yield* sessions.organization({ id: access.organization });
+          const origin = yield* addresses.origin(app, organization.slug);
+          const request = yield* HttpServerRequest.HttpServerRequest;
+          yield* sessions.nativeRevoke(
+            { app: app.id, organization: organization.id, slug: organization.slug, origin },
+            new Headers(request.headers),
+            payload.sessionId,
+          );
+          return { revoked: true };
+        }).pipe(
+          Effect.catchTags({
+            UiUnauthorized: () => Effect.fail(new Unauthorized()),
+            UiForbidden: () => Effect.fail(new OrganizationForbidden()),
+            UiFailed: () => Effect.fail(new AppUiUnavailable()),
+          }),
+        ),
+      )
+      .handle("location", ({ params }) =>
+        Effect.gen(function* () {
+          const access = yield* CurrentOrganization;
+          // Missing and inaccessible apps fail alike, before the app is read.
+          yield* requireAppAccess(params.app, "use");
+          const executor = yield* Effect.flatten(HostedExecutor);
+          const app = yield* executor.apps.get({ owner: access.owner, app: params.app });
+          if (app.activeDeployment === null) return yield* new AppNotDeployed({ app: app.id });
+          const version = yield* executor.apps.deployment({
+            owner: app.owner,
+            app: app.id,
+            deployment: app.activeDeployment,
+            deploymentOwner: app.owner,
+          });
+          // The build, organization and domain reads below fail only when their records are unavailable.
+          const page = yield* assets(version, "index.html").pipe(
+            Effect.mapError(() => new AppUiUnavailable()),
+          );
+          if (page === undefined)
+            return { status: "unavailable" as const, url: null, reason: "no_ui" as const };
+          if (!addresses.enabled)
+            return { status: "unavailable" as const, url: null, reason: "no_app_domain" as const };
+          const sessions = yield* HostedAppSessions;
+          const organization = yield* sessions
+            .organization({ id: access.organization })
+            .pipe(Effect.mapError(() => new AppUiUnavailable()));
+          const url = yield* addresses
+            .origin(app, organization.slug)
+            .pipe(Effect.catchTag("UiFailed", () => Effect.fail(new AppUiUnavailable())));
+          const status = yield* domainStatus(organization).pipe(
+            Effect.catchTag("UiFailed", () => Effect.fail(new AppUiUnavailable())),
+          );
+          return status === "ready" ? { status, url } : { status, url: null };
+        }),
+      ),
   );
   const dataFailure = (error: unknown) =>
     Schema.is(ProfileConflict)(error) && error.reason === "revision"
@@ -345,6 +412,19 @@ export const hostedAppUi = <R = never>(
       const profile = yield* Schema.decodeUnknownEffect(Schema.optional(ProfileId))(
         payload.profile,
       ).pipe(Effect.mapError(unavailable));
+      if (current.profile !== undefined && profile !== current.profile)
+        return yield* new UiForbidden();
+      if (current.profile !== undefined) {
+        const tool = yield* Schema.decodeUnknownEffect(ToolName)(payload.name).pipe(
+          Effect.mapError(() => new UiForbidden()),
+        );
+        yield* authorizeTool({ app: current.app.id, profile, tool }).pipe(
+          Effect.provideService(CurrentAuthorization, current.policy),
+          Effect.provideService(CurrentOrganization, current.access),
+          Effect.provideService(CurrentUserId, current.access.userId),
+          Effect.mapError(() => new UiForbidden()),
+        );
+      }
       if (profile !== undefined) {
         const executor = yield* Effect.flatten(HostedExecutor).pipe(Effect.mapError(unavailable));
         yield* selectedProfile(executor, current.access.owner, current.app.id, profile).pipe(
@@ -376,7 +456,7 @@ export const hostedAppUi = <R = never>(
       const executor = yield* Effect.flatten(HostedExecutor).pipe(Effect.mapError(unavailable));
       return yield* executor.appData[kind](input).pipe(
         Effect.provideService(CurrentOrganization, current.access),
-        Effect.provideService(CurrentAuthorization, fullAuthority),
+        Effect.provideService(CurrentAuthorization, current.policy),
         Effect.provideService(CurrentUserId, current.access.userId),
         Effect.provideService(CurrentUsage, { source: "app_ui" }),
         Effect.mapError(dataFailure),
@@ -527,7 +607,11 @@ export const hostedAppUi = <R = never>(
         navigation ? Effect.succeed(Option.none()) : Effect.fail(error),
       ),
     );
-    if (Option.isNone(authorized)) return yield* beginSignIn(resolved);
+    if (Option.isNone(authorized)) {
+      if (new URL(request.url, resolved.target.origin).searchParams.get("native") === "1")
+        return yield* new UiUnauthorized();
+      return yield* beginSignIn(resolved);
+    }
     const current = authorized.value;
     const version = yield* deployment(current.app);
     const url = new URL(request.url, current.target.origin);
@@ -550,6 +634,8 @@ export const hostedAppUi = <R = never>(
     const profile = yield* Schema.decodeUnknownEffect(Schema.optional(ProfileId))(
       requested ?? undefined,
     ).pipe(Effect.mapError(unavailable));
+    if (current.profile !== undefined && profile !== current.profile)
+      return yield* new UiForbidden();
     const executor = yield* Effect.flatten(HostedExecutor).pipe(Effect.mapError(unavailable));
     if (
       profile === undefined &&
@@ -713,6 +799,35 @@ export const hostedAppUi = <R = never>(
     if (path === undefined) return yield* appAsset(undefined, version.build, params["*"]);
     return yield* appAsset(yield* assets(version, path), version.build, path);
   }).pipe(htmlFailure);
+  const nativeRedeem = Effect.gen(function* () {
+    const resolved = yield* target;
+    const input = yield* resolved.request.json.pipe(
+      Effect.flatMap(Schema.decodeUnknownEffect(NativeAppRedeemInput)),
+      Effect.mapError(() => new UiUnauthorized()),
+    );
+    const sessions = yield* HostedAppSessions;
+    const completed = yield* sessions.nativeRedeem(resolved.target, input);
+    yield* requireAppUse(
+      resolved.app,
+      resolved.target.organization,
+      (yield* sessions.current(resolved.target, completed.token)).userId,
+    ).pipe(Effect.mapError(() => new UiForbidden()));
+    const returnTo = `/?profile=${encodeURIComponent(completed.profile)}&native=1`;
+    return yield* HttpServerResponse.redirect(returnTo, {
+      status: 303,
+      headers: appPrivateHeaders,
+    }).pipe(
+      HttpServerResponse.setCookie(
+        sessionCookie(resolved.target.origin),
+        Redacted.value(completed.token),
+        {
+          ...cookieOptions(resolved.target.origin),
+          maxAge: Math.max(0, completed.expiresAt.getTime() - (yield* Clock.currentTimeMillis)),
+        },
+      ),
+      Effect.orDie,
+    );
+  }).pipe(Effect.catch((error) => Effect.succeed(failure(error))));
   const originAccess = HttpRouter.middleware((response) =>
     requestOrigin.pipe(
       Effect.matchEffect({
@@ -738,6 +853,7 @@ export const hostedAppUi = <R = never>(
     );
   return {
     signIn,
+    nativeRedeem,
     callback,
     dashboard,
     calls,

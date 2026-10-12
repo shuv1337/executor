@@ -1,9 +1,10 @@
 /** The private app protocol is checked through each real hosted product and its browser runtime. */
 import { expect, layer } from "@effect/vitest";
-import { Effect, Layer, Redacted, Schema } from "effect";
+import { Clock, Effect, Fiber, Layer, Redacted, Schema } from "effect";
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http";
-import { randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { scenarios } from "../test-plan.ts";
+import { createProfile } from "../support/profiles.ts";
 import { Actors } from "../support/actors.ts";
 import { Api, body } from "../support/api.ts";
 import { Browser } from "../support/browser.ts";
@@ -169,6 +170,201 @@ const mcpSession = Effect.gen(function* () {
 });
 
 layer(HostedLive, { excludeTestServices: true })("Private app pages", (it) => {
+  it.effect(scenarios.appUiNative.title, (context) =>
+    withHostedCase(
+      context,
+      Effect.gen(function* () {
+        const { api, actors, browser, app, prefix, url } = yield* appFixture;
+        const oauth = yield* McpOAuth;
+        const http = yield* HttpClient.HttpClient;
+        const appPath = `${prefix}/apps/${app.id}`;
+        const own = yield* createProfile(actors.owner, appPath);
+        const other = yield* createProfile(actors.owner, appPath);
+        const current = yield* body(
+          Schema.Struct({ activeDeployment: Schema.String }),
+          yield* api.request(actors.owner, "GET", appPath),
+        );
+        yield* browser.login(actors.owner);
+        const grant = yield* oauth.authorizeApi;
+        const policy = {
+          kind: "tools",
+          approval: "client",
+          apps: [
+            {
+              app: app.id,
+              tools: { kind: "selected", names: ["list"] },
+              events: { kind: "selected", names: [] },
+              targets: [{ kind: "profile", id: own.id }],
+            },
+          ],
+        };
+        expect(
+          (yield* api.request(actors.owner, "POST", "/api/auth/mcp/grants/narrow", {
+            id: grant.grantId,
+            policy,
+          })).status,
+        ).toBe(200);
+        const anonymous = yield* api.session();
+        const headers = { authorization: `Bearer ${Redacted.value(grant.tokens).access_token}` };
+        const verifier = randomBytes(32).toString("base64url");
+        const challenge = createHash("sha256").update(verifier).digest("base64url");
+        const Launch = Schema.Struct({
+          ticket: Schema.RedactedFromValue(Schema.String),
+          sessionId: Schema.String,
+          redeemUrl: Schema.String,
+          expiresAt: Schema.String,
+        });
+        const launch = Effect.gen(function* () {
+          const response = yield* api.request(
+            anonymous,
+            "POST",
+            `${appPath}/ui/launch`,
+            { profile: own.id, challenge },
+            headers,
+          );
+          expect(response.status).toBe(200);
+          const result = yield* body(Launch, response);
+          expect(result.redeemUrl).toBe(`${url}/_executor/native/redeem`);
+          return result;
+        });
+        const send = (request: HttpClientRequest.HttpClientRequest) =>
+          request.pipe(
+            http.execute,
+            Effect.flatMap((response) =>
+              response.text.pipe(
+                Effect.map((text) => ({
+                  status: response.status,
+                  headers: response.headers,
+                  text: Redacted.make(text),
+                })),
+              ),
+            ),
+            Effect.provideService(FetchHttpClient.RequestInit, { redirect: "manual" }),
+          );
+        const redeem = (value: typeof Launch.Type, proof = verifier, origin?: string) =>
+          send(
+            HttpClientRequest.post(value.redeemUrl).pipe(
+              HttpClientRequest.bodyJsonUnsafe({
+                ticket: Redacted.value(value.ticket),
+                verifier: proof,
+              }),
+              HttpClientRequest.setHeaders(origin === undefined ? {} : { origin }),
+            ),
+          );
+        const revoke = (sessionId: string) =>
+          api.request(anonymous, "POST", `${appPath}/ui/revoke`, { sessionId }, headers);
+        const operation = (cookie: Redacted.Redacted<string>, profile = own.id, name = "list") =>
+          send(
+            HttpClientRequest.post(`${url}/_executor/api/query`).pipe(
+              HttpClientRequest.setHeaders({ cookie: Redacted.value(cookie), origin: url }),
+              HttpClientRequest.bodyJsonUnsafe({
+                deployment: current.activeDeployment,
+                profile,
+                name,
+                input: {},
+              }),
+            ),
+          );
+        expect(
+          (yield* api.request(actors.owner, "POST", `${appPath}/ui/launch`, {
+            profile: own.id,
+            challenge,
+          })).status,
+        ).toBe(401);
+        expect(
+          (yield* api.request(
+            anonymous,
+            "POST",
+            `${appPath}/ui/launch`,
+            { profile: other.id, challenge },
+            headers,
+          )).status,
+        ).toBe(403);
+        const first = yield* launch;
+        const expiring = yield* launch;
+        expect((yield* redeem(first, "x".repeat(43))).status).toBe(401);
+        expect((yield* redeem(first, verifier, "https://untrusted.example")).status).toBe(403);
+        const competing = yield* Effect.all([redeem(first), redeem(first), redeem(first)], {
+          concurrency: "unbounded",
+        });
+        expect(competing.map((item) => item.status).sort()).toEqual([303, 401, 401]);
+        const accepted = competing.find((item) => item.status === 303);
+        if (accepted === undefined) return yield* Effect.die("No native redemption succeeded");
+        const cookieHeader = accepted.headers["set-cookie"] ?? "";
+        expect(cookieHeader.includes("HttpOnly")).toBe(true);
+        expect(cookieHeader.includes("Domain=")).toBe(false);
+        const cookie = Redacted.make(cookieHeader.split(";")[0] ?? "");
+        expect((yield* redeem(first)).status).toBe(401);
+        expect((yield* operation(cookie)).status).toBe(200);
+        expect((yield* operation(cookie, other.id)).status).toBe(403);
+        expect((yield* operation(cookie, own.id, "save")).status).toBe(403);
+        expect(
+          (yield* send(
+            HttpClientRequest.get(`${url}/?profile=${own.id}&native=1`).pipe(
+              HttpClientRequest.setHeaders({ cookie: Redacted.value(cookie), accept: "text/html" }),
+            ),
+          )).status,
+        ).toBe(200);
+        const pending = yield* launch;
+        expect((yield* revoke(pending.sessionId)).status).toBe(200);
+        expect((yield* redeem(pending)).status).toBe(401);
+        const second = yield* launch;
+        const secondRedeem = yield* redeem(second);
+        expect(secondRedeem.status).toBe(303);
+        const secondCookie = Redacted.make(
+          (secondRedeem.headers["set-cookie"] ?? "").split(";")[0] ?? "",
+        );
+        const subscription = yield* http.execute(
+          HttpClientRequest.post(`${url}/_executor/api/subscribe`).pipe(
+            HttpClientRequest.setHeaders({ cookie: Redacted.value(cookie), origin: url }),
+            HttpClientRequest.bodyJsonUnsafe({
+              deployment: current.activeDeployment,
+              profile: own.id,
+              name: "list",
+              input: {},
+            }),
+          ),
+        );
+        expect(subscription.status).toBe(200);
+        const stream = yield* subscription.text.pipe(Effect.forkScoped);
+        expect((yield* revoke(first.sessionId)).status).toBe(200);
+        const closed = yield* Fiber.join(stream).pipe(Effect.timeout("12 seconds"));
+        expect(closed.includes("UiUnauthorized")).toBe(true);
+        expect((yield* operation(cookie)).status).toBe(401);
+        expect((yield* operation(secondCookie)).status).toBe(200);
+        const endedPage = yield* send(
+          HttpClientRequest.get(`${url}/?profile=${own.id}&native=1`).pipe(
+            HttpClientRequest.setHeaders({ cookie: Redacted.value(cookie), accept: "text/html" }),
+          ),
+        );
+        expect(endedPage.status).toBe(401);
+        expect(endedPage.headers.location).toBeUndefined();
+        // Wait against the server's real advertised ticket deadline, never edit its auth rows.
+        const remaining = Math.max(
+          0,
+          Date.parse(expiring.expiresAt) - (yield* Clock.currentTimeMillis) + 50,
+        );
+        yield* Effect.sleep(remaining);
+        expect((yield* redeem(expiring)).status).toBe(401);
+        expect(
+          (yield* api.request(actors.owner, "POST", "/api/auth/mcp/grants/narrow", {
+            id: grant.grantId,
+            policy: {
+              ...policy,
+              apps: policy.apps.map((item) => ({
+                ...item,
+                tools: { kind: "selected", names: [] },
+              })),
+            },
+          })).status,
+        ).toBe(200);
+        expect((yield* operation(secondCookie)).status).toBe(403);
+        yield* oauth.revoke(grant);
+        expect((yield* operation(secondCookie)).status).toBe(401);
+      }).pipe(Effect.provide(McpOAuth.layer)),
+    ),
+  );
+
   it.effect(scenarios.appUiApiDocument.title, (context) =>
     withHostedCase(
       context,

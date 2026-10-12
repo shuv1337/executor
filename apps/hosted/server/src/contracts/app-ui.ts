@@ -3,6 +3,7 @@ import { defaultUrlPolicy, parseEndpoint } from "@executor-js/utils/url-policy";
 import { ApiError } from "@executor-js/utils/api-error";
 import {
   AppId,
+  ProfileId,
   AppNotDeployed,
   AppNotFound,
   DeploymentNotFound,
@@ -14,6 +15,8 @@ import { AppReturnPath, AppSignInCode, AppSignInId } from "apps/ui/auth/contract
 import { UiFailed, UiForbidden, UiUnauthorized } from "apps/ui/contracts";
 import { Context, type Effect, Schema } from "effect";
 import { HttpApi, HttpApiEndpoint, HttpApiGroup, OpenApi } from "effect/http-api";
+import { AuthorizationPolicy } from "@executor-js/authorization";
+import { RequiredAction } from "./authorization.ts";
 import { Principal } from "./auth.ts";
 import {
   OrganizationForbidden,
@@ -112,13 +115,85 @@ export const AppUiSession = Schema.Struct({
   parent: Principal.fields.sessionId,
   user: Principal.fields.userId,
 });
+/** Native exchange state retains only an OAuth hash and the exact launch-time authority. */
+const nativeFields = {
+  target: AppUiTarget,
+  user: Principal.fields.userId,
+  hash: Schema.String,
+  profile: ProfileId,
+  policy: AuthorizationPolicy,
+  sessionId: Schema.String,
+  sessionExpiresAt: Schema.Number,
+};
+export const NativeAppTicket = Schema.Struct({
+  kind: Schema.Literal("native_ticket"),
+  ...nativeFields,
+  challenge: Schema.String,
+});
+export const NativeAppSession = Schema.Struct({
+  kind: Schema.Literal("native_session"),
+  ...nativeFields,
+});
+export const NativeAppMarker = Schema.Struct({
+  kind: Schema.Literal("native_marker"),
+  ...nativeFields,
+});
+export const NativeAppLaunchInput = Schema.Struct({
+  profile: ProfileId,
+  challenge: Schema.String.check(Schema.isPattern(/^[A-Za-z0-9_-]{43}$/u)),
+});
+export const NativeAppRedeemInput = Schema.Struct({
+  ticket: AppSignInCode,
+  verifier: Schema.String.check(Schema.isPattern(/^[A-Za-z0-9._~-]{43,128}$/u)),
+});
+export interface NativeAppAuthority {
+  readonly userId: string;
+  readonly hash: string;
+  readonly policy: typeof AuthorizationPolicy.Type;
+  readonly expiresAt: Date;
+}
 /** Versioned records live in Better Auth's existing expiring verification store. */
-export const AppUiRecord = Schema.Union([AppUiAttempt, AppUiGrant, AppUiSession]);
+export const AppUiRecord = Schema.Union([
+  AppUiAttempt,
+  AppUiGrant,
+  AppUiSession,
+  NativeAppTicket,
+  NativeAppSession,
+  NativeAppMarker,
+]);
 
 /** Product authentication operations backed by the host's Better Auth instance. */
 export class HostedAppSessions extends Context.Service<
   HostedAppSessions,
   {
+    readonly nativeLaunch: (
+      target: AppUiTarget,
+      headers: Headers,
+      input: typeof NativeAppLaunchInput.Type,
+    ) => Effect.Effect<
+      {
+        readonly ticket: typeof AppSignInCode.Type;
+        readonly sessionId: string;
+        readonly expiresAt: Date;
+      },
+      UiUnauthorized | UiForbidden | UiFailed
+    >;
+    readonly nativeRedeem: (
+      target: AppUiTarget,
+      input: typeof NativeAppRedeemInput.Type,
+    ) => Effect.Effect<
+      {
+        readonly token: typeof AppSignInCode.Type;
+        readonly profile: ProfileId;
+        readonly expiresAt: Date;
+      },
+      UiUnauthorized | UiForbidden | UiFailed
+    >;
+    readonly nativeRevoke: (
+      target: AppUiTarget,
+      headers: Headers,
+      sessionId: string,
+    ) => Effect.Effect<void, UiUnauthorized | UiForbidden | UiFailed>;
     readonly organization: (
       find:
         | { readonly id: OrganizationId }
@@ -166,7 +241,14 @@ export class HostedAppSessions extends Context.Service<
     readonly current: (
       target: AppUiTarget,
       token: typeof AppSignInCode.Type,
-    ) => Effect.Effect<{ readonly userId: string }, UiUnauthorized | UiForbidden | UiFailed>;
+    ) => Effect.Effect<
+      {
+        readonly userId: string;
+        readonly policy?: typeof AuthorizationPolicy.Type;
+        readonly profile?: ProfileId;
+      },
+      UiUnauthorized | UiForbidden | UiFailed
+    >;
   }
 >()("hosted/AppSessions") {}
 
@@ -176,25 +258,65 @@ export class HostedAppRuntime extends Context.Service<HostedAppRuntime, Pick<Run
 ) {}
 
 /** URL discovery uses organization grants; browser authorization still requires a user session. */
-export const HostedAppUi = HttpApiGroup.make("appUi").add(
-  HttpApiEndpoint.get("location", "/api/organizations/:organization/apps/:app/ui", {
-    params: { organization: OrganizationReference, app: AppId },
-    success: AppUiLocation,
-    error: [
-      OrganizationForbidden,
-      StorageError,
-      AppNotFound,
-      AppNotDeployed,
-      DeploymentNotFound,
-      AppUiAddressInvalid,
-      AppUiUnavailable,
-    ],
-  })
-    .annotate(
-      OpenApi.Description,
-      "Get the canonical private app URL. Fails with AppNotDeployed until the app's first deployment. Returns null when the deployed app has no UI or the host has no app domain. Open the returned URL in a browser to sign in; no separate publish step is needed.",
-    )
-    .middleware(RequireOrganization),
-);
+export const HostedAppUi = HttpApiGroup.make("appUi")
+  .add(
+    HttpApiEndpoint.post("nativeLaunch", "/api/organizations/:organization/apps/:app/ui/launch", {
+      params: { organization: OrganizationReference, app: AppId },
+      payload: NativeAppLaunchInput,
+      success: Schema.Struct({
+        ticket: AppSignInCode,
+        sessionId: Schema.String,
+        redeemUrl: HttpUrl,
+        expiresAt: Schema.DateFromString,
+      }),
+      error: [
+        AppUiUnavailable,
+        OrganizationForbidden,
+        StorageError,
+        AppNotFound,
+        AppUiAddressInvalid,
+      ],
+    })
+      .annotate(RequiredAction, "run")
+      .middleware(RequireOrganization),
+  )
+  .add(
+    HttpApiEndpoint.post("nativeRevoke", "/api/organizations/:organization/apps/:app/ui/revoke", {
+      params: { organization: OrganizationReference, app: AppId },
+      payload: Schema.Struct({
+        sessionId: Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/u)),
+      }),
+      success: Schema.Struct({ revoked: Schema.Boolean }),
+      error: [
+        AppUiUnavailable,
+        OrganizationForbidden,
+        StorageError,
+        AppNotFound,
+        AppUiAddressInvalid,
+      ],
+    })
+      .annotate(RequiredAction, "run")
+      .middleware(RequireOrganization),
+  )
+  .add(
+    HttpApiEndpoint.get("location", "/api/organizations/:organization/apps/:app/ui", {
+      params: { organization: OrganizationReference, app: AppId },
+      success: AppUiLocation,
+      error: [
+        OrganizationForbidden,
+        StorageError,
+        AppNotFound,
+        AppNotDeployed,
+        DeploymentNotFound,
+        AppUiAddressInvalid,
+        AppUiUnavailable,
+      ],
+    })
+      .annotate(
+        OpenApi.Description,
+        "Get the canonical private app URL. Fails with AppNotDeployed until the app's first deployment. Returns null when the deployed app has no UI or the host has no app domain. Open the returned URL in a browser to sign in; no separate publish step is needed.",
+      )
+      .middleware(RequireOrganization),
+  );
 /** A browser client can consume the same narrow contract without importing a host's full API. */
 export const HostedAppUiApi = HttpApi.make("executor-hosted").add(HostedAppUi);

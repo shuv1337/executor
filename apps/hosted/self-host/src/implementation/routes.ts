@@ -189,6 +189,7 @@ export const selfHostRouteMap = <DashboardE, DashboardR>(options: {
         Layer.provide(appUi.calls),
         Layer.provide(appUi.sessionAccess.combine(appServices).layer),
       ),
+      HttpRouter.add("POST", "/_executor/native/redeem", appUi.nativeRedeem),
       HttpRouter.add("GET", appSignInCallbackPath, appUi.callback),
       HttpRouter.add("GET", "/_executor/assets/:deployment/*", appUi.asset),
       HttpRouter.add("GET", "/_executor/watch.js", appUi.watch),

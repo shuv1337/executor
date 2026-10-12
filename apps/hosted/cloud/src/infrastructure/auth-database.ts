@@ -581,6 +581,12 @@ export const appSessionsPerCall = (
     Effect.provide(RuntimeContext.phantom),
   );
   return HostedAppSessions.of({
+    nativeLaunch: (target, headers, input) =>
+      Effect.flatMap(sessions, (live) => live.nativeLaunch(target, headers, input)),
+    nativeRedeem: (target, input) =>
+      Effect.flatMap(sessions, (live) => live.nativeRedeem(target, input)),
+    nativeRevoke: (target, headers, sessionId) =>
+      Effect.flatMap(sessions, (live) => live.nativeRevoke(target, headers, sessionId)),
     organization: (find) => Effect.flatMap(sessions, (live) => live.organization(find)),
     access: (principal, target) =>
       Effect.flatMap(sessions, (live) => live.access(principal, target)),
