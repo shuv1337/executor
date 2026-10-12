@@ -50,8 +50,18 @@ export const OperatorSettings = Schema.Struct({
   EXECUTOR_OAUTH_CLIENT_METADATA_URL: Schema.optionalKey(Schema.NonEmptyString),
   /** The build an upgrade installs. */
   EXECUTOR_BUILD_VERSION: Schema.optionalKey(Schema.NonEmptyString),
-  /** The operator's own OAuth clients, as JSON; see notes/oauth.md, "First-party clients". */
-  EXECUTOR_FIRST_PARTY_OAUTH_CLIENTS: Schema.optionalKey(Schema.NonEmptyString),
+  /**
+   * The operator's OAuth clients (notes/oauth.md, "First-party clients"): test client definitions
+   * an E2E host adds to the reviewed ones, and the credentials of the clients scenarios turn on.
+   * An empty value unsets one, as it does for the product.
+   */
+  EXECUTOR_TEST_OAUTH_CLIENT_DEFINITIONS: Schema.optionalKey(Schema.String),
+  EXECUTOR_OAUTH_SYNTHETIC_MAIL_CLIENT_ID: Schema.optionalKey(Schema.String),
+  EXECUTOR_OAUTH_SYNTHETIC_MAIL_CLIENT_SECRET: Schema.optionalKey(Schema.String),
+  EXECUTOR_OAUTH_GOOGLE_CLIENT_ID: Schema.optionalKey(Schema.String),
+  EXECUTOR_OAUTH_GOOGLE_CLIENT_SECRET: Schema.optionalKey(Schema.String),
+  EXECUTOR_OAUTH_SLACK_CLIENT_ID: Schema.optionalKey(Schema.String),
+  EXECUTOR_OAUTH_SLACK_CLIENT_SECRET: Schema.optionalKey(Schema.String),
 });
 /** The runner owns every process generation and keeps the same synthetic secrets across restarts. */
 export const startManagedServer = (
@@ -479,7 +489,11 @@ export const startManagedServer = (
           );
           // Hold the lifecycle gate so no product generation can open the database meanwhile.
           const rows = yield* gate.withPermits(1)(
-            stop.pipe(Effect.andThen(applyLegacyStatements(database, body.statements))),
+            stop.pipe(
+              Effect.andThen(
+                applyLegacyStatements(database, body.statements, env.EXECUTOR_ENCRYPTION_KEY),
+              ),
+            ),
           );
           return HttpServerResponse.text(
             yield* Schema.encodeEffect(Schema.fromJsonString(LegacyResults))(rows),

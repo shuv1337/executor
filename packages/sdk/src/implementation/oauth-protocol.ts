@@ -39,6 +39,7 @@ import {
   providerCodeDiagnostics,
 } from "./oauth-diagnostics.ts";
 import { probeOAuthChallenge } from "./oauth-probe.ts";
+import { withExecutorUserAgent } from "./user-agent.ts";
 
 const ProtocolCode = Schema.Literals([
   oauth.WWW_AUTHENTICATE_CHALLENGE,
@@ -890,8 +891,44 @@ const formBody = (headers: HeadersInit | undefined, body: URLSearchParams) => {
   return { headers: form, body };
 };
 
+/**
+ * The client authentication a client uses. An undeclared method prefers a public client. A secret
+ * otherwise uses Basic, which RFC 6749 section 2.3.1 requires servers to support and RFC 8414
+ * makes the default when metadata lists no methods, unless the server does not advertise it. The
+ * server's list does not say how an individual client entered by hand was registered (RFC 7591
+ * section 2), so that client keeps Basic. A client Executor registers requests the body form when
+ * advertised, which services accept more consistently than Basic.
+ */
+export const preferredClientMethod = (
+  server: Pick<OAuthTokenServer, "token_endpoint_auth_methods_supported">,
+  client: "entered" | "registered",
+  configured?: OAuthClientAuth,
+): OAuthClientAuth => {
+  const supported = server.token_endpoint_auth_methods_supported;
+  return (
+    configured ??
+    (supported?.includes("none")
+      ? "none"
+      : supported?.includes("client_secret_post") &&
+          (client === "registered" || !supported.includes("client_secret_basic"))
+        ? "client_secret_post"
+        : "client_secret_basic")
+  );
+};
+
+/**
+ * The grants a registration asks for: refresh tokens too, unless the server's metadata lists grant
+ * types without them. Singular advertises only authorization_code and rejects the request.
+ */
+export const registrationGrantTypes = (server: { readonly grant_types_supported?: unknown }) =>
+  !Array.isArray(server.grant_types_supported) ||
+  server.grant_types_supported.includes("refresh_token")
+    ? ["authorization_code", "refresh_token"]
+    : ["authorization_code"];
+
 /** Resolve protocol operations against one host-supplied Effect HTTP client. */
 export const makeOAuthProtocol = (options: OAuthOptions) => {
+  const httpClient = withExecutorUserAgent(options.httpClient);
   // This callback is the external library boundary, not an internal Promise implementation.
   const transport =
     (
@@ -921,7 +958,7 @@ export const makeOAuthProtocol = (options: OAuthOptions) => {
               ),
             catch: failure,
           });
-          const response = yield* options.httpClient.execute(request);
+          const response = yield* httpClient.execute(request);
           yield* Effect.annotateCurrentSpan("http.response.status_code", response.status);
           const answer = {
             status: response.status,
@@ -1009,28 +1046,14 @@ export const makeOAuthProtocol = (options: OAuthOptions) => {
       ),
     );
 
-  /**
-   * An undeclared method prefers a public client. A secret otherwise uses Basic, which RFC 6749
-   * section 2.3.1 requires servers to support and RFC 8414 makes the default when metadata lists
-   * no methods, unless the server does not advertise it. The server's list does not say how an
-   * individual client entered by hand was registered (RFC 7591 section 2), so that client keeps
-   * Basic. A client Executor registers requests the body form when advertised, which services
-   * accept more consistently than Basic.
-   */
+  /** The client authentication to use, refused when the server does not advertise it. */
   const clientMethod = (
     server: OAuthTokenServer,
     client: "entered" | "registered",
     configured?: OAuthClientAuth,
   ) => {
     const supported = server.token_endpoint_auth_methods_supported;
-    const method =
-      configured ??
-      (supported?.includes("none")
-        ? "none"
-        : supported?.includes("client_secret_post") &&
-            (client === "registered" || !supported.includes("client_secret_basic"))
-          ? "client_secret_post"
-          : "client_secret_basic");
+    const method = preferredClientMethod(server, client, configured);
     const advertised = method === "client_secret_basic_raw" ? "client_secret_basic" : method;
     return supported !== undefined && !supported.includes(advertised)
       ? Effect.fail(new OAuthProtocolFailed({ reason: "invalid_response" }))
@@ -1339,9 +1362,16 @@ export const makeOAuthProtocol = (options: OAuthOptions) => {
           : audienceFromScopes
             ? undefined
             : found?.resource;
+      // Scopes only the resource metadata lists are what the resource offers, not what an
+      // operation requires, so an operator's client may ask for fewer of them.
+      const advertised =
+        method.scopes === undefined &&
+        read.scopes === undefined &&
+        resourceScopes(found) !== undefined;
       const settings = {
         server,
         scopes: [...scopes],
+        ...(advertised ? { scopesAdvertised: true as const } : {}),
         // RFC 8414 lists what the server accepts; which one applies is the client's property.
         // A server open to public and secret clients leaves an undeclared choice to the client.
         ...(method.tokenEndpointAuthMethod === undefined &&
@@ -1540,13 +1570,7 @@ export const makeOAuthProtocol = (options: OAuthOptions) => {
                 redirect_uris: [redirect.href],
                 application_type: applicationType(redirect),
                 token_endpoint_auth_method: advertised,
-                // Request refresh tokens unless the server's metadata lists grant types without
-                // them. Singular advertises only authorization_code and rejects the request.
-                grant_types:
-                  server.grant_types_supported === undefined ||
-                  server.grant_types_supported.includes("refresh_token")
-                    ? ["authorization_code", "refresh_token"]
-                    : ["authorization_code"],
+                grant_types: registrationGrantTypes(server),
                 response_types: ["code"],
                 ...(scopes.length === 0 ? {} : { scope: scopes.join(" ") }),
               },
@@ -1717,24 +1741,29 @@ export const makeOAuthProtocol = (options: OAuthOptions) => {
       client: OAuthRegistration;
       refreshToken: string;
       resource?: string | undefined;
+      /** Asked for again only when the grant names them; see `OAuthGrant`. */
+      scopes?: readonly string[] | undefined;
       tokenRequestFormat?: OAuthTokenRequestFormat | undefined;
       tokenResponse?: OAuthTokenResponse | undefined;
     }) =>
       request(
         async (settings) => {
           const server = metadata(input.server);
+          const additionalParameters = {
+            ...(input.scopes === undefined || input.scopes.length === 0
+              ? {}
+              : { scope: input.scopes.join(" ") }),
+            ...(input.resource === undefined ? {} : { resource: input.resource }),
+          };
           const response = await tokenResponse(
             await oauth.refreshTokenGrantRequest(
               server,
               input.client,
               clientAuth(input.client),
               input.refreshToken,
-              {
-                ...settings,
-                ...(input.resource === undefined
-                  ? {}
-                  : { additionalParameters: { resource: input.resource } }),
-              },
+              Object.keys(additionalParameters).length === 0
+                ? settings
+                : { ...settings, additionalParameters },
             ),
             input.tokenResponse,
           );

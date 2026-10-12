@@ -20,27 +20,48 @@ import { isAlchemyDevFailure, outputLines } from "./alchemy-dev-output.ts";
 import { startFixtureControl, fixtureRequest } from "../sdk/fixtures.ts";
 import { roleHost } from "./role-hosts.ts";
 import { freePort } from "./ports.ts";
-import { OperatorOAuthFixture, operatorOAuthFile } from "./operator-oauth.ts";
+import {
+  OperatorOAuthFixture,
+  operatorOAuthFile,
+  v1FirstPartyClients,
+  v1FirstPartyCredentials,
+} from "./operator-oauth.ts";
 
-/** The operator settings for `fixture`: one client whose tokens go only to its own host. */
+/**
+ * The operator settings for `fixture`: one test client, whose tokens go only to its own host, the
+ * clients v1's first-party connections move to (`v1FirstPartyClients`), and their credentials.
+ * Emulated Cloud adds the definitions to its reviewed clients.
+ */
 const operatorOAuthClients = (fixture: typeof OperatorOAuthFixture.Type) => {
   const origin = `http://127.0.0.1:${fixture.port}`;
-  return JSON.stringify([
-    {
-      id: "synthetic-cloud-mail",
-      label: "Executor for Synthetic Cloud Mail",
-      server: {
-        issuer: origin,
-        authorizationUrl: `${origin}/authorize`,
-        tokenUrl: `${origin}/token`,
+  return {
+    EXECUTOR_TEST_OAUTH_CLIENT_DEFINITIONS: JSON.stringify([
+      {
+        id: "synthetic-cloud-mail",
+        label: "Executor for Synthetic Cloud Mail",
+        server: {
+          issuer: origin,
+          authorizationUrl: `${origin}/authorize`,
+          tokenUrl: `${origin}/token`,
+        },
+        tokenEndpointAuthMethod: "client_secret_basic",
+        defaultScopes: ["mail.read"],
+        placement: { hosts: [`127.0.0.1:${fixture.port}`] },
       },
-      clientId: fixture.clientId,
-      clientSecret: fixture.clientSecret,
-      tokenEndpointAuthMethod: "client_secret_basic",
-      defaultScopes: ["mail.read"],
-      placement: { hosts: [`127.0.0.1:${fixture.port}`] },
-    },
-  ]);
+      ...v1FirstPartyClients(`http://127.0.0.1:${fixture.v1Port}`),
+    ]),
+    EXECUTOR_OAUTH_SYNTHETIC_CLOUD_MAIL_CLIENT_ID: fixture.clientId,
+    EXECUTOR_OAUTH_SYNTHETIC_CLOUD_MAIL_CLIENT_SECRET: fixture.clientSecret,
+    ...Object.fromEntries(
+      Object.entries(v1FirstPartyCredentials).flatMap(([id, credentials]) => {
+        const prefix = `EXECUTOR_OAUTH_${id.toUpperCase().replaceAll("-", "_")}`;
+        return [
+          [`${prefix}_CLIENT_ID`, credentials.clientId],
+          [`${prefix}_CLIENT_SECRET`, credentials.secret],
+        ];
+      }),
+    ),
+  };
 };
 
 class CloudStartFailed extends Schema.TaggedError<CloudStartFailed>()("CloudStartFailed", {
@@ -143,6 +164,7 @@ export const startCloudEnvironment = (input: {
       port: yield* freePort,
       clientId: "first-party-client",
       clientSecret: randomBytes(16).toString("hex"),
+      v1Port: yield* freePort,
     });
     const operatorOAuthPath = `${directory}/${operatorOAuthFile}`;
     yield* fs.writeFileString(operatorOAuthPath, JSON.stringify(operatorOAuth), { mode: 0o600 });
@@ -219,7 +241,7 @@ export const startCloudEnvironment = (input: {
       CLOUD_BROWSER_ORIGIN: input.browserOrigin,
       EXECUTOR_EMULATED_OAUTH_PROXY_PRODUCTION_URL: oauthProxy.productionUrl,
       EXECUTOR_EMULATED_OAUTH_PROXY_SECRET: Redacted.value(oauthProxy.secret),
-      EXECUTOR_FIRST_PARTY_OAUTH_CLIENTS: operatorOAuthClients(operatorOAuth),
+      ...operatorOAuthClients(operatorOAuth),
     };
     yield* fs.makeDirectory(env.ALCHEMY_HOME, { recursive: true, mode: 0o700 });
     const dockerHost = (yield* processes.string(

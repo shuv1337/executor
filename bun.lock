@@ -40,7 +40,7 @@
     },
     "apps/cli": {
       "name": "executor",
-      "version": "2.0.0-beta.15",
+      "version": "2.0.0-beta.16",
     },
     "apps/docs": {
       "name": "@executor-js/docs",
@@ -80,6 +80,7 @@
         "@executor-js/hosted-cloud-web": "workspace:*",
         "@executor-js/hosted-server": "workspace:*",
         "@executor-js/marketing": "workspace:*",
+        "@executor-js/mcp-auth": "workspace:*",
         "@executor-js/sdk": "workspace:*",
         "@executor-js/telemetry": "workspace:*",
         "@executor-js/utils": "workspace:*",
@@ -91,9 +92,11 @@
         "better-auth": "1.7.5",
         "effect": "4.0.1",
         "fumadb-effect": "workspace:*",
+        "js-yaml": "5.4.2",
         "kysely": "0.29.6",
         "pg": "8.16.3",
         "postal-mime": "4.0.2",
+        "tldts": "7.4.13",
       },
       "devDependencies": {
         "@cloudflare/workers-types": "5.20260729.1",
@@ -207,6 +210,7 @@
         "@better-auth/core": "1.7.5",
         "@better-auth/oauth-provider": "1.7.5",
         "@executor-js/app-management": "workspace:*",
+        "@executor-js/app-registry": "workspace:*",
         "@executor-js/app-templates": "workspace:*",
         "@executor-js/authorization": "workspace:*",
         "@executor-js/catalog": "workspace:*",
@@ -480,7 +484,7 @@
     },
     "packages/apps": {
       "name": "apps",
-      "version": "0.0.1-beta.82",
+      "version": "0.0.1-beta.84",
       "dependencies": {
         "@cfworker/json-schema": "4.1.1",
         "@csstools/css-tokenizer": "4.0.2",

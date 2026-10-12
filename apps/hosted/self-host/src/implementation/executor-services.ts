@@ -1,3 +1,4 @@
+import { organizationPublishers } from "@executor-js/hosted-server/publishers";
 import { hostedAppCapabilities } from "@executor-js/hosted-server/app-management";
 import { executorSelfHostApiDocument } from "../contracts/api.ts";
 import { AppGitOrigins, AppManagementHost } from "@executor-js/app-management";
@@ -29,6 +30,7 @@ import {
   organizationDefaults,
   noOrganizationRemovals,
   lazyHostedApiDocument,
+  authSettings,
   clientMetadataSetting,
   firstPartyOAuthClients,
   hostedOAuthClientName,
@@ -73,7 +75,13 @@ export const selfHostExecutorServices = <E, R>(
       const key = yield* Config.Redacted("EXECUTOR_ENCRYPTION_KEY");
       const origin = yield* Config.String("BETTER_AUTH_URL");
       const clientMetadata = yield* clientMetadataSetting(origin);
-      const firstPartyClients = yield* firstPartyOAuthClients;
+      // Only E2E hosts add test client definitions; see `firstPartyOAuthClients`.
+      const firstPartyClients = yield* firstPartyOAuthClients({
+        testDefinitions:
+          (yield* Config.String("EXECUTOR_ENVIRONMENT").pipe(Config.withDefault(""))) === "e2e",
+      });
+      // A configured account callback is the one saved clients were keyed with.
+      const accountCallback = (yield* authSettings).oauthRedirectUri;
       const storage = yield* makeExecutorStorage({ provider: "postgresql" });
       const evaluation = yield* declarationConfig;
       const server = yield* Scope.Scope;
@@ -83,7 +91,7 @@ export const selfHostExecutorServices = <E, R>(
       );
       // This fork publishes inside the organization, from the same database as its apps, rather
       // than reading the hosted public registry. `selfHostDatabaseSchema` migrated the tables.
-      const registryStorage = yield* makeRegistryStorage;
+      const registryStorage = yield* makeRegistryStorage(yield* organizationPublishers);
       if (Option.isSome(yield* Config.option(Config.String("EXECUTOR_REGISTRY_URL"))))
         yield* Effect.logWarning(
           "EXECUTOR_REGISTRY_URL is set but has no effect: this self-host serves its organization's own registry.",
@@ -103,6 +111,9 @@ export const selfHostExecutorServices = <E, R>(
           clientName: hostedOAuthClientName,
           urlPolicy: egress.policy,
           ...(Option.isSome(clientMetadata) ? { clientMetadataUrl: clientMetadata.value.url } : {}),
+          ...(Option.isSome(accountCallback)
+            ? { savedClientCallbacks: [accountCallback.value] }
+            : {}),
           firstPartyClients,
         },
         cache: {

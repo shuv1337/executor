@@ -79,8 +79,8 @@ in these files, never resolved credentials. Vault and item references also stay
 out of tracked scripts. Edit values in 1Password, then restart the affected
 process. Keep encryption/signing keys stable.
 
-Cloud uses Alchemy's PlanetScale database and role resources; Workers connect
-through PlanetScale's PgBouncer.
+Cloud uses Alchemy's PlanetScale database and role resources. Worker events reach
+PlanetScale's PgBouncer through Hyperdrive; Durable Objects connect to PgBouncer directly.
 `bun run hosted:cloud:dev` starts the cloud Worker, local Postgres, migrations,
 and frontend through Alchemy with service emulators and no credentials.
 `bun run hosted:cloud:dev:1password` uses `.env.cloud-development.op` instead;
@@ -344,3 +344,9 @@ Development happens in this private repository. The public
 through `scripts/export-public.sh`. Paths listed in
 `scripts/export-public.exclude`, such as `notes/`, stay private. The export
 workflow runs the script on every push to `main`. See `RELEASING.md`.
+
+Pull requests against `v2` are ported into the private repository with the
+contributor's `Co-Authored-By` trailer and a line naming the public pull request
+and its full head sha, `Public-PR: UsefulSoftwareCo/executor#<number> <sha>`. The next
+export takes that head as another parent of its commit, so the pull request shows
+as merged and its commits stay in `v2`'s history.

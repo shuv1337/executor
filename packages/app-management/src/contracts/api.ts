@@ -255,7 +255,7 @@ export const appManagementApi = <I extends HttpApiMiddleware.AnyId, S>(
           error: appOperationErrors,
         }).annotate(
           OpenApi.Description,
-          "Publish this Git commit to this server's registry. Self-host publications are organization-only; Cloud publications are public. package.json supplies a scoped name and optional description. Existing copies do not update. Git history, accounts, and app data stay private.",
+          "Publish this Git commit to this server's registry. Self-host publications are organization-only; Cloud publications are public. package.json supplies a name under the organization's current publishing scope and an optional description. Existing copies do not update. Git history, accounts, and app data stay private.",
         ),
         HttpApiEndpoint.get("history", "/apps/:app/history", {
           params: app,

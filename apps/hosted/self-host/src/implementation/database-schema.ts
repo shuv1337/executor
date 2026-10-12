@@ -1,3 +1,4 @@
+import { organizationPublishers } from "@executor-js/hosted-server/publishers";
 /** Shared auth and product schema initialization over an acquired SQL client. */
 import { selfHostAuthOptions, selfHostAuthSettings } from "./auth-options.ts";
 import { migrateHostedSchemas } from "@executor-js/hosted-server/migrations";
@@ -18,7 +19,7 @@ export const selfHostDatabaseSchema = Layer.effect(
       database,
       secret: Redacted.value(settings.secret),
     });
-    const registry = yield* makeRegistryStorage;
+    const registry = yield* makeRegistryStorage(yield* organizationPublishers);
     const sql = yield* SqlClient.SqlClient;
     yield* sql.withTransaction(
       Effect.gen(function* () {
