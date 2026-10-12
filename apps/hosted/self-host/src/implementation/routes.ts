@@ -39,7 +39,12 @@ import { appAddresses, hostedAppUi } from "@executor-js/hosted-server/app-ui";
 import { appSignInCallbackPath } from "apps/ui/auth";
 import { AppUiApi } from "apps/ui/contracts";
 import { HttpApiBuilder } from "effect/http-api";
-import { appUiBaseUrl, appUiDefaultOrganization, appUiHostFormat, catalogFeedUrl } from "../contracts/config.ts";
+import {
+  appUiBaseUrl,
+  appUiDefaultOrganization,
+  appUiHostFormat,
+  catalogFeedUrl,
+} from "../contracts/config.ts";
 import { type HostEgress } from "@executor-js/utils/url-policy";
 import { Config, Effect, Layer, Option } from "effect";
 import { HttpRouter, HttpServer, HttpServerRequest, HttpServerResponse } from "effect/http";
