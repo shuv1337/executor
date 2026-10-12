@@ -4693,6 +4693,17 @@ export const scenarios = plan({
       local: na("The API document and catalog installation are hosted product surfaces."),
     },
   },
+  appUiNative: {
+    fixtures: "actors",
+    file: "app-ui.spec.ts",
+    title:
+      "Native app sessions preserve scoped OAuth authority through PKCE, expiry and revocation",
+    targets: {
+      "self-host": scheduled,
+      cloud: na("Native OAuth app-session exchange is currently mounted by self-host only."),
+      local: na("Hosted OAuth and organization sessions only."),
+    },
+  },
   appUiApiDocument: {
     fixtures: "actors",
     managementProfiles: ["owner"],

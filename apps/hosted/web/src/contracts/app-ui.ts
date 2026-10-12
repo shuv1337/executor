@@ -76,9 +76,7 @@ export { AppSignInFailure, AppSignInId };
 
 /** Expected app authentication failures stay typed through the atom and view. */
 export type AppUiError =
-  | HttpApiEndpoint.Errors<
-      (typeof HostedAppUiApi.groups.appUi.endpoints)[keyof typeof HostedAppUiApi.groups.appUi.endpoints]
-    >
+  | HttpApiEndpoint.Errors<typeof HostedAppUiApi.groups.appUi.endpoints.location>
   | HttpClientError.HttpClientError
   | Schema.SchemaError
   | Cause.NoSuchElementError;

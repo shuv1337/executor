@@ -270,12 +270,13 @@ const oauthAccess = (
   kind: "mcp" | "api",
   token: string,
   request: BearerRequest,
+  hashed = false,
 ) =>
   Effect.gen(function* () {
     const header = request.headers.get("x-executor-organization");
     const rows = yield* loadOAuth(
       sql,
-      yield* storedHash(token),
+      hashed ? token : yield* storedHash(token),
       request.organization ?? null,
       header,
     );
@@ -382,6 +383,7 @@ const oauthAccess = (
     return {
       userId: row.subject,
       clientId: row.tokenClient,
+      expiresAt: new Date(row.expiresAt),
       grant: { id: grantId, policy, target },
       access: { organization, owner: organizationOwner(organization), role },
       organizationSlug: row.organizationSlug,
@@ -618,3 +620,31 @@ export const apiBearerAccess = (origins: HostedOAuthOrigins, request: BearerRequ
           : new OrganizationForbidden(),
     ),
   );
+
+/** Internal app-session validation reuses every live OAuth check; hashes never authenticate an HTTP caller. */
+export const nativeAppOAuthAccess = (
+  origins: HostedOAuthOrigins,
+  organization: OrganizationReference,
+  credential: { readonly kind: "bearer" | "hash"; readonly value: string },
+) =>
+  Effect.gen(function* () {
+    if (credential.kind === "bearer" && isApiKey(credential.value)) return yield* unauthorized;
+    const hash =
+      credential.kind === "hash" ? credential.value : yield* storedHash(credential.value);
+    const grant = yield* oauthAccess(
+      yield* SqlClient.SqlClient,
+      origins,
+      "api",
+      hash,
+      { organization, headers: new Headers() },
+      true,
+    );
+    if (grant.grant.policy.kind !== "tools" || grant.grant.policy.approval !== "client")
+      return yield* forbidden("membership");
+    return {
+      userId: grant.userId,
+      hash,
+      expiresAt: grant.expiresAt,
+      policy: grantAuthorization(grant.grant.policy),
+    };
+  });

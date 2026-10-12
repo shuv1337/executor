@@ -1,3 +1,4 @@
+import { permitsTarget } from "@executor-js/authorization";
 import { resolveOrganizationReference } from "./organization-reference.ts";
 /** Better Auth owns persistence and atomic consume; no schema or dashboard-token copies are introduced. */
 import type { AuthContext } from "@better-auth/core";
@@ -5,6 +6,10 @@ import { AppSignInId } from "apps/ui/auth/contracts";
 import { UiFailed, UiForbidden, UiUnauthorized } from "apps/ui/contracts";
 import { Clock, Effect, Redacted, Result, Schema } from "effect";
 import {
+  NativeAppTicket,
+  NativeAppSession,
+  NativeAppMarker,
+  type NativeAppAuthority,
   AppUiAttempt,
   AppUiGrant,
   AppUiRecord,
@@ -53,6 +58,10 @@ export const hostedAppSessions = (
     readonly adapter: Pick<AuthContext["adapter"], "findOne" | "findMany">;
   },
   crypto: Crypto,
+  nativeAuthority?: (
+    target: AppUiTarget,
+    credential: { readonly kind: "bearer" | "hash"; readonly value: string },
+  ) => Effect.Effect<NativeAppAuthority, UiUnauthorized | UiForbidden | UiFailed>,
 ) => {
   const query = <A>(call: () => Promise<A>) => Effect.tryPromise({ try: call, catch: unavailable });
   const nonce = Effect.sync(() =>
@@ -71,8 +80,10 @@ export const hostedAppSessions = (
         (byte) => byte.toString(16).padStart(2, "0"),
       ).join(""),
     );
-  const key = (kind: "attempt" | "grant" | "session", id: string) =>
-    `executor-app-ui:v1:${kind}:${id}`;
+  const key = (
+    kind: "attempt" | "grant" | "session" | "native_ticket" | "native_marker",
+    id: string,
+  ) => `executor-app-ui:v1:${kind}:${id}`;
   const put = (identifier: string, value: typeof AppUiRecord.Type, expiresAt: Date) =>
     Schema.encodeEffect(recordJson)(value).pipe(
       Effect.mapError(unavailable),
@@ -150,7 +161,113 @@ export const hostedAppSessions = (
       parent(principal.sessionId, principal.userId),
       membership(principal.userId, target),
     ).pipe(Effect.map(([, access]) => access));
+  const native = (
+    target: AppUiTarget,
+    credential: { readonly kind: "bearer" | "hash"; readonly value: string },
+  ) =>
+    nativeAuthority === undefined
+      ? Effect.fail(unavailable())
+      : nativeAuthority(target, credential);
+  const nativeBearer = (target: AppUiTarget, headers: Headers) => {
+    const token = headers.get("authorization")?.match(/^Bearer ([^\s]+)$/i)?.[1];
+    return token === undefined
+      ? Effect.fail(new UiUnauthorized())
+      : native(target, { kind: "bearer", value: token });
+  };
+  const checkNative = (record: typeof NativeAppSession.Type | typeof NativeAppTicket.Type) =>
+    Effect.gen(function* () {
+      const marker = yield* read(key("native_marker", record.sessionId));
+      if (
+        !Schema.is(NativeAppMarker)(marker) ||
+        marker.hash !== record.hash ||
+        marker.user !== record.user ||
+        !sameTarget(marker.target, record.target)
+      )
+        return yield* new UiUnauthorized();
+      const live = yield* native(record.target, { kind: "hash", value: record.hash });
+      // Any grant edit ends the app session; it cannot inherit wider or changed authority.
+      if (
+        live.userId !== record.user ||
+        JSON.stringify(live.policy) !== JSON.stringify(record.policy) ||
+        !permitsTarget(live.policy, record.target.app, record.profile)
+      )
+        return yield* new UiForbidden();
+      return live;
+    });
   return HostedAppSessions.of({
+    nativeLaunch: (target, headers, input) =>
+      Effect.gen(function* () {
+        const authority = yield* nativeBearer(target, headers);
+        if (!permitsTarget(authority.policy, target.app, input.profile))
+          return yield* new UiForbidden();
+        const now = yield* Clock.currentTimeMillis;
+        const expiresAt = new Date(Math.min(authority.expiresAt.getTime(), now + 5 * 60_000));
+        const ticket = yield* nonce;
+        const sessionId = Redacted.value(yield* nonce);
+        const fields = {
+          target,
+          user: yield* Schema.decodeUnknownEffect(Principal.fields.userId)(authority.userId).pipe(
+            Effect.mapError(unavailable),
+          ),
+          hash: authority.hash,
+          profile: input.profile,
+          policy: authority.policy,
+          sessionId,
+          sessionExpiresAt: expiresAt.getTime(),
+        };
+        yield* put(
+          key("native_marker", sessionId),
+          { kind: "native_marker", ...fields },
+          expiresAt,
+        );
+        const ticketExpiry = new Date(Math.min(expiresAt.getTime(), now + 30_000));
+        yield* put(
+          key("native_ticket", yield* digest(ticket)),
+          { kind: "native_ticket", ...fields, challenge: input.challenge },
+          ticketExpiry,
+        );
+        return { ticket, sessionId, expiresAt: ticketExpiry };
+      }),
+    nativeRedeem: (target, input) =>
+      Effect.gen(function* () {
+        const identifier = key("native_ticket", yield* digest(input.ticket));
+        const ticket = yield* read(identifier);
+        if (!Schema.is(NativeAppTicket)(ticket) || !sameTarget(ticket.target, target))
+          return yield* new UiUnauthorized();
+        const challenge = yield* query(async () => {
+          const bytes = new Uint8Array(
+            await crypto.subtle.digest("SHA-256", new TextEncoder().encode(input.verifier)),
+          );
+          return btoa(String.fromCharCode(...bytes))
+            .replaceAll("+", "-")
+            .replaceAll("/", "_")
+            .replace(/=+$/u, "");
+        });
+        if (challenge !== ticket.challenge) return yield* new UiUnauthorized();
+        const live = yield* checkNative(ticket);
+        yield* read(identifier, true);
+        const token = yield* nonce;
+        const expiresAt = new Date(Math.min(live.expiresAt.getTime(), ticket.sessionExpiresAt));
+        yield* put(
+          key("session", yield* digest(token)),
+          { ...ticket, kind: "native_session" },
+          expiresAt,
+        );
+        return { token, profile: ticket.profile, expiresAt };
+      }),
+    nativeRevoke: (target, headers, sessionId) =>
+      Effect.gen(function* () {
+        const authority = yield* nativeBearer(target, headers);
+        const marker = yield* read(key("native_marker", sessionId));
+        if (
+          !Schema.is(NativeAppMarker)(marker) ||
+          !sameTarget(marker.target, target) ||
+          marker.user !== authority.userId ||
+          marker.hash !== authority.hash
+        )
+          return yield* new UiForbidden();
+        yield* read(key("native_marker", sessionId), true);
+      }),
     organization: (find) =>
       Effect.gen(function* () {
         const target =
@@ -252,6 +369,11 @@ export const hostedAppSessions = (
     current: (target, token) =>
       Effect.gen(function* () {
         const session = yield* read(key("session", yield* digest(token)));
+        if (Schema.is(NativeAppSession)(session)) {
+          if (!sameTarget(session.target, target)) return yield* new UiUnauthorized();
+          yield* checkNative(session);
+          return { userId: session.user, policy: session.policy, profile: session.profile };
+        }
         if (!Schema.is(AppUiSession)(session) || !sameTarget(session.target, target))
           return yield* new UiUnauthorized();
         yield* parent(session.parent, session.user);

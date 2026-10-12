@@ -1,6 +1,7 @@
 import { selfHostAuthOptions, selfHostAuthSettings } from "./implementation/auth-options.ts";
 import { selfHostRegistration, selfHostUserHooks } from "./implementation/registration.ts";
 /** Better Auth over the host's shared, persisted PGlite database. */
+import { UiFailed, UiForbidden, UiUnauthorized } from "apps/ui/contracts";
 import { betterAuth } from "better-auth";
 import { HostedAppSessions, hostedAppSessions } from "@executor-js/hosted-server/app-ui";
 import {
@@ -10,6 +11,7 @@ import {
   provisionHostedOAuthResources,
   ApiAuthentication,
   apiBearerAccess,
+  nativeAppOAuthAccess,
   mcpBearerAccess,
   Authentication,
   AuthenticationUnavailable,
@@ -180,7 +182,18 @@ export const selfHostAuth = Effect.gen(function* () {
   );
   const appSessions = Layer.succeed(
     HostedAppSessions,
-    hostedAppSessions(context, globalThis.crypto),
+    hostedAppSessions(context, globalThis.crypto, (target, credential) =>
+      nativeAppOAuthAccess(origins, target.organization, credential).pipe(
+        Effect.provideService(SqlClient.SqlClient, sql),
+        Effect.mapError((error) =>
+          error.reason === "unavailable"
+            ? new UiFailed({ reason: "unavailable" })
+            : error.reason === "unauthorized"
+              ? new UiUnauthorized()
+              : new UiForbidden(),
+        ),
+      ),
+    ),
   );
   return {
     identity,
