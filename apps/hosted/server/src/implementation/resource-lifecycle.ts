@@ -12,7 +12,7 @@ import { Context, Effect, Schema } from "effect";
 import { SqlClient } from "effect/sql";
 import { CurrentUserId } from "../contracts/auth.ts";
 import { OrganizationId } from "../contracts/organization.ts";
-import { ConnectionDestination } from "../contracts/resource-access.ts";
+import { ConnectionDestination, type AppAudience } from "../contracts/resource-access.ts";
 
 import { requireGroupSharing } from "./group-sharing.ts";
 
@@ -40,6 +40,23 @@ export const personalAccountCreation =
   <A, E, R>(effect: Effect.Effect<A, E, R>) =>
     effect.pipe(Effect.provideService(AccountCreation, { kind: "attributed-personal", user }));
 
+/**
+ * Who may use a stored OAuth client: the audience an administrator chose when registering it, or
+ * everyone for a client Executor registered automatically or a data step moved, which has no
+ * creator.
+ */
+type OAuthClientCreation =
+  | { readonly kind: "member"; readonly audience: typeof AppAudience.Type }
+  | { readonly kind: "system" };
+const OAuthClientCreation = Context.Reference<OAuthClientCreation>("hosted/OAuthClientCreation", {
+  defaultValue: () => ({ kind: "system" }),
+});
+/** The audience is recorded with the client's access record, in the client's transaction. */
+export const oauthClientAudience =
+  (audience: typeof AppAudience.Type) =>
+  <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+    effect.pipe(Effect.provideService(OAuthClientCreation, { kind: "member", audience }));
+
 const organizationOf = (owner: OwnerId) =>
   owner.startsWith("organization:")
     ? Schema.decodeUnknownEffect(OrganizationId)(owner.slice("organization:".length)).pipe(
@@ -48,6 +65,8 @@ const organizationOf = (owner: OwnerId) =>
     : Effect.fail(new StorageError());
 
 const AllowedAccount = Schema.Struct({ id: AccountId, owner: Schema.String });
+/** What the account checks read of an account: its ID and the owner the SDK resolved it under. */
+type AccountOwner = Pick<Account, "id" | "owner">;
 type AllowedAccount = typeof AllowedAccount.Type;
 const ProfileRecheck = Schema.Struct({
   access: Schema.Number,
@@ -75,14 +94,14 @@ export const hostedResourceLifecycle = Effect.gen(function* () {
             join hosted_group_members gm on gm.group_id = g.group_id
             where g.app_id = p.id and gm.member_id = m.id)))`;
   // An account outside an organization is never authorized; it is refused in its turn.
-  const organizationAccounts = (accounts: readonly Account[]) =>
+  const organizationAccounts = <A extends AccountOwner>(accounts: readonly A[]) =>
     accounts.filter(
       (account) =>
         account.owner.startsWith("organization:") &&
         Schema.is(OrganizationId)(account.owner.slice("organization:".length)),
     );
   /** The accounts whose policy still lets the user use them, with the owner each belongs to. */
-  const accountAccess = (accounts: readonly Account[], user: string) =>
+  const accountAccess = (accounts: readonly AccountOwner[], user: string) =>
     sql`select p.account_id as id, 'organization:' || p.organization_id as owner
         from hosted_account_access p
         where ${sql.in(
@@ -98,7 +117,7 @@ export const hostedResourceLifecycle = Effect.gen(function* () {
               select 1 from hosted_account_groups g join hosted_group_members gm on gm.group_id = g.group_id
               where g.account_id = p.account_id and gm.member_id = m.id)))))`;
   // Each account must still belong to the owner the invocation resolved it under.
-  const allowedOf = (accounts: readonly Account[], allowed: ReadonlyArray<AllowedAccount>) => {
+  const allowedOf = (accounts: readonly AccountOwner[], allowed: ReadonlyArray<AllowedAccount>) => {
     const owners = new Map(accounts.map((account) => [account.id, account.owner]));
     return new Set(allowed.filter((row) => owners.get(row.id) === row.owner).map((row) => row.id));
   };
@@ -147,34 +166,29 @@ export const hostedResourceLifecycle = Effect.gen(function* () {
         const user = yield* CurrentUserId;
         if (user === undefined) return yield* new StorageError();
         // The SDK supplies the connection's reconnect target and the profile it targets, so the
-        // product checks its own access rows only. A targeted profile must be the caller's own,
+        // product checks its own access rows only. The targeted profile must be the caller's own,
         // enabled, and not on its way out.
         const target = connection.target;
         if (
-          target !== null &&
-          (target.profile.subject !== user ||
-            !target.profile.enabled ||
-            target.profile.status === "removing" ||
-            target.profile.status === "removed")
+          target.profile.subject !== user ||
+          !target.profile.enabled ||
+          target.profile.status === "removing" ||
+          target.profile.status === "removed"
         )
           return yield* new StorageError();
-        const targetApp = target === null ? null : target.app;
-        const targetProfile = target === null ? null : target.profile.id;
         const reconnect = connection.reconnectAccount;
         const rows =
           yield* sql`select c.connection_id, c.organization_id as organization, c.destination from hosted_connection_access c
         join member m on m."organizationId" = c.organization_id and m."userId" = ${user}
         where c.connection_id = ${connection.id}
         and c.creator_id = ${user}
-        and (c.target is null or (
-          (c.target ->> 'app') = ${targetApp} and (c.target ->> 'installation') = ${targetProfile}
-          and exists (
-            select 1 from hosted_app_access a
-            where a.id = (c.target ->> 'app') and a.organization_id = c.organization_id
-            and ((a.audience = 'private' and a.creator_id = ${user}) or a.audience = 'everyone'
-              or (a.audience = 'groups' and exists(select 1 from hosted_app_groups g join hosted_group_members gm on gm.group_id = g.group_id where g.app_id = a.id and gm.member_id = m.id)))
-          )
-        ))
+        and (c.target ->> 'app') = ${target.app} and (c.target ->> 'installation') = ${target.profile.id}
+        and exists (
+          select 1 from hosted_app_access a
+          where a.id = (c.target ->> 'app') and a.organization_id = c.organization_id
+          and ((a.audience = 'private' and a.creator_id = ${user}) or a.audience = 'everyone'
+            or (a.audience = 'groups' and exists(select 1 from hosted_app_groups g join hosted_group_members gm on gm.group_id = g.group_id where g.app_id = a.id and gm.member_id = m.id)))
+        )
         and (${reconnect}::text is null or exists (
           select 1 from hosted_account_access a where a.account_id = ${reconnect}
           and a.organization_id = c.organization_id
@@ -237,6 +251,43 @@ export const hostedResourceLifecycle = Effect.gen(function* () {
           OrganizationForbidden: () => new StorageError(),
         }),
       ),
+    oauthClientCreated: (client) =>
+      Effect.gen(function* () {
+        const organization = yield* organizationOf(client.owner);
+        const intent = yield* OAuthClientCreation;
+        const creator =
+          intent.kind === "system" ? null : yield* member(organization, yield* CurrentUserId);
+        const audience: typeof AppAudience.Type =
+          intent.kind === "system" ? { kind: "everyone" } : intent.audience;
+        const groups = audience.kind === "groups" ? audience.groups : [];
+        yield* requireGroupSharing(sql, organization, creator ?? undefined, groups);
+        yield* sql`insert into hosted_oauth_client_access (client_id, organization_id, creator_id, audience)
+        values (${client.id}, ${organization}, ${creator}, ${audience.kind})`;
+        for (const group of groups)
+          yield* sql`insert into hosted_oauth_client_groups (organization_id, client_id, group_id) values (${organization}, ${client.id}, ${group})`;
+      }).pipe(
+        Effect.catchTags({
+          SqlError: () => new StorageError(),
+          SchemaError: () => new StorageError(),
+          OrganizationForbidden: () => new StorageError(),
+        }),
+      ),
+    // Whichever way a sign-in resolved the client, the caller must be in its audience now. A client
+    // without an access record, or a caller who is no longer a member, is refused.
+    oauthClientResolving: (client) =>
+      Effect.gen(function* () {
+        const user = yield* CurrentUserId;
+        if (user === undefined || !client.owner.startsWith("organization:")) return false;
+        const organization = client.owner.slice("organization:".length);
+        const rows = yield* sql`select p.client_id from hosted_oauth_client_access p
+        join member m on m."organizationId" = p.organization_id and m."userId" = ${user}
+        where p.client_id = ${client.id} and p.organization_id = ${organization}
+        and ((p.audience = 'private' and p.creator_id = ${user}) or p.audience = 'everyone'
+          or (p.audience = 'groups' and exists(select 1 from hosted_oauth_client_groups g
+            join hosted_group_members gm on gm.group_id = g.group_id
+            where g.client_id = p.client_id and gm.member_id = m.id)))`;
+        return rows.length === 1;
+      }).pipe(Effect.catchTag("SqlError", () => new StorageError())),
     accountRemoving: (account) =>
       Effect.gen(function* () {
         const organization = yield* organizationOf(account.owner);

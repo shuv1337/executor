@@ -29,32 +29,54 @@ const catalogKind = (entry: CatalogEntry) => {
       return entry.kind.toUpperCase();
   }
 };
+type CatalogProps<E, P> = QueryProps<readonly CatalogEntry[], E> & {
+  /** Published apps listed beside the templates; without it, Add app lists templates only. */
+  readonly publications?: Query<ReadonlyArray<typeof Publication.Type>, P> | undefined;
+  readonly PublicationFailure?: ComponentType<FailureProps<NoInfer<P>>> | undefined;
+  readonly back: ReactNode;
+  readonly action?: ReactNode;
+  readonly onSelect?: ((entry: CatalogEntry) => void) | undefined;
+  readonly onPublication?: ((publication: typeof Publication.Type) => void) | undefined;
+};
+type PublicationsResult<P> = AsyncResult.AsyncResult<ReadonlyArray<typeof Publication.Type>, P>;
 /** One discovery list combines published apps and integration templates, with independent failure states. */
-export function CatalogPage<E, P>({
+export function CatalogPage<E, P>(props: CatalogProps<E, P>) {
+  const { publications } = props;
+  return publications === undefined ? (
+    <CatalogList {...props} />
+  ) : (
+    <PublishedCatalog {...props} publications={publications} />
+  );
+}
+function PublishedCatalog<E, P>(
+  props: CatalogProps<E, P> & {
+    readonly publications: Query<ReadonlyArray<typeof Publication.Type>, P>;
+  },
+) {
+  const publicResult = useAtomValue(props.publications);
+  const retryPublic = useAtomRefresh(props.publications);
+  return <CatalogList {...props} publicResult={publicResult} retryPublic={retryPublic} />;
+}
+function CatalogList<E, P>({
   query,
   Failure,
-  publications,
   PublicationFailure,
   back,
   action,
   onSelect,
   onPublication,
-}: QueryProps<readonly CatalogEntry[], E> & {
-  readonly publications: Query<ReadonlyArray<typeof Publication.Type>, P>;
-  readonly PublicationFailure: ComponentType<FailureProps<NoInfer<P>>>;
-  readonly back: ReactNode;
-  readonly action?: ReactNode;
-  readonly onSelect?: ((entry: CatalogEntry) => void) | undefined;
-  readonly onPublication?: ((publication: typeof Publication.Type) => void) | undefined;
+  publicResult,
+  retryPublic,
+}: CatalogProps<E, P> & {
+  readonly publicResult?: PublicationsResult<P> | undefined;
+  readonly retryPublic?: (() => void) | undefined;
 }) {
   const result = useAtomValue(query);
   const retry = useAtomRefresh(query);
-  const publicResult = useAtomValue(publications);
-  const retryPublic = useAtomRefresh(publications);
   const [search, setSearch] = useState("");
   const [limit, setLimit] = useState(50);
   const templates = AsyncResult.value(result);
-  const published = AsyncResult.value(publicResult);
+  const published = publicResult === undefined ? Option.none() : AsyncResult.value(publicResult);
   type Row =
     | { readonly kind: "template"; readonly entry: CatalogEntry }
     | { readonly kind: "publication"; readonly publication: typeof Publication.Type };
@@ -97,7 +119,11 @@ export function CatalogPage<E, P>({
           <h1 className="text-[22px] font-semibold tracking-[-0.035em] leading-[1.35] [&>span]:text-muted-foreground [&>span]:text-[13px] [&>span]:font-mono [&>span]:font-normal [&>span]:ml-[8px] [&>span]:align-middle">
             Add app
           </h1>
-          <p>Find a published app or connect a service.</p>
+          <p>
+            {publicResult === undefined
+              ? "Find a service to connect."
+              : "Find a published app or connect a service."}
+          </p>
         </div>
         {action}
       </div>
@@ -116,14 +142,19 @@ export function CatalogPage<E, P>({
         </span>
       </div>
       {AsyncResult.isFailure(result) && <Failure cause={result.cause} retry={retry} />}
-      {AsyncResult.isFailure(publicResult) && (
-        <PublicationFailure cause={publicResult.cause} retry={retryPublic} />
-      )}
-      {!entries.length && (AsyncResult.isInitial(result) || AsyncResult.isInitial(publicResult)) ? (
+      {publicResult !== undefined &&
+        AsyncResult.isFailure(publicResult) &&
+        PublicationFailure !== undefined && (
+          <PublicationFailure cause={publicResult.cause} retry={retryPublic} />
+        )}
+      {!entries.length &&
+      (AsyncResult.isInitial(result) ||
+        (publicResult !== undefined && AsyncResult.isInitial(publicResult))) ? (
         <LoadingRows />
       ) : !entries.length &&
         (AsyncResult.isFailure(result) ||
-          AsyncResult.isFailure(publicResult)) ? null : !entries.length ? (
+          (publicResult !== undefined &&
+            AsyncResult.isFailure(publicResult))) ? null : !entries.length ? (
         <Empty
           title={search ? "No matching apps" : "No apps available"}
           action={

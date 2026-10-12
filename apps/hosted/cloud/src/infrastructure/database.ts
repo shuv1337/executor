@@ -21,6 +21,7 @@ import {
 import { developmentDatabase } from "./development.ts";
 import { cloudOrigin, roleHostsJobEnvironment, testStage, type TestStage } from "./stage.ts";
 import { postgresUrl, previewDatabase } from "./preview-database.ts";
+import { missingV1PlanetscaleDatabase } from "./v1-membership-settings.ts";
 
 /** Both SQL adapters create schema objects as the stable owner, not the rotating login. */
 const migrationUrl = (origin: Planetscale.PostgresOrigin) => {
@@ -180,6 +181,32 @@ export const cloudDatabaseConnection = Effect.gen(function* () {
 });
 
 /**
+ * v1's Postgres for the v1 sign-in check, on production only. The stack declares a role on v1's
+ * PlanetScale database (`V1_PLANETSCALE_DATABASE_NAME`, branch `main`) that inherits only
+ * `pg_read_all_data`, and binds its pooled URL as the `V1_DATABASE_URL` Worker secret. It never
+ * declares v1's database, which v1 owns; removing the resource drops only the role. Temporary,
+ * with the v1 import window. Without the name a production deploy stops and says what to set.
+ */
+export const v1DatabaseConnection = Effect.gen(function* () {
+  const role = globalThis.__ALCHEMY_RUNTIME__
+    ? yield* Planetscale.PostgresRole.ref("V1ReaderRole")
+    : yield* Planetscale.PostgresRole("V1ReaderRole", {
+        database: yield* Config.String("V1_PLANETSCALE_DATABASE_NAME").pipe(
+          Config.option,
+          Effect.map(Option.filter((name) => name !== "")),
+          Effect.flatMap(
+            Option.match({
+              onNone: () => Effect.die(new Error(missingV1PlanetscaleDatabase)),
+              onSome: Effect.succeed,
+            }),
+          ),
+        ),
+        inheritedRoles: ["pg_read_all_data"],
+      });
+  return yield* Output.named(role.pooledOrigin.pipe(Output.map(postgresUrl)), "V1_DATABASE_URL");
+}).pipe(Effect.orDie);
+
+/**
  * How long one attempt to open a runtime connection may take. A connection usually opens in
  * about 100 ms, but a few attempts stall until they time out while connections opened just before
  * and after take the usual time. An attempt that fails has sent no statement, so the pool makes
@@ -202,6 +229,16 @@ export const cloudDatabasePool = (options: {
   readonly maxConnections: number;
   readonly idleTimeout?: Duration.Input;
   readonly applicationName?: string;
+  /**
+   * Statements of one `PgPool.grouped` group that are in flight at the same time share one
+   * connection and go out in one write; the connection carries no other statement meanwhile, so a
+   * group only ever waits behind its own statements. Ungrouped statements, transactions, streams
+   * and reserved connections each take a connection of their own, as without this. A statement
+   * whose caller gives up while it runs stops the connection taking new statements (the group's
+   * next ones take another); before the connection goes back, what nobody awaits is cancelled and
+   * drained, and the connection is kept, as an interrupted statement's is without grouping.
+   */
+  readonly statementGroups?: boolean;
 }) =>
   Layer.effectContext(
     Effect.gen(function* () {
@@ -218,7 +255,12 @@ export const cloudDatabasePool = (options: {
       });
       const sql = yield* Layer.build(
         PgClient.layer({
-          ...options,
+          url: options.url,
+          maxConnections: options.maxConnections,
+          idleTimeout: options.idleTimeout,
+          applicationName: options.applicationName,
+          // One connection per lease: grouping is what puts statements on a connection together.
+          ...(options.statementGroups === true ? { multiplex: true, multiplexConcurrency: 1 } : {}),
           prepare: false,
           connectTimeout: connectAttemptTimeout,
           connectRetries: 1,

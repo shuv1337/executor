@@ -1,7 +1,7 @@
 import { UserFacingError } from "@executor-js/utils/user-facing-error";
 import { ApiError } from "@executor-js/utils/api-error";
 /** Saved reusable accounts. Products decide access; pending setup lives in account-connection.ts. */
-import { Schema } from "effect";
+import { type Effect, Schema } from "effect";
 import { StorageError, CredentialsError } from "./shared.ts";
 import { HttpApiEndpoint, HttpApiGroup, OpenApi } from "effect/http-api";
 import { AccountInfo } from "apps/contracts";
@@ -159,8 +159,11 @@ export const AccountFieldsInvalid = ApiError.define({
 });
 export type AccountFieldsInvalid = typeof AccountFieldsInvalid.Type;
 
-/** Canonical decoded inputs shared by HTTP contracts and the Promise facade. */
-export const AccountInputs = {
+/**
+ * Host-only credential writes. Users and agents save credentials through an app's connection
+ * request; products use these for accounts they provision themselves, such as their own API access.
+ */
+export const ManagedAccountInputs = {
   add: Schema.Struct({
     owner: OwnerId,
     provider: ProviderId,
@@ -171,6 +174,37 @@ export const AccountInputs = {
     description: Schema.optional(Schema.NullOr(Schema.String)),
     fields: AccountFieldsInput,
   }),
+  /** Replace every field of a secrets-method account, keeping its ID and selections. */
+  replaceCredentials: Schema.Struct({
+    account: AccountId,
+    owner: Schema.optional(OwnerId),
+    fields: AccountFieldsInput,
+  }),
+};
+
+/** Host-only: not part of the HTTP API or the Promise SDK. */
+export interface ManagedAccounts {
+  readonly add: (
+    input: typeof ManagedAccountInputs.add.Type,
+  ) => Effect.Effect<
+    Account,
+    StorageError | CredentialsError | ProviderNotFound | AuthMethodInvalid | AccountFieldsInvalid
+  >;
+  readonly replaceCredentials: (
+    input: typeof ManagedAccountInputs.replaceCredentials.Type,
+  ) => Effect.Effect<
+    Account,
+    | StorageError
+    | CredentialsError
+    | AccountNotFound
+    | ProviderNotFound
+    | AuthMethodInvalid
+    | AccountFieldsInvalid
+  >;
+}
+
+/** Canonical decoded inputs shared by HTTP contracts and the Promise facade. */
+export const AccountInputs = {
   get: Schema.Struct({ account: AccountId, owner: Schema.optional(OwnerId) }),
   /** `clear` drops the account from every profile selection, leaving those profiles pending. */
   remove: Schema.Struct({
@@ -187,11 +221,6 @@ export const AccountInputs = {
     label: Schema.optional(Schema.String),
     description: Schema.optional(Schema.NullOr(Schema.String)),
   }),
-  replaceCredentials: Schema.Struct({
-    account: AccountId,
-    owner: Schema.optional(OwnerId),
-    fields: AccountFieldsInput,
-  }),
   listHealth: Schema.Struct({ owner: Schema.optional(OwnerId) }),
   check: Schema.Struct({
     account: AccountId,
@@ -201,6 +230,17 @@ export const AccountInputs = {
   }),
 };
 const accountParams = { account: AccountInputs.get.fields.account };
+
+/**
+ * What deleting an account does at its service. `automatic`: Executor asks the service to revoke
+ * the account's grant (RFC 7009) once the deletion commits, best effort. `manual`: the service
+ * offers no revocation Executor can use, or the account has no OAuth grant, so access ends only
+ * when the person removes it at the service.
+ */
+export const AccountRevocation = Schema.Struct({
+  revocation: Schema.Literals(["automatic", "manual"]),
+});
+export type AccountRevocation = typeof AccountRevocation.Type;
 const ownerQuery = { owner: AccountInputs.get.fields.owner };
 
 /**
@@ -244,22 +284,6 @@ export type AccountSignIn = typeof AccountSignIn.Type;
 
 export const AccountsGroup = HttpApiGroup.make("accounts")
   .add(
-    HttpApiEndpoint.post("add", "/v1/accounts", {
-      payload: AccountInputs.add,
-      success: Account,
-      error: [
-        StorageError,
-        CredentialsError,
-        ProviderNotFound,
-        AuthMethodInvalid,
-        AccountFieldsInvalid,
-      ],
-    }).annotate(
-      OpenApi.Description,
-      "Save an account using its provider reference and named secrets method. Fields must match the provider schema. An optional description tells agents what the account is for. Returns metadata only. For user-supplied credentials, use the product browser connection link so secrets never pass through the agent.",
-    ),
-  )
-  .add(
     HttpApiEndpoint.patch("update", "/v1/accounts/:account", {
       params: accountParams,
       query: ownerQuery,
@@ -275,25 +299,6 @@ export const AccountsGroup = HttpApiGroup.make("accounts")
     ),
   )
   .add(
-    HttpApiEndpoint.put("replaceCredentials", "/v1/accounts/:account/credentials", {
-      params: accountParams,
-      query: ownerQuery,
-      payload: Schema.Struct({ fields: AccountInputs.replaceCredentials.fields.fields }),
-      success: Account,
-      error: [
-        StorageError,
-        CredentialsError,
-        AccountNotFound,
-        ProviderNotFound,
-        AuthMethodInvalid,
-        AccountFieldsInvalid,
-      ],
-    }).annotate(
-      OpenApi.Description,
-      "Replace all fields of a saved API-key account using its provider and method schema. All apps selecting this account use the new credentials. Returns metadata only. Use a browser connection link to collect user-supplied credentials.",
-    ),
-  )
-  .add(
     HttpApiEndpoint.delete("remove", "/v1/accounts/:account", {
       params: accountParams,
       query: { ...ownerQuery, bindings: AccountInputs.remove.fields.bindings },
@@ -301,7 +306,7 @@ export const AccountsGroup = HttpApiGroup.make("accounts")
       error: [StorageError, AccountWebhooksActive, AccountWorkflowsActive],
     }).annotate(
       OpenApi.Description,
-      "Delete a saved account and its local credentials. Inspect affected profile selections and confirm the intended account first. Does not revoke access at the provider. To stop using the account in only one app, update that profile selection instead.",
+      "Delete a saved account and its local credentials. Inspect affected profile selections and confirm the intended account first. When the service supports revocation, also asks it to revoke the account's OAuth grant after the deletion, best effort; accounts.revocation reports whether it will. To stop using the account in only one app, update that profile selection instead.",
     ),
   )
   .add(
@@ -332,6 +337,17 @@ export const AccountsGroup = HttpApiGroup.make("accounts")
     }).annotate(
       OpenApi.Description,
       "Read each selecting app's latest check of an account and the identity the checks reported. Does not run a check.",
+    ),
+  )
+  .add(
+    HttpApiEndpoint.get("revocation", "/v1/accounts/:account/revocation", {
+      params: accountParams,
+      query: ownerQuery,
+      success: AccountRevocation,
+      error: [StorageError, CredentialsError, AccountNotFound],
+    }).annotate(
+      OpenApi.Description,
+      "Report whether deleting an account also asks its service to revoke access, so a person can be told before they delete it. Does not contact the service.",
     ),
   )
   .add(

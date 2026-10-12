@@ -12,7 +12,12 @@ import {
 import { accountDestination } from "./resource-lifecycle.ts";
 import { AccountGrants } from "./proofs/account-access.ts";
 import { AccountTargets } from "../contracts/account-grants.ts";
-import { requireAppAccess, visibleApps, visibleAccounts } from "./resource-policy.ts";
+import {
+  currentResourceAuthority,
+  requireAppAccess,
+  visibleApps,
+  visibleAccounts,
+} from "./resource-policy.ts";
 import type { ConnectionDestination } from "../contracts/resource-access.ts";
 /** Account use cases, connection grants and OAuth routes share the same ownership checks. */
 import {
@@ -23,8 +28,10 @@ import {
   type AppId,
   type Executor,
   type OwnerId,
+  type OAuthClientSelection,
   StorageError,
 } from "@executor-js/sdk/core";
+import { connectionClient, usableOAuthClients } from "./oauth-clients.ts";
 import { Effect, Schema } from "effect";
 import { HttpServerRequest, HttpServerResponse } from "effect/http";
 import { HttpApiBuilder } from "effect/http-api";
@@ -53,11 +60,16 @@ export const getAccount = Effect.gen(function* () {
     Effect.flatMap(visibleApps),
   );
   const health = yield* executor.accounts.health({ owner, account });
+  // An unreadable grant is unreadable storage to this view.
+  const { revocation } = yield* executor.accounts
+    .revocation({ owner, account })
+    .pipe(Effect.catchTag("CredentialsError", () => new StorageError()));
   return {
     account: metadata,
     provider,
     apps,
     health: visibleHealth(health, apps),
+    revocation,
     canManage: access.canManage,
   };
 });
@@ -92,7 +104,10 @@ export const checkAccount = Effect.gen(function* () {
   });
   return visibleHealth(health, apps);
 });
-/** Check only providers reachable through the caller's app or account access; return no client details. */
+/**
+ * Check only providers reachable through the caller's app or account access. Lists the registered
+ * clients the caller may use, as metadata; never a client secret.
+ */
 export const oauthSetup = (
   owner: OwnerId,
   input: Omit<Parameters<Executor["accountConnections"]["oauthSetup"]>[0], "owner">,
@@ -116,7 +131,18 @@ export const oauthSetup = (
           .pipe(Effect.flatMap(visibleAccounts))).length === 0)
     )
       return yield* new OrganizationForbidden();
-    return yield* executor.accountConnections.oauthSetup({ ...input, owner });
+    const setup = yield* executor.accountConnections.oauthSetup({ ...input, owner });
+    // Client credentials clients are each account's own; only browser sign-in shares clients.
+    const clients =
+      setup.grant === "client_credentials"
+        ? []
+        : yield* usableOAuthClients(
+            executor,
+            owner,
+            yield* currentResourceAuthority,
+            input.provider,
+          );
+    return { ...setup, clients };
   });
 
 /** Delete saved credentials and remove their selections through the transactional lifecycle hook. */
@@ -207,18 +233,25 @@ export const submitConnection = (
       Effect.tap(() => Effect.flatten(ScheduleWakeup)),
     );
   });
-/** OAuth client resolution and credentials remain inside the trusted SDK. */
+/**
+ * The member's client choice is checked against its audience here, then named to the SDK, which
+ * keeps client secrets and protocol state. Entered clients sign in this account only.
+ */
 export const startOAuth = (
   owner: OwnerId,
-  input: Omit<Parameters<Executor["accountConnections"]["startOAuth"]>[0], "owner">,
+  input: Omit<Parameters<Executor["accountConnections"]["startOAuth"]>[0], "owner" | "client"> & {
+    readonly client?: OAuthClientSelection | undefined;
+  },
 ) =>
   Effect.gen(function* () {
     const executor = yield* Effect.flatten(HostedExecutor);
     const intent = yield* checkConnection(
       yield* ownedConnection(executor, owner, input.connection),
     );
+    const client = yield* connectionClient(executor, owner, input);
+    const { client: _selected, ...rest } = input;
     return yield* executor.accountConnections
-      .startOAuth({ ...input, owner })
+      .startOAuth({ ...rest, owner, ...(client === undefined ? {} : { client }) })
       .pipe(accountDestination(intent.destination));
   });
 /** Completion rechecks connection and target ownership before saving provider credentials. */
@@ -281,16 +314,10 @@ export const hostedAccountHandlers = HttpApiBuilder.group(HostedApi, "accounts",
           const owner = yield* currentOwner;
           const connection = yield* getConnection(owner, params);
           const target = connection.target;
-          const app =
-            target === null || target === undefined
-              ? undefined
-              : yield* Effect.flatten(HostedExecutor).pipe(
-                  Effect.flatMap((executor) => executor.apps.get({ owner, app: target.app })),
-                );
-          const requirement =
-            app === undefined || target === null || target === undefined
-              ? undefined
-              : app.requirements.accounts[target.requirement];
+          const app = yield* Effect.flatten(HostedExecutor).pipe(
+            Effect.flatMap((executor) => executor.apps.get({ owner, app: target.app })),
+          );
+          const requirement = app.requirements.accounts[target.requirement];
           return {
             ...connection,
             url: yield* connectionUrl(connection.id),
@@ -307,10 +334,6 @@ export const hostedAccountHandlers = HttpApiBuilder.group(HostedApi, "accounts",
       .handle("startOAuth", ({ params, payload }) =>
         Effect.flatMap(currentOwner, (owner) =>
           startOAuth(owner, { connection: params.connection, ...payload, redirectUri }),
-        ).pipe(
-          Effect.map((result) =>
-            result.status === "redirect" ? { ...result, redirectUri } : result,
-          ),
         ),
       )
       .handle("completeOAuth", ({ params, payload }) =>
@@ -332,7 +355,6 @@ export const hostedOAuthCallbackHandlers = HttpApiBuilder.group(
   (handlers) =>
     Effect.gen(function* () {
       const auth = yield* Authentication;
-      const redirectUri = accountOAuthRedirectUri(auth);
       return handlers.handle("resolve", ({ payload }) =>
         Effect.gen(function* () {
           const principal = yield* CurrentPrincipal;
@@ -355,9 +377,10 @@ export const hostedOAuthCallbackHandlers = HttpApiBuilder.group(
           return {
             organizationSlug,
             connection: connection.id,
-            app: connection.target?.app ?? null,
-            profile: connection.target?.profile,
-            redirectUri,
+            app: connection.target.app,
+            profile: connection.target.profile,
+            // The callback this sign-in sent, which a saved client may have kept from before.
+            redirectUri: connection.redirectUri,
             reconnect: connection.reconnectAccount !== null,
           };
         }),

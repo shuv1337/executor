@@ -7,6 +7,7 @@ import {
   type App,
   type PublicationIssue,
   type PublicationReadiness,
+  sourceText,
 } from "@executor-js/sdk";
 import type { AppSourceDisplay } from "@executor-js/app-management/contracts";
 import { HugeiconsIcon } from "@hugeicons/react";
@@ -104,14 +105,7 @@ function publicationRepair(issue: PublicationIssue, suggestedName: string | null
         title: "Check the package details",
         detail: "The name is valid, but other package details are not.",
         rename: false,
-        task: "Check the description and executor fields in package.json and fix any that are invalid. The description can be at most 2,000 characters.",
-      };
-    case "unsupported-dependencies":
-      return {
-        title: "Include the required app code",
-        detail: "App-to-app package dependencies are not supported.",
-        rename: false,
-        task: "Remove executor.dependencies from package.json and include the code the app needs directly in its source.",
+        task: "Check the description in package.json and fix it if it is invalid. The description can be at most 2,000 characters.",
       };
     case "invalid-source":
       return {
@@ -119,7 +113,7 @@ function publicationRepair(issue: PublicationIssue, suggestedName: string | null
         detail:
           "The source includes files that cannot be published, such as .env, .npmrc, or node_modules.",
         rename: false,
-        task: "Remove files that cannot be published (.env files, .npmrc, node_modules, .git, .executor, executor.lock.json) from the saved app source.",
+        task: "Remove files that cannot be published (.env files, .npmrc, node_modules, .git, .executor) from the saved app source.",
       };
     case "limit":
       return {
@@ -239,8 +233,7 @@ function RenameAndContinue<E>({
   const loaded = AsyncResult.isSuccess(workspace);
   const rename = async () => {
     if (!AsyncResult.isSuccess(workspace)) return;
-    const base =
-      workspace.value.files.find((file) => file.path === "package.json")?.content ?? null;
+    const base = sourceText(workspace.value.files, "package.json") ?? null;
     setSaving(true);
     setError(undefined);
     setChanged(false);

@@ -97,7 +97,7 @@ const jobs = {
     runner: 1,
 
     pattern:
-      "Cloud onboarding|Cloud sign-in (?:keeps a new v1|skips the v1 check)|Cloud OAuth callbacks|Cloud OAuth token requests record|Cloud product events|Cloud feedback|Cloud tracks an unusable OAuth|app query traces|observability retains|browser decode and startup|Browser connection failures explain|optimistic replay failures|private app crash reports|Platform admin impersonation|Cloud reports the framework pin|Cloud deploys fail promptly when the compiler does not answer|refuses every stored state Better Auth refuses|Billing reconciles only while visible|A dashboard read refreshed while in flight|Cloud finishes a slow app's tool listing|Cloud remembers a stalled tool listing|Cloud keeps each JSON Schema definition a tool listing repeats once|definitions share a name and length but not their JSON|definition names are long and of one length|Cloud MCP session objects (?:hold|make)|Cloud MCP request spans say whether|database failure while verifying an API key|Cloud cron wakes the schedule coordinator|Cloud runs a due schedule and requested profile setup while|app evaluation failures explain the likely cause|client request rejections are recorded on their request span|failure text reaches its caller|an app request Executor's network failed to send|MCP tool calls deliver their tool name and outcome|Executor time|Cloud serves a tool listing its isolate cannot keep|Cloud writes the background refresh of a stale tool listing|Owners delete an organization with every app|Hosted MCP negotiates older protocol versions|Hosted MCP ends a cancelled call|Cloud copies each build's browser files|Hosted dashboard runs of approval-gated tools|Hosted dashboard approval",
+      "Cloud onboarding|Cloud sign-in (?:keeps a new v1|skips the v1 check|admits members of only empty free v1)|Cloud OAuth callbacks|Cloud OAuth token requests record|Cloud product events|Cloud feedback|Cloud tracks an unusable OAuth|app query traces|observability retains|browser decode and startup|Browser connection failures explain|optimistic replay failures|private app crash reports|Platform admin impersonation|Cloud reports the framework pin|Cloud deploys fail promptly when the compiler does not answer|refuses every stored state Better Auth refuses|Billing reconciles only while visible|A dashboard read refreshed while in flight|Cloud finishes a slow app's tool listing|Cloud remembers a stalled tool listing|Cloud keeps each JSON Schema definition a tool listing repeats once|definitions share a name and length but not their JSON|definition names are long and of one length|Cloud MCP session objects (?:hold|make)|Cloud MCP request spans say whether|database failure while verifying an API key|use one API key together|Cloud cron wakes the schedule coordinator|Cloud runs a due schedule and requested profile setup while|app evaluation failures explain the likely cause|client request rejections are recorded on their request span|failure text reaches its caller|an app request Executor's network failed to send|MCP tool calls deliver their tool name and outcome|Executor time|Cloud serves a tool listing its isolate cannot keep|Cloud writes the background refresh of a stale tool listing|Owners delete an organization with every app|Hosted MCP negotiates older protocol versions|Hosted MCP ends a cancelled call|Cloud lists each build's browser files|Hosted dashboard runs of approval-gated tools|Hosted dashboard approval",
   },
   // The scenarios above share one local Cloud and collector, and their span and latency checks
   // stall when more scenarios load it. These assert no such bound, so they start their own.
@@ -106,7 +106,7 @@ const jobs = {
     runner: 3,
 
     pattern:
-      "Cloud SSO SAML accepts|Safari reports only the page's own failures|Cloud cron triggers run their jobs|Cloud support dialog lists every channel|Hosted feedback enforces its API contract|Executor's catalog calls an app's own cache methods|Executor app is installed by its request|Request and workflow attempts at one team|remote skill catalog|a skill read without a revision|abandons a GitHub skills load|another organization's admin cannot read the link|account connections cannot cross organizations|Deploys wake profile setup",
+      "Cloud SSO SAML accepts|Cloud's operator OAuth client signs in|Safari reports only the page's own failures|Cloud cron triggers run their jobs|Cloud support dialog lists every channel|Hosted feedback enforces its API contract|Executor's catalog calls an app's own cache methods|Executor app is installed with nothing left pending|Cloud MCP routes a request inside a session|Request and workflow attempts at one team|remote skill catalog|a skill read without a revision|abandons a GitHub skills load|reads its catalog and the tool in one cache command|another organization's admin cannot read the link|account connections cannot cross organizations|Deploys wake profile setup|A skill catalog refreshed in the background after a dashboard batch read|Cloud MCP session objects run parallel tool calls|Cloud MCP session objects cancel a statement|Cloud MCP session objects discover the other apps|Cloud MCP session objects' database pool|Hosted MCP resume reports an approved call's own failure",
   },
   // Cloud's hosts: role hosts, the edge and sign-in on `app.`. Run in `cloud-product`, their
   // load kept the team installation's workflow span from arriving within its 30-second wait, so
@@ -115,7 +115,7 @@ const jobs = {
     target: "cloud",
     runner: 3,
     pattern:
-      "cloud role hosts serve only|a grant is for its one resource|role host resource seed|Cloud request spans name the host|Cloud sign-in explains that a passkey|Cloud connected-account sign-ins return through|Cloud serves its site for the edge|keep serving the published skills index|Apps directory on the edge reads|Cloud's API host serves the SDK|Cloud's own social sign-ins on app\\.|hosted wildcard routes trace their template",
+      "cloud role hosts serve only|a grant is for its one resource|role host resource seed|Cloud request spans name the host|Cloud sign-in explains that a passkey|Cloud connected-account sign-ins return through|Cloud serves its site for the edge|keep serving the published skills index|Apps directory on the edge reads|Cloud's API host serves the SDK|Cloud's own social sign-ins on app\\.|hosted wildcard routes trace their template|Cloud links the site's anonymous visitor",
   },
   "cloud-workers": {
     target: "cloud",
@@ -131,6 +131,13 @@ const jobs = {
     runner: 2,
 
     pattern: "A Better Auth query|Cloud starts organization removals whose Workflow start stalled",
+  },
+  // This holds a lock on the accounts table to stop a tool call's batch partway, which would
+  // stall every other scenario that reads accounts.
+  "cloud-batch": {
+    target: "cloud",
+    runner: 2,
+    pattern: "Cloud MCP tool calls send their checks and reads",
   },
   // This counts every request in local Cloud's single session object isolate, so another
   // scenario's MCP request in flight would change its count.
@@ -432,7 +439,12 @@ const verify = (suite: string | undefined, directory: string | undefined) =>
  * compared with main, not the pull request's base, so the top of a stack counts every layer.
  */
 const patchGuards: Readonly<Record<string, ReadonlyArray<string>>> = {
-  "@opencode-ai/codemode": ["mcp-catalog.spec.ts"],
+  "@opencode-ai/codemode": [
+    "mcp-catalog.spec.ts",
+    "mcp-execute-concurrency.spec.ts",
+    "mcp-execute-lazy.spec.ts",
+    "local-mcp-connections.spec.ts",
+  ],
   effect: [
     "mcp-telemetry-privacy.spec.ts",
     "mcp-protocol-versions.spec.ts",
@@ -554,10 +566,13 @@ const suiteConfigs: Record<string, () => Promise<unknown>> = {
   "desktop-release.config.ts": () => import("./desktop-release.config.ts"),
   "emulator-failures.config.ts": () => import("./emulator-failures.config.ts"),
   "docker-release.config.ts": () => import("./docker-release.config.ts"),
+  "installer.config.ts": () => import("./installer.config.ts"),
   "local-bootstrap.config.ts": () => import("./local-bootstrap.config.ts"),
+  "npm-launcher.config.ts": () => import("./npm-launcher.config.ts"),
   "pglite.config.ts": () => import("./pglite.config.ts"),
   "prepare-cache.config.ts": () => import("./prepare-cache.config.ts"),
   "release-archives.config.ts": () => import("./release-archives.config.ts"),
+  "standalone-lockdown.config.ts": () => import("./standalone-lockdown.config.ts"),
   "typecheck-runner.config.ts": () => import("./typecheck-runner.config.ts"),
   "welcome-email.config.ts": () => import("./welcome-email.config.ts"),
 };
@@ -1050,6 +1065,8 @@ NodeRuntime.runMain(
           : [],
       ),
       `cloud-runners=${cloudRunners.length === 0 ? "" : JSON.stringify(cloudRunners)}`,
+      // Line coverage is comparable only between runs of every scenario.
+      `full=${files === undefined}`,
     ].join("\n");
     const report = [
       "## E2E selection",

@@ -1,4 +1,5 @@
 import { CheckOAuthSetup } from "../contracts/oauth.ts";
+import { OAuthClientInputs } from "../contracts/oauth-clients.ts";
 import { ProfileInputs } from "../contracts/profiles.ts";
 import {
   StartWorkflow,
@@ -79,17 +80,15 @@ export const promiseExecutor = (executor: Executor): PromiseExecutor => {
       answer: (input) => run(ScheduleInputs.answer, input, executor.schedules.answer),
     },
     accounts: {
-      add: (input) => run(AccountInputs.add, input, executor.accounts.add),
       get: (input) => run(AccountInputs.get, input, executor.accounts.get),
       provider: (input) => run(AccountInputs.get, input, executor.accounts.provider),
       list: (input = {}) => run(AccountInputs.list, input, executor.accounts.list),
       update: (input) => run(AccountInputs.update, input, executor.accounts.update),
-      replaceCredentials: (input) =>
-        run(AccountInputs.replaceCredentials, input, executor.accounts.replaceCredentials),
       remove: (input) => run(AccountInputs.remove, input, executor.accounts.remove),
       signIn: (input) => run(AccountInputs.get, input, executor.accounts.signIn),
       providers: (input = {}) => run(AccountInputs.providers, input, executor.accounts.providers),
       health: (input) => run(AccountInputs.get, input, executor.accounts.health),
+      revocation: (input) => run(AccountInputs.get, input, executor.accounts.revocation),
       listHealth: (input = {}) =>
         run(AccountInputs.listHealth, input, executor.accounts.listHealth),
       check: (input) => run(AccountInputs.check, input, executor.accounts.check),
@@ -105,6 +104,13 @@ export const promiseExecutor = (executor: Executor): PromiseExecutor => {
       findOAuth: (input) => run(FindConnectionOAuth, input, executor.accountConnections.findOAuth),
       completeOAuth: (input) =>
         run(CompleteConnectionOAuth, input, executor.accountConnections.completeOAuth),
+    },
+    oauthClients: {
+      register: (input) => run(OAuthClientInputs.register, input, executor.oauthClients.register),
+      list: (input) => run(OAuthClientInputs.list, input, executor.oauthClients.list),
+      get: (input) => run(OAuthClientInputs.get, input, executor.oauthClients.get),
+      update: (input) => run(OAuthClientInputs.update, input, executor.oauthClients.update),
+      remove: (input) => run(OAuthClientInputs.remove, input, executor.oauthClients.remove),
     },
     owners: {
       check: (input) => run(OwnerInputs.check, input, executor.owners.check),
@@ -165,6 +171,7 @@ export const promiseExecutor = (executor: Executor): PromiseExecutor => {
     registry: {
       list: (input = {}) => run(RegistryInputs.list, input, executor.registry.list),
       snapshot: (input) => run(RegistryInputs.snapshot, input, executor.registry.snapshot),
+      file: (input) => run(RegistryInputs.file, input, executor.registry.file),
     },
     webhookSetup: {
       read: (input) => run(WebhookTarget, input, executor.webhookSetup.read),

@@ -39,7 +39,7 @@ import { appAddresses, hostedAppUi } from "@executor-js/hosted-server/app-ui";
 import { appSignInCallbackPath } from "apps/ui/auth";
 import { AppUiApi } from "apps/ui/contracts";
 import { HttpApiBuilder } from "effect/http-api";
-import { appUiBaseUrl } from "../contracts/config.ts";
+import { appUiBaseUrl, catalogFeedUrl } from "../contracts/config.ts";
 import { type HostEgress } from "@executor-js/utils/url-policy";
 import { Config, Effect, Layer, Option } from "effect";
 import { HttpRouter, HttpServer, HttpServerRequest, HttpServerResponse } from "effect/http";
@@ -49,7 +49,7 @@ import { selfHostMcp } from "../mcp.ts";
 import { SelfHostAuth } from "../auth.ts";
 import { selfHostAnalytics } from "./product-analytics.ts";
 
-import type { SourceFile } from "@executor-js/sdk/core";
+import type { SourceTextFile as SourceFile } from "@executor-js/sdk/core";
 import type { selfHostExecutorServices } from "./executor-services.ts";
 /** Compose the self-host route map without opening a listener; shared by the process entry and HTTP tests. */
 export const selfHostRouteMap = <DashboardE, DashboardR>(options: {
@@ -108,7 +108,13 @@ export const selfHostRouteMap = <DashboardE, DashboardR>(options: {
       Layer.provide(appUi.dashboard),
       HttpRouter.provideRequest(auth.appSessions),
       HttpRouter.provideRequest(
-        catalogLive(document.document, egress, clientMetadata, auth.origin),
+        catalogLive(
+          document.document,
+          egress,
+          clientMetadata,
+          auth.origin,
+          Option.getOrUndefined(yield* catalogFeedUrl),
+        ),
       ),
       Layer.provide(hostedMiddlewareLive),
       // Organization middleware reads the product's removal tombstones when it is built.

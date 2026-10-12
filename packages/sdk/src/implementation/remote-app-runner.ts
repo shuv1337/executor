@@ -8,7 +8,7 @@
 import { Cause, Effect, Redacted, Schema } from "effect";
 import { withRemoteSpan } from "@executor-js/telemetry";
 import {
-  ResolvedAccounts,
+  HostAccounts,
   WorkflowDuration,
   WorkflowFailure,
   WorkflowRpcResult,
@@ -25,7 +25,13 @@ import {
 import { BuildId } from "../contracts/shared.ts";
 import { LoadedWorkerBuild } from "../contracts/worker-build.ts";
 import { WorkerInvocation } from "../contracts/workerd-host.ts";
-import type { AppCapabilities, AppInvocation, AppRunner } from "./app-runner.ts";
+import {
+  RunnerIngress,
+  runnerIngress,
+  type AppCapabilities,
+  type AppInvocation,
+  type AppRunner,
+} from "./app-runner.ts";
 import { invocationBuildLoader } from "./app-runtime.ts";
 
 type Callback = (input: unknown) => Promise<unknown>;
@@ -207,7 +213,7 @@ const localCapabilities = (remote: RemoteCapabilities, load: () => Promise<Loade
             },
             resolve: () =>
               settle(() => workflow.context()).pipe(
-                Effect.flatMap(Schema.decodeUnknownEffect(ResolvedAccounts)),
+                Effect.flatMap(Schema.decodeUnknownEffect(HostAccounts)),
                 Effect.mapError(engine),
                 Effect.map((accounts) => ({ accounts: Redacted.make(accounts) })),
               ),
@@ -251,6 +257,8 @@ export const serveAppRunner = (
     answer(
       Effect.scoped(
         Effect.gen(function* () {
+          // The runner's part starts here, so decoding the call and reading its build count too.
+          const ingress = yield* runnerIngress;
           const {
             elicitation: _elicitation,
             workflowControls: _controls,
@@ -264,6 +272,7 @@ export const serveAppRunner = (
               runner.invoke(decoded, yield* localCapabilities(capabilities, loader.load)),
             );
           }).pipe(
+            Effect.provideService(RunnerIngress, ingress),
             withRemoteSpan(
               new Request("https://app-runner.internal", { headers: decoded.headers }),
               "runtime.app.serve",

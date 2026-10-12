@@ -22,7 +22,14 @@ export {
 } from "./contracts/auth.ts";
 export { authOptions, authSettings, sessionPrincipal } from "./implementation/auth.ts";
 export * from "./contracts/organization.ts";
-export { HostedExecutor } from "./contracts/executor.ts";
+export {
+  CallStateCache,
+  ConcurrentStatements,
+  HostedExecutor,
+  StatementBatch,
+  type CallState,
+  type StatementGroups,
+} from "./contracts/executor.ts";
 export { OrganizationDefaults } from "./contracts/organization-defaults.ts";
 export { organizationDefaults } from "./implementation/organization-defaults.ts";
 export { executorDefaultRedeployed } from "./implementation/executor-app-upgrades.ts";
@@ -45,6 +52,7 @@ export { migrateOrganizationRemovals } from "./implementation/organization-remov
 
 export { hostedOAuthCallback } from "./implementation/accounts.ts";
 export * from "./contracts/oauth-client-metadata.ts";
+export { firstPartyOAuthClients } from "./implementation/first-party-oauth.ts";
 export {
   clientMetadataDocument,
   clientMetadataSetting,
@@ -65,6 +73,7 @@ export {
   provisionHostedConnectionResources,
   provisionHostedOAuthResources,
   type HostedOAuthOrigins,
+  type RefreshRejection,
 } from "./implementation/mcp-oauth.ts";
 export { authEndpointTemplates, grantExpiry, type GrantExpiry } from "@executor-js/mcp-auth/oauth";
 export type { OriginList, ResourceOrigins } from "@executor-js/mcp-auth";
@@ -75,6 +84,7 @@ export {
   mcpSessionKey,
   dispatchHostedMcp,
   authenticatedMcp,
+  mcpChallenge,
   mcpProtectedResource,
   mcpAuthorizationServer,
 } from "./implementation/mcp-http.ts";

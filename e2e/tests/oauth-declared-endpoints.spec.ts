@@ -18,6 +18,7 @@ import { createProfile, Profile } from "../support/profiles.ts";
 import { nameConnectedAccount } from "../support/name-account.ts";
 import { scenarios } from "../test-plan.ts";
 import { appsManifest } from "../support/apps-release.ts";
+import { enterClientDetails } from "../support/oauth-client-entry.ts";
 
 const AppProvider = Schema.Struct({
   id: Schema.String,
@@ -194,9 +195,10 @@ export default defineApp({accounts:{service}},async({accounts})=>({tools: router
           mode: "client-required",
           scopes: ["openid", "read"],
           grant: "authorization_code",
+          clients: [],
         });
-        // Executor cannot check an ID token against a derived issuer and never reads one, so
-        // sign-in and refresh must both succeed even though these name the sign-in host.
+        // Executor never reads ID tokens, so sign-in and refresh succeed even though these name
+        // the sign-in host rather than the derived issuer.
         yield* issuer.configure({
           callbackIssuer: signInOrigin,
           includeIdToken: true,
@@ -222,7 +224,7 @@ export default defineApp({accounts:{service}},async({accounts})=>({tools: router
           undeclared,
         );
         expect(confidentialAccount.label).toBe("Default");
-        expect((yield* issuer.metrics).nonceRequested).toBe(true);
+        expect((yield* issuer.metrics).nonceRequested).toBe(false);
         expect((yield* issuer.metrics).lastExchangeAuth).toBe("client_secret_basic");
         yield* expectRenewed(confidential, undeclared);
 
@@ -267,7 +269,7 @@ export default defineApp({accounts:{service}},async({accounts})=>({tools: router
           label: "Renamed public account",
         });
 
-        // A declared issuer is the service's identifier, so the callback and ID tokens must match it.
+        // A declared issuer is the service's identifier, so the callback's `iss` must match it.
         const declared = yield* deploy("Declared issuer", { ...endpoints, issuer: signInOrigin });
         const matching = yield* connect(declared);
         const matchingStart = yield* start(matching.connection, clients.confidential);
@@ -283,7 +285,7 @@ export default defineApp({accounts:{service}},async({accounts})=>({tools: router
         const expectRejected = (
           attempt: { readonly profile: typeof Profile.Type; readonly connection: string },
           response: { readonly status: number; readonly body: unknown },
-          reason: "incompatible_response" | "issuer_mismatch",
+          reason: "issuer_mismatch",
         ) =>
           Effect.gen(function* () {
             expect(response.status).toBe(400);
@@ -309,17 +311,16 @@ export default defineApp({accounts:{service}},async({accounts})=>({tools: router
               )).body,
             ).toMatchObject({ state: { status: "pending" } });
           });
+        // ID tokens are ignored, so one naming another issuer than the declared one never fails.
         yield* issuer.configure({ idTokenIssuer: issuer.origin });
         const foreignIdToken = yield* connect(declared);
         const foreignStart = yield* start(foreignIdToken.connection, clients.confidential);
-        const foreignCallback = yield* consent(foreignStart.authorizationUrl);
-        const exchangesBeforeIdToken = (yield* issuer.metrics).tokenExchanges;
-        yield* expectRejected(
+        yield* expectCompleted(
           foreignIdToken,
-          yield* complete(foreignIdToken.connection, foreignCallback),
-          "incompatible_response",
+          yield* complete(foreignIdToken.connection, yield* consent(foreignStart.authorizationUrl)),
+          declared,
         );
-        expect((yield* issuer.metrics).tokenExchanges).toBe(exchangesBeforeIdToken + 1);
+        yield* expectRenewed(foreignIdToken, declared);
         yield* issuer.configure({ idTokenIssuer: signInOrigin });
         yield* issuer.configure({ callbackIssuer: issuer.origin });
         const mismatched = yield* connect(declared);
@@ -346,7 +347,10 @@ export default defineApp({accounts:{service}},async({accounts})=>({tools: router
           page.goto(`/org/${actors.organization.slug}/apps/${formApp.id}?view=accounts`),
         );
         yield* browser.use("Open the account form", (page) =>
-          page.getByRole("button", { name: "Connect new account", exact: true }).click(),
+          page
+            .getByRole("button", { name: "Connect new account", exact: true })
+            .click()
+            .then(() => enterClientDetails(page)),
         );
         yield* browser.use("The client secret is offered as optional", (page) => {
           const dialog = page.getByRole("dialog");
@@ -430,6 +434,7 @@ export default defineApp({accounts:{service}},async({accounts})=>({tools: router
           mode: "client-required",
           scopes: ["read"],
           grant: "authorization_code",
+          clients: [],
         });
         const signInWith = (
           client: { readonly clientId: string; readonly clientSecret?: string },

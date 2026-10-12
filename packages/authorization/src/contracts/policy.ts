@@ -1,5 +1,5 @@
 /** Product permission policies, independent of credentials, OAuth and approval delivery. */
-import { AppId, ProfileId, ToolName } from "@executor-js/sdk/core";
+import { AppId, ProfileId, ToolName, type ToolSearchScope } from "@executor-js/sdk/core";
 import { Match, Schema } from "effect";
 
 /** Product operations; roles still bound the authority granted by any of these actions. */
@@ -106,6 +106,12 @@ export const selectsApp = (selection: ToolSelection, app: AppId) =>
       (scopeGrantsAny(item.tools) || eventsGrantAny(item.events)) &&
       permissionTargets(item),
   );
+/** An app is in the tool inventory only when its permission grants at least one tool. */
+export const selectsToolApp = (selection: ToolSelection, app: AppId) =>
+  selection.kind === "all" ||
+  selection.apps.some(
+    (item) => item.app === app && scopeGrantsAny(item.tools) && permissionTargets(item),
+  );
 const scopeSelects = (tools: ToolScope, tool: ToolIdentity) =>
   Match.value(tools).pipe(
     Match.when({ kind: "all" }, () => true),
@@ -143,6 +149,31 @@ export const selectsTool = (selection: ToolSelection, request: ToolRequest) =>
       targetSelects(item, request.profile) &&
       scopeSelects(item.tools, request.tool),
   );
+/**
+ * The tools of one app target a policy lets the caller discover, as a search scope, or undefined
+ * when it permits every tool. A tool is in the scope exactly when `permitsTool` allows it to be
+ * discovered: one entry for the app and target permits it, read-only or by name.
+ */
+export const discoverableTools = (
+  policy: AuthorizationPolicy,
+  app: AppId,
+  profile: ProfileId | undefined,
+): ToolSearchScope | undefined => {
+  if (!permitsAction(policy, "discover")) return { readOnly: false, names: [] };
+  if (policy.tools.kind === "all") return undefined;
+  const entries = policy.tools.apps.filter(
+    (item) => item.app === app && targetSelects(item, profile),
+  );
+  if (entries.some((item) => item.tools.kind === "all")) return undefined;
+  return {
+    readOnly: entries.some((item) => item.tools.kind === "readOnly"),
+    names: [
+      ...new Set(
+        entries.flatMap((item) => (item.tools.kind === "selected" ? item.tools.names : [])),
+      ),
+    ],
+  };
+};
 /** Only a read-only rule needs the live catalog to decide; exact names and all-tools do not. */
 export const requiresToolMetadata = (selection: ToolSelection, app: AppId) =>
   selection.kind === "tools" &&
@@ -283,6 +314,28 @@ export const permittedAppIds = (
           .filter(
             (item) =>
               selectsApp(policy.tools, item.app) &&
+              (requested === undefined || requested.includes(item.app)),
+          )
+          .map((item) => item.app),
+      ),
+    ]),
+    Match.exhaustive,
+  );
+};
+/** App IDs for tool discovery and execution; event-only grants stay in the event inventory. */
+export const permittedToolAppIds = (
+  policy: AuthorizationPolicy,
+  requested?: readonly AppId[],
+): readonly AppId[] | undefined => {
+  if (!permitsAction(policy, "discover")) return [];
+  return Match.value(policy.tools).pipe(
+    Match.when({ kind: "all" }, () => requested),
+    Match.when({ kind: "tools" }, ({ apps }) => [
+      ...new Set(
+        apps
+          .filter(
+            (item) =>
+              selectsToolApp(policy.tools, item.app) &&
               (requested === undefined || requested.includes(item.app)),
           )
           .map((item) => item.app),

@@ -6,6 +6,7 @@ import { AppWorkflowsActive } from "../contracts/apps.ts";
 import { AccountWorkflowsActive } from "../contracts/account.ts";
 import { AccountId, OwnerId, WebhookId } from "../contracts/shared.ts";
 import { query, transaction, type Query } from "./database.ts";
+import { removeToolSearch } from "./tool-search-store.ts";
 
 /**
  * The refusals a caller cannot clear by acting on providers: work is in flight
@@ -123,11 +124,35 @@ export const makeOwners = (db: Query): Executor["owners"] => ({
         yield* query(() => tx.deleteMany("schedules", { where: (b) => b("owner", "=", owner) }));
         // Profiles run as the app owner; delete by owner for the same reason as schedules.
         yield* query(() => tx.deleteMany("profiles", { where: (b) => b("owner", "=", owner) }));
+        // Event subscriptions too, so a subscription whose app row already went stays reachable.
+        const subscriptions = yield* query(() =>
+          tx.findMany("eventSubscriptions", {
+            select: ["id"],
+            where: (b) => b("owner", "=", owner),
+          }),
+        );
+        if (subscriptions.length > 0) {
+          yield* query(() =>
+            tx.deleteMany("eventDeliveries", {
+              where: (b) =>
+                b(
+                  "subscription",
+                  "in",
+                  subscriptions.map((subscription) => subscription.id),
+                ),
+            }),
+          );
+          yield* query(() =>
+            tx.deleteMany("eventSubscriptions", { where: (b) => b("owner", "=", owner) }),
+          );
+        }
         if (appIds.length > 0) {
+          yield* query(() => tx.deleteMany("events", { where: (b) => b("app", "in", appIds) }));
           yield* query(() => tx.deleteMany("appRecords", { where: (b) => b("app", "in", appIds) }));
           yield* query(() =>
             tx.deleteMany("accountChecks", { where: (b) => b("app", "in", appIds) }),
           );
+          yield* removeToolSearch(tx, appIds);
           yield* query(() => tx.deleteMany("apps", { where: (b) => b("owner", "=", owner) }));
         }
         if (accountIds.length > 0) {
@@ -158,6 +183,13 @@ export const makeOwners = (db: Query): Executor["owners"] => ({
           );
         yield* query(() =>
           tx.deleteMany("toolApprovals", { where: (b) => b("owner", "=", owner) }),
+        );
+        // Grants keep their own copy of a client, so other owners' accounts keep renewing.
+        yield* query(() =>
+          tx.deleteMany("storedOAuthClients", { where: (b) => b("owner", "=", owner) }),
+        );
+        yield* query(() =>
+          tx.deleteMany("storedOAuthClientCredentials", { where: (b) => b("owner", "=", owner) }),
         );
         // Apps reference their active deployment, so retained code is removed last.
         const deployments = yield* query(() =>

@@ -52,21 +52,20 @@ export const executorHandlers = (executor: Executor) =>
     ),
     HttpApiBuilder.group(ExecutorApi, "accounts", (handlers) =>
       handlers
-        .handle("add", ({ payload }) => executor.accounts.add(payload))
         .handle("update", ({ params, query, payload }) =>
           executor.accounts.update({ ...params, ...query, ...payload }),
         )
         .handle("provider", ({ params, query }) =>
           executor.accounts.provider({ ...params, ...query }),
         )
-        .handle("replaceCredentials", ({ params, query, payload }) =>
-          executor.accounts.replaceCredentials({ ...params, ...query, ...payload }),
-        )
         .handle("remove", ({ params, query }) => executor.accounts.remove({ ...params, ...query }))
         .handle("signIn", ({ params, query }) => executor.accounts.signIn({ ...params, ...query }))
         .handle("providers", ({ query }) => executor.accounts.providers(query))
         .handle("get", ({ params, query }) => executor.accounts.get({ ...params, ...query }))
         .handle("health", ({ params, query }) => executor.accounts.health({ ...params, ...query }))
+        .handle("revocation", ({ params, query }) =>
+          executor.accounts.revocation({ ...params, ...query }),
+        )
         .handle("listHealth", ({ query }) => executor.accounts.listHealth(query))
         .handle("check", ({ params, query, payload }) =>
           executor.accounts.check({ ...params, ...query, ...payload }),
@@ -88,6 +87,18 @@ export const executorHandlers = (executor: Executor) =>
         .handle("findOAuth", ({ payload }) => executor.accountConnections.findOAuth(payload))
         .handle("completeOAuth", ({ payload }) =>
           executor.accountConnections.completeOAuth(payload),
+        ),
+    ),
+    HttpApiBuilder.group(ExecutorApi, "oauthClients", (handlers) =>
+      handlers
+        .handle("register", ({ payload }) => executor.oauthClients.register(payload))
+        .handle("list", ({ query }) => executor.oauthClients.list(query))
+        .handle("get", ({ params, query }) => executor.oauthClients.get({ ...params, ...query }))
+        .handle("update", ({ params, payload }) =>
+          executor.oauthClients.update({ ...params, ...payload }),
+        )
+        .handle("remove", ({ params, query }) =>
+          executor.oauthClients.remove({ ...params, ...query }),
         ),
     ),
     HttpApiBuilder.group(ExecutorApi, "apps", (handlers) =>
@@ -136,7 +147,8 @@ export const executorHandlers = (executor: Executor) =>
     HttpApiBuilder.group(ExecutorApi, "registry", (handlers) =>
       handlers
         .handle("list", ({ query }) => executor.registry.list(query))
-        .handle("snapshot", ({ query }) => executor.registry.snapshot(query)),
+        .handle("snapshot", ({ query }) => executor.registry.snapshot(query))
+        .handle("file", ({ query }) => executor.registry.file(query)),
     ),
     HttpApiBuilder.group(ExecutorApi, "owners", (handlers) =>
       handlers

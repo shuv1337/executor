@@ -2,20 +2,24 @@
  * The one app Worker runner. It runs beside the Worker Loader on every host: in the Cloud API
  * Worker, and in the trusted apps Worker of self-host and local. It names each Worker, loads it,
  * wraps the authored modules and delivers each call's accounts, run, approval, replay and deadline.
- * Secret fields of providers that declare hosts leave the runner only as sealed handles.
+ * Secret fields of providers that declare hosts, and every string of a managed account, leave the
+ * runner only as sealed handles: `bundleAccounts` is the one path from the host's accounts to the
+ * accounts a bundle reads.
  * A host supplies only its bindings and, per invocation, a build loader that the runner calls from
  * the Worker Loader's cold-start callback, so a warm call reads and transfers no code. Every
  * request and reply passes through the adapter of the protocol the build's framework speaks.
  */
 import type { Fetcher, WorkerLoader } from "@cloudflare/workers-types";
-import { Clock, Effect, Exit, Option, Redacted, Result, Schema, Semaphore } from "effect";
+import { Clock, Context, Effect, Exit, Option, Redacted, Result, Schema, Semaphore } from "effect";
 import {
   ElicitationReply,
   type HostRequest,
+  type HostAccounts,
   type InvocationDeadline,
   type ResolvedAccounts,
   type TrustedToolApproval,
   type WorkflowExecution,
+  WorkflowFailure,
   type WorkflowReplay,
 } from "apps/contracts";
 import { AppDatabaseError } from "@executor-js/app-data/contracts";
@@ -43,13 +47,14 @@ import {
   type RuntimeFailure,
 } from "../contracts/runtime.ts";
 import type { LoadedWorkerBuild, WorkerBundle } from "../contracts/worker-build.ts";
+import type { StartedPart } from "../contracts/runtime.ts";
 import { appProtocol, type AppProtocol } from "./app-protocols.ts";
 import { appFacetBridge, appNetworkModuleName, appRpcBridge } from "./worker-bridge.ts";
 import { appNetworkModule } from "./app-network.ts";
-import { sealAccounts } from "./credential-handles.ts";
+import { sealAccounts, unsealedAccounts } from "./credential-handles.ts";
 import { AppRpcEntrypoint, AppRpcInvocation } from "./worker-elicitation.ts";
 import { invocationWorkflow } from "./worker-workflow-rpc.ts";
-import type { AppWorkerResidency } from "./app-worker-residency.ts";
+import { type AppWorkerResidency, namedWorker } from "./app-worker-residency.ts";
 
 type Callback = (input: unknown) => Promise<unknown>;
 
@@ -83,6 +88,11 @@ export interface AppRunnerHost {
    * Shared by every runner in the process.
    */
   readonly residency?: AppWorkerResidency;
+  /**
+   * Unload an app's facet Worker for one execution context when it is idle, so facet Workers count
+   * against the residency's limit. True once it is unloaded. Supplied with a residency.
+   */
+  readonly unloadFacet?: (app: string, identity: string) => Effect.Effect<boolean, unknown>;
 }
 
 /** The authorized call. Credentials travel here, never in a Worker name or retained code. */
@@ -91,7 +101,7 @@ export interface AppInvocation {
   readonly build: string;
   readonly database: boolean;
   readonly command: HostRequest;
-  readonly accounts: typeof ResolvedAccounts.Type;
+  readonly accounts: HostAccounts;
   readonly approval?: typeof TrustedToolApproval.Type;
   readonly replay?: typeof WorkflowReplay.Type;
   readonly deadline?: typeof InvocationDeadline.Type;
@@ -341,25 +351,40 @@ export const appWorker = (
   );
 
 /**
- * A workflow whose steps read their accounts as this app's invocations do: secret fields of
- * providers with hosts are sealed. The host resolves current credentials for each step.
+ * The accounts a bundle of this protocol reads. A bundle that reads sealed handles gets the
+ * secret fields of providers with hosts, and every string of a managed account, sealed. An
+ * earlier bundle reads every field as a real value, so it gets accounts as they are, and an
+ * invocation of it with a managed account fails without reaching it.
  */
-const sealedWorkflow = (
-  execution: WorkflowExecution,
+const bundleAccounts = (
+  protocol: AppProtocol,
   app: string,
   key: Effect.Effect<CryptoKey>,
+  accounts: HostAccounts,
+): Effect.Effect<ResolvedAccounts, RuntimeProtocolFailed> => {
+  if (protocol.sealedCredentials) return sealAccounts(accounts, { app, key });
+  const unsealed = unsealedAccounts(accounts);
+  return unsealed === undefined ? failed("managed") : Effect.succeed(unsealed);
+};
+
+/**
+ * A workflow whose steps read their accounts as this app's invocations do, through
+ * `bundleAccounts`. The host resolves current credentials for each step.
+ */
+const boundWorkflow = (
+  execution: WorkflowExecution,
+  accounts: (resolved: HostAccounts) => Effect.Effect<ResolvedAccounts, RuntimeProtocolFailed>,
 ): WorkflowExecution => ({
   ...execution,
   resolve: () =>
-    execution
-      .resolve()
-      .pipe(
-        Effect.flatMap((context) =>
-          sealAccounts(Redacted.value(context.accounts), { app, key }).pipe(
-            Effect.map((accounts) => ({ ...context, accounts: Redacted.make(accounts) })),
-          ),
+    execution.resolve().pipe(
+      Effect.flatMap((context) =>
+        accounts(Redacted.value(context.accounts)).pipe(
+          Effect.mapError(() => new WorkflowFailure({ reason: "credentials", retryable: false })),
+          Effect.map((accounts) => ({ ...context, accounts: Redacted.make(accounts) })),
         ),
       ),
+    ),
 });
 
 /** Times one step of an invocation on the runner's clock. */
@@ -367,14 +392,49 @@ type Timed = <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>
 const notTimed: Timed = (effect) => effect;
 
 /**
+ * Told when a part the runner reaches for a call started for it: the app's Worker on a Worker
+ * Loader cold start, or its data supervisor on a cache command. `unknown` when a part answered
+ * without saying whether it started, such as a supervisor that predates it. Telemetry only.
+ */
+export const IsolateStarted = Context.Reference<(part: StartedPart | "unknown") => void>(
+  "executor/IsolateStarted",
+  { defaultValue: () => () => undefined },
+);
+
+// oxlint-disable-next-line executor/no-module-level-mutable-state -- whether this isolate has received a call; it carries no request data
+let runnerReceived = false;
+
+/**
+ * Where a call entered the runner's isolate: when, on its clock, and whether it was the first call
+ * the isolate received, so its start-up ran in the caller's wait. Taken once, where the call
+ * arrives, before anything it waits on, so concurrent first calls cannot both claim the start.
+ */
+export const runnerIngress = Effect.map(Clock.currentTimeNanos, (receivedAt) => {
+  const first = !runnerReceived;
+  runnerReceived = true;
+  return { receivedAt, first };
+});
+
+/**
+ * The call's ingress, when the host that serves the runner took the call before `invoke`, for
+ * instance to decode it. The runner's part starts there.
+ */
+export const RunnerIngress = Context.Reference<
+  { readonly receivedAt: bigint; readonly first: boolean } | undefined
+>("executor/RunnerIngress", { defaultValue: () => undefined });
+
+/**
  * The runner's own part of one invocation, on its own clock: how long it took, and how much of that
  * it waited on the isolate running the app. Starting the call there, cold starts included, is the
  * runner's own time: the app runs only once the runner waits for its result. A caller in another
  * isolate cannot measure any of it, since Workers clocks advance only on I/O and are not comparable
- * across isolates.
+ * across isolates. It also tells what started for this call: the runner's isolate, and what the
+ * runner reached (see `IsolateStarted`).
  */
 const runnerTiming = () => {
   let waitMs = 0;
+  const startedParts = new Set<StartedPart>();
+  let startsKnown = true;
   const waiting: Timed = (effect) =>
     Effect.flatMap(Clock.currentTimeNanos, (from) =>
       effect.pipe(
@@ -390,11 +450,23 @@ const runnerTiming = () => {
   /** Add the timing to an object reply: an additive field, like `cacheChanged`. */
   const report = <E, R>(invoke: Effect.Effect<unknown, E, R>) =>
     Effect.gen(function* () {
-      const started = yield* Clock.currentTimeNanos;
-      const result = yield* invoke;
+      const ingress = (yield* RunnerIngress) ?? (yield* runnerIngress);
+      if (ingress.first) startedParts.add("runner");
+      const started = ingress.receivedAt;
+      const result = yield* invoke.pipe(
+        Effect.provideService(IsolateStarted, (part) => {
+          if (part === "unknown") startsKnown = false;
+          else startedParts.add(part);
+        }),
+      );
       const elapsedMs = Number((yield* Clock.currentTimeNanos) - started) / 1_000_000;
       return typeof result === "object" && result !== null && !Array.isArray(result)
-        ? { ...result, runner: { elapsedMs, waitMs } }
+        ? {
+            ...result,
+            // `started` is sent whenever it is known, so a warm call is told apart from a runner
+            // that predates it or a part that did not say.
+            runner: { elapsedMs, waitMs, ...(startsKnown ? { started: [...startedParts] } : {}) },
+          }
         : result;
     });
   return { waiting, report };
@@ -431,11 +503,13 @@ export const makeAppRunner = (host: AppRunnerHost) => {
         const unhold =
           name === null || residency === undefined
             ? Effect.void
-            : yield* Effect.acquireRelease(residency.hold(host.loader, name), (unhold) =>
-                held ? Effect.void : unhold,
+            : yield* Effect.acquireRelease(
+                residency.hold(name, namedWorker(host.loader, name), host.waitUntil),
+                (unhold) => (held ? Effect.void : unhold),
               );
         const services = yield* Effect.context<never>();
         const load = async () => {
+          Context.get(services, IsolateStarted)("app");
           // Recorded when the Worker Loader runs its cold-start callback, inside runtime.app.rpc.start.
           const read = await Effect.runPromiseWith(services)(
             Effect.tryPromise({ try: code, catch: (cause) => cause }).pipe(
@@ -678,13 +752,9 @@ export const makeAppRunner = (host: AppRunnerHost) => {
         // A command this protocol's bundles would not run as asked fails without reaching them.
         const refused = protocol.refuse(invocation.command);
         if (refused !== undefined) return { ok: false, error: refused };
-        // A bundle from before credential hosts reads every field as a real value.
-        const accounts = protocol.sealedCredentials
-          ? yield* sealAccounts(invocation.accounts, {
-              app: invocation.app,
-              key: host.credentialKey,
-            })
-          : invocation.accounts;
+        const accountsFor = (resolved: HostAccounts) =>
+          bundleAccounts(protocol, invocation.app, host.credentialKey, resolved);
+        const accounts = yield* accountsFor(invocation.accounts);
         const body = protocol.invocation({
           command: invocation.command,
           accounts,
@@ -696,14 +766,34 @@ export const makeAppRunner = (host: AppRunnerHost) => {
             : { workflowRun: capabilities.workflow.runId }),
         });
         if (mode === "facet")
-          return yield* facet(
-            invocation,
-            identity,
-            capabilities,
-            protocol,
-            load,
-            body,
-            timing.waiting,
+          return yield* Effect.scoped(
+            Effect.gen(function* () {
+              // The facet Worker counts against the same limit as app Workers while it is loaded.
+              const unloadFacet = host.unloadFacet;
+              if (host.residency !== undefined && unloadFacet !== undefined) {
+                const hold = host.residency.hold(
+                  `data:${name}`,
+                  {
+                    run: unloadFacet(invocation.app, identity).pipe(
+                      Effect.orElseSucceed(() => false),
+                    ),
+                    // The supervisor replaces a facet Worker whose unload does not settle.
+                    abandon: () => undefined,
+                  },
+                  host.waitUntil,
+                );
+                yield* Effect.acquireRelease(hold, (unhold) => unhold).pipe(Effect.asVoid);
+              }
+              return yield* facet(
+                invocation,
+                identity,
+                capabilities,
+                protocol,
+                load,
+                body,
+                timing.waiting,
+              );
+            }),
           );
         const data = host.data(invocation.app);
         const services = yield* Effect.context<never>();
@@ -755,11 +845,7 @@ export const makeAppRunner = (host: AppRunnerHost) => {
           ...(capabilities.workflow === undefined
             ? {}
             : {
-                workflow: protocol.workflow(
-                  protocol.sealedCredentials
-                    ? sealedWorkflow(capabilities.workflow, invocation.app, host.credentialKey)
-                    : capabilities.workflow,
-                ),
+                workflow: protocol.workflow(boundWorkflow(capabilities.workflow, accountsFor)),
               }),
           cache,
           explain: false,

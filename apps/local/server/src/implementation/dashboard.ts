@@ -1,4 +1,5 @@
 import { sourceDisplay, sourceDisplayFile } from "@executor-js/app-management/source-display";
+import { connectOptions, connectionClient } from "./oauth-clients.ts";
 import { localResourceHandlers } from "./resources.ts";
 import { localProfileHandlers } from "./profiles.ts";
 import { appOrigin } from "../contracts/app-ui.ts";
@@ -32,7 +33,7 @@ import {
 import { HttpServerResponse } from "effect/http";
 import { HttpApiBuilder } from "effect/http-api";
 import { localRequest, requestOrigin, sessionCookie, type LocalAuth } from "./auth.ts";
-import { createCatalog, type CatalogSource } from "@executor-js/catalog";
+import { createCatalog } from "@executor-js/catalog";
 import type { HostEgress } from "@executor-js/utils/url-policy";
 import type { AuthStorageError } from "../contracts/auth.ts";
 import type { ServerConfig } from "../contracts/config.ts";
@@ -92,20 +93,22 @@ export const dashboard = (
   auth: LocalAuth,
   egress: HostEgress,
   {
-    catalog,
+    catalogFeedUrl,
     managedApp,
     managedAccount,
   }: {
-    readonly catalog?: CatalogSource;
+    /** A mirror of the integrations.sh feed; the public feed by default. */
+    readonly catalogFeedUrl?: string | undefined;
     readonly managedApp?: AppId;
     readonly managedAccount?: AccountId;
   } = {},
 ) => {
   const owner = OwnerId.make("local");
-  const appCatalog = createCatalog(
-    { egress, clientMetadataUrl: config.oauthClientMetadataUrl },
-    catalog,
-  );
+  const appCatalog = createCatalog({
+    egress,
+    clientMetadataUrl: config.oauthClientMetadataUrl,
+    feedUrl: catalogFeedUrl,
+  });
   /** Only status and a non-refreshable expiry leave the trusted host. */
   const signIn = (account: AccountId) =>
     executor.accounts.signIn({ account }).pipe(
@@ -215,6 +218,10 @@ export const dashboard = (
         .pipe(Effect.catchTag("ProviderNotFound", () => new StorageError()));
       const apps = yield* executor.apps.list({ account: account.id });
       const health = yield* executor.accounts.health({ account: account.id });
+      // An unreadable grant is unreadable storage to this view.
+      const { revocation } = yield* executor.accounts
+        .revocation({ account: account.id })
+        .pipe(Effect.catchTag("CredentialsError", () => new StorageError()));
       return {
         account: {
           ...account,
@@ -225,6 +232,7 @@ export const dashboard = (
         provider,
         apps,
         health,
+        revocation,
         canManage: account.id !== managedAccount,
       };
     });
@@ -460,7 +468,7 @@ export const dashboard = (
           const request = yield* localRequest(config.port, config.browserOrigin).pipe(
             Effect.mapError(() => new DashboardForbidden()),
           );
-          return yield* executor.accountConnections.oauthSetup({
+          return yield* connectOptions(executor, {
             ...payload,
             owner,
             redirectUri: new URL(OAuthCallbackPath, requestOrigin(config, request)).href,
@@ -484,11 +492,12 @@ export const dashboard = (
             Effect.mapError(() => new DashboardForbidden()),
           );
           const connection = yield* appConnection(params.app, target);
+          const chosen = yield* connectionClient(connection, { method, client });
           const signIn = yield* executor.accountConnections.startOAuth({
             connection: connection.id,
             method,
             ...(label === undefined ? {} : { label }),
-            ...(client === undefined ? {} : { client }),
+            ...(chosen === undefined ? {} : { client: chosen }),
             redirectUri: new URL(OAuthCallbackPath, requestOrigin(config, request)).href,
           });
           return { ...signIn, connection: connection.id };
@@ -526,7 +535,8 @@ export const dashboard = (
               status: "approval-required",
               requestId: params.requestId,
               invocation,
-              // Built from the saved call, so the prompt shows exactly what approval resumes.
+              // Built from the saved call, so it describes what approval resumes; the review card
+              // shows the exact arguments from the invocation.
               elicitation: approvalElicitation(invocation.tool, invocation.input),
               expiresAt,
             },

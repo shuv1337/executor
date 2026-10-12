@@ -6,7 +6,11 @@ import {
 } from "../contracts/product-analytics.ts";
 import { McpSchema } from "effect/ai";
 import { authorizeTool, authorizeApp } from "./authorization.ts";
-import { permittedAppIds } from "@executor-js/authorization";
+import {
+  permittedAppIds,
+  permittedToolAppIds,
+  requiresToolMetadata,
+} from "@executor-js/authorization";
 import { GroupDatabase } from "../contracts/groups.ts";
 import { CurrentUserId } from "../contracts/auth.ts";
 import { visibleApps, visibleAccounts, requireAppAccess } from "./resource-policy.ts";
@@ -15,6 +19,8 @@ import { appTargets, type McpBackend } from "@executor-js/mcp";
 import {
   AppNotFound,
   ElicitationFailed,
+  EventNotFound,
+  InvocationSelection,
   type AppId,
   type ToolInvocationOptions,
 } from "@executor-js/sdk/core";
@@ -22,14 +28,15 @@ import { Context, Effect, Option } from "effect";
 import {
   currentOwner,
   selectedApp,
-  selectedActiveDeployment,
+  checkedActiveDeployment,
   ownProfile,
   checkInvocationAccounts,
+  SelectionReadAhead,
 } from "./access.ts";
-import { HostedExecutor } from "../contracts/executor.ts";
+import { ConcurrentStatements, HostedExecutor } from "../contracts/executor.ts";
 import { CurrentOrganization, OrganizationForbidden } from "../contracts/organization.ts";
 import { CurrentMcpGrant } from "../contracts/mcp.ts";
-import { listTools } from "./tools.ts";
+import { listTools, searchableTools, searchTools } from "./tools.ts";
 import { listAppSkills, readAppSkill } from "./skills.ts";
 
 /**
@@ -91,6 +98,13 @@ export const hostedMcpBackend = Effect.gen(function* () {
         .pipe(Effect.flatMap(visibleApps)),
     ).pipe(Effect.provideContext(context)),
   );
+  const discoveryToolApps = yield* Effect.cached(
+    Effect.flatMap(sdk, (executor) =>
+      executor.apps
+        .list({ ids: permittedToolAppIds(policy), owner: organization.owner })
+        .pipe(Effect.flatMap(visibleApps)),
+    ).pipe(Effect.provideContext(context)),
+  );
   const discoveryProfiles = yield* Effect.cached(
     Effect.gen(function* () {
       if (user === undefined) return yield* new OrganizationForbidden();
@@ -131,7 +145,10 @@ export const hostedMcpBackend = Effect.gen(function* () {
     subscribeEvent: ({ key, ...input }) =>
       Effect.gen(function* () {
         const { principal, subject } = yield* subscriber;
-        yield* eventApp(input.target.app);
+        // A saved subscription can name an app the caller no longer sees; to them it has no event.
+        yield* eventApp(input.target.app).pipe(
+          Effect.catchTag("AppNotFound", () => Effect.fail(new EventNotFound({ kind: "event" }))),
+        );
         return yield* (yield* sdk).events.subscribe({
           ...input,
           key: { ...key, principal },
@@ -143,7 +160,7 @@ export const hostedMcpBackend = Effect.gen(function* () {
         const { principal } = yield* subscriber;
         yield* (yield* sdk).events.unsubscribe({ ...key, principal });
       }).pipe((work) => observe("unsubscribeEvent", work)),
-    listSkills: (input) => observe("listSkills", listAppSkills(input), "read"),
+    listSkills: (input, options) => observe("listSkills", listAppSkills(input, options), "read"),
     readSkill: (input) => observe("readSkill", readAppSkill(input), "read"),
     authorizeElicitation: (input) =>
       Effect.gen(function* () {
@@ -169,7 +186,7 @@ export const hostedMcpBackend = Effect.gen(function* () {
         }),
       ),
     listApps: (input = {}) =>
-      discoveryApps.pipe(
+      (input.toolsOnly ? discoveryToolApps : discoveryApps).pipe(
         Effect.map((apps) => {
           if (input.ids === undefined) return apps;
           const requested = new Set(input.ids);
@@ -188,13 +205,32 @@ export const hostedMcpBackend = Effect.gen(function* () {
         return appTargets(app, profiles, accounts);
       }).pipe((work) => observe("listTargets", work, "read")),
     listTools: (input, options) => observe("listTools", listTools(input, options), "read"),
+    searchableTools: (input, options) =>
+      observe("searchableTools", searchableTools(input, options), "read"),
+    searchTools: (input) => observe("searchTools", searchTools(input), "read"),
     callTool: (input, options?: ToolInvocationOptions) =>
       Effect.gen(function* () {
         const owner = yield* currentOwner;
         const executor = yield* sdk;
-        const deployment = yield* selectedActiveDeployment(executor, owner, input);
+        // Under a read-only rule the grant check evaluates the app before the call reaches here,
+        // so selection reads made beside authentication would be older than that evaluation.
+        const ahead = yield* SelectionReadAhead;
+        const read =
+          ahead !== undefined && !requiresToolMetadata(policy.tools, input.app) ? ahead : undefined;
+        const { deployment, profile } = yield* checkedActiveDeployment(
+          executor,
+          owner,
+          input,
+          read,
+        );
         yield* authorizeTool({ ...input, deployment });
-        return yield* executor.tools.call({ ...input, deployment }, options);
+        const call = executor.tools.call({ ...input, deployment }, options);
+        // The check has finished: the call may read its state and recheck the profile at once.
+        return yield* profile !== undefined && (yield* ConcurrentStatements) !== undefined
+          ? call.pipe(
+              Effect.provideService(InvocationSelection, { app: input.app, owner, profile }),
+            )
+          : call;
       }).pipe((work) => observe("callTool", work)),
     resumeInvocation: (request, response, options?: ToolInvocationOptions) =>
       Effect.gen(function* () {

@@ -3,6 +3,7 @@ import { makeProfileSetup } from "./profile-setup.ts";
 import { WorkflowHost } from "../contracts/workflow-runtime.ts";
 import { RepositoryHost } from "../contracts/source.ts";
 import { StorageHost } from "../contracts/storage.ts";
+import { PrefetchHost } from "../contracts/profiles.ts";
 import { gitSourceStorage } from "./git-sources.ts";
 import { makeRegistry } from "./registry.ts";
 import { remoteRegistry } from "./remote-registry.ts";
@@ -19,7 +20,9 @@ import { AppId, CredentialsError, NotImplemented, StorageError } from "../contra
 import { makeWebhooks } from "./webhooks.ts";
 import { makeAppData } from "./app-storage.ts";
 import { makeAccountConnections } from "./account-connections.ts";
-import { makeAccounts } from "./accounts.ts";
+import { makeAccounts, storedAccount } from "./accounts.ts";
+import { makeSavedOAuthClients } from "./saved-oauth-clients.ts";
+import { SavedOAuthClientsHost } from "../contracts/oauth-clients.ts";
 import { makeAccountHealth } from "./account-health.ts";
 import { makeProfiles } from "./profiles.ts";
 import { makeApps } from "./apps.ts";
@@ -32,6 +35,7 @@ import { database } from "./database.ts";
 import { makeOAuth } from "./oauth.ts";
 import { makeDeclarationCache, makeDeclarations } from "./declarations.ts";
 import { makeListings } from "./listings.ts";
+import { makeToolSearch } from "./tool-search.ts";
 import { makeEvents } from "./events.ts";
 import { AppEventSink, RuntimeProtocolFailed, type Runtime } from "../contracts/runtime.ts";
 
@@ -78,6 +82,10 @@ export const createExecutor = (
       mutate: (input) => base.mutate(input).pipe(Effect.provideService(AppEventSink, sink)),
       webhook: (input) => base.webhook(input).pipe(Effect.provideService(AppEventSink, sink)),
     };
+    // The operator's own OAuth clients, by ID; their tokens are managed.
+    const firstPartyClients = new Map(
+      (options.oauth?.firstPartyClients ?? []).map((client) => [client.id, client] as const),
+    );
     const oauth = makeOAuth(
       db,
       credentials,
@@ -131,9 +139,11 @@ export const createExecutor = (
       workflows: { list: workflows.definitions },
       workflowRuns: workflows.runs,
     };
+    const search = makeToolSearch({ store: options.database.toolSearch, crypto });
     const tools = makeTools(
       options.database,
       oauth,
+      firstPartyClients,
       runtime,
       credentials,
       crypto,
@@ -144,12 +154,26 @@ export const createExecutor = (
         resolveAccount: oauth.resolveSelected,
         lifecycle: options.hooks,
         policy: toolListings,
+        search,
       }),
       workflows.controls,
       options.hooks,
     );
     const connections = makeAccountConnections(db, credentials, crypto, options.hooks);
-    const { checkCredentials, ...accountHealth } = makeAccountHealth(db, runtime, oauth, apps.list);
+    const { add, replaceCredentials, ...accountOperations } = makeAccounts(
+      db,
+      credentials,
+      crypto,
+      options.hooks,
+      oauth.revokeRemoved,
+    );
+    const { checkCredentials, ...accountHealth } = makeAccountHealth(
+      db,
+      runtime,
+      oauth,
+      firstPartyClients,
+      apps.list,
+    );
     const schedules = makeSchedules(options.database, apps, tools, credentials, crypto);
     const setup = makeProfileSetup(db, crypto, apps.profiles, {
       webhooks: webhooks.webhooks,
@@ -196,18 +220,30 @@ export const createExecutor = (
             Effect.catchTag("SqlError", () => new StorageError()),
           ),
       },
+      [PrefetchHost]: { invocation: tools.prefetchInvocation },
+      [SavedOAuthClientsHost]: makeSavedOAuthClients(db, credentials, options.hooks),
       scheduler: schedules.dispatcher,
       events,
       schedules: schedules.operations,
       accounts: {
-        ...makeAccounts(db, credentials, crypto, options.hooks, oauth.revokeRemoved),
+        ...accountOperations,
         ...accountHealth,
+        revocation: (input) =>
+          storedAccount(db, input.account, input.owner).pipe(
+            Effect.flatMap((account) => oauth.revocation(account.id)),
+            Effect.withSpan("sdk.accounts.revocation"),
+          ),
       },
+      managedAccounts: { add, replaceCredentials },
       accountConnections: {
         ...connections,
         ...oauth.connections,
-        findOAuth: (input) => Effect.flatMap(oauth.findOAuth(input), connections.get),
+        findOAuth: (input) =>
+          Effect.flatMap(oauth.findOAuth(input), ({ redirectUri, ...found }) =>
+            Effect.map(connections.get(found), (connection) => ({ ...connection, redirectUri })),
+          ),
       },
+      oauthClients: oauth.clients,
       apps: {
         ...apps,
         deploy: (input) =>
@@ -235,7 +271,7 @@ export const createExecutor = (
         workflows.controls,
         options.hooks,
       ),
-      tools,
+      tools: { ...tools, search: search.page },
     };
   });
 

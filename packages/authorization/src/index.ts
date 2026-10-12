@@ -19,10 +19,13 @@ export {
   permitsTool,
   permitsTarget,
   permitsRouter,
+  discoverableTools,
   selectsApp,
+  selectsToolApp,
   selectsTool,
   selectsTarget,
   requiresToolMetadata,
   isToolSelectionSubset,
   permittedAppIds,
+  permittedToolAppIds,
 } from "./contracts/policy.ts";
