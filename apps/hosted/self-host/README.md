@@ -218,8 +218,14 @@ same server, with a matching TLS certificate.
   app. Organization slugs never contain `--`, so the address stays unambiguous
   even when an app slug does. The combined label must fit in 63 characters.
 
-Changing the format changes every app's address; sessions on the old addresses
-end.
+A single-organization installation can drop the organization from its
+addresses: set `EXECUTOR_APP_UI_DEFAULT_ORGANIZATION` to that organization's
+slug and its apps are published as `<app-slug>.apps.example.com`. Other
+organizations keep the format above. Each app still has exactly one address;
+the other spellings are refused.
+
+Changing the format or the default organization changes app addresses;
+sessions on the old addresses end.
 
 App code can reach only public addresses. Requests to the dashboard origin go
 straight to the server, so the built-in Executor app works when that origin
