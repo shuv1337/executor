@@ -206,8 +206,20 @@ direct socket address.
 Localhost derives app UI addresses automatically. For a public installation,
 set `EXECUTOR_APP_UI_BASE_URL` to a separate HTTPS base such as
 `https://apps.example.com`. Route that base and its wildcard subdomains to the
-same server, with a matching TLS certificate. App addresses take the form
-`<app-slug>--<organization-slug>.apps.example.com`.
+same server, with a matching TLS certificate.
+
+`EXECUTOR_APP_UI_HOST_FORMAT` chooses the address shape:
+
+- `nested` (default): `<app-slug>.<organization-slug>.apps.example.com`. The
+  certificate must cover two wildcard levels (`*.*.apps.example.com`), which
+  Let's Encrypt wildcards and Cloudflare Universal SSL do not.
+- `flat`: `<app-slug>--<organization-slug>.apps.example.com`. One label under
+  the base, so a single `*.apps.example.com` wildcard certificate covers every
+  app. Organization slugs never contain `--`, so the address stays unambiguous
+  even when an app slug does. The combined label must fit in 63 characters.
+
+Changing the format changes every app's address; sessions on the old addresses
+end.
 
 App code can reach only public addresses. Requests to the dashboard origin go
 straight to the server, so the built-in Executor app works when that origin
