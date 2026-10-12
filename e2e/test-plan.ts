@@ -5917,6 +5917,17 @@ export const scenarios = plan({
       ),
     },
   },
+  appUiDefaultOrganization: {
+    file: "app-ui-default-organization.spec.ts",
+    title: "a self-host with a default organization publishes its apps directly under the app base",
+    targets: {
+      "self-host": scheduled,
+      cloud: na("Cloud has no default organization."),
+      local: na(
+        "Local serves app UIs from its own origin; only self-host starts a scenario-owned server.",
+      ),
+    },
+  },
   remoteRegistryFailures: {
     file: "registry-failures.spec.ts",
     title: "Public app catalog refuses registry redirects and reports distinct registry failures",
