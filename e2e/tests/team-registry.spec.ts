@@ -39,7 +39,7 @@ layer(HostedLive, { excludeTestServices: true })("Team registry", (it) => {
           oauth = yield* McpOAuth,
           origin = (yield* Target).metadata.origin;
         const prefix = `/api/organizations/${actors.organization.id}`;
-        const name = `@${actors.organization.slug}/team-${randomUUID().slice(0, 8)}`;
+        const name = `@${actors.organization.slug}.executor.community/team-${randomUUID().slice(0, 8)}`;
         const files = [
           { path: "README.md", content: "The reviewed team snapshot" },
           {
