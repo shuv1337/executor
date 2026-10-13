@@ -12,8 +12,8 @@ The local dashboard shows apps, accounts, live tools and retained source.
 Provider OAuth supports supplied clients, DCR, CIMD, and token refresh.
 Outbound MCP works over HTTP/SSE on local, self-host and cloud: custom remote
 MCP imports and catalog MCP entries deploy, discover live upstream tools, and
-call them, verified end to end including a real public server. Local process
-(stdio) MCP servers remain local-only. The remote SDK facade
+call them, verified end to end including a real public server. Apps cannot
+start local processes, so stdio MCP servers are not supported. The remote SDK facade
 (`createRemoteExecutor`) is not implemented.
 
 Effect is pinned to an upstream snapshot with MCP `2026-07-28` support.
@@ -79,8 +79,8 @@ in these files, never resolved credentials. Vault and item references also stay
 out of tracked scripts. Edit values in 1Password, then restart the affected
 process. Keep encryption/signing keys stable.
 
-Cloud uses Alchemy's PlanetScale database and role resources; Workers connect
-through PlanetScale's PgBouncer.
+Cloud uses Alchemy's PlanetScale database and role resources. Worker events reach
+PlanetScale's PgBouncer through Hyperdrive; Durable Objects connect to PgBouncer directly.
 `bun run hosted:cloud:dev` starts the cloud Worker, local Postgres, migrations,
 and frontend through Alchemy with service emulators and no credentials.
 `bun run hosted:cloud:dev:1password` uses `.env.cloud-development.op` instead;
@@ -121,7 +121,7 @@ Keep contracts flat, one cohesive area per file.
 - `apps/hosted/self-host/`: Effect Node HTTP entry point and Docker image
 - `packages/fumadb-effect/`: Effect SQL schema, typed query and migration implementation
 - `packages/mcp/`: shared execute/skills contracts, codemode and search over product-authorized operations
-- `packages/app-templates/`: source generators using the `apps` protocol subpaths for MCP, stdio, OpenAPI and GraphQL
+- `packages/app-templates/`: source generators using the `apps` protocol subpaths for MCP, OpenAPI and GraphQL
 - `packages/apps/`: provider/app authoring, shared context, schema constructors,
   native Effect contracts, an author facade, a portable host handler and fetch decoding
 - `playground/demo-apps/`: Vercel, Axiom, Mail, and Issue Mail authoring examples
@@ -344,3 +344,9 @@ Development happens in this private repository. The public
 through `scripts/export-public.sh`. Paths listed in
 `scripts/export-public.exclude`, such as `notes/`, stay private. The export
 workflow runs the script on every push to `main`. See `RELEASING.md`.
+
+Pull requests against `v2` are ported into the private repository with the
+contributor's `Co-Authored-By` trailer and a line naming the public pull request
+and its full head sha, `Public-PR: UsefulSoftwareCo/executor#<number> <sha>`. The next
+export takes that head as another parent of its commit, so the pull request shows
+as merged and its commits stay in `v2`'s history.

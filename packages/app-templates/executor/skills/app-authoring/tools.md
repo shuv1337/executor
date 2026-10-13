@@ -35,6 +35,32 @@ The schema helpers are `object`, `string`, `number`, `boolean`, `array`,
 type. `object` strips undeclared properties. `decodeJson(response, schema)`
 checks HTTP status and parses a JSON response.
 
+## Give the app an icon
+
+Declare `icons` beside `accounts`. The dashboard shows them on the app's card
+and page, choosing the `light` or `dark` variant for the color scheme; an icon
+without `theme` suits both. The build records them, so they show without
+evaluating the app or listing its tools:
+
+```ts
+export default defineApp(
+  {
+    accounts: {},
+    icons: [
+      { src: "data:image/svg+xml;base64,PHN2Zy...", mimeType: "image/svg+xml", theme: "light" },
+      { src: "https://example.com/logo-dark.png", mimeType: "image/png", theme: "dark" },
+    ],
+  },
+  async () => ({ tools: router({/* ... */}) }),
+);
+```
+
+Each entry is `{ src, mimeType?, sizes?, theme? }`. `src` is a base64
+`data:image/svg+xml`, `image/png`, `image/webp` or `image/jpeg` URI, or an
+`https:` URL. Declare at most 8 icons, together at most 32 KiB of JSON.
+Anything else fails the build at its declaration stage. Icons are not part of
+a published listing.
+
 ## Group tools with routers
 
 Nest routers to group related tools. Keys form the tool path, like tRPC:
@@ -252,8 +278,8 @@ accepted content against the form. Handle decline/cancel in tool code. The same
 tool continues with its local state intact. This works in native or model mode, or with an SDK
 host that supplies a delivery handler. The capability is unavailable during
 factory evaluation/discovery and after the invocation closes. An earlier tool
-policy approval never auto-answers these requests. Upstream MCP form elicitation uses this same path automatically for HTTP and
-stdio tools. URL-mode input is not yet supported.
+policy approval never auto-answers these requests. Upstream MCP form elicitation uses this same path automatically for MCP
+tools. URL-mode input is not yet supported.
 
 With `/mcp?elicitation_mode=browser`, pending requests include `approvalUrl`. Show
 that link to the user, then call `resume({ requestId })` with no response. The user

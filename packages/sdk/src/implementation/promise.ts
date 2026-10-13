@@ -82,11 +82,11 @@ export const promiseExecutor = (executor: Executor): PromiseExecutor => {
     accounts: {
       get: (input) => run(AccountInputs.get, input, executor.accounts.get),
       provider: (input) => run(AccountInputs.get, input, executor.accounts.provider),
-      list: (input = {}) => run(AccountInputs.list, input, executor.accounts.list),
+      list: (input) => run(AccountInputs.list, input, executor.accounts.list),
       update: (input) => run(AccountInputs.update, input, executor.accounts.update),
       remove: (input) => run(AccountInputs.remove, input, executor.accounts.remove),
       signIn: (input) => run(AccountInputs.get, input, executor.accounts.signIn),
-      providers: (input = {}) => run(AccountInputs.providers, input, executor.accounts.providers),
+      providers: (input) => run(AccountInputs.providers, input, executor.accounts.providers),
       health: (input) => run(AccountInputs.get, input, executor.accounts.health),
       revocation: (input) => run(AccountInputs.get, input, executor.accounts.revocation),
       listHealth: (input = {}) =>
@@ -108,6 +108,7 @@ export const promiseExecutor = (executor: Executor): PromiseExecutor => {
     oauthClients: {
       register: (input) => run(OAuthClientInputs.register, input, executor.oauthClients.register),
       list: (input) => run(OAuthClientInputs.list, input, executor.oauthClients.list),
+      issuers: (input) => run(OAuthClientInputs.issuers, input, executor.oauthClients.issuers),
       get: (input) => run(OAuthClientInputs.get, input, executor.oauthClients.get),
       update: (input) => run(OAuthClientInputs.update, input, executor.oauthClients.update),
       remove: (input) => run(OAuthClientInputs.remove, input, executor.oauthClients.remove),

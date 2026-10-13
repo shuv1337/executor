@@ -368,6 +368,7 @@ export const makeApps = (
           : { database: built.requirements.database }),
         ...(built.requirements.sql === true ? { sql: true as const } : {}),
         ...(built.requirements.events === undefined ? {} : { events: built.requirements.events }),
+        ...(built.requirements.icons === undefined ? {} : { icons: built.requirements.icons }),
         accounts: Object.fromEntries(
           entries.map(({ slot, provider, cardinality, health }) => [
             slot,
@@ -571,10 +572,15 @@ export const makeApps = (
           ? "package" in from
             ? {
                 ...(yield* resolvePublication(registry, from)),
-                stored: ({ path }) =>
-                  registry
-                    .file(from.package, from.commit, path)
-                    .pipe(Effect.mapError(() => new SourceError({ reason: "not-found" }))),
+                stored: yield* registry.files(from.package, from.commit).pipe(
+                  Effect.map(
+                    (read): StoredBytes =>
+                      ({ path }) =>
+                        read(path).pipe(
+                          Effect.mapError(() => new SourceError({ reason: "not-found" })),
+                        ),
+                  ),
+                ),
               }
             : from
           : yield* Effect.gen(function* () {

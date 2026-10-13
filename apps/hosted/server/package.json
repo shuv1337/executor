@@ -24,13 +24,15 @@
     "./browser": "./src/browser.ts",
     "./browser/contracts": "./src/contracts/browser.ts",
     "./app-management": "./src/app-management.ts",
-    "./document": "./src/implementation/document.ts"
+    "./document": "./src/implementation/document.ts",
+    "./publishers": "./src/implementation/publishers.ts"
   },
   "dependencies": {
     "@better-auth/api-key": "1.7.5",
     "@better-auth/core": "1.7.5",
     "@better-auth/oauth-provider": "1.7.5",
     "@executor-js/app-management": "workspace:*",
+    "@executor-js/app-registry": "workspace:*",
     "@executor-js/app-templates": "workspace:*",
     "@executor-js/authorization": "workspace:*",
     "@executor-js/catalog": "workspace:*",

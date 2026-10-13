@@ -126,6 +126,12 @@ for (const mode of ["explicit", "local", "railway"] as const)
         yield* Effect.acquireRelease(run(["volume", "create", id]), () =>
           run(["volume", "rm", id]).pipe(Effect.orDie),
         );
+        const backupVolume = `${id}-backup`;
+        const restoredVolume = `${id}-restored`;
+        for (const volume of [backupVolume, restoredVolume])
+          yield* Effect.acquireRelease(run(["volume", "create", volume]), () =>
+            run(["volume", "rm", volume]).pipe(Effect.orDie),
+          );
         // Railway volumes do not inherit the image directory's owner.
         if (mode === "railway")
           yield* run([
@@ -158,7 +164,7 @@ for (const mode of ["explicit", "local", "railway"] as const)
             : {}),
           ...(mode === "railway" ? { RAILWAY_PUBLIC_DOMAIN: "release.up.railway.app" } : {}),
         };
-        const start = (containerImage = image) =>
+        const start = (containerImage = image, productVolume = id) =>
           run(
             [
               "run",
@@ -173,7 +179,7 @@ for (const mode of ["explicit", "local", "railway"] as const)
               "--publish",
               `127.0.0.1:${port}:${containerPort}`,
               "--volume",
-              `${id}:/app/data`,
+              `${productVolume}:/app/data`,
               ...Object.keys(environment).flatMap((name) => ["--env", name]),
               ...registry.docker,
               containerImage,
@@ -276,7 +282,7 @@ export default defineApp({ accounts: { service } }, async ({ accounts }) => ({
               {
                 path: "package.json",
                 content: JSON.stringify({
-                  name: `@${parsed[0].slug}/release-app`,
+                  name: `@${parsed[0].slug}.executor.community/release-app`,
                   dependencies: withApps({ "is-number": "7.0.0" }),
                 }),
               },
@@ -391,14 +397,49 @@ visit("/app/data/hosted.pglite");process.stdout.write(hash.digest("hex"));`,
           );
         let nativeBackup: string | undefined;
         let beforeRestartTrace: string | undefined;
-        const publicationName = `@${parsed[0].slug}/release-app`;
-        let publicationCommit: string | undefined;
-        if (initialImage === image) {
+        const publicationName = `@${parsed[0].slug}.executor.community/release-app`;
+        let initialPublicationName = publicationName;
+        let publicationCommit: string;
+        let retainedWorkflow: string | undefined;
+        {
           const response = yield* request(`${prefix}/apps/${app.id}/workspace`, undefined, cookie);
           const workspace = yield* Schema.decodeUnknownEffect(
-            Schema.Struct({ revision: Schema.Struct({ commit: Schema.String }) }),
+            Schema.Struct({
+              revision: Schema.Struct({ commit: Schema.String }),
+              namespace: Schema.String,
+              files: Schema.Array(Schema.Struct({ path: Schema.String, content: Schema.String })),
+            }),
           )(yield* driver("Read publication revision", () => response.json()));
           publicationCommit = workspace.revision.commit;
+          initialPublicationName = `@${workspace.namespace}/release-app`;
+          if (initialPublicationName !== publicationName) {
+            // Publish through the previous server's real API and required scope. An upgrade
+            // must retain a nonempty old registry, not just initialize a new empty one.
+            const committed = yield* request(
+              `${prefix}/apps/${app.id}/commits`,
+              {
+                expected: publicationCommit,
+                message: "Use the previous server's publishing scope",
+                files: workspace.files.map((file) =>
+                  file.path === "package.json"
+                    ? {
+                        ...file,
+                        content: JSON.stringify({
+                          name: initialPublicationName,
+                          dependencies: withApps({ "is-number": "7.0.0" }),
+                        }),
+                      }
+                    : file,
+                ),
+              },
+              cookie,
+            );
+            expect(committed.status).toBe(200);
+            publicationCommit = (yield* Schema.decodeUnknownEffect(
+              Schema.Struct({ revision: Schema.Struct({ commit: Schema.String }) }),
+            )(yield* driver("Read legacy publication commit", () => committed.json()))).revision
+              .commit;
+          }
           expect(
             (yield* request(
               `${prefix}/apps/${app.id}/publication`,
@@ -407,13 +448,55 @@ visit("/app/data/hosted.pglite");process.stdout.write(hash.digest("hex"));`,
             )).status,
           ).toBe(200);
         }
+        const readPublication = (name: string, commit: string, session = cookie) =>
+          Effect.gen(function* () {
+            const response = yield* request(
+              `${prefix}/app-publications/source?name=${encodeURIComponent(name)}&commit=${commit}`,
+              undefined,
+              session,
+            );
+            expect(response.status).toBe(200);
+            const source = yield* Schema.decodeUnknownEffect(
+              Schema.Struct({
+                publication: Schema.Struct({ name: Schema.String, commit: Schema.String }),
+                files: Schema.Array(Schema.Struct({ path: Schema.String, content: Schema.String })),
+              }),
+            )(yield* driver("Read selected publication source", () => response.json()));
+            expect(source.publication).toEqual({ name, commit });
+            return [...source.files].sort((left, right) => left.path.localeCompare(right.path));
+          });
+        // Keep every original path and content byte, including package.json and the UI. A
+        // surviving filename alone cannot detect an empty or substituted restored source file.
+        const publicationFiles = yield* readPublication(initialPublicationName, publicationCommit);
+        expect(publicationFiles).toEqual(
+          expect.arrayContaining([expect.objectContaining({ path: "index.ts" })]),
+        );
         for (const restart of [false, true]) {
           if (restart) {
             yield* run(
-              initialRuntime === "executor-host" && mode === "local"
+              initialImage === image && initialRuntime === "executor-host" && mode === "local"
                 ? ["kill", "--signal", "KILL", id]
                 : ["stop", "--time", "15", id],
             );
+            // The source is stopped and mounted read-only. The archive includes keys, Git,
+            // builds, app/workflow data and whichever product storage the old image used.
+            yield* run([
+              "run",
+              "--rm",
+              "--network",
+              "none",
+              "--volume",
+              `${id}:/source:ro`,
+              "--volume",
+              `${backupVolume}:/backup`,
+              "node:24-bookworm-slim",
+              "tar",
+              "cf",
+              "/backup/product.tar",
+              "-C",
+              "/source",
+              ".",
+            ]);
             if (initialRuntime !== "executor-host" && runtime === "executor-host")
               nativeBackup = yield* legacyDigest();
             yield* run(["rm", id]);
@@ -471,16 +554,14 @@ visit("/app/data/hosted.pglite");process.stdout.write(hash.digest("hex"));`,
             ).toMatchObject({ canPublish: true, publicationAudience: "organization" });
           }
           if (publicationCommit !== undefined) {
-            const query = `name=${encodeURIComponent(publicationName)}&commit=${publicationCommit}`;
-            const published = yield* request(
-              `${prefix}/app-publications/source?${query}`,
-              undefined,
-              cookie,
-            );
-            expect(published.status).toBe(200);
+            const expectedName = restart ? publicationName : initialPublicationName;
+            const query = `name=${encodeURIComponent(expectedName)}&commit=${publicationCommit}`;
+            // The registry upgrade copies source before dropping the old tables, so every
+            // published path and content byte must survive, not just the name and commit.
             expect(
-              yield* driver("Publication survives restart", () => published.json()),
-            ).toMatchObject({ publication: { name: publicationName, commit: publicationCommit } });
+              yield* readPublication(expectedName, publicationCommit),
+              "publication files survive startup",
+            ).toEqual(publicationFiles);
             expect((yield* request(`/api/registry/source?${query}`)).status).toBe(404);
           }
           if (mode === "explicit") {
@@ -679,18 +760,30 @@ http.createServer((request, response) => {
           // The image under test serves its collector only on a private Unix socket, which
           // operators read through `executor-host telemetry`. An earlier image may still listen
           // on loopback, or name its collector's port in collector.json.
-          const legacyCollector =
-            restart || initialImage === image
-              ? undefined
-              : initialRuntime === "executor-host"
-                ? "http://127.0.0.1:4318"
-                : (yield* run(["exec", id, "cat", "/app/data/diagnostics/collector.json"]).pipe(
-                    Effect.flatMap(
-                      Schema.decodeUnknownEffect(
-                        Schema.fromJsonString(Schema.Struct({ url: Schema.String })),
-                      ),
+          const socketCollector =
+            (restart ? runtime : initialRuntime) === "executor-host" &&
+            Number(
+              yield* processes.exitCode(
+                ChildProcess.make("docker", [
+                  "exec",
+                  id,
+                  "sh",
+                  "-c",
+                  "test -f /app/data/.executor-telemetry",
+                ]),
+              ),
+            ) === 0;
+          const legacyCollector = socketCollector
+            ? undefined
+            : (restart ? runtime : initialRuntime) === "executor-host"
+              ? "http://127.0.0.1:4318"
+              : (yield* run(["exec", id, "cat", "/app/data/diagnostics/collector.json"]).pipe(
+                  Effect.flatMap(
+                    Schema.decodeUnknownEffect(
+                      Schema.fromJsonString(Schema.Struct({ url: Schema.String })),
                     ),
-                  )).url;
+                  ),
+                )).url;
           const readCollector = (path: string) =>
             legacyCollector === undefined
               ? run(["exec", id, "executor-host", "telemetry", path])
@@ -895,6 +988,7 @@ http.createServer((request, response) => {
           expect(completed.output, "workflow callbacks retain the selected encrypted account").toBe(
             true,
           );
+          if (!restart) retainedWorkflow = workflowRun.id;
           if (token !== undefined) {
             yield* Effect.scoped(
               Effect.gen(function* () {
@@ -985,7 +1079,7 @@ const result=await pg.query('SELECT name FROM "user"');await pg.close();process.
             yield* Schema.decodeUnknownEffect(
               Schema.fromJsonString(Schema.Array(Schema.Struct({ name: Schema.String }))),
             )(restored),
-            "rollback retains writes made after migration",
+            "PostgreSQL export retains later rows; it does not prove old-application compatibility",
           ).toEqual([{ name: "Written after migration" }]);
           expect(yield* legacyDigest(), "export leaves the original backup intact").toBe(
             nativeBackup,
@@ -1014,6 +1108,211 @@ const result=await pg.query('SELECT name FROM "user"');await pg.close();process.
               : "Saved EXECUTOR_ENCRYPTION_KEY is invalid",
           );
           expect(logs).not.toContain("broken-key");
+        }
+        // A database SELECT is not a restore rehearsal. Boot the actual old application on a
+        // separate restored volume and exercise its encrypted account, app DB, source and workflow.
+        yield* run(["stop", "--time", "15", id]);
+        yield* run(["rm", id]);
+        yield* run([
+          "run",
+          "--rm",
+          "--network",
+          "none",
+          "--volume",
+          `${backupVolume}:/backup:ro`,
+          "--volume",
+          `${restoredVolume}:/restore`,
+          "node:24-bookworm-slim",
+          "tar",
+          "xf",
+          "/backup/product.tar",
+          "-C",
+          "/restore",
+        ]);
+        yield* start(initialImage, restoredVolume);
+        yield* ready;
+        expect((yield* request("/api/viewer", undefined, cookie)).status).toBe(200);
+        for (const [tool, expected] of [
+          ["check", true],
+          ["messages", ["Retained app data"]],
+        ] as const) {
+          const response = yield* request(
+            `${prefix}/apps/${app.id}/tools/call`,
+            { profile: profile.id, tool, kind: "query", input: {} },
+            cookie,
+          );
+          expect(response.status).toBe(200);
+          expect(yield* driver(`restored ${tool}`, () => response.json())).toEqual(expected);
+        }
+        expect(retainedWorkflow).toBeDefined();
+        const restoredRun = yield* request(
+          `${prefix}/apps/${app.id}/workflow-runs/${retainedWorkflow}`,
+          undefined,
+          cookie,
+        );
+        expect(restoredRun.status).toBe(200);
+        expect(yield* driver("restored workflow", () => restoredRun.json())).toMatchObject({
+          status: "complete",
+          output: true,
+        });
+        expect(yield* readPublication(initialPublicationName, publicationCommit)).toEqual(
+          publicationFiles,
+        );
+        expect((yield* request(`${prefix}/apps/${app.id}/ui`, undefined, cookie)).status).toBe(200);
+        if (initialPublicationName !== publicationName) {
+          // The supported layout-1 image keeps old publications after an organization rename.
+          // Create its valid-but-conflicting history through the old APIs, without rewriting
+          // schemas. Layout-2 previous images do not have this historical transition to exercise.
+          const renamedSlug = `renamed-${randomBytes(8).toString("hex")}`;
+          expect(
+            (yield* request(
+              "/api/auth/organization/update",
+              {
+                organizationId: parsed[0].id,
+                data: { slug: renamedSlug },
+              },
+              cookie,
+            )).status,
+          ).toBe(200);
+          const workspaceResponse = yield* request(
+            `${prefix}/apps/${app.id}/workspace`,
+            undefined,
+            cookie,
+          );
+          expect(workspaceResponse.status).toBe(200);
+          const workspace = yield* Schema.decodeUnknownEffect(
+            Schema.Struct({
+              revision: Schema.Struct({ commit: Schema.String }),
+              namespace: Schema.String,
+              files: Schema.Array(Schema.Struct({ path: Schema.String, content: Schema.String })),
+            }),
+          )(yield* driver("Read renamed legacy workspace", () => workspaceResponse.json()));
+          const conflictingName = `@${workspace.namespace}/release-app`;
+          expect(conflictingName).not.toBe(initialPublicationName);
+          const committed = yield* request(
+            `${prefix}/apps/${app.id}/commits`,
+            {
+              expected: workspace.revision.commit,
+              message: "Publish a second legacy alias for the same owner and label",
+              files: workspace.files.map((file) =>
+                file.path === "package.json"
+                  ? {
+                      ...file,
+                      content: JSON.stringify({
+                        name: conflictingName,
+                        dependencies: withApps({ "is-number": "7.0.0" }),
+                      }),
+                    }
+                  : file,
+              ),
+            },
+            cookie,
+          );
+          expect(committed.status).toBe(200);
+          const conflictingCommit = (yield* Schema.decodeUnknownEffect(
+            Schema.Struct({
+              revision: Schema.Struct({ commit: Schema.String }),
+            }),
+          )(yield* driver("Read conflicting legacy commit", () => committed.json()))).revision
+            .commit;
+          expect(
+            (yield* request(
+              `${prefix}/apps/${app.id}/publication`,
+              { commit: conflictingCommit },
+              cookie,
+            )).status,
+          ).toBe(200);
+          const conflictingFiles = yield* readPublication(conflictingName, conflictingCommit);
+          expect(yield* readPublication(initialPublicationName, publicationCommit)).toEqual(
+            publicationFiles,
+          );
+
+          yield* run(["stop", "--time", "15", id]);
+          yield* run(["rm", id]);
+          yield* start(image, restoredVolume);
+          const rejected = yield* request("/health").pipe(
+            Effect.flatMap((response) =>
+              response.status === 500
+                ? Effect.succeed(response)
+                : Effect.fail("Waiting for rejected registry upgrade"),
+            ),
+            Effect.retry({ schedule: Schedule.spaced("250 millis"), times: 200 }),
+          );
+          expect(rejected.status).toBe(500);
+          expect(yield* run(["logs", id])).toContain("Public listings share an owner and label");
+          yield* run(["stop", "--time", "15", id]);
+          yield* run(["rm", id]);
+          // Reuse the rejected database directly: no snapshot restoration, SQL repair, or key
+          // replacement. This includes Better Auth's independently committed migration changes.
+          yield* start(initialImage, restoredVolume);
+          const recovered = yield* request("/health").pipe(
+            Effect.flatMap((response) =>
+              response.status === 503
+                ? Effect.fail("Waiting for the previous image")
+                : Effect.succeed(response),
+            ),
+            Effect.retry({ schedule: Schedule.spaced("250 millis"), times: 200 }),
+          );
+          expect(
+            recovered.status,
+            "previous image serves the rejected-upgrade database without restore",
+          ).toBe(200);
+          expect((yield* request("/api/viewer", undefined, cookie)).status).toBe(200);
+          const signedIn = yield* request("/api/auth/sign-in/email", {
+            email: "release@example.test",
+            password: "Synthetic-release-password-123!",
+          });
+          expect(signedIn.status).toBe(200);
+          const freshCookie = signedIn.headers
+            .getSetCookie()
+            .map((part) => part.split(";")[0])
+            .join("; ");
+          expect(freshCookie).not.toBe("");
+          expect((yield* request("/api/viewer", undefined, freshCookie)).status).toBe(200);
+          for (const [tool, expected] of [
+            ["check", true],
+            ["messages", ["Retained app data"]],
+          ] as const) {
+            const response = yield* request(
+              `${prefix}/apps/${app.id}/tools/call`,
+              {
+                profile: profile.id,
+                tool,
+                kind: "query",
+                input: {},
+              },
+              freshCookie,
+            );
+            expect(response.status).toBe(200);
+            expect(
+              yield* driver(`old image after rejected upgrade: ${tool}`, () => response.json()),
+            ).toEqual(expected);
+          }
+          expect(
+            yield* readPublication(initialPublicationName, publicationCommit, freshCookie),
+          ).toEqual(publicationFiles);
+          expect(yield* readPublication(conflictingName, conflictingCommit, freshCookie)).toEqual(
+            conflictingFiles,
+          );
+          // Prove the old registry remains writable too, then repair through its public API.
+          expect(
+            (yield* request(
+              `${prefix}/app-publications/unpublish`,
+              { package: conflictingName },
+              freshCookie,
+            )).status,
+          ).toBe(200);
+          yield* run(["stop", "--time", "15", id]);
+          yield* run(["rm", id]);
+          yield* start(image, restoredVolume);
+          yield* ready;
+          expect(
+            yield* readPublication(
+              `@${renamedSlug}.executor.community/release-app`,
+              publicationCommit,
+              freshCookie,
+            ),
+          ).toEqual(publicationFiles);
         }
       }),
     ).pipe(Effect.provide(NodeServices.layer)),

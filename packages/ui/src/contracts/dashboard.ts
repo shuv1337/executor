@@ -16,6 +16,7 @@ import type {
   ToolSummary,
 } from "@executor-js/sdk";
 import type { CatalogImport } from "@executor-js/catalog/contracts";
+import type { CatalogIcons } from "./icons.ts";
 import type {
   DeploymentDisplay,
   SourceDisplayFile,
@@ -111,6 +112,20 @@ export const AppView = Schema.Literals([
   "settings",
 ]);
 export type AppView = typeof AppView.Type;
+/** Assistants with a setup guide, as setup URLs name them. */
+export const AssistantId = Schema.Literals([
+  "claude",
+  "chatgpt",
+  "cursor",
+  "claude-code",
+  "codex",
+  "devin",
+  "grok-bot",
+  "grok",
+  "muse",
+  "other",
+]);
+export type AssistantId = typeof AssistantId.Type;
 /** Host routing remains typed by that host's TanStack tree. */
 export interface AppLinkProps {
   readonly app: AppId;
@@ -138,7 +153,8 @@ export interface FailureProps<E> {
 }
 /** Only error-independent presentation belongs in context. Queries keep their own error types. */
 export interface DashboardBindings {
-  readonly iconDomains: Atom.Atom<ReadonlyMap<string, string | null>>;
+  /** Catalog apps' icons by package and by name; see `catalogIconsAtom`. */
+  readonly catalogIcons: Atom.Atom<CatalogIcons>;
   readonly AppLink: ComponentType<AppLinkProps>;
   readonly AccountLink: ComponentType<AccountLinkProps>;
 }

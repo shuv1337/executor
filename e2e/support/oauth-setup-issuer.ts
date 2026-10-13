@@ -76,6 +76,12 @@ export const oauthSetupIssuer = Effect.gen(function* () {
     "invalid_client_metadata";
   /** The `error_description` a refused registration sends; undefined omits it. */
   let registrationErrorDescription: string | undefined = "PRIVATE_PROVIDER_ERROR";
+  /**
+   * The only redirect URIs registration accepts; undefined accepts any. A registration naming
+   * another is refused with `invalid_redirect_uri`, as Vercel's MCP authorization server refuses
+   * callbacks it has not approved.
+   */
+  let registrationRedirects: readonly string[] | undefined;
   let omitSecretExpiry = false;
   /** Vercel registers a public client whatever method the request names, as RFC 7591 allows. */
   let issuePublicClients = false;
@@ -124,6 +130,13 @@ export const oauthSetupIssuer = Effect.gen(function* () {
   const tokenContentTypes: Array<string | undefined> = [];
   /** The `scope` parameter of the latest authorization request. */
   let authorizationScope: string | null | undefined;
+  /**
+   * The RFC 8707 `resource` parameter of the latest authorization request, code exchange and
+   * refresh; null when it named none.
+   */
+  let authorizationResource: string | null | undefined;
+  let exchangeResource: string | null | undefined;
+  let refreshResource: string | null | undefined;
   let tokenExchanges = 0;
   let tokenChecks: Readonly<Record<string, boolean>> = {};
   let refreshes = 0;
@@ -243,6 +256,13 @@ export const oauthSetupIssuer = Effect.gen(function* () {
   // metadata. "atlassian" misses the path-inserted URL and refuses the appended OpenID path.
   let pathDiscovery: "atlassian" | "issuer-mismatch" | "invalid-metadata" = "atlassian";
   const discoveryRequests: string[] = [];
+  /**
+   * Refuse requests without a User-Agent with an HTML 403 page, as some firewalls in front of
+   * authorization servers do.
+   */
+  let requireUserAgent = false;
+  /** The path and User-Agent of each request, in order. */
+  const userAgents: Array<{ readonly path: string; readonly userAgent: string | undefined }> = [];
   let scopes = ["read"];
   /** A narrower scope requirement advertised by the resource's Bearer challenge. */
   let challengeScopes: readonly string[] | undefined;
@@ -260,6 +280,8 @@ export const oauthSetupIssuer = Effect.gen(function* () {
   let lastRegistration:
     | { scope: string; method: string; applicationType: string | undefined }
     | undefined;
+  /** The redirect URIs each registration request named, in order, including refused ones. */
+  const registeredRedirects: Array<readonly string[]> = [];
   /**
    * How the service reads HTTP Basic client credentials. "form-decoded" follows RFC 6749
    * section 2.3.1. "literal" compares them as sent, as Google and PlanetScale (Doorkeeper) do.
@@ -381,6 +403,7 @@ export const oauthSetupIssuer = Effect.gen(function* () {
         const code = randomUUID();
         nonceRequested = params.get("nonce") !== null;
         authorizationScope = params.get("scope");
+        authorizationResource = params.get("resource");
         const requested = authorizationScope?.split(" ") ?? [];
         const refusal =
           authorizeError ??
@@ -424,6 +447,8 @@ export const oauthSetupIssuer = Effect.gen(function* () {
         }
         if (refreshing) refreshes++;
         else tokenExchanges++;
+        if (refreshing) refreshResource = input.get("resource");
+        else exchangeResource = input.get("resource");
         tokenContentTypes.push(contentType);
         if (tokenError === "reset") {
           const source = request.source;
@@ -834,6 +859,7 @@ export const oauthSetupIssuer = Effect.gen(function* () {
           method: input.token_endpoint_auth_method,
           applicationType: input.application_type,
         };
+        registeredRedirects.push([...input.redirect_uris]);
         const description =
           registrationErrorDescription === undefined
             ? {}
@@ -847,6 +873,14 @@ export const oauthSetupIssuer = Effect.gen(function* () {
         if (registrationStatus === 400)
           return yield* HttpServerResponse.json(
             { error: registrationError, ...description },
+            { status: 400 },
+          );
+        if (
+          registrationRedirects !== undefined &&
+          !input.redirect_uris.every((uri) => registrationRedirects?.includes(uri))
+        )
+          return yield* HttpServerResponse.json(
+            { error: "invalid_redirect_uri", ...description },
             { status: 400 },
           );
         const issued = registeredClient ?? {
@@ -882,6 +916,21 @@ export const oauthSetupIssuer = Effect.gen(function* () {
         );
       }),
     ),
+    HttpRouter.middleware(
+      (handler) =>
+        Effect.gen(function* () {
+          const request = yield* HttpServerRequest.HttpServerRequest;
+          const userAgent = request.headers["user-agent"];
+          userAgents.push({ path: new URL(request.url, "http://issuer").pathname, userAgent });
+          return requireUserAgent && !userAgent
+            ? HttpServerResponse.text(
+                "<html><head><title>403 Forbidden</title></head><body>Request blocked</body></html>",
+                { status: 403, contentType: "text/html" },
+              )
+            : yield* handler;
+        }),
+      { global: true },
+    ),
   );
   const listener = yield* Effect.sync(() => createServer());
   const services = yield* Layer.build(
@@ -903,12 +952,15 @@ export const oauthSetupIssuer = Effect.gen(function* () {
   return {
     origin,
     configure: (input: {
+      readonly requireUserAgent?: boolean;
       readonly registration?: boolean;
       readonly registrationStatus?: typeof registrationStatus;
       readonly malformedRegistration?: boolean;
       readonly registrationError?: typeof registrationError;
       /** The `error_description` of a refused registration; null omits it. */
       readonly registrationErrorDescription?: string | null;
+      /** Refuse registrations naming a redirect URI outside these; null accepts any. */
+      readonly registrationRedirects?: readonly string[] | null;
       /** The Retry-After header of rate-limited discovery and registration; null omits it. */
       readonly retryAfter?: string | null;
       readonly omitSecretExpiry?: boolean;
@@ -979,6 +1031,7 @@ export const oauthSetupIssuer = Effect.gen(function* () {
       readonly resourceTokens?: typeof resourceTokens;
     }) =>
       Effect.sync(() => {
+        if (input.requireUserAgent !== undefined) requireUserAgent = input.requireUserAgent;
         if (input.scopeGrant !== undefined)
           scopeGrant = input.scopeGrant === null ? undefined : input.scopeGrant;
         if (input.resourceTokens !== undefined) resourceTokens = input.resourceTokens;
@@ -1015,6 +1068,9 @@ export const oauthSetupIssuer = Effect.gen(function* () {
             input.registrationErrorDescription === null
               ? undefined
               : input.registrationErrorDescription;
+        if (input.registrationRedirects !== undefined)
+          registrationRedirects =
+            input.registrationRedirects === null ? undefined : [...input.registrationRedirects];
         if (input.retryAfter !== undefined)
           retryAfter = input.retryAfter === null ? undefined : input.retryAfter;
         if (input.omitSecretExpiry !== undefined) omitSecretExpiry = input.omitSecretExpiry;
@@ -1093,12 +1149,17 @@ export const oauthSetupIssuer = Effect.gen(function* () {
       registrations,
       discoveries,
       discoveryRequests: [...discoveryRequests],
+      userAgents: [...userAgents],
       lastRegistration,
+      registeredRedirects: [...registeredRedirects],
       probes,
       tokenExchanges,
       tokenChecks,
       tokenContentTypes: [...tokenContentTypes],
       authorizationScope,
+      authorizationResource,
+      exchangeResource,
+      refreshResource,
       refreshes,
       refreshChecks,
       lastExchangeAuth,

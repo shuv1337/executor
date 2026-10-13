@@ -39,10 +39,8 @@ import { publishedSkillRoutes } from "@executor-js/app-templates/executor";
 import { hideRemovedOrganizations } from "./implementation/organization-removal.ts";
 import {
   browserTelemetry,
-  hostedOAuthCallback,
   clientMetadataDocument,
   clientMetadataDocumentPath,
-  clientMetadataSetting,
   hostedWebhookCallback,
   catalogLive,
   hostedMiddlewareLive,
@@ -60,7 +58,8 @@ import { AlchemyContext } from "alchemy/AlchemyContext";
 import { Config, Effect, Layer, Option, Path, Ref } from "effect";
 import { HttpRouter, HttpServer, HttpServerResponse } from "effect/http";
 import { cloudAuth } from "./infrastructure/auth.ts";
-import { cloudOnboarding } from "./infrastructure/onboarding.ts";
+import { cloudAccountCallback } from "./implementation/account-callback.ts";
+import { cloudOnboarding, cloudV1Import } from "./infrastructure/onboarding.ts";
 import { Onboarding } from "./contracts/onboarding.ts";
 import { cloudMcp } from "./infrastructure/mcp.ts";
 import { cloudApi } from "./implementation/api.ts";
@@ -119,12 +118,13 @@ import {
 import { roleHostRoutes } from "./infrastructure/role-hosts.ts";
 import { redirectTo, withRoleHosts } from "./implementation/host-roles.ts";
 import { hasSessionCookie } from "./contracts/browser.ts";
-import { clientMetadataBinding } from "./infrastructure/client-metadata.ts";
+import { clientMetadataBinding, cloudClientMetadata } from "./infrastructure/client-metadata.ts";
 import { appDataSupervisors } from "./infrastructure/app-data.ts";
 import { cloudDevelopment } from "./contracts/development.ts";
 import { requestServices } from "@executor-js/hosted-server";
 import { recordRequestRejections, requestTiming } from "@executor-js/telemetry/http";
 
+import { appCatalogBinding } from "./infrastructure/app-catalog.ts";
 import { Api } from "./infrastructure/api-worker.ts";
 import { Dashboard } from "./infrastructure/dashboard-worker.ts";
 import { cloudSourceFormatter } from "./infrastructure/source-formatter.ts";
@@ -169,6 +169,8 @@ export default Api.make(
         ...(yield* authRateLimitSwitchBindings),
         // A deployed stage identifies Executor to authorization servers by its own document.
         ...(origin === undefined ? {} : yield* clientMetadataBinding(origin)),
+        // Every deployed stage lists production's official app feed.
+        ...(origin === undefined ? {} : yield* appCatalogBinding),
       },
       build: workerBuild("api"),
       // Auth callbacks and the dashboard share the configured canonical origin.
@@ -212,6 +214,7 @@ export default Api.make(
     const errorTunnel = yield* cloudErrorTunnel;
     const email = yield* cloudEmail.pipe(Effect.orDie);
     const onboarding = yield* cloudOnboarding.pipe(Effect.orDie);
+    const v1Import = yield* cloudV1Import.pipe(Effect.orDie);
     const auth = yield* cloudAuth(email.send, yield* Onboarding.pipe(Effect.provide(onboarding)));
     const welcomeEmails = yield* cloudWelcomeEmails(email.welcome);
     yield* AppWorkflows;
@@ -393,7 +396,11 @@ export default Api.make(
     } satisfies Record<BackgroundJob, unknown>;
 
     const egress = yield* cloudEgress;
-    const clientMetadata = yield* clientMetadataSetting(auth.origin).pipe(Effect.orDie);
+    const clientMetadata = yield* cloudClientMetadata.pipe(Effect.orDie);
+    // The official app feed Add app lists; without it, only the built-in Executor app is listed.
+    const catalogFeedUrl = Option.getOrUndefined(
+      yield* Config.String("EXECUTOR_CATALOG_URL").pipe(Config.option),
+    );
     // Only /openapi.json and preparing the Executor catalog app read the document.
     // Clients and the Executor app call the API at its canonical origin.
     const apiOrigin = auth.resourceOrigins.api[0];
@@ -407,11 +414,14 @@ export default Api.make(
       HttpRouter.provideRequest(yield* cloudSourceFormatter),
       Layer.provide(appUi.dashboard),
       Layer.provide(requestServices(auth.appSessions).layer),
-      HttpRouter.provideRequest(catalogLive(document.document, egress, clientMetadata, apiOrigin)),
+      HttpRouter.provideRequest(
+        catalogLive(document.document, egress, clientMetadata, apiOrigin, catalogFeedUrl),
+      ),
       Layer.provide(schedules.layer),
       Layer.provide(billing),
       Layer.provide(removals),
       Layer.provide(onboarding),
+      Layer.provide(v1Import),
       Layer.provide(hostedMiddlewareLive),
       // Organization middleware reads the product's removal tombstones when it is built.
       Layer.provide(executor),
@@ -551,9 +561,11 @@ export default Api.make(
       ),
       HttpRouter.add("*", "/api/auth/*", dispatchAfterWrites(auth.handler)),
       HttpRouter.add("*", "/api/email/unsubscribe", welcomeEmails.unsubscribe),
-      HttpRouter.add("GET", "/api/oauth/callback", hostedOAuthCallback).pipe(
-        HttpRouter.provideRequest(auth.identity),
-      ),
+      HttpRouter.add(
+        "GET",
+        "/api/oauth/callback",
+        cloudAccountCallback(auth.returnsStageAccountCallback),
+      ).pipe(HttpRouter.provideRequest(auth.identity)),
       HttpRouter.add(
         "GET",
         clientMetadataDocumentPath,
@@ -607,10 +619,13 @@ export default Api.make(
     const edgeHost = yield* Layer.mergeAll(
       authorizationServerRoutes,
       HttpRouter.add("GET", "/api/auth/callback/:provider", redirectTo(auth.origin, 302)),
-      // A connected-account sign-in's return opens the browser origin's callback page.
-      HttpRouter.add("GET", "/api/oauth/callback", hostedOAuthCallback).pipe(
-        HttpRouter.provideRequest(auth.identity),
-      ),
+      // A connected-account sign-in's return opens the browser origin's callback page, or a
+      // stage's when the sign-in is the stage's.
+      HttpRouter.add(
+        "GET",
+        "/api/oauth/callback",
+        cloudAccountCallback(auth.returnsStageAccountCallback),
+      ).pipe(HttpRouter.provideRequest(auth.identity)),
       withGitAccess(gitRoutes),
       // The public site. Nobody is signed in to v2 on the edge, so `/` is always the site's.
       HttpRouter.add("GET", "/", staticDocument("/index.html")),
