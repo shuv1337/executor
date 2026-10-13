@@ -448,6 +448,29 @@ visit("/app/data/hosted.pglite");process.stdout.write(hash.digest("hex"));`,
             )).status,
           ).toBe(200);
         }
+        const readPublication = (name: string, commit: string, session = cookie) =>
+          Effect.gen(function* () {
+            const response = yield* request(
+              `${prefix}/app-publications/source?name=${encodeURIComponent(name)}&commit=${commit}`,
+              undefined,
+              session,
+            );
+            expect(response.status).toBe(200);
+            const source = yield* Schema.decodeUnknownEffect(
+              Schema.Struct({
+                publication: Schema.Struct({ name: Schema.String, commit: Schema.String }),
+                files: Schema.Array(Schema.Struct({ path: Schema.String, content: Schema.String })),
+              }),
+            )(yield* driver("Read selected publication source", () => response.json()));
+            expect(source.publication).toEqual({ name, commit });
+            return [...source.files].sort((left, right) => left.path.localeCompare(right.path));
+          });
+        // Keep every original path and content byte, including package.json and the UI. A
+        // surviving filename alone cannot detect an empty or substituted restored source file.
+        const publicationFiles = yield* readPublication(initialPublicationName, publicationCommit);
+        expect(publicationFiles).toEqual(
+          expect.arrayContaining([expect.objectContaining({ path: "index.ts" })]),
+        );
         for (const restart of [false, true]) {
           if (restart) {
             yield* run(
@@ -1135,17 +1158,165 @@ const result=await pg.query('SELECT name FROM "user"');await pg.close();process.
           status: "complete",
           output: true,
         });
-        const restoredSource = yield* request(
-          `${prefix}/app-publications/source?name=${encodeURIComponent(initialPublicationName)}&commit=${publicationCommit}`,
-          undefined,
-          cookie,
+        expect(yield* readPublication(initialPublicationName, publicationCommit)).toEqual(
+          publicationFiles,
         );
-        expect(restoredSource.status).toBe(200);
-        expect(yield* driver("restored publication", () => restoredSource.json())).toMatchObject({
-          publication: { name: initialPublicationName, commit: publicationCommit },
-          files: expect.arrayContaining([expect.objectContaining({ path: "index.ts" })]),
-        });
         expect((yield* request(`${prefix}/apps/${app.id}/ui`, undefined, cookie)).status).toBe(200);
+        if (initialPublicationName !== publicationName) {
+          // The supported layout-1 image keeps old publications after an organization rename.
+          // Create its valid-but-conflicting history through the old APIs, without rewriting
+          // schemas. Layout-2 previous images do not have this historical transition to exercise.
+          const renamedSlug = `renamed-${randomBytes(8).toString("hex")}`;
+          expect(
+            (yield* request(
+              "/api/auth/organization/update",
+              {
+                organizationId: parsed[0].id,
+                data: { slug: renamedSlug },
+              },
+              cookie,
+            )).status,
+          ).toBe(200);
+          const workspaceResponse = yield* request(
+            `${prefix}/apps/${app.id}/workspace`,
+            undefined,
+            cookie,
+          );
+          expect(workspaceResponse.status).toBe(200);
+          const workspace = yield* Schema.decodeUnknownEffect(
+            Schema.Struct({
+              revision: Schema.Struct({ commit: Schema.String }),
+              namespace: Schema.String,
+              files: Schema.Array(Schema.Struct({ path: Schema.String, content: Schema.String })),
+            }),
+          )(yield* driver("Read renamed legacy workspace", () => workspaceResponse.json()));
+          const conflictingName = `@${workspace.namespace}/release-app`;
+          expect(conflictingName).not.toBe(initialPublicationName);
+          const committed = yield* request(
+            `${prefix}/apps/${app.id}/commits`,
+            {
+              expected: workspace.revision.commit,
+              message: "Publish a second legacy alias for the same owner and label",
+              files: workspace.files.map((file) =>
+                file.path === "package.json"
+                  ? {
+                      ...file,
+                      content: JSON.stringify({
+                        name: conflictingName,
+                        dependencies: withApps({ "is-number": "7.0.0" }),
+                      }),
+                    }
+                  : file,
+              ),
+            },
+            cookie,
+          );
+          expect(committed.status).toBe(200);
+          const conflictingCommit = (yield* Schema.decodeUnknownEffect(
+            Schema.Struct({
+              revision: Schema.Struct({ commit: Schema.String }),
+            }),
+          )(yield* driver("Read conflicting legacy commit", () => committed.json()))).revision
+            .commit;
+          expect(
+            (yield* request(
+              `${prefix}/apps/${app.id}/publication`,
+              { commit: conflictingCommit },
+              cookie,
+            )).status,
+          ).toBe(200);
+          const conflictingFiles = yield* readPublication(conflictingName, conflictingCommit);
+          expect(yield* readPublication(initialPublicationName, publicationCommit)).toEqual(
+            publicationFiles,
+          );
+
+          yield* run(["stop", "--time", "15", id]);
+          yield* run(["rm", id]);
+          yield* start(image, restoredVolume);
+          const rejected = yield* request("/health").pipe(
+            Effect.flatMap((response) =>
+              response.status === 500
+                ? Effect.succeed(response)
+                : Effect.fail("Waiting for rejected registry upgrade"),
+            ),
+            Effect.retry({ schedule: Schedule.spaced("250 millis"), times: 200 }),
+          );
+          expect(rejected.status).toBe(500);
+          expect(yield* run(["logs", id])).toContain("Public listings share an owner and label");
+          yield* run(["stop", "--time", "15", id]);
+          yield* run(["rm", id]);
+          // Reuse the rejected database directly: no snapshot restoration, SQL repair, or key
+          // replacement. This includes Better Auth's independently committed migration changes.
+          yield* start(initialImage, restoredVolume);
+          const recovered = yield* request("/health").pipe(
+            Effect.flatMap((response) =>
+              response.status === 503
+                ? Effect.fail("Waiting for the previous image")
+                : Effect.succeed(response),
+            ),
+            Effect.retry({ schedule: Schedule.spaced("250 millis"), times: 200 }),
+          );
+          expect(
+            recovered.status,
+            "previous image serves the rejected-upgrade database without restore",
+          ).toBe(200);
+          expect((yield* request("/api/viewer", undefined, cookie)).status).toBe(200);
+          const signedIn = yield* request("/api/auth/sign-in/email", {
+            email: "release@example.test",
+            password: "Synthetic-release-password-123!",
+          });
+          expect(signedIn.status).toBe(200);
+          const freshCookie = signedIn.headers
+            .getSetCookie()
+            .map((part) => part.split(";")[0])
+            .join("; ");
+          expect(freshCookie).not.toBe("");
+          expect((yield* request("/api/viewer", undefined, freshCookie)).status).toBe(200);
+          for (const [tool, expected] of [
+            ["check", true],
+            ["messages", ["Retained app data"]],
+          ] as const) {
+            const response = yield* request(
+              `${prefix}/apps/${app.id}/tools/call`,
+              {
+                profile: profile.id,
+                tool,
+                kind: "query",
+                input: {},
+              },
+              freshCookie,
+            );
+            expect(response.status).toBe(200);
+            expect(
+              yield* driver(`old image after rejected upgrade: ${tool}`, () => response.json()),
+            ).toEqual(expected);
+          }
+          expect(
+            yield* readPublication(initialPublicationName, publicationCommit, freshCookie),
+          ).toEqual(publicationFiles);
+          expect(yield* readPublication(conflictingName, conflictingCommit, freshCookie)).toEqual(
+            conflictingFiles,
+          );
+          // Prove the old registry remains writable too, then repair through its public API.
+          expect(
+            (yield* request(
+              `${prefix}/app-publications/unpublish`,
+              { package: conflictingName },
+              freshCookie,
+            )).status,
+          ).toBe(200);
+          yield* run(["stop", "--time", "15", id]);
+          yield* run(["rm", id]);
+          yield* start(image, restoredVolume);
+          yield* ready;
+          expect(
+            yield* readPublication(
+              `@${renamedSlug}.executor.community/release-app`,
+              publicationCommit,
+              freshCookie,
+            ),
+          ).toEqual(publicationFiles);
+        }
       }),
     ).pipe(Effect.provide(NodeServices.layer)),
   );
