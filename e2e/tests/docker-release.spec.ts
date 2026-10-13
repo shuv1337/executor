@@ -276,7 +276,7 @@ export default defineApp({ accounts: { service } }, async ({ accounts }) => ({
               {
                 path: "package.json",
                 content: JSON.stringify({
-                  name: `@${parsed[0].slug}/release-app`,
+                  name: `@${parsed[0].slug}.executor.community/release-app`,
                   dependencies: withApps({ "is-number": "7.0.0" }),
                 }),
               },
@@ -391,7 +391,7 @@ visit("/app/data/hosted.pglite");process.stdout.write(hash.digest("hex"));`,
           );
         let nativeBackup: string | undefined;
         let beforeRestartTrace: string | undefined;
-        const publicationName = `@${parsed[0].slug}/release-app`;
+        const publicationName = `@${parsed[0].slug}.executor.community/release-app`;
         let publicationCommit: string | undefined;
         if (initialImage === image) {
           const response = yield* request(`${prefix}/apps/${app.id}/workspace`, undefined, cookie);
