@@ -44,6 +44,31 @@ layer(HostedLive, { excludeTestServices: true })("Registry upgrades", (it) => {
             commit,
           })).status,
         ).toBe(200);
+        const readFiles = Effect.gen(function* () {
+          const source = yield* api.request(
+            actors.owner,
+            "GET",
+            `${prefix}/app-publications/source?name=${encodeURIComponent(name)}&commit=${commit}`,
+          );
+          expect(source.status).toBe(200);
+          const decoded = yield* Schema.decodeUnknownEffect(
+            Schema.Struct({
+              publication: Schema.Struct({ name: Schema.String, commit: Schema.String }),
+              files: Schema.Array(Schema.Struct({ path: Schema.String, content: Schema.String })),
+            }),
+          )(source.body);
+          expect(decoded.publication).toEqual({ name, commit });
+          return [...decoded.files].sort((left, right) => left.path.localeCompare(right.path));
+        });
+        // Every published path and content byte, not just the README, must survive the upgrade.
+        const publishedFiles = yield* readFiles;
+        expect(publishedFiles).toEqual(
+          expect.arrayContaining([
+            { path: "README.md", content: "The original published source" },
+            expect.objectContaining({ path: "index.ts" }),
+            expect.objectContaining({ path: "package.json" }),
+          ]),
+        );
         // Reconstruct the supported prior schemas on the stopped runner-owned database. Both
         // historical scopes can legitimately retain one owner's same label in layout 1.
         yield* legacyStorage([
@@ -101,18 +126,9 @@ layer(HostedLive, { excludeTestServices: true })("Registry upgrades", (it) => {
         ]);
         for (const attempt of [1, 2]) {
           yield* serverControl("start");
-          const source = yield* api.request(
-            actors.owner,
-            "GET",
-            `${prefix}/app-publications/source?name=${encodeURIComponent(name)}&commit=${commit}`,
+          expect(yield* readFiles, `retained source after successful start ${attempt}`).toEqual(
+            publishedFiles,
           );
-          expect(source.status, `retained source after successful start ${attempt}`).toBe(200);
-          expect(source.body).toMatchObject({
-            publication: { name, commit },
-            files: expect.arrayContaining([
-              { path: "README.md", content: "The original published source" },
-            ]),
-          });
           const [sdk, registry, count] = yield* legacyStorage([
             { sql: `SELECT value FROM private_executor_settings WHERE key = 'version'` },
             {

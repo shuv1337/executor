@@ -556,15 +556,12 @@ visit("/app/data/hosted.pglite");process.stdout.write(hash.digest("hex"));`,
           if (publicationCommit !== undefined) {
             const expectedName = restart ? publicationName : initialPublicationName;
             const query = `name=${encodeURIComponent(expectedName)}&commit=${publicationCommit}`;
-            const published = yield* request(
-              `${prefix}/app-publications/source?${query}`,
-              undefined,
-              cookie,
-            );
-            expect(published.status).toBe(200);
+            // The registry upgrade copies source before dropping the old tables, so every
+            // published path and content byte must survive, not just the name and commit.
             expect(
-              yield* driver("Publication survives restart", () => published.json()),
-            ).toMatchObject({ publication: { name: expectedName, commit: publicationCommit } });
+              yield* readPublication(expectedName, publicationCommit),
+              "publication files survive startup",
+            ).toEqual(publicationFiles);
             expect((yield* request(`/api/registry/source?${query}`)).status).toBe(404);
           }
           if (mode === "explicit") {
