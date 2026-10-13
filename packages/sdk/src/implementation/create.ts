@@ -4,6 +4,7 @@ import { WorkflowHost } from "../contracts/workflow-runtime.ts";
 import { RepositoryHost } from "../contracts/source.ts";
 import { StorageHost } from "../contracts/storage.ts";
 import { PrefetchHost } from "../contracts/profiles.ts";
+import { OAuthGrantImport } from "../contracts/oauth.ts";
 import { gitSourceStorage } from "./git-sources.ts";
 import { makeRegistry } from "./registry.ts";
 import { remoteRegistry } from "./remote-registry.ts";
@@ -22,7 +23,9 @@ import { makeAppData } from "./app-storage.ts";
 import { makeAccountConnections } from "./account-connections.ts";
 import { makeAccounts, storedAccount } from "./accounts.ts";
 import { makeSavedOAuthClients } from "./saved-oauth-clients.ts";
+import { makeOwnerMoves } from "./owner-moves.ts";
 import { SavedOAuthClientsHost } from "../contracts/oauth-clients.ts";
+import { OwnerMovesHost } from "../contracts/owner.ts";
 import { makeAccountHealth } from "./account-health.ts";
 import { makeProfiles } from "./profiles.ts";
 import { makeApps } from "./apps.ts";
@@ -213,6 +216,10 @@ export const createExecutor = (
           blobs: options.blobs,
         }),
       },
+      [OAuthGrantImport]: {
+        importOAuthGrant: oauth.importGrant,
+        firstPartyClient: oauth.firstPartyClient,
+      },
       [StorageHost]: {
         transaction: (effect) =>
           db.transaction(effect).pipe(
@@ -221,7 +228,12 @@ export const createExecutor = (
           ),
       },
       [PrefetchHost]: { invocation: tools.prefetchInvocation },
-      [SavedOAuthClientsHost]: makeSavedOAuthClients(db, credentials, options.hooks),
+      [SavedOAuthClientsHost]: makeSavedOAuthClients(db, credentials, crypto, options.hooks, [
+        ...(options.oauth?.savedClientCallbacks ?? []),
+        ...(options.oauth?.previousRedirectUris ?? []),
+        new URL("/api/oauth/callback", origin).href,
+      ]),
+      [OwnerMovesHost]: makeOwnerMoves(db, credentials),
       scheduler: schedules.dispatcher,
       events,
       schedules: schedules.operations,

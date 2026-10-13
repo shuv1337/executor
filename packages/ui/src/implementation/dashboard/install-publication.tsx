@@ -30,6 +30,12 @@ export function InstallPublication<E>({
         <h1 className="text-[22px] font-semibold tracking-tight">Make a copy</h1>
         <p className="mt-1 text-sm text-muted-foreground">{publication.name}</p>
       </div>
+      <div className="space-y-1">
+        <p className="text-sm">{publication.description}</p>
+        <p className="text-xs text-muted-foreground">
+          Published source <code title={publication.commit}>{publication.commit.slice(0, 7)}</code>
+        </p>
+      </div>
       <AppCreateForm
         mutation={mutation}
         Failure={Failure}
@@ -38,15 +44,6 @@ export function InstallPublication<E>({
         label="Make a copy"
         onCancel={onBack}
         onCreated={onInstalled}
-        beforeName={
-          <>
-            <p className="text-sm">{publication.description}</p>
-            <p className="text-xs text-muted-foreground">
-              Published source{" "}
-              <code title={publication.commit}>{publication.commit.slice(0, 7)}</code>
-            </p>
-          </>
-        }
       >
         {() => (
           <p className="text-xs leading-5 text-muted-foreground">

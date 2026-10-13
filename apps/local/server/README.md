@@ -300,11 +300,12 @@ See [OAuth notes](../../../notes/oauth.md) for the protocol library and limits.
 
 ### Add apps and accounts
 
-The local dashboard can import OpenAPI and MCP apps from the public integrations.sh
-catalog. **Apps → Add app** generates ordinary `index.ts`, `provider.ts`,
-`request.ts`, and `operations.json` source and deploys it through the SDK. Choose
-an unused app name; this flow never replaces an existing app. API definitions
-are fetched at import time, not when a tool runs.
+**Apps → Add app** lists Executor's official apps from the feed at
+`EXECUTOR_CATALOG_URL` (the feed's `index.json`; without it the list is empty).
+Choosing one installs the app's own source as a copy, the way a published app is
+installed, and then asks for an account through the app's own providers. Choose
+an unused app name; this flow never replaces an existing app. See
+[catalog imports](../../../notes/catalog-imports.md).
 
 **Apps → Add app → Custom app** also accepts MCP, GraphQL, and OpenAPI URLs.
 These templates generate source and deploy through the same SDK. API keys are
@@ -317,21 +318,6 @@ selected account. Streamable HTTP and legacy SSE servers are supported. Each
 discovery or tool call owns its connection; session state is not retained across
 separate calls. Remote prompts/resources, sampling, and elicitation are
 not included. See [catalog imports](../../../notes/catalog-imports.md).
-
-For stdio, choose **MCP → Local process (stdio)** in Custom app. Enter an
-executable, one argument per line, an optional working directory, and any
-environment variable names. Environment values are saved through the normal
-account flow. No-account servers can be used immediately.
-
-This generates `index.ts`, `stdio.ts`, `package.json`, and a provider declaration
-when environment fields are needed. The retained `stdio.ts` uses the official
-MCP SDK as an ordinary npm dependency; the apps framework has no stdio transport.
-Discovery and calls launch separate processes, pass arguments without a shell,
-and close the child on success, failure, timeout, or cancellation. Each process
-gets the selected account's environment plus the MCP SDK's basic inherited
-environment, rather than the host's full environment. Stderr is not sent to
-Executor logs. The default operation timeout is 30 seconds and is editable in
-the generated app source. Persistent process sessions are not part of this template.
 
 Automatic import checks the server's Bearer OAuth metadata advertisement when
 the catalog does not already include OAuth. This supplements incomplete API-key

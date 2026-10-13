@@ -63,6 +63,8 @@ import {
   type OAuthFailureCause,
   type OAuthOptions,
   type OAuthTokenServer,
+  type ImportOAuthGrant,
+  OAuthGrantNotImportable,
 } from "../contracts/oauth.ts";
 import {
   OAuthAutomaticClient,
@@ -90,11 +92,15 @@ import {
 } from "../contracts/shared.ts";
 import { StoredAccount, type Credentials } from "../contracts/storage.ts";
 import { type AccountCredential, invocationAccount } from "./provider.ts";
+import { intersectCredentialHosts } from "./credential-handles.ts";
 import { query, transaction, type Query } from "./database.ts";
 import {
   claimCredentials,
   credentialsDigest,
   credentialsOwner,
+  legacyCredentialsDigest,
+  oauthClientIssuer,
+  registeredClientKey,
   withdrawCredentials,
 } from "./stored-oauth-client-credentials.ts";
 import { storedProfile } from "./profiles.ts";
@@ -102,6 +108,8 @@ import {
   clientRegistration,
   isOAuthErrorResponse,
   makeOAuthProtocol,
+  preferredClientMethod,
+  registrationGrantTypes,
   type OAuthProtocolFailed,
 } from "./oauth-protocol.ts";
 import { defaultLabel, ownedAccount } from "./accounts.ts";
@@ -111,19 +119,21 @@ import type { OAuthCallbackField, OAuthFailureDetail } from "./oauth-diagnostics
  * A stored client's encrypted part: its ID and secret, and for a registered client the rest of
  * the registration the service issued. A client entered by a person has no recorded method.
  */
-const StoredClientSecret = Schema.Struct({
+export const StoredClientSecret = Schema.Struct({
   client_id: Schema.NonEmptyString,
   client_secret: Schema.optional(Schema.NonEmptyString),
   token_endpoint_auth_method: Schema.optional(OAuthClientAuth),
   client_secret_expires_at: Schema.optional(Schema.Number),
 });
-type StoredClientSecret = typeof StoredClientSecret.Type;
+export type StoredClientSecret = typeof StoredClientSecret.Type;
 
 /** A row of `storedOAuthClients`, as the client store writes it. */
 interface StoredClientRow {
   readonly id: OAuthClientId;
   readonly owner: OwnerId;
-  readonly provider: ProviderId;
+  /** Only on a client stored before 4.0.12 whose issuer has not been recorded. */
+  readonly provider: ProviderId | null;
+  readonly issuer: string | null;
   readonly clientId: string;
   readonly source: OAuthClientSource;
   readonly hasSecret: boolean;
@@ -133,8 +143,56 @@ interface StoredClientRow {
   readonly createdAt: Date;
 }
 
+/**
+ * Whose stored clients a sign-in may use: the owner's for the server it signs in at. The provider
+ * finds the clients and credentials stored before 4.0.12, which name it rather than a server.
+ */
+interface ClientScope {
+  readonly owner: OwnerId;
+  readonly provider: ProviderId;
+  readonly issuer: string;
+}
+
+/** The connection a stored client is used for. */
+interface SignInScope {
+  readonly owner: OwnerId;
+  readonly provider: ProviderId;
+  readonly method: string;
+}
+
+/** A client of the owner for this server, or stored before 4.0.12 for this provider. */
+const inScope = (row: Pick<StoredClientRow, "owner" | "issuer" | "provider">, scope: ClientScope) =>
+  row.owner === scope.owner &&
+  (row.issuer === null ? row.provider === scope.provider : row.issuer === scope.issuer);
+
+/** Credentials a client of another server holds: this sign-in may never use them. */
+const unusableHere = (
+  found:
+    | { readonly kind: "held"; readonly row: StoredClientRow }
+    | {
+        readonly kind: "withdrawn";
+        readonly client: OAuthClientId;
+        readonly withdrawal: string | null;
+      },
+) =>
+  ({
+    kind: "withdrawn",
+    client: found.kind === "held" ? found.row.id : found.client,
+    withdrawal: null,
+  }) as const;
+
 const decode = <A>(schema: Schema.Decoder<A>, value: unknown) =>
   Schema.decodeUnknownEffect(schema)(value).pipe(Effect.mapError(() => new StorageError()));
+
+/**
+ * A stored client's registration as a sign-in reads it: the one the service issued, or none for a
+ * client entered by a person, which authenticates as each sign-in's discovery says. An owner move
+ * reads stored clients with this too, so it refuses exactly the ones a sign-in could not use.
+ */
+export const storedRegistration = (secret: StoredClientSecret) =>
+  secret.token_endpoint_auth_method === undefined
+    ? Effect.succeed(undefined)
+    : decode(OAuthRegistration, secret);
 
 /** Apply the authored output schema after removing host-only token material. */
 const project = (response: JsonObject, fields: unknown) =>
@@ -546,6 +604,8 @@ export const makeOAuth = (
           ? {}
           : { tokenRequestFormat: server.tokenRequestFormat }),
         ...(server.tokenResponse === undefined ? {} : { tokenResponse: server.tokenResponse }),
+        // Sent on the exchange and every renewal, as on the authorization request.
+        ...(server.resource === undefined ? {} : { resource: server.resource }),
       };
     });
   /**
@@ -584,24 +644,37 @@ export const makeOAuth = (
    * is offered: an issuer, which a provider can claim, never does, and signing in uses the
    * operator's endpoints whatever the provider declares. The method's scopes are asked for, or the
    * client's `defaultScopes` when it declares none, and every one must be among `allowedScopes`.
+   * Scopes discovered only in the resource's advertised list are what it offers, not what it
+   * requires, so they are narrowed to `allowedScopes`; the client is offered when any remain.
+   * An `unlisted` client is offered only to reconnect an account whose grant it issued, `reconnecting`.
    */
-  const firstPartyClient = (discovered: {
-    readonly grant: string;
-    readonly server: OAuthTokenServer;
-    readonly scopes: readonly string[];
-  }) => {
+  const firstPartyClient = (
+    discovered: {
+      readonly grant: string;
+      readonly server: OAuthTokenServer;
+      readonly scopes: readonly string[];
+      readonly scopesAdvertised?: true | undefined;
+    },
+    reconnecting?: FirstPartyOAuthClientId,
+  ) => {
     if (discovered.grant !== "authorization_code") return undefined;
     const { server } = discovered;
     const same = (declared: string | undefined, configured: string) =>
       declared !== undefined && new URL(declared).href === new URL(configured).href;
     for (const client of firstPartyClients.values()) {
+      if (client.unlisted === true && client.id !== reconnecting) continue;
       if (
         !same(server.authorization_endpoint, client.server.authorizationUrl) ||
         !same(server.token_endpoint, client.server.tokenUrl)
       )
         continue;
-      const scopes = discovered.scopes.length === 0 ? client.defaultScopes : discovered.scopes;
       const allowed = allowedScopes(client);
+      if (discovered.scopesAdvertised === true && discovered.scopes.length > 0) {
+        const scopes = discovered.scopes.filter((scope) => allowed.includes(scope));
+        if (scopes.length === 0) continue;
+        return { client, scopes };
+      }
+      const scopes = discovered.scopes.length === 0 ? client.defaultScopes : discovered.scopes;
       if (!scopes.every((scope) => allowed.includes(scope))) continue;
       return { client, scopes };
     }
@@ -619,6 +692,31 @@ export const makeOAuth = (
     credentials
       .decrypt(identity, Redacted.make(bytes))
       .pipe(Effect.flatMap((value) => decode(schema, Redacted.value(value))));
+
+  /** How a failed discovery is reported to whoever is setting up a sign-in. */
+  const discoveryFailed = (error: OAuthProtocolFailed) => {
+    const reason = Match.value(error.reason).pipe(
+      Match.when("request", () =>
+        error.status === 429 ? ("rate_limited" as const) : ("service_unavailable" as const),
+      ),
+      Match.when("metadata_missing", () => "discovery_missing" as const),
+      Match.when("destination_blocked", () => "discovery_blocked" as const),
+      Match.when("resource_mismatch", () => "resource_mismatch" as const),
+      Match.when("unsupported", () => "unsupported" as const),
+      Match.whenOr(
+        "invalid_response",
+        "invalid_client",
+        "invalid_grant",
+        () => "discovery_invalid" as const,
+      ),
+      Match.exhaustive,
+    );
+    return new OAuthSetupFailed({
+      cause: causeOf("discover", error),
+      ...retryAfterOf(reason, error),
+      reason,
+    });
+  };
 
   const resolveSetup = (input: {
     readonly provider: ProviderId;
@@ -651,31 +749,7 @@ export const makeOAuth = (
           ))
       )
         return yield* new OAuthSetupFailed({ reason: "invalid_redirect" });
-      const discovered = yield* protocol.discover(method).pipe(
-        Effect.mapError((error) => {
-          const reason = Match.value(error.reason).pipe(
-            Match.when("request", () =>
-              error.status === 429 ? ("rate_limited" as const) : ("service_unavailable" as const),
-            ),
-            Match.when("metadata_missing", () => "discovery_missing" as const),
-            Match.when("destination_blocked", () => "discovery_blocked" as const),
-            Match.when("resource_mismatch", () => "resource_mismatch" as const),
-            Match.when("unsupported", () => "unsupported" as const),
-            Match.whenOr(
-              "invalid_response",
-              "invalid_client",
-              "invalid_grant",
-              () => "discovery_invalid" as const,
-            ),
-            Match.exhaustive,
-          );
-          return new OAuthSetupFailed({
-            cause: causeOf("discover", error),
-            ...retryAfterOf(reason, error),
-            reason,
-          });
-        }),
-      );
+      const discovered = yield* protocol.discover(method).pipe(Effect.mapError(discoveryFailed));
       // Import checks report the same choice for the providers they generate.
       const registration =
         discovered.grant === "authorization_code"
@@ -694,33 +768,39 @@ export const makeOAuth = (
               const url = parseEndpoint(uri, options.urlPolicy);
               return url === undefined || url.href === redirect.href ? [] : [url];
             });
-      return { method, redirect, discovered, registration, previous };
+      // Stored clients belong to the server the sign-in discovered, not to the provider.
+      const issuer = oauthClientIssuer(discovered.server);
+      return { method, redirect, discovered, registration, previous, issuer };
     });
   type Resolved = Effect.Success<ReturnType<typeof resolveSetup>>;
 
   /**
-   * The settings an automatic client was registered for. A client registered for fewer scopes
-   * cannot be assumed to allow new ones. They are the settings, in the same order, that keyed
-   * the saved clients of earlier versions, so a client moved from them keeps its key. The null
-   * once held the metadata document URL; a document client is never stored.
+   * What a registered client was registered for, as its registration request said it: the
+   * authorization server, the callback (`redirect_uris`, which also decides `application_type`),
+   * the scopes (`scope`), the client authentication (`token_endpoint_auth_method`) and the grants
+   * (`grant_types`), the last two chosen from the provider's declaration and the server's metadata.
+   * The client name is the host's. A server may refuse a scope, callback or method the client was
+   * not registered for, so a client is reused only for the same request; the provider and method
+   * name are not part of it, so every provider that would send the same request finds the same
+   * client.
    */
   const automaticKey = (
     owner: OwnerId,
-    input: { readonly provider: ProviderId; readonly method: string },
     callback: URL | undefined,
-    discovered: Resolved["discovered"],
+    resolved: Pick<Resolved, "discovered" | "issuer" | "method">,
   ) =>
-    hash(
-      JSON.stringify([
-        owner,
-        input.provider,
-        input.method,
-        callback?.href,
-        discovered.server.issuer,
-        null,
-        [...discovered.scopes].sort(),
-      ]),
-    );
+    registeredClientKey(hash, {
+      owner,
+      issuer: resolved.issuer,
+      callback: callback?.href,
+      scopes: resolved.discovered.scopes,
+      tokenEndpointAuthMethod: preferredClientMethod(
+        resolved.discovered.server,
+        "registered",
+        resolved.method.tokenEndpointAuthMethod,
+      ),
+      grantTypes: registrationGrantTypes(resolved.discovered.server),
+    });
 
   /**
    * A client entered by a person. It authenticates as the provider declares, or with a secret by
@@ -757,43 +837,49 @@ export const makeOAuth = (
    * change what it allows, so it keeps sending it. Its key, a digest of the settings it was
    * registered for, names the callback; a client without one uses the current callback.
    */
-  const signInCallback = (
-    automatic: string | null,
-    input: { readonly owner: OwnerId; readonly provider: ProviderId; readonly method: string },
-    { redirect, previous, discovered }: Resolved,
-  ) =>
+  const signInCallback = (automatic: string | null, owner: OwnerId, resolved: Resolved) =>
     Effect.gen(function* () {
-      if (automatic === null) return redirect;
-      for (const candidate of previous)
-        if ((yield* automaticKey(input.owner, input, candidate, discovered)) === automatic)
-          return candidate;
-      return redirect;
+      if (automatic === null) return resolved.redirect;
+      for (const candidate of resolved.previous)
+        if ((yield* automaticKey(owner, candidate, resolved)) === automatic) return candidate;
+      return resolved.redirect;
     });
 
-  /** The owner's stored client for this provider, or undefined. */
-  const storedRow = (
-    id: OAuthClientId,
-    input: { readonly owner: OwnerId; readonly provider: ProviderId },
-  ) =>
+  /**
+   * The owner's stored client for this sign-in's server, or undefined. A client stored before
+   * 4.0.12 whose server is not recorded yet is still the one its provider's sign-ins used.
+   */
+  const storedRow = (id: OAuthClientId, input: ClientScope) =>
     query(() => db.findFirst("storedOAuthClients", { where: (b) => b("id", "=", id) })).pipe(
-      Effect.map((row) =>
-        row === null || row.owner !== input.owner || row.provider !== input.provider
-          ? undefined
-          : row,
-      ),
+      Effect.map((row) => (row === null || !inScope(row, input) ? undefined : row)),
     );
 
-  /** The identity of a client's credentials: its owner, provider, client ID and secret. */
+  /** The identity of a client's credentials: its owner, issuer, client ID and secret. */
   const digestOf = (
-    input: { readonly owner: OwnerId; readonly provider: ProviderId },
+    input: { readonly owner: OwnerId; readonly issuer: string },
     client: { readonly client_id: string; readonly client_secret?: string | undefined },
   ) =>
     credentialsDigest(credentials, {
       owner: input.owner,
-      provider: input.provider,
+      issuer: input.issuer,
       clientId: client.client_id,
       secret: client.client_secret,
     });
+  /** A client's identity under its own server, or its provider before that is recorded. */
+  const storedDigestOf = (
+    row: Pick<StoredClientRow, "owner" | "issuer" | "provider">,
+    client: { readonly client_id: string; readonly client_secret?: string | undefined },
+  ) =>
+    row.issuer !== null
+      ? digestOf({ owner: row.owner, issuer: row.issuer }, client)
+      : row.provider !== null
+        ? legacyCredentialsDigest(credentials, {
+            owner: row.owner,
+            provider: row.provider,
+            clientId: client.client_id,
+            secret: client.client_secret,
+          })
+        : Effect.fail(new StorageError());
   /** A registration's credentials; a public client has no secret, whatever it was issued. */
   const registrationCredentials = (client: OAuthRegistration) => ({
     client_id: client.client_id,
@@ -810,13 +896,40 @@ export const makeOAuth = (
    * a shortcut to the same answer.
    */
   const credentialsHolder = (
-    input: { readonly owner: OwnerId; readonly provider: ProviderId },
+    input: ClientScope,
     client: OAuthRegistration,
+    /** Another server the credentials were used at, such as the one a reconnected grant names. */
+    usedAt?: string,
   ) =>
-    // The digest covers owner and provider, so it finds only this owner's client for the provider.
-    digestOf(input, registrationCredentials(client)).pipe(
-      Effect.flatMap((digest) => credentialsOwner(db, digest)),
-    );
+    Effect.gen(function* () {
+      const details = registrationCredentials(client);
+      // The digest covers owner and issuer, so it finds only this owner's client for the server.
+      const found = yield* credentialsOwner(db, yield* digestOf(input, details));
+      if (found !== undefined) return found;
+      // Credentials a grant used at another server, if a client there holds them, are that
+      // client's, which this sign-in cannot use: they are withdrawn from it.
+      if (usedAt !== undefined && usedAt !== input.issuer) {
+        const elsewhere = yield* credentialsOwner(
+          db,
+          yield* digestOf({ owner: input.owner, issuer: usedAt }, details),
+        );
+        if (elsewhere !== undefined) return unusableHere(elsewhere);
+      }
+      // Credentials recorded before 4.0.12, under this sign-in's provider: an edited or removed
+      // client's earlier credentials, which cannot be recorded under their server.
+      const legacy = yield* credentialsOwner(
+        db,
+        yield* legacyCredentialsDigest(credentials, {
+          owner: input.owner,
+          provider: input.provider,
+          clientId: details.client_id,
+          secret: details.client_secret,
+        }),
+      );
+      return legacy === undefined || legacy.kind === "withdrawn" || inScope(legacy.row, input)
+        ? legacy
+        : unusableHere(legacy);
+    });
 
   /** Whether the product still lets the caller use a stored client; always, without a product. */
   const clientAuthorized = (row: unknown) =>
@@ -825,13 +938,10 @@ export const makeOAuth = (
       : clientMetadata(row).pipe(Effect.flatMap(lifecycle.oauthClientResolving));
 
   /** The owner's stored client a connection names, as its attempt uses it. */
-  const storedClient = (
-    id: OAuthClientId,
-    input: { readonly owner: OwnerId; readonly provider: ProviderId; readonly method: string },
-    resolved: Resolved,
-  ) =>
+  const storedClient = (id: OAuthClientId, input: SignInScope, resolved: Resolved) =>
     Effect.gen(function* () {
-      const row = yield* storedRow(id, input);
+      // A client of another server is not this sign-in's, like another owner's.
+      const row = yield* storedRow(id, { ...input, issuer: resolved.issuer });
       if (row === undefined) return yield* new OAuthClientNotFound({ client: id });
       // The caller named this client, so its refusal names it too.
       return yield* useStoredClient(row, input, resolved).pipe(
@@ -845,11 +955,7 @@ export const makeOAuth = (
    * found, like another owner's. The refusal carries no ID: a client the sign-in found by itself
    * may be one the caller cannot list.
    */
-  const useStoredClient = (
-    row: StoredClientRow,
-    input: { readonly owner: OwnerId; readonly provider: ProviderId; readonly method: string },
-    resolved: Resolved,
-  ) =>
+  const useStoredClient = (row: StoredClientRow, input: SignInScope, resolved: Resolved) =>
     Effect.gen(function* () {
       if (!(yield* clientAuthorized(row))) return yield* new OAuthClientNotFound({});
       // Expiry only stops an automatic client being found again; a named client is used as named,
@@ -862,31 +968,32 @@ export const makeOAuth = (
   const authorizedClientUse = (
     row: StoredClientRow,
     secret: StoredClientSecret,
-    input: { readonly owner: OwnerId; readonly provider: ProviderId; readonly method: string },
+    input: SignInScope,
     resolved: Resolved,
   ) =>
     Effect.gen(function* () {
       // Registered clients keep the registration the service issued; entered ones authenticate
       // as this sign-in's discovery says.
       const client =
-        secret.token_endpoint_auth_method === undefined
-          ? yield* enteredClient(
-              {
-                clientId: secret.client_id,
-                ...(secret.client_secret === undefined
-                  ? {}
-                  : { clientSecret: secret.client_secret }),
-              },
-              resolved.discovered,
-            )
-          : yield* decode(OAuthRegistration, secret);
+        (yield* storedRegistration(secret)) ??
+        (yield* enteredClient(
+          {
+            clientId: secret.client_id,
+            ...(secret.client_secret === undefined ? {} : { clientSecret: secret.client_secret }),
+          },
+          resolved.discovered,
+        ));
       const use: OAuthClientUse = {
         id: row.id,
         version: Base64.encode(row.encrypted),
         source: row.source,
         fresh: !row.confirmed,
       };
-      return { client, use, callback: yield* signInCallback(row.automaticKey, input, resolved) };
+      return {
+        client,
+        use,
+        callback: yield* signInCallback(row.automaticKey, input.owner, resolved),
+      };
     });
 
   /**
@@ -901,17 +1008,13 @@ export const makeOAuth = (
    * sign in again, so an authorized caller discards them; one refused to the caller stays until an
    * authorized sign-in reaches it.
    */
-  const existingAutomatic = (
-    owner: OwnerId,
-    input: { readonly provider: ProviderId; readonly method: string },
-    resolved: Resolved,
-  ) =>
+  const existingAutomatic = (owner: OwnerId, resolved: Resolved) =>
     Effect.gen(function* () {
       const { redirect, discovered, registration, previous } = resolved;
       if (discovered.grant !== "authorization_code" || redirect === undefined) return undefined;
       let refused: StoredClientRow | undefined;
       for (const candidate of registration === "manual" ? [redirect, ...previous] : [redirect]) {
-        const key = yield* automaticKey(owner, input, candidate, discovered);
+        const key = yield* automaticKey(owner, candidate, resolved);
         const rows = yield* query(() =>
           db.findMany("storedOAuthClients", {
             where: (b) =>
@@ -957,7 +1060,7 @@ export const makeOAuth = (
       const resolved = yield* resolveSetup(input);
       const { discovered, method, registration } = resolved;
       // A registered client the caller is refused still counts, as a start finds it too.
-      const existing = yield* existingAutomatic(input.owner, input, resolved);
+      const existing = yield* existingAutomatic(input.owner, resolved);
       // The operator's own client, after the owner's registered clients and before CIMD and DCR.
       const firstParty = existing === undefined ? firstPartyClient(discovered) : undefined;
       const mode =
@@ -988,6 +1091,7 @@ export const makeOAuth = (
         mode,
         scopes: firstParty?.scopes ?? discovered.scopes,
         grant: "authorization_code",
+        issuer: HttpUrl.make(resolved.issuer),
         ...operator,
         ...(discovered.tokenEndpointAuthMethod === undefined
           ? {}
@@ -1018,20 +1122,9 @@ export const makeOAuth = (
       return { stored: true as const, client };
     });
 
-  /** Register a client entered by a person for browser sign-in to one provider. */
+  /** Register a client entered by a person for browser sign-in at one authorization server. */
   const registerClient = (input: typeof OAuthClientInputs.register.Type) =>
     Effect.gen(function* () {
-      const row = yield* query(() =>
-        db.findFirst("providers", { where: (b) => b("id", "=", input.provider) }),
-      );
-      if (row === null) return yield* new ProviderNotFound({ provider: input.provider });
-      const provider = yield* decode(Provider, row);
-      if (
-        !Object.values(provider.definition.auth).some(
-          (method) => method.type === "oauth2" && method.grant !== "client_credentials",
-        )
-      )
-        return yield* new OAuthClientsUnsupported({ provider: input.provider });
       const id = OAuthClientId.make(`oac_${yield* nextId}`);
       const secret =
         input.clientSecret === undefined ? undefined : Redacted.value(input.clientSecret);
@@ -1050,7 +1143,8 @@ export const makeOAuth = (
           {
             id,
             owner: input.owner,
-            provider: input.provider,
+            provider: null,
+            issuer: input.issuer,
             clientId: input.clientId,
             source: "manual",
             hasSecret: secret !== undefined,
@@ -1104,9 +1198,11 @@ export const makeOAuth = (
       };
       const encrypted = yield* encrypt(row.id, details);
       const holder = yield* claimCredentials(db, {
-        digest: yield* digestOf(row, details),
+        digest: yield* storedDigestOf(row, details),
         owner: row.owner,
-        provider: row.provider,
+        // A client stored before 4.0.12 keeps its credentials' earlier identity until its server
+        // is recorded.
+        provider: row.issuer === null ? row.provider : null,
         client: row.id,
         createdAt: new Date(yield* Clock.currentTimeMillis),
         reclaim: true,
@@ -1122,15 +1218,44 @@ export const makeOAuth = (
       return yield* clientMetadata({ ...row, ...updated });
     });
 
+  /**
+   * The authorization server each browser sign-in method of a provider uses, discovered as its
+   * sign-in discovers it, so a client registered for it is offered to that sign-in.
+   */
+  const issuers = (input: typeof OAuthClientInputs.issuers.Type) =>
+    Effect.gen(function* () {
+      const row = yield* query(() =>
+        db.findFirst("providers", { where: (b) => b("id", "=", input.provider) }),
+      );
+      if (row === null) return yield* new ProviderNotFound({ provider: input.provider });
+      const provider = yield* decode(Provider, row);
+      const methods = Object.entries(provider.definition.auth).flatMap(([name, method]) =>
+        method.type === "oauth2" && method.grant !== "client_credentials" ? [{ name, method }] : [],
+      );
+      if (methods.length === 0)
+        return yield* new OAuthClientsUnsupported({ provider: input.provider });
+      if (protocol === undefined) return yield* new OAuthSetupFailed({ reason: "unsupported" });
+      return yield* Effect.forEach(methods, ({ name, method }) =>
+        protocol.discover(method).pipe(
+          Effect.mapError(discoveryFailed),
+          Effect.map((discovered) => ({
+            method: name,
+            issuer: HttpUrl.make(oauthClientIssuer(discovered.server)),
+          })),
+        ),
+      );
+    }).pipe(Effect.withSpan("oauth.clients.issuers"));
+
   const clients = {
     register: registerClient,
+    issuers,
     list: (input: typeof OAuthClientInputs.list.Type) =>
       query(() =>
         db.findMany("storedOAuthClients", {
           where: (b) =>
             b.and(
               b("owner", "=", input.owner),
-              input.provider === undefined ? true : b("provider", "=", input.provider),
+              input.issuer === undefined ? true : b("issuer", "=", input.issuer),
             ),
           orderBy: ["createdAt", "asc"],
         }),
@@ -1160,28 +1285,47 @@ export const makeOAuth = (
   };
 
   /**
+   * The callback a sign-in as `client` sends: the one the host's document lists for the
+   * document's client, which the server holds the sign-in to, and the sign-in's own for any other.
+   */
+  const clientCallback = (client: OAuthRegistration, redirect: URL | undefined) => {
+    const document =
+      options?.clientMetadataUrl === undefined
+        ? undefined
+        : parseDestination(options.clientMetadataUrl, httpsOnlyUrlPolicy);
+    return document === undefined ||
+      client.client_id !== document.href ||
+      options?.clientMetadataRedirectUri === undefined
+      ? redirect
+      : parseEndpoint(options.clientMetadataRedirectUri, options.urlPolicy);
+  };
+
+  /**
    * The automatic client for a sign-in, in MCP's order after the owner's own: a client the owner
    * already registered for these settings, the operator's client, the host's client metadata
    * document, then a client registered now. It uses the sign-in's own discovery rather than
    * discovering the service again. A newly registered client is stored at once, since the service
    * has already issued it; a document client is the host's configuration and is never stored.
+   * `reconnecting` names the operator's client that issued the grant a reconnect replaces, which
+   * is offered even when it is unlisted.
    */
   const automaticChoice = (
-    input: { readonly owner: OwnerId; readonly provider: ProviderId; readonly method: string },
+    input: SignInScope,
     resolved: Resolved,
+    reconnecting?: FirstPartyOAuthClientId,
   ) =>
     Effect.gen(function* () {
       if (protocol === undefined || options === undefined)
         return yield* new OAuthClientUnavailable(input);
       const { method, redirect, discovered, registration } = resolved;
-      const existing = yield* existingAutomatic(input.owner, input, resolved);
+      const existing = yield* existingAutomatic(input.owner, resolved);
       if (existing?.kind === "refused") return yield* new OAuthClientNotFound({});
       if (existing !== undefined)
         return {
           kind: "stored" as const,
           ...(yield* authorizedClientUse(existing.row, existing.secret, input, resolved)),
         };
-      const firstParty = firstPartyClient(discovered);
+      const firstParty = firstPartyClient(discovered, reconnecting);
       if (firstParty !== undefined) return { kind: "firstParty" as const, firstParty };
       if (registration === "client_id_metadata_document") {
         const url =
@@ -1193,7 +1337,7 @@ export const makeOAuth = (
           client_id: url.href,
           token_endpoint_auth_method: "none",
         };
-        return { kind: "entered" as const, client, callback: redirect };
+        return { kind: "entered" as const, client, callback: clientCallback(client, redirect) };
       }
       if (discovered.grant !== "authorization_code" || registration !== "dynamic")
         return yield* new OAuthClientUnavailable(input);
@@ -1209,11 +1353,12 @@ export const makeOAuth = (
         return yield* new OAuthSetupFailed({ reason: "invalid_client" });
       const id = OAuthClientId.make(`oac_${yield* nextId}`);
       const encrypted = yield* encrypt(id, client);
-      const key = yield* automaticKey(input.owner, input, redirect, discovered);
+      const key = yield* automaticKey(input.owner, redirect, resolved);
       const row: StoredClientRow = {
         id,
         owner: input.owner,
-        provider: input.provider,
+        provider: null,
+        issuer: resolved.issuer,
         clientId: client.client_id,
         source: "registered",
         hasSecret: client.token_endpoint_auth_method !== "none",
@@ -1222,10 +1367,11 @@ export const makeOAuth = (
         encrypted,
         createdAt: new Date(yield* Clock.currentTimeMillis),
       };
-      const digest = yield* digestOf(input, registrationCredentials(client));
+      const scope = { ...input, issuer: resolved.issuer };
+      const digest = yield* digestOf(scope, registrationCredentials(client));
       const stored = yield* transaction(db, (tx) => createStoredClient(tx, row, digest));
       // A service that issued credentials a stored client already holds issued that client.
-      const used = stored.stored ? row : yield* storedRow(stored.holder, input);
+      const used = stored.stored ? row : yield* storedRow(stored.holder, scope);
       if (used === undefined) return yield* new OAuthClientNotFound({});
       // A client registered now is a stored client like any other: the product authorizes it
       // before this sign-in uses it, as it will for every later one.
@@ -1250,17 +1396,23 @@ export const makeOAuth = (
     Effect.gen(function* () {
       const { discovered, redirect } = resolved;
       const choice = input.client;
+      const scope: ClientScope = { ...input, issuer: resolved.issuer };
+      const automatic = choice === undefined || Schema.is(OAuthAutomaticClient)(choice);
+      const row =
+        existing === undefined || !automatic
+          ? null
+          : yield* query(() =>
+              db.findFirst("oauthGrants", { where: (b) => b("id", "=", existing.id) }),
+            );
+      const previous =
+        existing === undefined || row === null
+          ? undefined
+          : yield* decrypt(existing.id, row.encrypted, OAuthGrant);
+      // The operator's client that issued the grant this reconnect replaces, offered again even
+      // when it is unlisted.
+      const reconnecting =
+        previous !== undefined && isFirstPartyGrant(previous) ? previous.firstParty : undefined;
       if (choice === undefined) {
-        const row =
-          existing === undefined
-            ? null
-            : yield* query(() =>
-                db.findFirst("oauthGrants", { where: (b) => b("id", "=", existing.id) }),
-              );
-        const previous =
-          existing === undefined || row === null
-            ? undefined
-            : yield* decrypt(existing.id, row.encrypted, OAuthGrant);
         const reusable =
           previous === undefined ||
           isFirstPartyGrant(previous) ||
@@ -1274,17 +1426,21 @@ export const makeOAuth = (
           reusable.grant === "client_credentials" ||
           reusable.oauthClient === undefined
             ? undefined
-            : yield* storedRow(reusable.oauthClient, input);
+            : yield* storedRow(reusable.oauthClient, scope);
         const holder =
           named !== undefined
             ? ({ kind: "held", row: named } as const)
             : reusable === undefined || reusable.grant === "client_credentials"
               ? undefined
-              : yield* credentialsHolder(input, reusable.client);
+              : yield* credentialsHolder(
+                  scope,
+                  reusable.client,
+                  oauthClientIssuer(reusable.server),
+                );
         // A removed client's credentials are withdrawn: the reconnect signs in automatically or
         // needs another client, and never reuses the grant's copy of them.
         if (holder?.kind === "withdrawn")
-          return yield* automaticChoice(input, resolved).pipe(
+          return yield* automaticChoice(input, resolved, reconnecting).pipe(
             Effect.catchTag("OAuthClientUnavailable", () =>
               Effect.fail(new OAuthClientNotFound({})),
             ),
@@ -1299,20 +1455,20 @@ export const makeOAuth = (
           // keeps it when the service offers no other. Either way a refusal fails rather than
           // fall back to the copy the grant holds of the same client.
           if (kept.source === "manual") return yield* keep;
-          return yield* automaticChoice(input, resolved).pipe(
+          return yield* automaticChoice(input, resolved, reconnecting).pipe(
             Effect.catchTag("OAuthClientUnavailable", () => keep),
           );
         }
         // No stored client holds or held the grant's copy, so reusing it uses no stored client's
         // credentials. Completion checks again, in case one is stored meanwhile.
-        return yield* automaticChoice(input, resolved).pipe(
+        return yield* automaticChoice(input, resolved, reconnecting).pipe(
           Effect.catchTag("OAuthClientUnavailable", (error) =>
             reusable === undefined
               ? Effect.fail(error)
               : Effect.succeed({
                   kind: "entered" as const,
                   client: reusable.client,
-                  callback: redirect,
+                  callback: clientCallback(reusable.client, redirect),
                 }),
           ),
         );
@@ -1323,7 +1479,8 @@ export const makeOAuth = (
           return yield* new OAuthSetupFailed({ reason: "invalid_client" });
         return { kind: "stored" as const, ...(yield* storedClient(choice.id, input, resolved)) };
       }
-      if (Schema.is(OAuthAutomaticClient)(choice)) return yield* automaticChoice(input, resolved);
+      if (Schema.is(OAuthAutomaticClient)(choice))
+        return yield* automaticChoice(input, resolved, reconnecting);
       if (choice.save === true && discovered.grant === "client_credentials")
         return yield* new OAuthSetupFailed({ reason: "invalid_client" });
       const client = yield* enteredClient(
@@ -1339,7 +1496,7 @@ export const makeOAuth = (
       // used with its current details; saving them again would only duplicate it. Those of a
       // removed client are withdrawn.
       if (discovered.grant !== "client_credentials") {
-        const holder = yield* credentialsHolder(input, client);
+        const holder = yield* credentialsHolder(scope, client);
         if (holder?.kind === "withdrawn") return yield* new OAuthClientNotFound({});
         if (holder !== undefined)
           return {
@@ -1549,7 +1706,7 @@ export const makeOAuth = (
         return yield* new OAuthSetupFailed({ reason: "invalid_redirect" });
       const operator = yield* operatorClient(firstParty.client.id);
       if (operator === undefined) return yield* new OAuthClientUnavailable(input);
-      const { scopeSeparator, authorizationParams } = firstParty.client.server;
+      const { scopeSeparator, authorizationParams, resource } = firstParty.client.server;
       const authorization = yield* protocol
         .authorize({
           server: operator.server,
@@ -1558,6 +1715,7 @@ export const makeOAuth = (
           scopes: firstParty.scopes,
           ...(scopeSeparator === undefined ? {} : { scopeSeparator }),
           ...(authorizationParams === undefined ? {} : { authorizationParams }),
+          ...(resource === undefined ? {} : { resource }),
         })
         .pipe(Effect.mapError(() => new OAuthSetupFailed({ reason: "unsupported" })));
       const id = OAuthAttemptId.make(`oauth_${yield* hash(authorization.state)}`);
@@ -1781,9 +1939,16 @@ export const makeOAuth = (
       // stored client. Sign-ins last ten minutes, so it fails closed and the person starts again.
       if (legacySavedClient) return yield* failed("client_unavailable");
       const storedRef = isFirstPartyAttempt(attempt) ? undefined : attempt.storedClient;
+      // The server this sign-in signs in at, whose clients its credentials belong to.
+      const scope: ClientScope | undefined = isFirstPartyAttempt(attempt)
+        ? undefined
+        : { ...attempt, issuer: oauthClientIssuer(attempt.server) };
       // Who may use a stored client can change while the browser is at the service: the product,
       // when it decides that, authorizes it again before its code is exchanged.
-      const named = storedRef === undefined ? undefined : yield* storedRow(storedRef.id, attempt);
+      const named =
+        storedRef === undefined || scope === undefined
+          ? undefined
+          : yield* storedRow(storedRef.id, scope);
       if (named !== undefined && !(yield* clientAuthorized(named)))
         return yield* failed("client_unavailable");
       // Otherwise the credentials the attempt holds decide, read where their client recorded them.
@@ -1793,9 +1958,9 @@ export const makeOAuth = (
       // gone and whose credentials were registered again. They are that client now, so the product
       // authorizes it like any other, and the grant names it.
       const holder =
-        isFirstPartyAttempt(attempt) || named !== undefined
+        isFirstPartyAttempt(attempt) || scope === undefined || named !== undefined
           ? undefined
-          : yield* credentialsHolder(attempt, attempt.client);
+          : yield* credentialsHolder(scope, attempt.client);
       // A client that is gone withdrew its credentials, and the attempt fails closed without the
       // product being asked or the code exchanged, since there is nothing left to authorize: a
       // person removed it, or Executor discarded it. Its stored client gone with no record of its
@@ -1828,14 +1993,21 @@ export const makeOAuth = (
           (error) =>
             Effect.gen(function* () {
               const stored = storedRef;
-              if (stored === undefined || isFirstPartyAttempt(attempt)) return yield* error;
+              if (stored === undefined || scope === undefined || isFirstPartyAttempt(attempt))
+                return yield* error;
               const version = yield* Effect.fromResult(Base64.decode(stored.version)).pipe(
                 Effect.mapError(() => new StorageError()),
               );
               // Only the version this attempt used: a client saved since then stays. Its credentials
               // are withdrawn as the service's refusal, which other sign-ins pending with it report
               // without an exchange, unless a person removed it first.
-              const digest = yield* digestOf(attempt, registrationCredentials(attempt.client));
+              // The rejected client's own identity: a client stored before 4.0.12 keeps its
+              // provider's until its server is recorded.
+              const rejectedRow = named ?? holding;
+              const digest =
+                rejectedRow === undefined
+                  ? yield* digestOf(scope, registrationCredentials(attempt.client))
+                  : yield* storedDigestOf(rejectedRow, registrationCredentials(attempt.client));
               const after = yield* transaction(db, (tx) =>
                 Effect.gen(function* () {
                   yield* query(() =>
@@ -1896,7 +2068,10 @@ export const makeOAuth = (
       // An entered client the connection asked to keep becomes a stored client of its owner,
       // unless one holds it already.
       const savedClient =
-        isFirstPartyAttempt(attempt) || attempt.saveClient !== true || holding !== undefined
+        isFirstPartyAttempt(attempt) ||
+        scope === undefined ||
+        attempt.saveClient !== true ||
+        holding !== undefined
           ? undefined
           : yield* Effect.gen(function* () {
               const client = attempt.client;
@@ -1906,7 +2081,8 @@ export const makeOAuth = (
                 row: {
                   id,
                   owner: attempt.owner,
-                  provider: attempt.provider,
+                  provider: null,
+                  issuer: scope.issuer,
                   clientId: client.client_id,
                   source: "manual" as const,
                   hasSecret: client.token_endpoint_auth_method !== "none",
@@ -1915,7 +2091,7 @@ export const makeOAuth = (
                   createdAt: new Date(completedAt),
                   encrypted: yield* encrypt(id, details),
                 },
-                digest: yield* digestOf(attempt, details),
+                digest: yield* digestOf(scope, details),
               };
             });
       const oauthClient = isFirstPartyAttempt(attempt)
@@ -2723,10 +2899,210 @@ export const makeOAuth = (
       };
     }).pipe(Effect.withSpan("oauth.revocation"));
 
+  /**
+   * The operator's client an imported grant was issued to, checked as a sign-in with it would be:
+   * it is offered here, the provider's method signs in with it (an unlisted client counts, as for
+   * a reconnect of its own account), the scopes renewals ask for are ones it allows, and its
+   * tokens reach every host the account's app declares. A host they never reach would refuse the
+   * app's calls there, so an account imported for it would only seem to work.
+   */
+  const importedFirstParty = (
+    id: FirstPartyOAuthClientId,
+    scopes: readonly string[],
+    hosts: readonly string[],
+    discovered: Parameters<typeof firstPartyClient>[0],
+  ) =>
+    Effect.gen(function* () {
+      const client = firstPartyClients.get(id);
+      if (client === undefined)
+        return yield* new OAuthGrantNotImportable({ reason: "unavailable" });
+      if (firstPartyClient(discovered, id)?.client.id !== id)
+        return yield* new OAuthGrantNotImportable({ reason: "method" });
+      const allowed = allowedScopes(client);
+      if (!scopes.every((scope) => allowed.includes(scope)))
+        return yield* new OAuthGrantNotImportable({ reason: "scopes" });
+      // A host is reached when a placement host allows every host it does, as a narrower pattern.
+      const unreachable = hosts.filter(
+        (host) =>
+          !intersectCredentialHosts([host], client.placement.hosts).includes(host.toLowerCase()),
+      );
+      if (hosts.length === 0 || unreachable.length > 0)
+        return yield* new OAuthGrantNotImportable({ reason: "hosts", unreachable });
+      return client;
+    });
+
+  /**
+   * Save an account whose grant another product issued (`OAuthGrantImport`). A grant to a client
+   * the product registered keeps that client and renews as that product did
+   * (`ImportOAuthGrant.renewal`), whatever the provider's method declares; an authorization-code
+   * client also becomes a stored client of the owner, as an entered client a sign-in keeps does,
+   * so a reconnect can name it. A grant to one of the operator's clients is saved as a sign-in
+   * with it saves one: it keeps only the client's ID, and no client is stored for the owner.
+   */
+  const importGrant = (input: ImportOAuthGrant) =>
+    Effect.gen(function* () {
+      const { method, discovered, issuer } = yield* resolveSetup({
+        provider: input.provider,
+        method: input.method,
+        redirectUri: input.redirectUri,
+      });
+      const { renewal } = input;
+      const firstParty =
+        "firstParty" in input
+          ? yield* importedFirstParty(input.firstParty, renewal.scopes, input.hosts, discovered)
+          : undefined;
+      const fields = yield* project(method.response, {
+        access_token: Redacted.value(input.accessToken),
+        token_type: "Bearer",
+      }).pipe(Effect.mapError(() => new OAuthSetupFailed({ reason: "unsupported" })));
+      const expires = input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt };
+      const refresh =
+        input.refreshToken === undefined
+          ? {}
+          : { refreshToken: Redacted.value(input.refreshToken) };
+      const scopes = renewal.scopes.length === 0 ? {} : { scopes: renewal.scopes };
+      const createdAt = yield* Clock.currentTimeMillis;
+      const account = yield* decode(Account, {
+        id: AccountId.make(`acc_${yield* nextId}`),
+        provider: input.provider,
+        owner: input.owner,
+        label: input.label,
+        description: null,
+        method: input.method,
+        createdAt: new Date(createdAt),
+      });
+      const registered =
+        "client" in input
+          ? yield* Effect.gen(function* () {
+              const client = Redacted.value(input.client);
+              // Renewals send the issuing product's token endpoint, held to the same policy as a
+              // declared one.
+              const tokenEndpoint =
+                options === undefined
+                  ? undefined
+                  : parseEndpoint(input.renewal.tokenEndpoint, options.urlPolicy);
+              if (tokenEndpoint === undefined)
+                return yield* new OAuthSetupFailed({ reason: "discovery_blocked" });
+              const server = { ...discovered.server, token_endpoint: tokenEndpoint.href };
+              const resource =
+                input.renewal.resource === undefined ? {} : { resource: input.renewal.resource };
+              const stored =
+                discovered.grant === "client_credentials"
+                  ? undefined
+                  : yield* Effect.gen(function* () {
+                      const id = OAuthClientId.make(`oac_${yield* nextId}`);
+                      const details = registrationCredentials(client);
+                      return {
+                        row: {
+                          id,
+                          owner: input.owner,
+                          provider: null,
+                          issuer,
+                          clientId: client.client_id,
+                          source: "manual" as const,
+                          hasSecret: client.token_endpoint_auth_method !== "none",
+                          automaticKey: null,
+                          confirmed: true,
+                          createdAt: new Date(createdAt),
+                          encrypted: yield* encrypt(id, details),
+                        },
+                        digest: yield* digestOf({ owner: input.owner, issuer }, details),
+                      };
+                    });
+              const grantOf = (oauthClient: OAuthClientId | undefined) =>
+                discovered.grant === "client_credentials"
+                  ? {
+                      ...Struct.omit(discovered, ["resource"]),
+                      server,
+                      scopes: input.renewal.scopes,
+                      ...resource,
+                      client,
+                      fields,
+                      response: method.response,
+                      generation: 0,
+                      ...expires,
+                    }
+                  : {
+                      server,
+                      client,
+                      ...(oauthClient === undefined ? {} : { oauthClient }),
+                      response: method.response,
+                      ...scopes,
+                      ...resource,
+                      ...(discovered.tokenRequestFormat === undefined
+                        ? {}
+                        : { tokenRequestFormat: discovered.tokenRequestFormat }),
+                      ...(discovered.tokenResponse === undefined
+                        ? {}
+                        : { tokenResponse: discovered.tokenResponse }),
+                      fields,
+                      ...refresh,
+                      generation: 0,
+                      ...expires,
+                    };
+              return { stored, grantOf };
+            })
+          : undefined;
+      const encryptGrant = (grant: unknown) =>
+        decode(OAuthGrant, grant).pipe(
+          Effect.mapError(() => new OAuthSetupFailed({ reason: "invalid_client" })),
+          Effect.flatMap((decoded) => encrypt(account.id, decoded)),
+        );
+      const encryptedCredentials = yield* encrypt(account.id, fields);
+      const ready = `ready_${yield* nextId}`;
+      yield* transaction(db, (tx) =>
+        Effect.gen(function* () {
+          // Credentials another stored client holds are that client; nothing is stored twice.
+          const saved =
+            registered?.stored === undefined
+              ? undefined
+              : yield* createStoredClient(tx, registered.stored.row, registered.stored.digest);
+          const oauthClient =
+            saved === undefined ? undefined : saved.stored ? saved.client.id : saved.holder;
+          yield* query(() =>
+            tx.create("accounts", { ...account, encryptedCredentials, credentialGeneration: 0 }),
+          );
+          if (lifecycle) yield* lifecycle.accountCreated(account);
+          const state = {
+            encrypted: yield* encryptGrant(
+              registered === undefined
+                ? {
+                    grant: "authorization_code",
+                    firstParty: firstParty?.id,
+                    response: method.response,
+                    fields,
+                    ...refresh,
+                    ...scopes,
+                    generation: 0,
+                    ...expires,
+                  }
+                : registered.grantOf(oauthClient),
+            ),
+            status: ready,
+            updatedAt: new Date(createdAt),
+          };
+          yield* query(() =>
+            tx.upsert("oauthGrants", {
+              where: (b) => b("id", "=", account.id),
+              create: { id: account.id, ...state },
+              update: state,
+            }),
+          );
+        }),
+      );
+      return account;
+    }).pipe(Effect.withSpan("oauth.importGrant"));
+
   return {
     revocation,
     clients,
     connections: { oauthSetup, startOAuth, completeOAuth },
+    importGrant,
+    /** The operator's client `id` as the importer checks a grant against it, without credentials. */
+    firstPartyClient: (id: string) => {
+      const client = [...firstPartyClients.values()].find((candidate) => candidate.id === id);
+      return client === undefined ? undefined : Struct.omit(client, ["clientId", "clientSecret"]);
+    },
     findOAuth,
     resolve: (account: StoredAccount, provider: ProviderDefinition) => resolve(account, provider),
     resolveSelected,

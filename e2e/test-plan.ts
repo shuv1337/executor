@@ -74,6 +74,9 @@ export const appWorkerIdleSeconds = 4;
 /** A relay callback in a valid form other than its serialization, which the SDK sends. */
 export const oauthRelayCallback =
   "https://Relay.Executor.example:443/api/oauth/callback?tenant=fixture";
+/** The same, on the origin of the client metadata document the scenarios publish. */
+export const oauthDocumentOriginCallback =
+  "https://Executor.example:443/api/oauth/callback?tenant=fixture";
 
 /**
  * Keeps each scenario name but gives every value the plan type. A literal type per scenario makes
@@ -243,6 +246,18 @@ export const scenarios = plan({
       local: na("Local does not serve the marketing site."),
     },
   },
+  packageScopes: {
+    fixtures: "actors",
+    file: "package-scopes.spec.ts",
+    title:
+      "Package names follow the organization's current slug, and a rename releases the old one to its next holder",
+    targets: {
+      // Publishing needs app Git storage, which a local Cloud Worker cannot reach.
+      cloud: { status: "scheduled", runtime: "attached" },
+      "self-host": na("Self-host does not publish apps."),
+      local: na("Local does not publish apps."),
+    },
+  },
   appGitRemotes: {
     fixtures: "actors",
     file: "app-git-remotes.spec.ts",
@@ -367,6 +382,17 @@ export const scenarios = plan({
     file: "cloud-oauth-proxy.spec.ts",
     title:
       "A test stage signs in through production's OAuth proxy and keeps the session on its own origin",
+    targets: {
+      cloud: oauthProxyPreviewCloud,
+      "self-host": na("The OAuth proxy and role hosts are Cloud's."),
+      local: na("The OAuth proxy and role hosts are Cloud's."),
+    },
+  },
+  cloudOAuthProxyPreviewAccount: {
+    fixtures: "actors",
+    file: "cloud-oauth-proxy.spec.ts",
+    title:
+      "A test stage connects an account with production's OAuth callback, which returns the sign-in to the stage",
     targets: {
       cloud: oauthProxyPreviewCloud,
       "self-host": na("The OAuth proxy and role hosts are Cloud's."),
@@ -793,6 +819,26 @@ export const scenarios = plan({
       local: na("Hosted deployment API scenario"),
     },
   },
+  mcpDirectCalls: {
+    fixtures: "actors",
+    file: "mcp-direct-calls.spec.ts",
+    title: "MCP search, describe and call reach app tools without an execute program",
+    targets: {
+      "self-host": scheduled,
+      cloud: na("Shared MCP path; covered on self-host"),
+      local: na("Hosted deployment API scenario"),
+    },
+  },
+  mcpNativeCallApproval: {
+    fixtures: "actors",
+    file: "mcp-direct-calls.spec.ts",
+    title: "Native MCP call leaves approval to the client's confirmation of the call",
+    targets: {
+      "self-host": scheduled,
+      cloud: na("Shared MCP path; covered on self-host"),
+      local: na("Hosted deployment API scenario"),
+    },
+  },
   mcpCatalogRefresh: {
     fixtures: "actors",
     file: "mcp-catalog.spec.ts",
@@ -823,6 +869,16 @@ export const scenarios = plan({
       local: na("Hosted deployment API scenario"),
     },
   },
+  liveOpenapiExampleIds: {
+    fixtures: "actors",
+    file: "live-openapi-example-ids.spec.ts",
+    title: "Live OpenAPI validates and calls tools whose schema examples repeat an id",
+    targets: {
+      "self-host": scheduled,
+      cloud: na("Loopback upstream fixture"),
+      local: na("Hosted deployment API scenario"),
+    },
+  },
   liveOpenapiDiagnostics: {
     fixtures: "actors",
     file: "live-openapi-import.spec.ts",
@@ -838,6 +894,17 @@ export const scenarios = plan({
     file: "live-openapi-import.spec.ts",
     title:
       "Live OpenAPI ignores security alternatives naming undeclared schemes and sends only the met one's credentials",
+    targets: {
+      "self-host": scheduled,
+      cloud: na("Loopback upstream fixture"),
+      local: na("Hosted deployment API scenario"),
+    },
+  },
+  liveOpenapiExtensions: {
+    fixtures: "actors",
+    file: "live-openapi-import.spec.ts",
+    title:
+      "Live OpenAPI lists and calls account tools whose schemas carry extensions holding references",
     targets: {
       "self-host": scheduled,
       cloud: na("Loopback upstream fixture"),
@@ -884,6 +951,16 @@ export const scenarios = plan({
       "self-host": scheduled,
       cloud: na("Loopback MCP fixture"),
       local: na("Hosted deployment API scenario"),
+    },
+  },
+  appIcons: {
+    fixtures: "actors",
+    file: "app-icons.spec.ts",
+    title: "Apps show the icons they declare on defineApp, in the light or dark variant",
+    targets: {
+      "self-host": scheduled,
+      cloud: scheduled,
+      local: na("Hosted deployment API scenario; the local overview carries the same requirements"),
     },
   },
   dynamicOnlyApp: {
@@ -1900,6 +1977,19 @@ export const scenarios = plan({
       local: na("Local serves MCP sessions in its server process, with no gateway hop."),
     },
   },
+  cloudMcpSessionRestore: {
+    fixtures: "actors",
+    file: "cloud-mcp-session-restore.spec.ts",
+    title:
+      "Cloud MCP sessions continue after their session object is evicted, restored from its storage only for a bearer that names the object",
+    targets: {
+      cloud: managedCloud,
+      "self-host": na(
+        "Self-host serves MCP sessions in its server process, with no session object.",
+      ),
+      local: na("Local serves MCP sessions in its server process, with no session object."),
+    },
+  },
   cloudMcpStreamLifetime: {
     fixtures: "actors",
     file: "cloud-mcp-stream-lifetime.spec.ts",
@@ -2408,10 +2498,10 @@ export const scenarios = plan({
       local: na("Shared error views and SDK are exercised through hosted APIs."),
     },
   },
-  catalogAgentSetup: {
+  catalogOfficialApps: {
     fixtures: "actors",
-    file: "catalog-agent-setup.spec.ts",
-    title: "Catalog services without quick add copy an agent setup prompt",
+    file: "catalog-official-apps.spec.ts",
+    title: "Add app lists official apps and installs one's own source as a copy",
     targets: {
       "self-host": scheduled,
       cloud: na("The shared catalog view and install rule are exercised through self-host."),
@@ -2755,6 +2845,32 @@ export const scenarios = plan({
       local: na("Local products have no operator OAuth clients."),
     },
   },
+  credentialManagedUnlisted: {
+    fixtures: "actors",
+    file: "credential-placement.spec.ts",
+    title:
+      "an unlisted operator client shaped like Executor for Slack renews and reconnects its accounts with its own resource and Slack's nested grant, but signs in no new ones",
+    targets: {
+      "self-host": scheduled,
+      cloud: na(
+        "Restarts a runner-owned product with the operator's client; managed Cloud has no per-case operator settings.",
+      ),
+      local: na("Local products have no operator OAuth clients."),
+    },
+  },
+  credentialManagedGoogle: {
+    fixtures: "actors",
+    file: "credential-placement.spec.ts",
+    title:
+      "Executor for Google is offered to providers on Google's endpoints whose scopes it allows, once its credentials are set",
+    targets: {
+      "self-host": scheduled,
+      cloud: na(
+        "Restarts a runner-owned product with the client's credentials; Cloud composes the same reviewed definitions.",
+      ),
+      local: na("Local products have no operator OAuth clients."),
+    },
+  },
   credentialManagedPlaced: {
     fixtures: "actors",
     file: "credential-placement.spec.ts",
@@ -2836,11 +2952,11 @@ export const scenarios = plan({
     fixtures: "actors",
     file: "credential-placement.spec.ts",
     title:
-      "invalid operator OAuth client settings stop the product and name each client field and why, never its value",
+      "an operator OAuth client with only one of its credentials stops the product, naming the missing setting and never a value",
     targets: {
       "self-host": scheduled,
       cloud: na(
-        "Cloud reads the same setting with the same parser; a deploy fails on it before any request.",
+        "Cloud reads the same settings with the same code; a deploy fails on them before any request.",
       ),
       local: na("Local products have no operator OAuth clients."),
     },
@@ -3571,6 +3687,88 @@ export const scenarios = plan({
       ),
     },
   },
+  localAccountOwners: {
+    file: "local-account-owners.spec.ts",
+    title:
+      "local saves apps and connected accounts under owners it assigns, lists one owner's accounts and providers, refuses a listing without an owner, and manages the account in the dashboard",
+    targets: {
+      local: scheduled,
+      "self-host": na("Local assigns owners; hosted derives them from the organization."),
+      cloud: na("Local assigns owners; hosted derives them from the organization."),
+    },
+  },
+  localReservedOwners: {
+    file: "local-account-owners.spec.ts",
+    title:
+      "local serves no owner removal, so neither its user's owner nor its Executor app's can be deleted",
+    targets: {
+      local: scheduled,
+      "self-host": na(
+        "Local's owners are fixed; hosted removes an organization's owner in process.",
+      ),
+      cloud: na("Local's owners are fixed; hosted removes an organization's owner in process."),
+    },
+  },
+  localOwnerMigration: {
+    legacyStorage: true,
+    serverEnvironment: { EXECUTOR_DATA_STEPS: "report" },
+    file: "local-owner-migration.spec.ts",
+    title:
+      "upgrading local moves apps, accounts and connections saved under other owners to local, where the dashboard lists them, their app opens and new connections stay local, and running the step again changes nothing",
+    targets: {
+      local: scheduled,
+      "self-host": na("Only local assigned owners agents named; hosted owners are organizations."),
+      cloud: na("Only local assigned owners agents named; hosted owners are organizations."),
+    },
+  },
+  localOwnerMigrationCollision: {
+    legacyStorage: true,
+    serverEnvironment: { EXECUTOR_DATA_STEPS: "report" },
+    file: "local-owner-migration.spec.ts",
+    title:
+      "upgrading local moves nothing while another owner's app shares a local app's name, names both in the log and on the dashboard, and moves everything once one is renamed",
+    targets: {
+      local: scheduled,
+      "self-host": na("Only local assigned owners agents named; hosted owners are organizations."),
+      cloud: na("Only local assigned owners agents named; hosted owners are organizations."),
+    },
+  },
+  localOwnerMigrationOAuth: {
+    legacyStorage: true,
+    serverEnvironment: { EXECUTOR_DATA_STEPS: "report" },
+    file: "local-owner-migration.spec.ts",
+    title:
+      "upgrading local moves an OAuth client, an account signed in with it, a pending sign-in and a pending approval saved under another owner, after which the sign-in completes, the approval runs, the account renews and local holds the client's credentials, and running the step again changes nothing",
+    targets: {
+      local: scheduled,
+      "self-host": na("Only local assigned owners agents named; hosted owners are organizations."),
+      cloud: na("Only local assigned owners agents named; hosted owners are organizations."),
+    },
+  },
+  localOwnerMigrationBlocked: {
+    legacyStorage: true,
+    serverEnvironment: { EXECUTOR_DATA_STEPS: "report" },
+    file: "local-owner-migration.spec.ts",
+    title:
+      "upgrading local moves nothing while a record it has to read does not decrypt, names it in the log and on the dashboard, never completes the step, and moves everything once the record is removed",
+    targets: {
+      local: scheduled,
+      "self-host": na("Only local assigned owners agents named; hosted owners are organizations."),
+      cloud: na("Only local assigned owners agents named; hosted owners are organizations."),
+    },
+  },
+  localOwnerMigrationMalformed: {
+    legacyStorage: true,
+    serverEnvironment: { EXECUTOR_DATA_STEPS: "report" },
+    file: "local-owner-migration.spec.ts",
+    title:
+      "upgrading local moves nothing while a registered client, a pending sign-in, a pending approval or a connection decrypts but would not be read back, names each with what to do in the log and on the dashboard, and changes no product row",
+    targets: {
+      local: scheduled,
+      "self-host": na("Only local assigned owners agents named; hosted owners are organizations."),
+      cloud: na("Only local assigned owners agents named; hosted owners are organizations."),
+    },
+  },
   localAccountDescriptions: {
     file: "local-account-descriptions.spec.ts",
     title:
@@ -3968,6 +4166,17 @@ export const scenarios = plan({
       local: na("Hosted account dialogs and saved-client management."),
     },
   },
+  oauthUserAgent: {
+    fixtures: "actors",
+    file: "oauth-user-agent.spec.ts",
+    title:
+      "OAuth discovery names Executor and sign-in completes against an authorization server that refuses requests without a User-Agent",
+    targets: {
+      "self-host": scheduled,
+      cloud: na("Uses a scoped loopback OAuth issuer."),
+      local: na("Exercises shared OAuth through the hosted API."),
+    },
+  },
   oauthAuthorizationParams: {
     fixtures: "actors",
     file: "oauth-authorization-params.spec.ts",
@@ -3986,12 +4195,30 @@ export const scenarios = plan({
       "a host with a client metadata document signs in without registering a client, and still registers where the server does not accept documents",
     serverEnvironment: {
       EXECUTOR_OAUTH_CLIENT_METADATA_URL: "https://executor.example/oauth/client-metadata.json",
-      EXECUTOR_OAUTH_CALLBACK_URL: oauthRelayCallback,
+      EXECUTOR_OAUTH_CALLBACK_URL: oauthDocumentOriginCallback,
     },
     targets: {
       "self-host": scheduled,
       cloud: na(
         "Managed Cloud runs on loopback without a public HTTPS origin; deployed stages serve the document.",
+      ),
+      local: na("Local's loopback callback has no public document; it registers dynamically."),
+    },
+  },
+  oauthClientMetadataDocumentOrigin: {
+    fixtures: "actors",
+    file: "oauth-client-metadata.spec.ts",
+    title:
+      "a host whose callback is on another origin than its client metadata document signs in where the server accepts redirect URIs only on the document's origin",
+    // Cloud's layout: the deployment serves the document while sign-ins return through the edge.
+    serverEnvironment: {
+      EXECUTOR_OAUTH_CLIENT_METADATA_URL: "https://executor.example/oauth/client-metadata.json",
+      EXECUTOR_OAUTH_CALLBACK_URL: oauthRelayCallback,
+    },
+    targets: {
+      "self-host": scheduled,
+      cloud: na(
+        "Managed Cloud runs on loopback without a public HTTPS origin; the same setting derives a deployed stage's document.",
       ),
       local: na("Local's loopback callback has no public document; it registers dynamically."),
     },
@@ -4739,6 +4966,42 @@ export const scenarios = plan({
       local: na("The module counts are read from Cloud's delivered traces."),
     },
   },
+  largeOpenapiApp: {
+    fixtures: "actors",
+    file: "large-openapi-app.spec.ts",
+    title:
+      "an OpenAPI app with an 11 MB document builds within the compiler's memory and calls its API",
+    targets: {
+      "self-host": scheduled,
+      // Only a deployed compiler Worker has Cloudflare's memory limit.
+      cloud: { status: "scheduled", runtime: "attached" },
+      local: na("Local builds and runs apps through the same workerd compiler as self-host."),
+    },
+  },
+  largeOpenapiAsciiApp: {
+    fixtures: "actors",
+    file: "large-openapi-app.spec.ts",
+    title:
+      "an OpenAPI app with a 13.6 MB document whose prose goes beyond Latin-1, written as ASCII JSON as imported apps write it, builds and calls its API",
+    targets: {
+      "self-host": scheduled,
+      // Only deployed Workers have Cloudflare's memory limit.
+      cloud: { status: "scheduled", runtime: "attached" },
+      local: na("Local builds and runs apps through the same workerd compiler as self-host."),
+    },
+  },
+  largeOpenapiWideSourceApp: {
+    fixtures: "actors",
+    file: "large-openapi-app.spec.ts",
+    title:
+      "an OpenAPI app with a 13.6 MB ASCII document beside source files whose text goes beyond Latin-1, such as a provider's display name, builds, reads back its files exactly and calls its API",
+    targets: {
+      "self-host": scheduled,
+      // Only deployed Workers have Cloudflare's memory limit.
+      cloud: { status: "scheduled", runtime: "attached" },
+      local: na("Local builds and runs apps through the same workerd compiler as self-host."),
+    },
+  },
   cloudBuildReuse: {
     fixtures: "actors",
     file: "cloud-build-reuse.spec.ts",
@@ -5006,6 +5269,20 @@ export const scenarios = plan({
       "self-host": scheduled,
       cloud: managedCloud,
       local: na("This scenario uses hosted MCP; the runtime and collector are shared with Local."),
+    },
+  },
+  toolCallOverheadWakeStart: {
+    fixtures: "actors",
+    file: "tool-call-overhead.spec.ts",
+    title: "A supervisor start made by a cold call's wake is reported by that call alone",
+    targets: {
+      "self-host": na(
+        "Self-host's supervisors run in the runner's own process, so its runner sends no wake.",
+      ),
+      cloud: managedCloud,
+      local: na(
+        "Local's supervisors run in the runner's own process, so its runner sends no wake.",
+      ),
     },
   },
   toolCallOverheadLoader: {
@@ -6374,7 +6651,7 @@ export const scenarios = plan({
   },
   addAppRegistry: {
     file: "add-app-registry.spec.ts",
-    title: "Add app lists integration templates and never reads the public registry",
+    title: "Add app lists catalog apps and never reads the public registry",
     targets: {
       "self-host": scheduled,
       cloud: na("Cloud serves the registry from its own database instead of a remote origin."),
@@ -6441,6 +6718,56 @@ export const scenarios = plan({
     file: "cloud-v1-sign-in.spec.ts",
     title:
       "Cloud sign-in admits members of only empty free v1 organizations, keeps members of paid or nonempty ones on v1, and fails closed while v1's database is unavailable",
+    targets: { ...cloudOnboarding, cloud: managedCloud },
+  },
+  // The import reads the emulated v1 WorkOS, Vault and database only a managed local Cloud has.
+  v1ImportPreview: {
+    file: "cloud-v1-import.spec.ts",
+    title:
+      "Cloud v1 import previews a single-member workspace and refuses shared, paid and other members' workspaces",
+    targets: { ...cloudOnboarding, cloud: managedCloud },
+  },
+  v1ImportRun: {
+    file: "cloud-v1-import.spec.ts",
+    title:
+      "Cloud v1 import moves a workspace into a new organization with v1's tool names, accounts, profiles and approvals, copies a fix prompt for what failed, records the move on v1's WorkOS organization, links back to v1, and imports another into it in dependency order",
+    targets: { ...cloudOnboarding, cloud: managedCloud },
+  },
+  v1ImportChecks: {
+    file: "cloud-v1-import.spec.ts",
+    title:
+      "Cloud v1 import carries v1's account checks with their identity field, fails a check that redirects without sending its credentials on, keeps fixed credentials out of app source, skips policies v1 never applied, and names OpenAPI tools v1 stored no operations for as v1 compiled them",
+    targets: { ...cloudOnboarding, cloud: managedCloud },
+  },
+  v1ImportToolkits: {
+    file: "cloud-v1-import.spec.ts",
+    title:
+      "Cloud v1 import turns toolkits into scoped MCP connections with v1's tools, profiles and approvals, and artifacts into undeployed apps that need repair",
+    targets: { ...cloudOnboarding, cloud: managedCloud },
+  },
+  v1ImportRequests: {
+    file: "cloud-v1-import.spec.ts",
+    title:
+      "Cloud v1 import sends each OpenAPI request where v1 did, for YAML, public, unnamed-method and one service's multi-host APIs, refuses an API whose operations call several services or send an account's credentials to several hosts over plain HTTP, drops an account check whose server variable turns it to plain HTTP, and offers a fix prompt only when an item failed",
+    targets: { ...cloudOnboarding, cloud: managedCloud },
+  },
+  v1ImportOAuthRenewal: {
+    file: "cloud-v1-import.spec.ts",
+    title:
+      "Cloud v1 import signs in and renews OAuth accounts with each connection's v1 client, granted scopes and resource, not the integration's method, and refuses a token endpoint v1 no longer trusted",
+    targets: { ...cloudOnboarding, cloud: managedCloud },
+  },
+  // The operator clients it moves grants to are the ones every managed local Cloud starts with.
+  v1ImportFirstParty: {
+    file: "cloud-v1-import.spec.ts",
+    title:
+      "Cloud v1 import moves connections that signed in through Executor's own apps to v2's operator client of the same name, including a GitHub-shaped MCP server that names the scopeless client's endpoints, which renews them with the granted scopes, sends the token to each of a service's hosts the client reaches, and refuses an app v2 does not offer, a scope it does not allow and a host its tokens never reach",
+    targets: { ...cloudOnboarding, cloud: managedCloud },
+  },
+  v1ImportBuilds: {
+    file: "cloud-v1-import.spec.ts",
+    title:
+      "Cloud v1 import writes an OpenAPI document with characters beyond ASCII as ASCII JSON that reads as v1's, also for a large API whose name and base URL path go beyond Latin-1, which builds and calls with its v1 key, builds OpenAPI and GraphQL apps whose v1 OAuth clients set scopes in their authorization URLs, which reconnect sending v1's authorization and token requests, refusing a client whose request v2 cannot send as v1 did, and says why and where a stored specification cannot be read",
     targets: { ...cloudOnboarding, cloud: managedCloud },
   },
   localSkills: {
@@ -6766,6 +7093,62 @@ export const scenarios = plan({
       ),
     },
   },
+  savedOAuthClientsAmbiguous: {
+    fixtures: "actors",
+    legacyStorage: true,
+    serverEnvironment: { EXECUTOR_DATA_STEPS: "report" },
+    file: "saved-oauth-clients-ambiguous.spec.ts",
+    title:
+      "The saved OAuth client data step reports why a client several providers hold is ambiguous, and whether its key names one holder",
+    targets: {
+      "self-host": scheduled,
+      cloud: na(
+        "Legacy rows need a runner-owned database; Cloud cases share one Worker and database.",
+      ),
+      local: na("Local has one owner; the step's ambiguity reading is shared with self-host."),
+    },
+  },
+  oauthClientSharedIssuer: {
+    fixtures: "actors",
+    file: "oauth-clients-by-issuer.spec.ts",
+    title:
+      "One OAuth client registered for an authorization server is offered to and signs in every app that signs in there, whatever its provider definition, and an app that signs in at another server is neither offered it nor can name it",
+    targets: {
+      "self-host": scheduled,
+      cloud: na("Uses a scoped loopback OAuth issuer."),
+      local: na("Hosted client registration; local shares the SDK's client lookup."),
+    },
+  },
+  oauthClientIssuerMigration: {
+    fixtures: "actors",
+    legacyStorage: true,
+    serverEnvironment: { EXECUTOR_DATA_STEPS: "report" },
+    file: "oauth-client-issuer-migration.spec.ts",
+    title:
+      "Upgrading OAuth clients stored per provider records each one's authorization server, merges an organization's clients holding the same details for one server into one with the union of their audiences, and leaves a client whose server is unknown offered to no sign-in",
+    targets: {
+      "self-host": scheduled,
+      cloud: na(
+        "Legacy rows need a runner-owned database; Cloud cases share one Worker and database.",
+      ),
+      local: na("Hosted audiences; the SDK step is shared with self-host."),
+    },
+  },
+  savedOAuthClientsByIssuer: {
+    fixtures: "actors",
+    legacyStorage: true,
+    serverEnvironment: { EXECUTOR_DATA_STEPS: "report" },
+    file: "saved-oauth-clients-by-issuer.spec.ts",
+    title:
+      "Saved OAuth clients move by owner and authorization server: one owner's records for several providers collapse into one client, a record several owners hold goes to the owner its key names, and a record no key names stays",
+    targets: {
+      "self-host": scheduled,
+      cloud: na(
+        "Legacy rows need a runner-owned database; Cloud cases share one Worker and database.",
+      ),
+      local: na("Local has one owner; the step's owner resolution is shared with self-host."),
+    },
+  },
   legacyTargetlessHostedConnections: {
     fixtures: "actors",
     legacyStorage: true,
@@ -6960,6 +7343,17 @@ export const scenarios = plan({
         "Self-host has a single instance organization and does not expose organization deletion.",
       ),
       local: na("Local has no hosted organizations."),
+    },
+  },
+  organizationRemovalWorkflowRefusal: {
+    fixtures: "actors",
+    file: "organization-removal.spec.ts",
+    title:
+      "Cloud refuses to remove an organization while one of its app workflows runs, and removes it once the run is terminated",
+    targets: {
+      cloud: managedCloud,
+      "self-host": na("Self-host has a single instance organization and no organization removal."),
+      local: na("Local has no hosted organizations and serves no owner removal."),
     },
   },
   organizationRemovalRecovery: {

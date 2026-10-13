@@ -2,6 +2,7 @@
 import { Effect } from "effect";
 import {
   RegistryError,
+  resolvePublication,
   SourceError,
   type AppCopySnapshot,
   type AppId,
@@ -10,7 +11,6 @@ import {
   type PublicationReference,
   type Registry,
 } from "@executor-js/sdk/core";
-import { publicationFailure, publicationSource } from "./manifest.ts";
 import type { RegistryStorage } from "./storage.ts";
 
 /**
@@ -58,26 +58,21 @@ export const ownedRegistry = (
     readable(name).pipe(Effect.andThen(catalog.snapshot({ name, commit })));
   const file = (name: string, commit: string, path: string) =>
     readable(name).pipe(Effect.andThen(catalog.file({ name, commit, path })));
-  return {
+  const registry: Registry = {
     origin,
     list: (name) => storage.list(name, access),
     snapshot,
     file,
+    files: (name, commit) =>
+      readable(name).pipe(Effect.as((path: string) => file(name, commit, path))),
+  };
+  return {
+    ...registry,
     copy: (reference) =>
       Effect.gen(function* () {
-        const found = yield* snapshot(reference.package, reference.commit);
-        if (
-          found.publication.name !== reference.package ||
-          found.publication.commit !== reference.commit
-        )
-          return yield* new RegistryError({ reason: "changed" });
-        const manifest = yield* publicationSource(found.files).pipe(
-          Effect.mapError(publicationFailure),
-        );
-        if (manifest.name !== reference.package)
-          return yield* new RegistryError({ reason: "invalid-source" });
+        const found = yield* resolvePublication(registry, reference);
         return {
-          files: found.files,
+          ...found,
           stored: ({ path }) =>
             file(reference.package, reference.commit, path).pipe(
               Effect.mapError(() => new SourceError({ reason: "not-found" })),

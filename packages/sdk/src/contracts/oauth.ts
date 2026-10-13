@@ -2,9 +2,9 @@ import { UserFacingError, type ErrorPresentation } from "@executor-js/utils/user
 import { ApiError } from "@executor-js/utils/api-error";
 /** Host-owned OAuth configuration and encrypted protocol records. */
 import type { UrlPolicy } from "@executor-js/utils/url-policy";
-import { AuthMethodName } from "./provider.ts";
-import { AccountConnectionId } from "./shared.ts";
-import { Schema } from "effect";
+import { AuthMethodName, type AuthMethodInvalid, type ProviderNotFound } from "./provider.ts";
+import { AccountConnectionId, type CredentialsError, type StorageError } from "./shared.ts";
+import { Schema, type Effect, type Redacted } from "effect";
 import {
   CredentialHost,
   OAuthAuthorizationParams,
@@ -58,6 +58,11 @@ export const OAuthClientSetup = Schema.Union([
   Schema.Struct({
     ...clientSetup,
     grant: Schema.Literal("authorization_code"),
+    /**
+     * The authorization server this sign-in uses (see `OAuthClientIssuer`): stored clients
+     * registered for it are the ones a connection may name.
+     */
+    issuer: HttpUrl,
     /** Omitted when the provider does not declare one; the client secret is then optional. */
     tokenEndpointAuthMethod: Schema.optional(OAuthClientAuth),
     /**
@@ -348,6 +353,11 @@ export const FirstPartyOAuthServer = Schema.Struct({
   authorizationParams: Schema.optionalKey(OAuthAuthorizationParams),
   tokenRequestFormat: Schema.optionalKey(OAuthTokenRequestFormat),
   tokenResponse: Schema.optionalKey(OAuthTokenResponse),
+  /**
+   * The RFC 8707 resource sent on the authorization request, the code exchange and every renewal,
+   * such as `https://mcp.slack.com`. A provider's own resource is never sent for this client.
+   */
+  resource: Schema.optionalKey(HttpUrl),
 });
 export type FirstPartyOAuthServer = typeof FirstPartyOAuthServer.Type;
 
@@ -376,7 +386,8 @@ export type FirstPartyOAuthClientId = typeof FirstPartyOAuthClientId.Type;
 /**
  * An OAuth client the instance's operator provides, such as one-click Google sign-in. It is offered
  * for a provider method only when the method's authorization and token endpoints are exactly the
- * client's and the scopes it asks for are among `allowedScopes`. Signing in, renewal and
+ * client's and the scopes it asks for are among `allowedScopes`; scopes the method only discovered
+ * in the resource's advertised list are narrowed to `allowedScopes` instead. Signing in, renewal and
  * revocation then use only the operator's server configuration, and the access token it issues
  * is managed: it reaches app code sealed, goes only as `placement` says, and a token response
  * reporting a scope outside `allowedScopes` is refused. Its secret never leaves the host: grants
@@ -395,6 +406,11 @@ export const FirstPartyOAuthClient = Schema.Struct({
   /** Every scope a sign-in may ask for and a grant may hold. Defaults to `defaultScopes`. */
   allowedScopes: Schema.optionalKey(Schema.Array(ScopeToken)),
   placement: ManagedPlacement,
+  /**
+   * Withheld from new sign-ins: offered only to reconnect an account whose grant it issued. Its
+   * grants keep renewing, so an operator can stop offering a client without stranding them.
+   */
+  unlisted: Schema.optionalKey(Schema.Boolean),
 }).check(
   Schema.makeFilter(
     (client) => (client.tokenEndpointAuthMethod === "none") === (client.clientSecret === undefined),
@@ -430,12 +446,27 @@ export interface OAuthOptions {
   readonly urlPolicy: UrlPolicy;
   readonly clientMetadataUrl?: string;
   /**
+   * The callback the host's Client ID Metadata Document lists, which every sign-in as that client
+   * sends. Authorization servers may accept only redirect URIs on the document's own origin, so a
+   * host whose callback is elsewhere names one there. Unset, those sign-ins send the request's
+   * callback, which the document's publisher lists.
+   */
+  readonly clientMetadataRedirectUri?: string;
+  /**
    * Callbacks this host sent as `redirect_uri` before its current one. A saved client someone
    * entered at one of them keeps signing in there, as does one for a server that neither registers
    * clients nor reads a metadata document. Executor registers every other client again at the
    * current callback.
    */
   readonly previousRedirectUris?: readonly string[];
+  /**
+   * Callbacks this host sent as `redirect_uri` when versions before 4.0.10 saved clients, besides
+   * `previousRedirectUris` and `/api/oauth/callback` at its origin. Read only to rebuild the keys
+   * of earlier versions: which owner a saved client's key names (`6_stored_oauth_clients`,
+   * `9_saved_oauth_clients_by_issuer`) and what a registered client was registered for
+   * (`8_oauth_clients_by_issuer`).
+   */
+  readonly savedClientCallbacks?: readonly string[];
   /**
    * A fixed prefix for every sign-in's OAuth `state`, so a proxy in front of a shared callback
    * URL can tell this host's callbacks apart without a lookup. The random part is unchanged.
@@ -1319,6 +1350,12 @@ export const OAuthGrant = Schema.Union([
     /** The stored client signed in with. The grant keeps its own copy for renewal. */
     oauthClient: Schema.optionalKey(OAuthClientId),
     refreshToken: Schema.optional(Schema.NonEmptyString),
+    /**
+     * Scopes each refresh asks for again, space-separated. Only imported grants carry them, as the
+     * product that issued the grant sent them; other refreshes ask for none, keeping what was
+     * granted (RFC 6749 §6).
+     */
+    scopes: Schema.optionalKey(Schema.Array(Schema.String)),
     /** Nested grant location frozen at sign-in; renewals read the same member. */
     tokenResponse: Schema.optional(OAuthTokenResponse),
     generation: grantGeneration,
@@ -1346,6 +1383,11 @@ export const OAuthGrant = Schema.Union([
     expiresAt: Schema.optional(Schema.Number),
     fields: JsonObject,
     refreshToken: Schema.optional(Schema.NonEmptyString),
+    /**
+     * Scopes each refresh asks for again. Only imported grants carry them, as the product that
+     * issued the grant sent them; see the other authorization code grant's `scopes`.
+     */
+    scopes: Schema.optionalKey(Schema.Array(Schema.String)),
     generation: Schema.Int,
   }),
 ]);
@@ -1358,3 +1400,96 @@ export type OAuthFirstPartyGrant = Extract<
 /** Whether a grant was issued to the operator's client. */
 export const isFirstPartyGrant = (grant: OAuthGrant): grant is OAuthFirstPartyGrant =>
   "firstParty" in grant;
+
+/**
+ * An account whose OAuth grant was issued by another product, as the Executor v1 importer saves
+ * it (`notes/v1-import.md`). Internal to that importer and deleted with it; not part of the HTTP
+ * or Promise API. The grant was issued either to a client the product registered, which the
+ * account keeps (`client`), or to one of the operator's own clients (`firstParty`), which must
+ * be the same client at the authorization server: the same client ID, so its refresh token is
+ * valid for it.
+ */
+export type ImportOAuthGrant = {
+  readonly owner: OwnerId;
+  readonly provider: ProviderId;
+  readonly method: string;
+  readonly label: string;
+  /** The callback the client was registered with, for an authorization-code grant. */
+  readonly redirectUri?: string | undefined;
+  readonly accessToken: Redacted.Redacted<string>;
+  readonly refreshToken?: Redacted.Redacted<string> | undefined;
+  /** Epoch milliseconds when the access token expires. */
+  readonly expiresAt?: number | undefined;
+} & (
+  | {
+      /** The client the grant was issued to, with its secret. */
+      readonly client: Redacted.Redacted<OAuthRegistration>;
+      /**
+       * How renewals ask for a token, as the product that issued the grant did. It replaces what
+       * the provider's method declares: the token endpoint, the scopes asked for again (none when
+       * empty) and the RFC 8707 resource (none when absent).
+       */
+      readonly renewal: {
+        readonly tokenEndpoint: string;
+        readonly scopes: readonly string[];
+        readonly resource?: string | undefined;
+      };
+    }
+  | {
+      /**
+       * The operator's client the grant was issued to. The account's token is managed, and the
+       * grant renews and is revoked with the operator's current configuration, as one a sign-in
+       * with that client saves.
+       */
+      readonly firstParty: FirstPartyOAuthClientId;
+      /**
+       * The hosts the app the account is imported for declares for the provider, which a
+       * connection would grant it; the client's tokens must reach every one of them, or the
+       * app's calls to the others would be refused.
+       */
+      readonly hosts: readonly string[];
+      /** The scopes renewals ask for again (none when empty); each must be one the client allows. */
+      readonly renewal: { readonly scopes: readonly string[] };
+    }
+);
+/**
+ * Why a grant to one of the operator's clients cannot be imported: the operator does not offer
+ * that client (`unavailable`), the provider's method would not sign in with it (`method`), the
+ * grant holds a scope the client does not allow (`scopes`), or the client's tokens do not reach
+ * every host the account's app declares (`hosts`, with the `unreachable` ones). Internal to the v1
+ * importer.
+ */
+export class OAuthGrantNotImportable extends Schema.TaggedError<OAuthGrantNotImportable>()(
+  "OAuthGrantNotImportable",
+  {
+    reason: Schema.Literals(["unavailable", "method", "scopes", "hosts"]),
+    unreachable: Schema.optionalKey(Schema.Array(Schema.String)),
+  },
+) {}
+/** One of the operator's clients as the importer checks a grant against it, without credentials. */
+export type FirstPartyOAuthClientDescription = Omit<
+  FirstPartyOAuthClient,
+  "clientId" | "clientSecret"
+>;
+/** Host-only access to {@link ImportOAuthGrant}. */
+export const OAuthGrantImport = Symbol("executor.OAuthGrantImport");
+export interface OAuthGrantImport {
+  /**
+   * Save the account, its encrypted grant (ready to use and renew) and its client in one
+   * transaction, as completing a sign-in does. The provider's method must be OAuth with the same
+   * grant. Runs the provider's discovery, but no token request.
+   */
+  readonly importOAuthGrant: (
+    input: ImportOAuthGrant,
+  ) => Effect.Effect<
+    typeof Account.Type,
+    | StorageError
+    | CredentialsError
+    | ProviderNotFound
+    | AuthMethodInvalid
+    | OAuthSetupFailed
+    | OAuthGrantNotImportable
+  >;
+  /** The operator's client `id` when it is offered here, which its credentials being set decides. */
+  readonly firstPartyClient: (id: string) => FirstPartyOAuthClientDescription | undefined;
+}

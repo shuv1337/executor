@@ -8,6 +8,8 @@ import type { ExecutorApi } from "./http.ts";
 import { StorageHost, type Credentials } from "./storage.ts";
 import { PrefetchHost } from "./profiles.ts";
 import { SavedOAuthClientsHost } from "./oauth-clients.ts";
+import { OwnerMovesHost } from "./owner.ts";
+import { OAuthGrantImport } from "./oauth.ts";
 import type { ExecutorDatabase } from "../implementation/storage.ts";
 import type { AppRuntime } from "../implementation/runtime.ts";
 import type { OAuthOptions } from "./oauth.ts";
@@ -92,6 +94,19 @@ export interface ResourceLifecycle {
   readonly oauthClientResolving?: (
     client: import("./oauth-clients.ts").OAuthClient,
   ) => Effect.Effect<boolean, StorageError>;
+  /**
+   * Called when clients of one owner that hold the same credentials for one authorization server
+   * become one (data step `8_oauth_clients_by_issuer`): `merged` are removed and `survivor` keeps
+   * their credentials. A product that decides who may use clients lets everyone who could use any
+   * of them use the survivor, and returns false when it cannot, which leaves every one of them as
+   * it was. With `apply` false it only answers whether it could; with `apply` true it records the
+   * survivor's access in the step's transaction, before the merged clients are removed.
+   */
+  readonly oauthClientsMerging?: (input: {
+    readonly survivor: import("./oauth-clients.ts").OAuthClient;
+    readonly merged: ReadonlyArray<import("./oauth-clients.ts").OAuthClient>;
+    readonly apply: boolean;
+  }) => Effect.Effect<boolean, StorageError>;
 }
 
 /** Evaluated declarations and tool listings: where they are kept and how long they are trusted. */
@@ -269,6 +284,9 @@ export type Executor = Omit<
   readonly [StorageHost]: StorageHost;
   readonly [PrefetchHost]: import("./profiles.ts").PrefetchHost;
   readonly [SavedOAuthClientsHost]: import("./oauth-clients.ts").SavedOAuthClients;
+  readonly [OwnerMovesHost]: import("./owner.ts").OwnerMoves;
+  /** Host-only: the v1 importer's grant import (`notes/v1-import.md`). */
+  readonly [OAuthGrantImport]: OAuthGrantImport;
   readonly scheduler: import("./scheduler.ts").ScheduleDispatcher;
   /** Host-only: products authorize every event operation before calling it. */
   readonly events: import("./events.ts").ExecutorEvents;
@@ -293,6 +311,8 @@ export type PromiseExecutor = Promisify<
     | typeof StorageHost
     | typeof PrefetchHost
     | typeof SavedOAuthClientsHost
+    | typeof OwnerMovesHost
+    | typeof OAuthGrantImport
     | "scheduler"
     | "events"
     | "managedAccounts"
