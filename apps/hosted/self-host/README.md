@@ -104,7 +104,7 @@ workflow updates a channel tag. See the [release check](../../../e2e/README.md#t
 
 This source build includes an organization-only registry in the same database as
 your apps. Owners and administrators can open an app's **Publish** dialog to share
-its saved Git revision. Set `package.json`'s name to `@organization-slug/app-name`
+its saved Git revision. Set `package.json`'s name to `@organization-slug.executor.community/app-name`
 first; the dialog shows the required handle when a name needs repair.
 
 Signed-in organization members can discover publications in **Add app** and read
@@ -116,8 +116,12 @@ Publishing shares only the selected files, not connected accounts, app data or
 Git history. Later edits remain private until republished. Unpublishing removes
 discovery and source access; already installed copies remain independent.
 
-Registry tables are created additively on first startup and retained across
-restarts. There is no publishing environment-variable switch. Self-host uses its
+Fresh hosts create registry tables on first startup. Upgrading registry 1.0.0 to
+2.0.0 moves listings from saved package names to owner/label pairs, then removes
+the old registry tables. Conflicting labels for the same owner reject the upgrade;
+repair the conflict before retrying. Product schema changes commit together, so
+a rejected registry upgrade leaves the SDK and registry at their prior versions.
+There is no publishing environment-variable switch. Self-host uses its
 own registry rather than `EXECUTOR_REGISTRY_URL`; Cloud retains its public registry.
 
 ## Railway
@@ -149,12 +153,24 @@ those traces are needed, export them or stop the container and copy its complete
 Motel directory into the new volume before replacement. Keep the product and
 Motel volumes separate; the entrypoint prepares their ownership for the non-root
 server user. Do not remove either volume during updates.
-Product upgrades do not import old Motel data. See [workerd storage and rollback](../../../notes/self-host-workerd.md)
-for the native PostgreSQL import and an export that preserves later product writes.
+Product upgrades do not import old Motel data. The product database is PGlite
+(PostgreSQL). Bun development stores it at `/app/data/hosted.pglite`; the native
+image stores the active database in `/app/data/product` and retains an imported
+`hosted.pglite` directory when present. Copying only that legacy directory does
+not back up a running native image. The native `executor-host export` command
+exports PostgreSQL data from an exclusively locked, stopped product volume; it
+does not include the whole product volume or downgrade its schema.
 
-Before an upgrade, stop the server and back up the whole volume, including the
-key files. Keep any explicit secret overrides in your secret manager. An existing
-database with a missing or invalid saved key will not start; restore the original
+Before an upgrade, stop the server and back up the whole `/app/data` volume,
+including key files, Git repositories, builds, app data, and workflow state.
+Keep the exact previous image digest as well as the backup. This upgrade changes
+the SDK schema to 4.0.12 and registry schema to 2.0.0; the previous binary cannot
+start directly on those migrated schemas. To roll back, stop the upgraded server,
+restore the complete pre-upgrade backup into a clean volume, and start the exact
+previous image with the original origin and secrets. Restoring that snapshot
+discards writes made after it; a PostgreSQL export is not a schema rollback.
+Back up `/app/motel-data` separately if traces must also survive restoration.
+Keep any explicit secret overrides in your secret manager. An existing database with a missing or invalid saved key will not start; restore the original
 key instead of generating a replacement. To build and start an updated version:
 
 ```sh

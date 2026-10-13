@@ -126,6 +126,12 @@ for (const mode of ["explicit", "local", "railway"] as const)
         yield* Effect.acquireRelease(run(["volume", "create", id]), () =>
           run(["volume", "rm", id]).pipe(Effect.orDie),
         );
+        const backupVolume = `${id}-backup`;
+        const restoredVolume = `${id}-restored`;
+        for (const volume of [backupVolume, restoredVolume])
+          yield* Effect.acquireRelease(run(["volume", "create", volume]), () =>
+            run(["volume", "rm", volume]).pipe(Effect.orDie),
+          );
         // Railway volumes do not inherit the image directory's owner.
         if (mode === "railway")
           yield* run([
@@ -158,7 +164,7 @@ for (const mode of ["explicit", "local", "railway"] as const)
             : {}),
           ...(mode === "railway" ? { RAILWAY_PUBLIC_DOMAIN: "release.up.railway.app" } : {}),
         };
-        const start = (containerImage = image) =>
+        const start = (containerImage = image, productVolume = id) =>
           run(
             [
               "run",
@@ -173,7 +179,7 @@ for (const mode of ["explicit", "local", "railway"] as const)
               "--publish",
               `127.0.0.1:${port}:${containerPort}`,
               "--volume",
-              `${id}:/app/data`,
+              `${productVolume}:/app/data`,
               ...Object.keys(environment).flatMap((name) => ["--env", name]),
               ...registry.docker,
               containerImage,
@@ -392,13 +398,48 @@ visit("/app/data/hosted.pglite");process.stdout.write(hash.digest("hex"));`,
         let nativeBackup: string | undefined;
         let beforeRestartTrace: string | undefined;
         const publicationName = `@${parsed[0].slug}.executor.community/release-app`;
-        let publicationCommit: string | undefined;
-        if (initialImage === image) {
+        let initialPublicationName = publicationName;
+        let publicationCommit: string;
+        let retainedWorkflow: string | undefined;
+        {
           const response = yield* request(`${prefix}/apps/${app.id}/workspace`, undefined, cookie);
           const workspace = yield* Schema.decodeUnknownEffect(
-            Schema.Struct({ revision: Schema.Struct({ commit: Schema.String }) }),
+            Schema.Struct({
+              revision: Schema.Struct({ commit: Schema.String }),
+              namespace: Schema.String,
+              files: Schema.Array(Schema.Struct({ path: Schema.String, content: Schema.String })),
+            }),
           )(yield* driver("Read publication revision", () => response.json()));
           publicationCommit = workspace.revision.commit;
+          initialPublicationName = `@${workspace.namespace}/release-app`;
+          if (initialPublicationName !== publicationName) {
+            // Publish through the previous server's real API and required scope. An upgrade
+            // must retain a nonempty old registry, not just initialize a new empty one.
+            const committed = yield* request(
+              `${prefix}/apps/${app.id}/commits`,
+              {
+                expected: publicationCommit,
+                message: "Use the previous server's publishing scope",
+                files: workspace.files.map((file) =>
+                  file.path === "package.json"
+                    ? {
+                        ...file,
+                        content: JSON.stringify({
+                          name: initialPublicationName,
+                          dependencies: withApps({ "is-number": "7.0.0" }),
+                        }),
+                      }
+                    : file,
+                ),
+              },
+              cookie,
+            );
+            expect(committed.status).toBe(200);
+            publicationCommit = (yield* Schema.decodeUnknownEffect(
+              Schema.Struct({ revision: Schema.Struct({ commit: Schema.String }) }),
+            )(yield* driver("Read legacy publication commit", () => committed.json()))).revision
+              .commit;
+          }
           expect(
             (yield* request(
               `${prefix}/apps/${app.id}/publication`,
@@ -410,10 +451,29 @@ visit("/app/data/hosted.pglite");process.stdout.write(hash.digest("hex"));`,
         for (const restart of [false, true]) {
           if (restart) {
             yield* run(
-              initialRuntime === "executor-host" && mode === "local"
+              initialImage === image && initialRuntime === "executor-host" && mode === "local"
                 ? ["kill", "--signal", "KILL", id]
                 : ["stop", "--time", "15", id],
             );
+            // The source is stopped and mounted read-only. The archive includes keys, Git,
+            // builds, app/workflow data and whichever product storage the old image used.
+            yield* run([
+              "run",
+              "--rm",
+              "--network",
+              "none",
+              "--volume",
+              `${id}:/source:ro`,
+              "--volume",
+              `${backupVolume}:/backup`,
+              "node:24-bookworm-slim",
+              "tar",
+              "cf",
+              "/backup/product.tar",
+              "-C",
+              "/source",
+              ".",
+            ]);
             if (initialRuntime !== "executor-host" && runtime === "executor-host")
               nativeBackup = yield* legacyDigest();
             yield* run(["rm", id]);
@@ -471,7 +531,8 @@ visit("/app/data/hosted.pglite");process.stdout.write(hash.digest("hex"));`,
             ).toMatchObject({ canPublish: true, publicationAudience: "organization" });
           }
           if (publicationCommit !== undefined) {
-            const query = `name=${encodeURIComponent(publicationName)}&commit=${publicationCommit}`;
+            const expectedName = restart ? publicationName : initialPublicationName;
+            const query = `name=${encodeURIComponent(expectedName)}&commit=${publicationCommit}`;
             const published = yield* request(
               `${prefix}/app-publications/source?${query}`,
               undefined,
@@ -480,7 +541,7 @@ visit("/app/data/hosted.pglite");process.stdout.write(hash.digest("hex"));`,
             expect(published.status).toBe(200);
             expect(
               yield* driver("Publication survives restart", () => published.json()),
-            ).toMatchObject({ publication: { name: publicationName, commit: publicationCommit } });
+            ).toMatchObject({ publication: { name: expectedName, commit: publicationCommit } });
             expect((yield* request(`/api/registry/source?${query}`)).status).toBe(404);
           }
           if (mode === "explicit") {
@@ -679,18 +740,30 @@ http.createServer((request, response) => {
           // The image under test serves its collector only on a private Unix socket, which
           // operators read through `executor-host telemetry`. An earlier image may still listen
           // on loopback, or name its collector's port in collector.json.
-          const legacyCollector =
-            restart || initialImage === image
-              ? undefined
-              : initialRuntime === "executor-host"
-                ? "http://127.0.0.1:4318"
-                : (yield* run(["exec", id, "cat", "/app/data/diagnostics/collector.json"]).pipe(
-                    Effect.flatMap(
-                      Schema.decodeUnknownEffect(
-                        Schema.fromJsonString(Schema.Struct({ url: Schema.String })),
-                      ),
+          const socketCollector =
+            (restart ? runtime : initialRuntime) === "executor-host" &&
+            Number(
+              yield* processes.exitCode(
+                ChildProcess.make("docker", [
+                  "exec",
+                  id,
+                  "sh",
+                  "-c",
+                  "test -f /app/data/.executor-telemetry",
+                ]),
+              ),
+            ) === 0;
+          const legacyCollector = socketCollector
+            ? undefined
+            : (restart ? runtime : initialRuntime) === "executor-host"
+              ? "http://127.0.0.1:4318"
+              : (yield* run(["exec", id, "cat", "/app/data/diagnostics/collector.json"]).pipe(
+                  Effect.flatMap(
+                    Schema.decodeUnknownEffect(
+                      Schema.fromJsonString(Schema.Struct({ url: Schema.String })),
                     ),
-                  )).url;
+                  ),
+                )).url;
           const readCollector = (path: string) =>
             legacyCollector === undefined
               ? run(["exec", id, "executor-host", "telemetry", path])
@@ -895,6 +968,7 @@ http.createServer((request, response) => {
           expect(completed.output, "workflow callbacks retain the selected encrypted account").toBe(
             true,
           );
+          if (!restart) retainedWorkflow = workflowRun.id;
           if (token !== undefined) {
             yield* Effect.scoped(
               Effect.gen(function* () {
@@ -985,7 +1059,7 @@ const result=await pg.query('SELECT name FROM "user"');await pg.close();process.
             yield* Schema.decodeUnknownEffect(
               Schema.fromJsonString(Schema.Array(Schema.Struct({ name: Schema.String }))),
             )(restored),
-            "rollback retains writes made after migration",
+            "PostgreSQL export retains later rows; it does not prove old-application compatibility",
           ).toEqual([{ name: "Written after migration" }]);
           expect(yield* legacyDigest(), "export leaves the original backup intact").toBe(
             nativeBackup,
@@ -1015,6 +1089,63 @@ const result=await pg.query('SELECT name FROM "user"');await pg.close();process.
           );
           expect(logs).not.toContain("broken-key");
         }
+        // A database SELECT is not a restore rehearsal. Boot the actual old application on a
+        // separate restored volume and exercise its encrypted account, app DB, source and workflow.
+        yield* run(["stop", "--time", "15", id]);
+        yield* run(["rm", id]);
+        yield* run([
+          "run",
+          "--rm",
+          "--network",
+          "none",
+          "--volume",
+          `${backupVolume}:/backup:ro`,
+          "--volume",
+          `${restoredVolume}:/restore`,
+          "node:24-bookworm-slim",
+          "tar",
+          "xf",
+          "/backup/product.tar",
+          "-C",
+          "/restore",
+        ]);
+        yield* start(initialImage, restoredVolume);
+        yield* ready;
+        expect((yield* request("/api/viewer", undefined, cookie)).status).toBe(200);
+        for (const [tool, expected] of [
+          ["check", true],
+          ["messages", ["Retained app data"]],
+        ] as const) {
+          const response = yield* request(
+            `${prefix}/apps/${app.id}/tools/call`,
+            { profile: profile.id, tool, kind: "query", input: {} },
+            cookie,
+          );
+          expect(response.status).toBe(200);
+          expect(yield* driver(`restored ${tool}`, () => response.json())).toEqual(expected);
+        }
+        expect(retainedWorkflow).toBeDefined();
+        const restoredRun = yield* request(
+          `${prefix}/apps/${app.id}/workflow-runs/${retainedWorkflow}`,
+          undefined,
+          cookie,
+        );
+        expect(restoredRun.status).toBe(200);
+        expect(yield* driver("restored workflow", () => restoredRun.json())).toMatchObject({
+          status: "complete",
+          output: true,
+        });
+        const restoredSource = yield* request(
+          `${prefix}/app-publications/source?name=${encodeURIComponent(initialPublicationName)}&commit=${publicationCommit}`,
+          undefined,
+          cookie,
+        );
+        expect(restoredSource.status).toBe(200);
+        expect(yield* driver("restored publication", () => restoredSource.json())).toMatchObject({
+          publication: { name: initialPublicationName, commit: publicationCommit },
+          files: expect.arrayContaining([expect.objectContaining({ path: "index.ts" })]),
+        });
+        expect((yield* request(`${prefix}/apps/${app.id}/ui`, undefined, cookie)).status).toBe(200);
       }),
     ).pipe(Effect.provide(NodeServices.layer)),
   );

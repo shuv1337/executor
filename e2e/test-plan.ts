@@ -150,6 +150,18 @@ export const scenarios = plan({
       local: na("Local does not publish apps."),
     },
   },
+  registryMigration: {
+    fixtures: "actors",
+    legacyStorage: true,
+    file: "registry-migration.spec.ts",
+    title:
+      "a rejected legacy registry upgrade preserves the old SDK and listings, retries after repair, and retains published source on repeat startup",
+    targets: {
+      "self-host": scheduled,
+      cloud: na("The legacy fixture requires a runner-owned product database."),
+      local: na("Local does not publish apps."),
+    },
+  },
   cloudRoleHostRoutes: {
     fixtures: "actors",
     file: "cloud-role-hosts.spec.ts",

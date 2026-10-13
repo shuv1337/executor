@@ -153,11 +153,19 @@ export const migrateHostedSchemas = (
       try: () => migrations.runMigrations(),
       catch: migrationFailed("auth"),
     });
-    yield* storage.migrateTables.pipe(Effect.mapError(migrationFailed("product")));
-    yield* hostedProductMigrations;
-    yield* additional;
-    // Index builds block writes to their tables until the enclosing transaction commits, and
-    // runtime writers set no lock timeout. Build them last so they hold that lock only for
-    // themselves, the version update and the commit.
-    yield* storage.migrate.pipe(Effect.mapError(migrationFailed("product")));
+    // Auth owns an independent connection and commits only additive changes. Do not hold the
+    // single PGlite connection while it runs. All product layouts, including the host's registry,
+    // then commit together: a rejected registry must not strand the old image on a newer SDK.
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql.withTransaction(
+      Effect.gen(function* () {
+        yield* sql`set local lock_timeout = '5s'`;
+        yield* sql`set local statement_timeout = '60s'`;
+        yield* storage.migrateTables.pipe(Effect.mapError(migrationFailed("product")));
+        yield* hostedProductMigrations;
+        yield* additional;
+        // Build trailing indexes last to limit the time they block runtime writers.
+        yield* storage.migrate.pipe(Effect.mapError(migrationFailed("product")));
+      }),
+    );
   });
