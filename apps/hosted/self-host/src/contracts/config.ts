@@ -1,5 +1,6 @@
 /** Self-host storage configuration shared by the database, retained builds and diagnostics. */
-import { AppUiBaseUrl } from "@executor-js/hosted-server/app-ui/contracts";
+import { AppUiBaseUrl, AppUiHostFormat } from "@executor-js/hosted-server/app-ui/contracts";
+import { OrganizationSlug } from "@executor-js/hosted-server/organization";
 import { Config, Effect, Option, Schema } from "effect";
 
 /** One persistent root; Docker supplies /app/data and source development uses .local/hosted. */
@@ -18,6 +19,17 @@ export const appUiBaseUrl = (dashboardOrigin: string) =>
     dashboard.hostname = "localhost";
     return yield* Schema.decodeUnknownEffect(AppUiBaseUrl)(dashboard.origin);
   });
+
+/** `nested` (default) needs a two-level wildcard certificate; `flat` fits a single `*.<base>` certificate. */
+export const appUiHostFormat = Config.schema(AppUiHostFormat, "EXECUTOR_APP_UI_HOST_FORMAT").pipe(
+  Config.withDefault("nested" as const),
+);
+
+/** Apps of this one organization live directly under the base as `<app>.<base>`; others keep the format's shape. */
+export const appUiDefaultOrganization = Config.schema(
+  OrganizationSlug,
+  "EXECUTOR_APP_UI_DEFAULT_ORGANIZATION",
+).pipe(Config.option);
 
 /**
  * App isolates reach only public addresses, the same as Executor Cloud. Requests for the

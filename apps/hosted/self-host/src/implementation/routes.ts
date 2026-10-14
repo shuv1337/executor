@@ -40,7 +40,12 @@ import { appAddresses, hostedAppUi } from "@executor-js/hosted-server/app-ui";
 import { appSignInCallbackPath } from "apps/ui/auth";
 import { AppUiApi } from "apps/ui/contracts";
 import { HttpApiBuilder } from "effect/http-api";
-import { appUiBaseUrl, catalogFeedUrl } from "../contracts/config.ts";
+import {
+  appUiBaseUrl,
+  appUiHostFormat,
+  appUiDefaultOrganization,
+  catalogFeedUrl,
+} from "../contracts/config.ts";
 import { type HostEgress } from "@executor-js/utils/url-policy";
 import { Config, Effect, Layer, Option } from "effect";
 import { HttpRouter, HttpServer, HttpServerRequest, HttpServerResponse } from "effect/http";
@@ -103,7 +108,10 @@ export const selfHostRouteMap = <DashboardE, DashboardR>(options: {
       origin: auth.origin,
       oauthRedirectUri: Option.getOrUndefined((yield* authSettings).oauthRedirectUri),
     });
-    const addresses = appAddresses(auth.origin, yield* appUiBaseUrl(auth.origin));
+    const addresses = appAddresses(auth.origin, yield* appUiBaseUrl(auth.origin), {
+      format: yield* appUiHostFormat,
+      defaultOrganization: Option.getOrUndefined(yield* appUiDefaultOrganization),
+    });
     const appUi = hostedAppUi(addresses);
     const mcp = yield* selfHostMcp.pipe(Effect.provide(HttpServer.layerServices));
     const document = lazyHostedApiDocument(() => executorSelfHostApiDocument(auth.origin));

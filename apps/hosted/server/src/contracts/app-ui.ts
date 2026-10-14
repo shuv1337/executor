@@ -51,7 +51,16 @@ export const AppUiBaseUrl = Schema.String.check(
   }),
 ).pipe(Schema.brand("AppUiBaseUrl"));
 export type AppUiBaseUrl = typeof AppUiBaseUrl.Type;
-/** One DNS label; the app and team are separate labels. */
+/**
+ * How an app address is formed under the base. `nested` puts the app and organization in separate
+ * labels (`<app>.<org>.<base>`), which needs a certificate for two wildcard levels. `flat` joins
+ * them into one label (`<app>--<org>.<base>`) so a single-level wildcard certificate such as
+ * Cloudflare Universal SSL covers every app. Organization slugs never contain `--`, so the last
+ * `--` always separates the two.
+ */
+export const AppUiHostFormat = Schema.Literals(["nested", "flat"]);
+export type AppUiHostFormat = typeof AppUiHostFormat.Type;
+/** One DNS label; in the nested format the app and team are separate labels. */
 export const AppUiHostnameLabel = Schema.String.check(
   Schema.isMaxLength(63),
   Schema.isPattern(/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/u),
