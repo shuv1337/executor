@@ -35,6 +35,10 @@ services:
       EXECUTOR_OAUTH_CLIENT_METADATA_URL:
       # Optional HTTPS app origin base. Localhost derives it from BETTER_AUTH_URL.
       EXECUTOR_APP_UI_BASE_URL:
+      # nested (default): <app>.<org>.<base>; flat: <app>--<org>.<base>.
+      EXECUTOR_APP_UI_HOST_FORMAT:
+      # Optional organization whose apps use <app>.<base>.
+      EXECUTOR_APP_UI_DEFAULT_ORGANIZATION:
       # Unset passthrough entries stay absent; the default is bundled Motel.
       OTEL_EXPORTER_OTLP_ENDPOINT:
       OTEL_EXPORTER_OTLP_HEADERS:

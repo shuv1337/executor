@@ -6625,6 +6625,29 @@ export const scenarios = plan({
       ),
     },
   },
+  appUiFlatHosts: {
+    file: "app-ui-flat-hosts.spec.ts",
+    title:
+      "a self-host with flat app hosts publishes app--organization addresses and refuses nested ones",
+    targets: {
+      "self-host": scheduled,
+      cloud: na("Cloud always uses nested app hosts."),
+      local: na(
+        "Local serves app UIs from its own origin; only self-host starts a scenario-owned server.",
+      ),
+    },
+  },
+  appUiDefaultOrganization: {
+    file: "app-ui-default-organization.spec.ts",
+    title: "a self-host with a default organization publishes its apps directly under the app base",
+    targets: {
+      "self-host": scheduled,
+      cloud: na("Cloud has no default organization."),
+      local: na(
+        "Local serves app UIs from its own origin; only self-host starts a scenario-owned server.",
+      ),
+    },
+  },
   remoteRegistryFailures: {
     file: "registry-failures.spec.ts",
     title: "Public app catalog refuses registry redirects and reports distinct registry failures",
