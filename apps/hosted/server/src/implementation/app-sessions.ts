@@ -210,6 +210,7 @@ export const hostedAppSessions = (
             Effect.mapError(unavailable),
           ),
           hash: authority.hash,
+          grantId: authority.grantId,
           profile: input.profile,
           policy: authority.policy,
           sessionId,
@@ -263,7 +264,11 @@ export const hostedAppSessions = (
           !Schema.is(NativeAppMarker)(marker) ||
           !sameTarget(marker.target, target) ||
           marker.user !== authority.userId ||
-          marker.hash !== authority.hash
+          // Rotation changes the access-token hash, but keeps this exact OAuth grant.
+          // Legacy markers without a grant ID retain their original hash-only boundary.
+          (marker.grantId === undefined
+            ? marker.hash !== authority.hash
+            : marker.grantId !== authority.grantId)
         )
           return yield* new UiForbidden();
         yield* read(key("native_marker", sessionId), true);

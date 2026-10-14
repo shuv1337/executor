@@ -129,6 +129,7 @@ const nativeFields = {
   target: AppUiTarget,
   user: Principal.fields.userId,
   hash: Schema.String,
+  grantId: Schema.optional(Schema.String),
   profile: ProfileId,
   policy: AuthorizationPolicy,
   sessionId: Schema.String,
@@ -158,6 +159,7 @@ export const NativeAppRedeemInput = Schema.Struct({
 export interface NativeAppAuthority {
   readonly userId: string;
   readonly hash: string;
+  readonly grantId: string;
   readonly policy: typeof AuthorizationPolicy.Type;
   readonly expiresAt: Date;
 }

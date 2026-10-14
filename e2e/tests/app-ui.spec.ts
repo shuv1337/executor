@@ -305,6 +305,17 @@ layer(HostedLive, { excludeTestServices: true })("Private app pages", (it) => {
             ),
           )).status,
         ).toBe(200);
+        const unrelated = yield* oauth.authorizeApi;
+        expect(
+          (yield* api.request(
+            anonymous,
+            "POST",
+            `${appPath}/ui/revoke`,
+            { sessionId: first.sessionId },
+            { authorization: `Bearer ${Redacted.value(unrelated.tokens).access_token}` },
+          )).status,
+        ).toBe(403);
+        yield* oauth.revoke(unrelated);
         const pending = yield* launch;
         expect((yield* revoke(pending.sessionId)).status).toBe(200);
         expect((yield* redeem(pending)).status).toBe(401);
@@ -327,6 +338,8 @@ layer(HostedLive, { excludeTestServices: true })("Private app pages", (it) => {
         );
         expect(subscription.status).toBe(200);
         const stream = yield* subscription.text.pipe(Effect.forkScoped);
+        const refreshed = yield* oauth.refresh(grant);
+        headers.authorization = `Bearer ${Redacted.value(refreshed.tokens).access_token}`;
         expect((yield* revoke(first.sessionId)).status).toBe(200);
         const closed = yield* Fiber.join(stream).pipe(Effect.timeout("12 seconds"));
         expect(closed.includes("UiUnauthorized")).toBe(true);

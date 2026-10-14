@@ -643,6 +643,7 @@ export const nativeAppOAuthAccess = (
       return yield* forbidden("membership");
     return {
       userId: grant.userId,
+      grantId: grant.grant.id,
       hash,
       expiresAt: grant.expiresAt,
       policy: grantAuthorization(grant.grant.policy),
