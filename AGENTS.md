@@ -306,19 +306,21 @@ Validate workflow edits with `actionlint`.
 
 ## Workspace lifecycle
 
-The canonical checkout and shared preview live at
-`~/agent-workspace/executor-next`, on `main`. Keep it clean and synchronized with
-`origin/main`. The old `sdk-scaffold` rift is not the shared preview or a second
-source of truth. Its active task branches must be finished through normal PRs.
+The canonical fork checkout is `/Users/shuv/repos/executor-v2`, on `v2`.
+Keep it clean and synchronized with `origin/v2`. The upstream `main` branch
+and `executor-next` preview layout are not this fork's workspace baseline.
 
 Before work, run `bun run workspace:check` in the canonical checkout. The check
 fetches origin and reports the branch, dirty files, and divergence. It never
 stashes, resets, switches branches, or changes worktree files. Resolve any
 reported work before starting another task; never discard it to pass the check.
 
-Each implementation task or agent gets its own short-lived rift and named
-branch, created from current main. Run `bun run workspace:check --task` there
-before editing. Use that rift for the whole task; do not mix another agent's
+Each implementation task or agent gets its own short-lived linked Git worktree and named
+branch, created from current origin/v2. Run `bun run workspace:check --task` there
+before editing. The checker recognizes linked worktrees through Git metadata,
+not a required directory name. The default check (also `--main`, its legacy flag)
+requires the primary checkout on `v2`; `--task` requires a named non-`v2` branch
+containing current `origin/v2`. Both modes reject dirty files. Use that worktree for the whole task; do not mix another agent's
 edits into it. Give task previews separate ports and scratch data.
 
 Commit coherent pieces of authorized task work before starting a different task.
@@ -329,8 +331,8 @@ uncommitted files. Do not leave work only in a dirty shared preview.
 A merge is complete only after verifying the remote result and fast-forwarding
 the clean canonical checkout to it. Run `bun run workspace:check` again. If the
 preview has local edits, preserve and identify them; report the sync as blocked
-instead of resetting or calling the preview current. Keep active task rifts
-unchanged until their owners reconcile with the merged main.
+instead of resetting or calling the preview current. Keep active task worktrees
+unchanged until their owners reconcile with the merged v2.
 
 Develop locally and keep secrets in 1Password. Publishing, merging, deployment,
 and deferred features still require the user's authorization. This workflow
