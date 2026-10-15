@@ -17,7 +17,7 @@ import {
   type Schema,
 } from "apps";
 
-type Account = Context["accounts"]["syncro"];
+type Account = Context["user"]["accounts"]["syncro"];
 type Fetch = (input: URL, init: RequestInit) => Promise<Response>;
 
 /** One authenticated GET; the response body is never surfaced because it may echo credentials. */
@@ -75,7 +75,7 @@ const syncro = defineProvider({
     await decodeJson(response, record(json()));
   },
 });
-const requirements = { accounts: { syncro } };
+const requirements = { user: { accounts: { syncro } } };
 type Context = QueryContext<typeof requirements>;
 const Entity = record(json());
 const Meta = object({ page: number(), total_pages: number(), per_page: number().optional() });
@@ -95,7 +95,7 @@ async function get<T>(
   params: Record<string, string | number | undefined>,
   schema: Schema<T>,
 ): Promise<T> {
-  const response = await request(ctx.fetch, ctx.accounts.syncro, path, params, ctx.signal);
+  const response = await request(ctx.fetch, ctx.user.accounts.syncro, path, params, ctx.signal);
   return decodeJson(response, schema);
 }
 

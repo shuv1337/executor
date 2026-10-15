@@ -1,9 +1,9 @@
 # Syncro reads
 
 Deploy two files: `index.ts` as `index.ts`, and `deploy.package.json` as
-`package.json`. The deploy manifest pins `apps` to `0.0.1-beta.35`, the newest
-published release that speaks host protocol 8; later releases speak protocols
-this host's build does not run, so their builds fail. The workspace
+`package.json`. The deploy manifest pins `apps` to `0.0.1-beta.91` and uses
+per-user account requirements (host protocol 13). Deploy it after upgrading
+the host to this upstream baseline. The workspace
 `package.json` uses `workspace:*` for repository typechecks and must not be sent
 to a host.
 

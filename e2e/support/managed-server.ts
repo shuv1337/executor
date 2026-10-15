@@ -31,9 +31,10 @@ import type { Target } from "./platform.ts";
 import { startAnalyticsCollector } from "./analytics-collector.ts";
 import {
   applyLegacyStatements,
+  LegacyDatabase,
+  legacyDatabase,
   LegacyResults,
   LegacyStatements,
-  productDatabase,
 } from "./legacy-storage.ts";
 import { scenarios } from "../test-plan.ts";
 import { recordWorkerdCoverage, workerdCoverageFlags } from "./workerd-coverage.ts";
@@ -47,6 +48,9 @@ class ServerFailed extends Schema.TaggedError<ServerFailed>()("ServerFailed", {
 const maxClockOffset = 40 * 86_400_000;
 /** Operator settings a scenario may turn on between product generations. */
 export const OperatorSettings = Schema.Struct({
+  EXECUTOR_URL_ALLOW_LOOPBACK_HTTP: Schema.optionalKey(Schema.String),
+  EXECUTOR_URL_ALLOW_HTTP_ORIGINS: Schema.optionalKey(Schema.String),
+  NODE_EXTRA_CA_CERTS: Schema.optionalKey(Schema.NonEmptyString),
   EXECUTOR_OAUTH_CLIENT_METADATA_URL: Schema.optionalKey(Schema.NonEmptyString),
   /** The build an upgrade installs. */
   EXECUTOR_BUILD_VERSION: Schema.optionalKey(Schema.NonEmptyString),
@@ -481,12 +485,19 @@ export const startManagedServer = (
           );
           if (!declared || target.metadata.target === "cloud")
             return HttpServerResponse.empty({ status: 403 });
-          const database = productDatabase(env.EXECUTOR_DATA_DIR, target.metadata.target);
           const body = yield* request.json.pipe(
             Effect.flatMap(
-              Schema.decodeUnknownEffect(Schema.Struct({ statements: LegacyStatements })),
+              Schema.decodeUnknownEffect(
+                Schema.Struct({ statements: LegacyStatements, database: LegacyDatabase }),
+              ),
             ),
           );
+          const database = legacyDatabase(
+            env.EXECUTOR_DATA_DIR,
+            target.metadata.target,
+            body.database,
+          );
+          if (database === undefined) return HttpServerResponse.empty({ status: 403 });
           // Hold the lifecycle gate so no product generation can open the database meanwhile.
           const rows = yield* gate.withPermits(1)(
             stop.pipe(

@@ -9,7 +9,7 @@ import { HostedLive, withHostedCase } from "../support/case.ts";
 import { Resource } from "../support/contracts.ts";
 import { publishedRelease } from "../support/app-package.ts";
 import { appsManifest } from "../support/apps-release.ts";
-import { createProfile, selectProfileAccounts } from "../support/profiles.ts";
+import { connectionsPath, linkedAccountIds } from "../support/app-accounts.ts";
 import { scenarios } from "../test-plan.ts";
 
 const App = Schema.Struct({
@@ -120,7 +120,7 @@ layer(HostedLive, { excludeTestServices: true })("Syncro REST", (it) => {
         );
         const prefix = `/api/organizations/${actors.organization.id}`;
         // The same source runs on this checkout's framework and on the published release that
-        // deploy.package.json pins, served from its npm archive.
+        // previously deployed Syncro release used, served from its npm archive.
         const beta35 = yield* publishedRelease("0.0.1-beta.35");
         const published = {
           path: "package.json",
@@ -130,7 +130,22 @@ layer(HostedLive, { excludeTestServices: true })("Syncro REST", (it) => {
           received.length = 0;
           const deployed = yield* api.request(actors.owner, "POST", `${prefix}/apps/deploy`, {
             name: manifest === published ? "Syncro REST reads on beta.35" : "Syncro REST reads",
-            files: [{ path: "index.ts", content: source }, manifest],
+            files: [
+              {
+                path: "index.ts",
+                content:
+                  manifest === published
+                    ? source
+                        .replace('Context["user"]["accounts"]', 'Context["accounts"]')
+                        .replace(
+                          "const requirements = { user: { accounts: { syncro } } };",
+                          "const requirements = { accounts: { syncro } };",
+                        )
+                        .replaceAll("ctx.user.accounts.syncro", "ctx.accounts.syncro")
+                    : source,
+              },
+              manifest,
+            ],
           });
           expect(deployed.status, JSON.stringify(deployed.body)).toBe(200);
           const fetched = (yield* beta35.requests)[beta35.route] ?? 0;
@@ -172,15 +187,16 @@ layer(HostedLive, { excludeTestServices: true })("Syncro REST", (it) => {
           yield* Ref.set(status, 200);
           expect(received.filter((request) => request.url === "/api/v1/me")).toHaveLength(4);
 
-          const profile = yield* createProfile(actors.owner, path);
           const connect = (subdomain: string) =>
             Effect.gen(function* () {
               const connection = yield* body(
                 Resource,
-                yield* api.request(actors.owner, "POST", `${path}/connections`, {
-                  requirement: "syncro",
-                  profile: profile.id,
-                }),
+                yield* api.request(
+                  actors.owner,
+                  "POST",
+                  connectionsPath(path, "user", "syncro"),
+                  {},
+                ),
               );
               const saved = yield* api.request(
                 actors.owner,
@@ -199,10 +215,7 @@ layer(HostedLive, { excludeTestServices: true })("Syncro REST", (it) => {
                   .request(actors.owner, "DELETE", `${prefix}/accounts/${account.id}`)
                   .pipe(Effect.orDie),
               );
-              const selected = yield* selectProfileAccounts(actors.owner, path, profile.id, {
-                syncro: account.id,
-              });
-              expect(selected.status).toBe(200);
+              expect(yield* linkedAccountIds(actors.owner, path)).toEqual([account.id]);
               return account.id;
             });
           const account = yield* connect("127");
@@ -228,7 +241,6 @@ layer(HostedLive, { excludeTestServices: true })("Syncro REST", (it) => {
           yield* Ref.set(status, 200);
           const call = (tool: string, input: object) =>
             api.request(actors.owner, "POST", `${path}/tools/call`, {
-              profile: profile.id,
               tool,
               kind: "query",
               input,

@@ -80,14 +80,33 @@ export const parseSpec = (bytes: Uint8Array): ParsedSpec => {
   }
 };
 
-const serverUrl = (server: unknown) => {
-  if (!isObject(server) || typeof server.url !== "string") return undefined;
+/**
+ * A server's URL with its variables at their defaults, or the variables nothing defines. A path- or
+ * operation-level server that uses a variable without declaring it takes the declaration of the
+ * same name from the document's first server, whatever that server's URL, as the imported app's
+ * router does.
+ */
+const serverUrl = (
+  server: unknown,
+  documentServer: unknown,
+):
+  | { readonly url: string | undefined }
+  | { readonly unresolved: readonly [string, ...string[]] } => {
+  if (!isObject(server) || typeof server.url !== "string") return { url: undefined };
+  const declared = (from: unknown) =>
+    isObject(from) && isObject(from.variables) ? from.variables : {};
+  const variables = { ...declared(documentServer), ...declared(server) };
   let url = server.url;
-  const variables = isObject(server.variables) ? server.variables : {};
-  for (const [name, variable] of Object.entries(variables))
-    if (isObject(variable) && typeof variable.default === "string")
-      url = url.replaceAll(`{${name}}`, variable.default);
-  return URL.canParse(url) ? url : undefined;
+  for (const [name, variable] of Object.entries(variables)) {
+    const value = isObject(variable) ? variable.default : undefined;
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean")
+      url = url.replaceAll(`{${name}}`, String(value));
+  }
+  const [first, ...rest] = [
+    ...new Set([...url.matchAll(/\{([^{}]*)\}/gu)].map((match) => match[1] ?? "")),
+  ];
+  if (first !== undefined) return { unresolved: [first, ...rest] };
+  return { url: URL.canParse(url) ? url : undefined };
 };
 
 /** The first non-empty list of servers with a URL, as v1 chose an operation's servers. */
@@ -101,12 +120,31 @@ const firstServers = (...lists: readonly unknown[]) =>
     .find((list) => list.length > 0) ?? [];
 
 /**
- * Where v1 sent each operation of a document: the configured base URL, else the operation's own
- * first server, else its path's, else the document's, with variables at their defaults. Undefined
- * when an operation has no absolute URL to send to.
+ * Why an operation has no host: v1 prefixed requests with the configured base URL, else the
+ * operation's server, and sent the bare path when neither named a host, which never reached an
+ * API. A finished import is not run again, so the person's agent recreates the integration from
+ * the fix prompt, which carries the item's name and kind. The reason names no URL: the
+ * specification's URL can carry a key in its user, host, port, path or query.
  */
-export const operationBaseUrls = (config: OpenApiConfig, document: Json) => {
-  if (config.baseUrl !== undefined) return [config.baseUrl];
+const noHost = (why: string) =>
+  ({
+    ok: false,
+    reason: `${why} and the integration sets no base URL, so v1 had no host to send its requests to either. Use 'Copy fix prompt' to recreate this integration in v2 with an absolute API base URL.`,
+  }) as const;
+
+/**
+ * Where v1 sent each operation of a document: the configured base URL, else the operation's own
+ * first server, else its path's, else the document's, with variables at their defaults. Refused
+ * when an operation has no absolute URL to send to, or its server uses a variable nothing defines.
+ */
+export const operationBaseUrls = (
+  config: OpenApiConfig,
+  document: Json,
+):
+  | { readonly ok: true; readonly urls: readonly string[] }
+  | { readonly ok: false; readonly reason: string } => {
+  if (config.baseUrl !== undefined) return { ok: true, urls: [config.baseUrl] };
+  const documentServer = Array.isArray(document.servers) ? document.servers[0] : undefined;
   const urls = new Set<string>();
   const paths = isObject(document.paths) ? document.paths : {};
   for (const item of Object.values(paths)) {
@@ -114,12 +152,21 @@ export const operationBaseUrls = (config: OpenApiConfig, document: Json) => {
     for (const method of methods) {
       const operation = item[method];
       if (!isObject(operation)) continue;
-      const url = serverUrl(firstServers(operation.servers, item.servers, document.servers)[0]);
-      if (url === undefined) return undefined;
-      urls.add(url);
+      const server = firstServers(operation.servers, item.servers, document.servers)[0];
+      const resolved = serverUrl(server, documentServer);
+      if ("unresolved" in resolved)
+        return {
+          ok: false,
+          reason: `Its server URL uses ${resolved.unresolved.map((name) => `{${name}}`).join(", ")}, which no server defines.`,
+        };
+      if (server === undefined) return noHost("Its specification names no server URL");
+      if (resolved.url === undefined) return noHost("Its server URL is not absolute");
+      urls.add(resolved.url);
     }
   }
-  return [...urls];
+  return urls.size === 0
+    ? { ok: false, reason: "Its API has no absolute base URL." }
+    : { ok: true, urls: [...urls] };
 };
 
 /**

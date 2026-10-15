@@ -153,7 +153,7 @@ function PublicationProblem({
           aria-hidden
         />
         <div className="min-w-0">
-          <p className="text-sm font-medium">This app can’t be shared publicly yet</p>
+          <p className="text-sm font-medium">This app can’t be published yet</p>
           <p className="mt-1 text-sm">{repair.title}</p>
           <p className="mt-2 text-sm leading-6 text-muted-foreground">{repair.detail}</p>
         </div>
@@ -189,7 +189,7 @@ function PublicationProblem({
             app or its connected accounts. You can also copy a prompt and have your agent do it.
           </>
         ) : (
-          "Copy a prompt and have your agent fix this, then open Share publicly again."
+          "Copy a prompt and have your agent fix this, then open Publish again."
         )}
       </p>
     </div>
@@ -356,6 +356,12 @@ function PublishAction<E>({
                   ? "Share this app with your organization."
                   : "List your app in Add app so anyone can find it and make their own copy."}
               </DialogDescription>
+              {audience !== "organization" && (
+                <p className="mt-2 text-xs leading-5 text-muted-foreground">
+                  For now, apps can only be published under executor.community. Claiming your own
+                  domain is coming soon.
+                </p>
+              )}
             </div>
             <QueryView
               query={atoms.source(app.id)}
@@ -615,7 +621,7 @@ function PublicationActions<E>({
                 if (Exit.isSuccess(result)) setCompleted("unpublished");
               }}
             >
-              Stop sharing
+              Unpublish
             </Button>
           )}
         </div>

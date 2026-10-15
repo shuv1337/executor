@@ -1,7 +1,7 @@
-import { AsyncResult } from "effect/reactivity";
-import { useAtomRefresh, useAtomSet, useAtomValue } from "@effect/atom-react";
-import { useRef, useState, type ReactNode } from "react";
-import { Cause, Exit, Option, Predicate } from "effect";
+import { AsyncResult, AtomRegistry } from "effect/reactivity";
+import { RegistryContext, useAtomRefresh, useAtomValue } from "@effect/atom-react";
+import { useContext, useState, type ReactNode } from "react";
+import { Cause, Effect, Exit, Option, Predicate } from "effect";
 import type { App, DeployedApp, Publication } from "@executor-js/sdk";
 import type { ComponentType } from "react";
 import { HugeiconsIcon } from "@hugeicons/react";
@@ -48,20 +48,21 @@ export function CatalogPage<E, IE, P = never>({
   action,
   inventory,
   open,
-}: QueryProps<readonly CatalogEntry[], E> &
-  Pick<MutationProps<InstallApp, DeployedApp, IE>, "mutation"> & {
-    readonly InstallFailure: MutationProps<InstallApp, DeployedApp, IE>["Failure"];
-    readonly back: ReactNode;
-    readonly action?: ReactNode;
-    /** The apps already installed; a failed read just leaves every row on Add. */
-    readonly inventory: Query<Inventory, unknown>;
-    /** A link to the installed app, rendered inside the row's Open button. */
-    readonly open: (app: App) => ReactNode;
-    /** The organization's published apps; without it, Add app lists the official feed only. */
-    readonly publications?: Query<ReadonlyArray<typeof Publication.Type>, P> | undefined;
-    readonly PublicationFailure?: ComponentType<FailureProps<NoInfer<P>>> | undefined;
-    readonly onPublication?: ((publication: typeof Publication.Type) => void) | undefined;
-  }) {
+}: QueryProps<readonly CatalogEntry[], E> & {
+  /** The install command for one catalog entry; each row has its own. */
+  readonly mutation: (entry: string) => MutationProps<InstallApp, DeployedApp, IE>["mutation"];
+  readonly InstallFailure: MutationProps<InstallApp, DeployedApp, IE>["Failure"];
+  readonly back: ReactNode;
+  readonly action?: ReactNode;
+  /** The apps already installed; a failed read just leaves every row on Add. */
+  readonly inventory: Query<Inventory, unknown>;
+  /** A link to the installed app, rendered inside the row's Open button. */
+  readonly open: (app: App) => ReactNode;
+  /** The organization's published apps; omitted for the official feed only. */
+  readonly publications?: Query<ReadonlyArray<typeof Publication.Type>, P> | undefined;
+  readonly PublicationFailure?: ComponentType<FailureProps<NoInfer<P>>> | undefined;
+  readonly onPublication?: ((publication: typeof Publication.Type) => void) | undefined;
+}) {
   const result = useAtomValue(query);
   const apps = Option.getOrUndefined(AsyncResult.value(useAtomValue(inventory)))?.apps;
   const installedByPackage = new Map<string, App>();
@@ -71,9 +72,21 @@ export function CatalogPage<E, IE, P = never>({
     if (name !== undefined && (!latest || app.createdAt > latest.createdAt))
       installedByPackage.set(name, app);
   }
-  const install = useAtomSet(mutation, { mode: "promiseExit" });
-  const installing = useRef(false);
-  const [adding, setAdding] = useState<string>();
+  const registry = useContext(RegistryContext);
+  /** Runs one entry's install and resolves with that entry's own result. */
+  const install = async (entry: CatalogEntry, input: InstallApp) => {
+    const command = mutation(entry.id);
+    const release = registry.mount(command);
+    try {
+      registry.set(command, input);
+      return await Effect.runPromiseExit(
+        AtomRegistry.getResult(registry, command, { suspendOnWaiting: true }),
+      );
+    } finally {
+      release();
+    }
+  };
+  const [adding, setAdding] = useState<ReadonlySet<string>>(new Set());
   const [failure, setFailure] = useState<Cause.Cause<IE>>();
   const [conflict, setConflict] = useState<{
     readonly entry: CatalogEntry;
@@ -81,12 +94,11 @@ export function CatalogPage<E, IE, P = never>({
   }>();
   /** Installs under `name`; a taken name reopens the prompt, any other failure is shown above the list. */
   const add = async (entry: CatalogEntry, name: string) => {
-    if (installing.current || !name.trim()) return;
-    installing.current = true;
-    setAdding(entry.id);
+    if (adding.has(entry.id) || !name.trim()) return;
+    setAdding((current) => new Set(current).add(entry.id));
     setFailure(undefined);
     try {
-      const exit = await install({ entry: entry.id, name: name.trim() });
+      const exit = await install(entry, { entry: entry.id, name: name.trim() });
       if (Exit.isSuccess(exit)) {
         setConflict(undefined);
         return;
@@ -98,10 +110,14 @@ export function CatalogPage<E, IE, P = never>({
       setFailure(exit.cause);
       setConflict(Option.isSome(taken) ? { entry, name: name.trim() } : undefined);
     } finally {
-      installing.current = false;
-      setAdding(undefined);
+      setAdding((current) => {
+        const next = new Set(current);
+        next.delete(entry.id);
+        return next;
+      });
     }
   };
+  const renaming = conflict !== undefined && adding.has(conflict.entry.id);
   const retry = useAtomRefresh(query);
   const [search, setSearch] = useState("");
   const templates = AsyncResult.value(result);
@@ -190,10 +206,10 @@ export function CatalogPage<E, IE, P = never>({
                       variant="outline"
                       size="sm"
                       aria-label={`Add ${entry.name}`}
-                      disabled={adding !== undefined}
+                      disabled={adding.has(entry.id)}
                       onClick={() => void add(entry, entry.name)}
                     >
-                      {adding === entry.id && conflict === undefined ? "Adding…" : "Add"}
+                      {adding.has(entry.id) ? "Adding…" : "Add"}
                     </Button>
                   );
                 })()}
@@ -206,7 +222,7 @@ export function CatalogPage<E, IE, P = never>({
       <Dialog
         open={conflict !== undefined}
         onOpenChange={(open) => {
-          if (!open && adding === undefined) {
+          if (!open && !renaming) {
             setConflict(undefined);
             setFailure(undefined);
           }
@@ -234,7 +250,7 @@ export function CatalogPage<E, IE, P = never>({
                 onChange={(event) =>
                   setConflict((current) => current && { ...current, name: event.target.value })
                 }
-                disabled={adding !== undefined}
+                disabled={renaming}
               />
             </label>
             {failure && <InstallFailure cause={failure} layout="compact" />}
@@ -242,7 +258,7 @@ export function CatalogPage<E, IE, P = never>({
               <Button
                 type="button"
                 variant="outline"
-                disabled={adding !== undefined}
+                disabled={renaming}
                 onClick={() => {
                   setConflict(undefined);
                   setFailure(undefined);
@@ -250,8 +266,8 @@ export function CatalogPage<E, IE, P = never>({
               >
                 Cancel
               </Button>
-              <Button type="submit" disabled={adding !== undefined || !conflict?.name.trim()}>
-                {adding !== undefined ? "Adding…" : "Add app"}
+              <Button type="submit" disabled={renaming || !conflict?.name.trim()}>
+                {renaming ? "Adding…" : "Add app"}
               </Button>
             </DialogFooter>
           </form>

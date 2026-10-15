@@ -7,6 +7,7 @@ import { withApps } from "../support/apps-release.ts";
 import { HostedLive, withHostedCase } from "../support/case.ts";
 import { App } from "../support/contracts.ts";
 import { legacyStorage } from "../support/legacy-storage.ts";
+import { beforeAppAccounts, beforeProfileRemoval } from "../support/profile-removal-rollback.ts";
 import { serverControl } from "../support/server-control.ts";
 import { scenarios } from "../test-plan.ts";
 
@@ -26,8 +27,7 @@ layer(HostedLive, { excludeTestServices: true })("Registry upgrades", (it) => {
             files: [
               {
                 path: "index.ts",
-                content:
-                  'import {defineApp} from "apps"; export default defineApp({accounts:{}},{});',
+                content: 'import {defineApp} from "apps"; export default defineApp({},{});',
               },
               { path: "README.md", content: "The original published source" },
               { path: "package.json", content: JSON.stringify({ name, dependencies: withApps() }) },
@@ -75,6 +75,8 @@ layer(HostedLive, { excludeTestServices: true })("Registry upgrades", (it) => {
           {
             sql: `CREATE TABLE executor_public_scopes (scope varchar(80) PRIMARY KEY, owner varchar(255) NOT NULL)`,
           },
+          ...beforeAppAccounts(),
+          ...beforeProfileRemoval(),
           {
             sql: `CREATE TABLE executor_public_apps (name varchar(255) PRIMARY KEY, owner varchar(255) NOT NULL, app varchar(255) NOT NULL, publication json NOT NULL, source json NOT NULL)`,
           },
@@ -136,7 +138,7 @@ layer(HostedLive, { excludeTestServices: true })("Registry upgrades", (it) => {
             },
             { sql: `SELECT count(*)::integer AS count FROM executor_public_listings` },
           ]);
-          expect(sdk).toEqual([{ value: "4.0.12" }]);
+          expect(sdk).toEqual([{ value: "4.0.15" }]);
           expect(registry).toEqual([{ value: "2.0.0" }]);
           expect(count).toEqual([{ count: 1 }]);
         }

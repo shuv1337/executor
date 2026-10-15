@@ -37,6 +37,7 @@ import {
   withDeploySetupWake,
   withExecutorAnalytics,
   executorDefaultRedeployed,
+  hostedAppCopies,
 } from "@executor-js/hosted-server";
 import { hostedResourceLifecycle } from "@executor-js/hosted-server/resource-lifecycle";
 import { hostedEventAuthority } from "@executor-js/hosted-server/events";
@@ -100,6 +101,7 @@ export const selfHostExecutorServices = <E, R>(
         yield* Effect.logWarning(
           "EXECUTOR_REGISTRY_URL is set but has no effect: this self-host serves its organization's own registry.",
         );
+      const lifecycle = yield* hostedResourceLifecycle;
       const executor = yield* createExecutor({
         database: storage,
         secret: key,
@@ -109,7 +111,7 @@ export const selfHostExecutorServices = <E, R>(
         runtime,
         workflows,
         registry: { storage: registryStorage },
-        hooks: yield* hostedResourceLifecycle,
+        hooks: lifecycle.hooks,
         oauth: {
           httpClient: egress.client,
           clientName: hostedOAuthClientName,
@@ -139,6 +141,7 @@ export const selfHostExecutorServices = <E, R>(
           allowInsecureCallbacks: egress.policy.allowLoopbackHttp,
         },
       }).pipe(Effect.provide(BrowserCrypto.layer));
+      yield* lifecycle.attach(executor);
       yield* Deferred.succeed(ready, executor);
       yield* Effect.forkScoped(deliverEvents(executor));
       // The schema is current and nothing serves or builds yet; the caller holds the data lock.
@@ -148,9 +151,10 @@ export const selfHostExecutorServices = <E, R>(
           executor,
           blobs,
           agentGrants: auth.agentGrants,
-          // Nothing sets profiles up yet: the schedule worker starts after these steps, and its
-          // first pass sets up the profiles a redeploy left pending.
+          // Nothing reconciles webhook sources yet: the schedule worker starts after these steps,
+          // and its first pass reconciles the sources a redeploy left pending.
           executorAppRedeployed: executorDefaultRedeployed(Effect.void),
+          appCopies: hostedAppCopies(executor),
         },
         "private_hosted",
       );
