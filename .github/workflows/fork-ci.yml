@@ -4,7 +4,7 @@ name: fork-ci
 
 on:
   push:
-    branches: [v2]
+    branches: [v2, fork-ci]
   pull_request:
     branches: [v2]
 
