@@ -6,6 +6,9 @@ import { FetchHttpClient } from "effect/http";
 import { nativeClientProxy, nativeSelfHost } from "../support/native-self-host.ts";
 import { scenarios } from "../test-plan.ts";
 
+// Public client registration allows 60 requests per address per minute (packages/mcp-auth).
+const registerLimit = 60;
+
 it.live(scenarios.selfHostNativeAuth.title, () =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -15,7 +18,7 @@ it.live(scenarios.selfHostNativeAuth.title, () =>
       });
       const proxy = yield* nativeClientProxy(host.origin);
       const client = { "cf-connecting-ip": "198.51.100.99" };
-      for (let index = 0; index < 5; index++)
+      for (let index = 0; index < registerLimit; index++)
         expect((yield* host.register(client, proxy.first)).status).toBe(201);
       const limited = yield* host.register(client, proxy.first);
       expect(limited.status).toBe(429);
@@ -35,11 +38,14 @@ it.live(scenarios.selfHostNativeAuth.title, () =>
       // Missing, malformed, and multi-value single-IP assertions all share the socket bucket.
       for (const value of ["invalid", "198.51.100.3, 198.51.100.4", "", "127.0.0.1:80", "::1%lo0"])
         expect((yield* host.register({ "cf-connecting-ip": value })).status).toBe(201);
+      for (let index = 5; index < registerLimit; index++)
+        expect((yield* host.register({})).status).toBe(201);
       expect((yield* host.register({})).status).toBe(429);
       // Other MCP OAuth protocol paths use the same early generic limiter, at
       // their own thresholds. Preserve ordinary OAuth errors before exhaustion.
       for (const endpoint of ["token", "authorize"] as const) {
-        const limit = endpoint === "token" ? 20 : 30;
+        // Hosted servers allow device-flow polling: 20 token requests plus 120 polls per minute.
+        const limit = endpoint === "token" ? 140 : 30;
         for (let index = 0; index < limit; index++) {
           const response = yield* host.oauth(endpoint, { "cf-connecting-ip": "198.51.100.50" });
           expect(response.status).not.toBe(429);
@@ -64,7 +70,7 @@ it.live(scenarios.selfHostNativeAuth.title, () =>
         EXECUTOR_TRUSTED_PROXY_HEADER: "cf-connecting-ip",
         EXECUTOR_TRUSTED_PROXIES: "192.0.2.0/24",
       });
-      for (let index = 0; index < 5; index++)
+      for (let index = 0; index < registerLimit; index++)
         expect(
           (yield* untrusted.register({ "cf-connecting-ip": `198.51.100.${index + 10}` })).status,
         ).toBe(201);
@@ -80,7 +86,7 @@ it.live(scenarios.selfHostNativeAuth.title, () =>
         EXECUTOR_TRUSTED_PROXY_HEADER: "x-forwarded-for",
         EXECUTOR_TRUSTED_PROXIES: "127.0.0.1, ::1/128",
       });
-      for (let index = 0; index < 5; index++)
+      for (let index = 0; index < registerLimit; index++)
         expect(
           (yield* chain.register({
             "x-forwarded-for": `198.51.100.${index + 30}, 198.51.100.20, 127.0.0.1`,
