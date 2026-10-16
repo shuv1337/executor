@@ -304,7 +304,7 @@ export function PublishApp<E>({
           />
         ) : (
           <Button variant="outline" disabledReason="Publishing is not available on this server.">
-            {metadata.publicationAudience === "organization" ? "Publish" : "Share publicly"}
+            Publish
           </Button>
         )
       }
@@ -335,7 +335,7 @@ function PublishAction<E>({
           strokeWidth={1.8}
           aria-hidden
         />
-        {audience === "organization" ? "Publish" : "Share publicly"}
+        Publish
       </Button>
       <Dialog
         open={open}
@@ -349,12 +349,12 @@ function PublishAction<E>({
           <DialogContent className="max-h-[calc(100dvh-2rem)] gap-0 overflow-y-auto p-0 sm:max-w-xl">
             <div className="px-7 pb-6 pt-7 max-[740px]:px-5">
               <DialogTitle className="pr-5 text-2xl leading-tight tracking-tight">
-                {audience === "organization" ? `Publish ${app.name}` : `Share ${app.name} publicly`}
+                Publish {app.name}
               </DialogTitle>
               <DialogDescription className="mt-2 leading-6">
                 {audience === "organization"
                   ? "Share this app with your organization."
-                  : "List your app in Add app so anyone can find it and make their own copy."}
+                  : "Anyone can find it in Add app and make their own copy."}
               </DialogDescription>
               {audience !== "organization" && (
                 <p className="mt-2 text-xs leading-5 text-muted-foreground">
@@ -568,24 +568,30 @@ function PublicationActions<E>({
           <div>
             <p className="font-medium">
               {completed === "unpublished"
-                ? "Stopped sharing"
-                : source.publicationAudience === "organization"
-                  ? "Your app is published"
-                  : "Your app is listed publicly"}
+                ? source.publicationAudience === "organization"
+                  ? "Stopped sharing"
+                  : "Unpublished"
+                : "Your app is published"}
             </p>
             <p className="mt-1 text-xs leading-5 text-muted-foreground">
               {completed === "unpublished"
                 ? "It no longer appears in Add app. Existing copies keep working."
                 : completed === "published"
-                  ? "Find it in Add app to make an independent copy."
-                  : "Your latest saved changes are already shared."}
+                  ? source.publicationAudience === "organization"
+                    ? "Find it in Add app to make an independent copy."
+                    : "People can find it in Add app and make their own copy."
+                  : source.publicationAudience === "organization"
+                    ? "Your latest saved changes are already shared."
+                    : "Your latest saved changes are already published."}
             </p>
           </div>
         </div>
       )}
       {publishedCommit !== undefined && !current && completed === null && (
         <p className="border-t px-7 py-4 text-sm leading-6 text-muted-foreground max-[740px]:px-5">
-          Share your latest saved changes as the new version. Existing copies stay as they are.
+          {source.publicationAudience === "organization"
+            ? "Share your latest saved changes as the new version. Existing copies stay as they are."
+            : "Publish your latest saved changes as the new public version. Existing copies stay as they are."}
         </p>
       )}
       {publishedCommit !== undefined && completed !== "unpublished" && (
@@ -646,14 +652,16 @@ function PublicationActions<E>({
                 }}
               >
                 {publishing.waiting
-                  ? "Sharing…"
+                  ? source.publicationAudience === "organization"
+                    ? "Sharing…"
+                    : "Publishing…"
                   : source.publicationAudience === "organization"
                     ? publishedCommit === undefined
                       ? "Publish app"
                       : "Update publication"
                     : publishedCommit === undefined
-                      ? "List publicly"
-                      : "Update public listing"}
+                      ? "Publish"
+                      : "Publish update"}
               </Button>
             </>
           )}
