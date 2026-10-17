@@ -1,0 +1,44 @@
+# Fork CI for shuv1337/executor. The upstream v2 export ships without .github/,
+# so nothing gated this fork. Kept in its own file so upstream syncs never touch it.
+name: fork-ci
+
+on:
+  push:
+    branches: [v2]
+  pull_request:
+    branches: [v2]
+
+concurrency:
+  group: fork-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: bun install --frozen-lockfile
+      # format, lint (deny warnings), typecheck and the repo's structural checks
+      - run: bun run check
+      # Self-contained e2e suites (no cloud, browser or Docker). ci-selection and
+      # export-public are left out: they assume upstream's main-branch CI layout.
+      - name: tests
+        run: |
+          set -euo pipefail
+          for suite in pglite typecheck-runner prepare-cache emulator-failures dashboard-file-names release-archives; do
+            echo "::group::e2e:$suite"
+            bun run "e2e:$suite"
+            echo "::endgroup::"
+          done
