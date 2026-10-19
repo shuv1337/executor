@@ -316,7 +316,7 @@ export const appManagementHandlers = <I extends HttpApiMiddleware.AnyId, S, Id e
           });
           return {
             app: yield* projectApp(host, deployed.app, identity),
-            deployment: deployed.deployment,
+            version: deployed.version,
           };
         }),
       )
