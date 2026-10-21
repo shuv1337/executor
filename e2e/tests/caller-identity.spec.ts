@@ -127,7 +127,7 @@ const mcpUser = (actor: Session, label: string, slug: string) =>
           Schema.decodeUnknownEffect(schema)(done.structuredContent.execution.value),
         ),
       );
-    return { actor, execute, resume, completed, revoke, keyId: key.id };
+    return { actor, execute, resume, completed, revoke, keyId: key.id, secret: key.key };
   });
 
 layer(HostedLive, { excludeTestServices: true })("Caller identity", (it) => {
@@ -169,7 +169,10 @@ layer(HostedLive, { excludeTestServices: true })("Caller identity", (it) => {
         });
         expect(bobCaller).toMatchObject({ kind: "agent", email: "admin@example.test" });
         expect(aliceCaller.subject).not.toBe(bobCaller.subject);
-        expect(aliceCaller.provenance?.clientId?.startsWith("pat:")).toBe(true);
+        // Provenance names the key by its record ID, never by the secret the client presents.
+        expect(aliceCaller.provenance?.clientId).toBe(`pat:${alice.keyId}`);
+        for (const secret of [alice.secret, bob.secret])
+          expect(JSON.stringify([first, aliceCaller, bobCaller])).not.toContain(secret);
         expect(aliceCaller.issuer).not.toBe(null);
         expect(first![0].approvedBy).toBe(null);
 
@@ -295,6 +298,8 @@ layer(HostedLive, { excludeTestServices: true })("Caller identity", (it) => {
           email: "member@example.test",
           subject: done.caller.subject,
         });
+        // No part of the caller, the approver or the approval link carries the key's secret.
+        expect(JSON.stringify([asked, refused, done])).not.toContain(alice.secret);
       }).pipe(Effect.provide(McpClient.layer)),
     ),
   );
