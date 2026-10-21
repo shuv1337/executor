@@ -533,6 +533,9 @@ deploy.
 
 The CLI also provides `executor apps source`, `executor apps commit`,
 `executor apps deploy --commit <sha>` and `executor apps deploy --files <dir>`.
+`executor apps call --app <slug> --tool <path> --input-file <file.json>` calls one
+deployed tool as the CLI's credential and prints its result; `--input-file -`
+reads stdin. A call that needs approval exits 2 without completing.
 Deploying reads the chosen commit and leaves the Git branch unchanged. Ordinary
 Git pushes save source without deploying it.
 

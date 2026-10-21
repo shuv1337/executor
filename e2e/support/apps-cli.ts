@@ -175,10 +175,11 @@ export const appsCli = Effect.gen(function* () {
         }),
       ),
     );
-  /** Run `executor apps <args>`. */
-  const cli = (args: ReadonlyArray<string>) =>
+  /** Run `executor apps <args>`, with `input` on its stdin when given. */
+  const cli = (args: ReadonlyArray<string>, input?: string) =>
     run(`executor apps ${args.join(" ")}`, launch.command, [...launch.prefix, "apps", ...args], {
       env,
+      input,
     });
   // Git runs the CLI as its credential helper, configured as the docs configure it.
   const helper = `!${[launch.command, ...launch.prefix].map((part) => `'${part}'`).join(" ")} apps credential`;

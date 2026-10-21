@@ -139,6 +139,20 @@ save fails with `SourcePathConflict` and saves nothing.
 between, the commit is rejected. Read the source again and reconcile before
 retrying. A commit alone does not change the running app.
 
+To call a deployed tool from a shell, such as an import with a large input, use
+`executor apps call`. It runs as the CLI's credential, with that user's access:
+
+```sh
+executor apps call --app <slug-or-id> --tool import.records --input-file ./records.json
+```
+
+`--tool` is the tool's path within the app. `--input-file -` reads stdin, and
+`--input '<json>'` takes the input inline; it defaults to `{}`. Input that is not
+one JSON object is refused before anything is sent. The tool's result is printed
+as JSON. A failing tool exits 1 with the app's message. A call that needs approval
+does not complete and exits 2; the CLI never approves calls, so call such a tool through
+MCP, where a person can approve it.
+
 On hosted Executor you can also use Git. `executor apps git --app <app-id>`
 prints the clone URL. Clone with the credential helper configured in the clone, so later
 pushes and fetches use it too:

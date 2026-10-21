@@ -20,7 +20,7 @@ import {
   HttpClientRequest,
   type HttpClientResponse,
 } from "effect/http";
-import { HttpApiClient } from "effect/http-api";
+import { HttpApi, HttpApiClient, HttpApiEndpoint, HttpApiGroup } from "effect/http-api";
 import { isPlatformError } from "effect/PlatformError";
 import {
   AppId,
@@ -38,7 +38,13 @@ import {
   hostedExecutorOrigin,
   publicFileLimits,
   sourceLimits,
+  Json,
+  JsonObject,
+  ToolListingTimedOut,
+  ToolName,
+  ToolResumeFailure,
   type App,
+  type ToolCallResult,
 } from "@executor-js/sdk/core";
 import { GitPushRefused, readCommitBlobs } from "@executor-js/app-source/git-client";
 import {
@@ -55,6 +61,9 @@ import {
 import { UserFacingError } from "@executor-js/utils/user-facing-error";
 import {
   AppClientError,
+  CallApprovalPending,
+  CallInputRejected,
+  CallReturnedError,
   HostRecovery,
   HostRequestFailed,
   LoginFailed,
@@ -78,6 +87,10 @@ import {
 
 /** Skill lookups report the host's failure tag or the missing option; never a response body. */
 class SkillLookupFailed extends Schema.TaggedError<SkillLookupFailed>()("SkillLookupFailed", {
+  reason: Schema.String,
+}) {}
+/** `executor apps call --app <slug>` names no app this credential can see. */
+class AppLookupFailed extends Schema.TaggedError<AppLookupFailed>()("AppLookupFailed", {
   reason: Schema.String,
 }) {}
 const localOrigin = "http://127.0.0.1:4312";
@@ -216,6 +229,22 @@ const localManagementApi = appManagementApi("/api", AppAccess);
 const hostedManagementApi = appManagementApi("/api/organizations/:organization", AppAccess);
 const localFrameworkApi = frameworkApi("/api", AppAccess);
 const hostedFrameworkApi = frameworkApi("/api/organizations/:organization", AppAccess);
+/**
+ * The hosted tool call as an API credential makes it: it runs as the credential's own user under
+ * that user's grants, returns the tool's value, and refuses a call that needs approval
+ * (ToolApprovalRequired), because the credential cannot present one. Local serves the SDK's
+ * `/v1/tools/call` instead.
+ */
+const hostedToolsApi = HttpApi.make("hostedTools").add(
+  HttpApiGroup.make("tools").add(
+    HttpApiEndpoint.post("call", "/api/organizations/:organization/apps/:app/tools/call", {
+      params: { organization: Schema.NonEmptyString, app: AppId },
+      payload: Schema.Struct({ tool: ToolName, input: Json }),
+      success: Json,
+      error: [...ToolResumeFailure.members, ToolListingTimedOut],
+    }),
+  ),
+);
 /** Both hosts serve one app management contract; hosted routes add the organization. */
 type Management = HttpApiClient.ForApi<typeof localManagementApi>["appManagement"];
 type Framework = HttpApiClient.ForApi<typeof localFrameworkApi>["framework"];
@@ -234,11 +263,15 @@ const connect = (host: string, organization: Option.Option<string>) =>
       const framework: Framework = (yield* HttpApiClient.makeWith(localFrameworkApi, {
         httpClient,
       })).framework;
+      const tools = yield* HttpApiClient.group(ExecutorApi, { group: "tools", httpClient });
       return {
         management,
         framework,
         tenant: {},
         skills: yield* HttpApiClient.group(ExecutorApi, { group: "skills", httpClient }),
+        // Local runs the call with the accounts linked to the app and may save it for approval.
+        call: (app: AppId, tool: ToolName, input: Json) =>
+          tools.call({ payload: { app, tool, input } }),
       };
     }
     const prefix = `/api/organizations/${encodeURIComponent(target.organization)}`;
@@ -249,11 +282,17 @@ const connect = (host: string, organization: Option.Option<string>) =>
     const management: Management = client.appManagement;
     const framework: Framework = (yield* HttpApiClient.makeWith(hostedFrameworkApi, { httpClient }))
       .framework;
+    const tools = (yield* HttpApiClient.makeWith(hostedToolsApi, { httpClient })).tools;
+    const tenant = { organization: target.organization };
     return {
       management,
       framework,
-      tenant: { organization: target.organization },
+      tenant,
       skills: yield* HttpApiClient.group(ExecutorApi, { group: "skills", httpClient: sdkClient }),
+      call: (app: AppId, tool: ToolName, input: Json) =>
+        tools
+          .call({ params: { ...tenant, app }, payload: { tool, input } })
+          .pipe(Effect.map((value): ToolCallResult => ({ status: "completed", value }))),
     };
   });
 /** Run one app management operation; contract errors stay typed for command diagnostics. */
@@ -386,6 +425,88 @@ const readSkills = (args: {
         query: { file: Option.getOrUndefined(args.file) },
       }),
     ).pipe(Effect.flatMap(print(AppSkillDocument)));
+  });
+
+/** The call's input: one JSON object from --input, --input-file (`-` for stdin), or `{}`. */
+const callInput = (args: {
+  readonly input: Option.Option<string>;
+  readonly inputFile: Option.Option<string>;
+}) =>
+  Effect.gen(function* () {
+    if (Option.isSome(args.input) && Option.isSome(args.inputFile))
+      return yield* new CallInputRejected({
+        detail: "Pass at most one of --input and --input-file.",
+      });
+    const source = Option.isSome(args.inputFile)
+      ? `--input-file ${args.inputFile.value}`
+      : "--input";
+    const stdio = yield* Stdio.Stdio;
+    const fs = yield* FileSystem.FileSystem;
+    const text = Option.isSome(args.input)
+      ? args.input.value
+      : Option.isNone(args.inputFile)
+        ? "{}"
+        : args.inputFile.value === "-"
+          ? yield* stdio.stdin.pipe(Stream.decodeText(), Stream.mkString)
+          : yield* fs
+              .readFileString(args.inputFile.value)
+              .pipe(
+                Effect.mapError(
+                  () => new CallInputRejected({ detail: `Could not read ${source}.` }),
+                ),
+              );
+    return yield* Schema.decodeUnknownEffect(Schema.fromJsonString(JsonObject))(text).pipe(
+      Effect.mapError(
+        () =>
+          new CallInputRejected({
+            detail: `${source} is not a JSON object. Nothing was sent.`,
+          }),
+      ),
+    );
+  });
+
+/**
+ * Call one app tool as the CLI's credential: its user's grants and the app's linked accounts
+ * decide it, as for any other API caller. The input is checked before any request.
+ */
+const callTool = (args: {
+  readonly host: string;
+  readonly organization: Option.Option<string>;
+  readonly app: string;
+  readonly tool: ToolName;
+  readonly input: Option.Option<string>;
+  readonly inputFile: Option.Option<string>;
+}) =>
+  Effect.gen(function* () {
+    const input = yield* callInput(args);
+    const client = yield* connect(args.host, args.organization);
+    const app = Schema.is(AppId)(args.app)
+      ? args.app
+      : yield* client.management.list({ params: client.tenant }).pipe(
+          Effect.catchIf(isTransportFailure, hostFailure),
+          Effect.flatMap((apps) => {
+            const found = apps.find((candidate) => candidate.slug === args.app);
+            return found === undefined
+              ? Effect.fail(
+                  new AppLookupFailed({
+                    reason: `No visible app has slug ${args.app}. Run executor apps list to see apps.`,
+                  }),
+                )
+              : Effect.succeed(found.id);
+          }),
+        );
+    const result = yield* client
+      .call(app, args.tool, input)
+      .pipe(Effect.catchIf(isTransportFailure, hostFailure));
+    if (result.status === "approval-required")
+      return yield* new CallApprovalPending({
+        requestId: result.requestId,
+        expiresAt: result.expiresAt,
+        ...(result.human === undefined ? {} : { human: true }),
+        ...(result.approvalUrl === undefined ? {} : { approvalUrl: result.approvalUrl }),
+      });
+    if (result.toolError === true) return yield* new CallReturnedError({ value: result.value });
+    yield* Console.log(JSON.stringify(result.value, null, 2));
   });
 
 const notSignedIn = `Not signed in to this host. For hosted Executor, run executor apps login --host ${hostedExecutorOrigin} and pass the same --host to each command, or set EXECUTOR_HOST. For a local server (default ${localOrigin}), set EXECUTOR_API_KEY to its API key.`;
@@ -548,6 +669,29 @@ export const describeAppFailure = (error: unknown): AppCommandFailure | undefine
         };
   if (Schema.is(SkillLookupFailed)(error))
     return { code: "SkillLookupFailed", message: error.reason };
+  if (Schema.is(AppLookupFailed)(error)) return { code: "AppLookupFailed", message: error.reason };
+  if (Schema.is(CallInputRejected)(error))
+    return { code: "CallInputRejected", message: error.detail };
+  if (Schema.is(CallReturnedError)(error))
+    return {
+      code: "ToolReturnedError",
+      message: "The tool returned a result its app marks as an error; details.value holds it.",
+      details: { value: error.value },
+    };
+  if (Schema.is(CallApprovalPending)(error))
+    return {
+      code: "ToolApprovalPending",
+      message:
+        error.approvalUrl === undefined
+          ? `The call is waiting for approval as request ${error.requestId}. The CLI never approves calls; a person approves it where the host presents approvals.`
+          : `The call is waiting for approval as request ${error.requestId}. Approve it at ${error.approvalUrl}; the CLI never approves calls.`,
+      details: {
+        requestId: error.requestId,
+        expiresAt: error.expiresAt,
+        ...(error.human === undefined ? {} : { human: error.human }),
+        ...(error.approvalUrl === undefined ? {} : { approvalUrl: error.approvalUrl }),
+      },
+    };
   if (Schema.is(LoginFailed)(error))
     return {
       code: "LoginFailed",
@@ -585,6 +729,15 @@ export const describeAppFailure = (error: unknown): AppCommandFailure | undefine
   return undefined;
 };
 
+/** Failures that mean a call needs a person's approval, which the CLI never gives. */
+const approvalFailures = new Set(["ToolApprovalPending", "ToolApprovalRequired"]);
+/**
+ * The exit status for a failed apps command: 2 when `executor apps call` stopped because the call
+ * needs approval, so scripts can tell it from a failure; 1 otherwise.
+ */
+export const appFailureExitCode = (failure: AppCommandFailure): number =>
+  approvalFailures.has(failure.code) ? 2 : 1;
+
 /** One failure as people read it: the message, its code and status, then the recovery. */
 export const renderAppFailure = (failure: AppCommandFailure): string =>
   [
@@ -604,7 +757,7 @@ export const encodeAppFailure = (failure: AppCommandFailure): string =>
 export const appsCommand = (platform: string) =>
   Command.make("apps").pipe(
     Command.withDescription(
-      `Create, edit, deploy, share, and install apps. Output is JSON on stdout. A failure exits 1 and prints the error's message, code, HTTP status and recovery on stderr; when stdout is not a terminal it also prints them as {"error": {"code", "status", "message", "recovery", "details", "update"}} on stdout; "update" says when a newer CLI release exists. Set EXECUTOR_HOST to skip --host; --organization defaults to the one you signed in to`,
+      `Create, edit, deploy, share, and install apps. Output is JSON on stdout. A failure exits 1 (2 when executor apps call needs approval) and prints the error's message, code, HTTP status and recovery on stderr; when stdout is not a terminal it also prints them as {"error": {"code", "status", "message", "recovery", "details", "update"}} on stdout; "update" says when a newer CLI release exists. Set EXECUTOR_HOST to skip --host; --organization defaults to the one you signed in to`,
     ),
     Command.withExamples([
       {
@@ -995,6 +1148,45 @@ export const appsCommand = (platform: string) =>
               .pipe(Effect.flatMap(printResponse)),
           ),
         ),
+      ),
+      Command.make("call", {
+        ...connection,
+        app: Flag.String("app").pipe(
+          Flag.withSchema(Schema.NonEmptyString),
+          Flag.withDescription("App slug or ID; executor apps list prints both"),
+        ),
+        tool: Flag.String("tool").pipe(
+          Flag.withSchema(ToolName),
+          Flag.withDescription(
+            "Tool path within the app, such as import.records; MCP search shows it after the app's slug",
+          ),
+        ),
+        input: Flag.String("input").pipe(
+          Flag.withDescription("The tool's input as one JSON object. Defaults to {}"),
+          Flag.optional,
+        ),
+        inputFile: Flag.String("input-file").pipe(
+          Flag.withDescription(
+            "Read the input from this JSON file instead of --input; - reads stdin. Suits large inputs",
+          ),
+          Flag.optional,
+        ),
+      }).pipe(
+        Command.withDescription(
+          "Call one app tool as this CLI's credential, under its user's own access, and print the tool's result as JSON. The input must be a JSON object; anything else is refused before a request. A call that needs approval does not complete: it exits 2, and the CLI never approves it",
+        ),
+        Command.withExamples([
+          {
+            command:
+              "executor apps call --app mesh --tool import.records --input-file ./records.json",
+            description: "Call import.records with a large input read from a file",
+          },
+          {
+            command: `executor apps call --app mesh --tool status --input '{"verbose":true}'`,
+            description: "Call a tool with an inline JSON input",
+          },
+        ]),
+        Command.withHandler(callTool),
       ),
       Command.make("skills", {
         ...connection,

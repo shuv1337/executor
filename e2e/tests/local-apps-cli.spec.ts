@@ -347,6 +347,13 @@ layer(TestLive, { excludeTestServices: true })("Local apps CLI", (it) => {
           true,
         );
         expect(deployed.code, deployed.stderr).toBe(0);
+        // executor apps call runs the deployed tool through the local server's /v1 route.
+        const called = yield* run(
+          ["call", "--host", origin, "--app", app.id, "--tool", "hello", "--input", "{}"],
+          true,
+        );
+        expect(called.code, called.stderr).toBe(0);
+        expect(JSON.parse(called.stdout)).toEqual({ message: "Hello" });
 
         // The host-managed Executor app is generated with the same pinned release.
         const inventory = yield* session.send("GET", "/v1/apps", undefined, {
