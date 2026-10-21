@@ -376,3 +376,31 @@ func TestProductProbeReportsOnlyOK(t *testing.T) {
 		t.Fatal("a closed socket is not an answer")
 	}
 }
+
+func TestSuperviseProcessKillRestartsOnlyThatProcess(t *testing.T) {
+	var starts atomic.Int32
+	stop, kill := superviseProcess("Test process", func() *exec.Cmd {
+		starts.Add(1)
+		// A process that never exits on its own, like a workerd whose thread is stuck.
+		return exec.Command("sh", "-c", "while :; do sleep 0.05; done")
+	}, 10*time.Millisecond, 50*time.Millisecond, func(time.Duration) <-chan time.Time { return time.After(0) })
+	defer stop()
+	waitFor := func(count int32) {
+		deadline := time.Now().Add(5 * time.Second)
+		for starts.Load() < count && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		if starts.Load() < count {
+			t.Fatalf("started %d times, want %d", starts.Load(), count)
+		}
+	}
+	waitFor(1)
+	// Let the first process be registered as running before killing it.
+	time.Sleep(100 * time.Millisecond)
+	kill()
+	waitFor(2)
+	time.Sleep(100 * time.Millisecond)
+	if count := starts.Load(); count != 2 {
+		t.Fatalf("a running process restarted on its own: %d starts", count)
+	}
+}

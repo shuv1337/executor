@@ -24,7 +24,12 @@ it.live("released image restarts after an app isolate spins, and other apps answ
   Effect.scoped(
     Effect.gen(function* () {
       const server = yield* releasedServerWith({
-        environment: { EXECUTOR_WATCHDOG_INTERVAL: "1", EXECUTOR_WATCHDOG_FAILURES: "3" },
+        environment: {
+          EXECUTOR_WATCHDOG_INTERVAL: "1",
+          EXECUTOR_WATCHDOG_FAILURES: "3",
+          // The whole-host watchdog: with app code in the product's process, as before isolation.
+          EXECUTOR_APP_PROCESS: "shared",
+        },
         restart: "unless-stopped",
       });
       const spinning = yield* server.deploy("Spinner", [
