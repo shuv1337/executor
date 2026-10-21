@@ -3,6 +3,7 @@
  * the signed-in person, and workflows as the host's own work. Resumed approvals run as their
  * requester and name their approver; a tool that requires a person refuses the agent's own answer.
  */
+import { Browser } from "../support/browser.ts";
 import { expect, layer } from "@effect/vitest";
 import { Effect, Exit, Schema } from "effect";
 import { randomUUID } from "node:crypto";
@@ -253,8 +254,7 @@ layer(HostedLive, { excludeTestServices: true })("Caller identity", (it) => {
     withHostedCase(
       context,
       Effect.gen(function* () {
-        const api = yield* Api,
-          actors = yield* Actors;
+        const actors = yield* Actors;
         const { app } = yield* deployCallerApp;
         const alice = yield* mcpUser(actors.member, "person", app.slug);
         const asked = yield* Schema.decodeUnknownEffect(Pending)(
@@ -278,14 +278,18 @@ layer(HostedLive, { excludeTestServices: true })("Caller identity", (it) => {
         expect(asked.approvalUrl).not.toContain("pat:");
         expect(asked.approvalUrl).not.toContain(alice.keyId);
         expect(decodeURIComponent(asked.approvalUrl!)).not.toContain("{");
-        const answer = yield* api.request(
-          actors.member,
-          "POST",
-          `/api/mcp/approvals/${asked.requestId}${page.search}`,
-          { response: { action: "accept", content: {} } },
+        // The requester opens the link in a real browser, signed in, and approves it there.
+        const browser = yield* Browser;
+        yield* browser.login(actors.member);
+        yield* browser.use("person opens the approval link", (tab) =>
+          tab.goto(`${page.pathname}${page.search}`),
         );
-        expect(answer.status, JSON.stringify(answer.body)).toBe(200);
-        expect(answer.body).toEqual({ status: "answered" });
+        yield* browser.use("person approves on the page", (tab) =>
+          tab.getByRole("button", { name: "Approve", exact: true }).click(),
+        );
+        yield* browser.use("the page confirms the answer", (tab) =>
+          tab.getByText("You can return to your agent.").waitFor(),
+        );
         const done = yield* alice.completed(
           Identity,
           yield* alice.resume("agent collects", asked.requestId),
