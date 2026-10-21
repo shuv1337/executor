@@ -228,6 +228,50 @@ layer(HostedLive, { excludeTestServices: true })("App Git remotes", (it) => {
     { timeout: 240_000 },
   );
 
+  // Automation uses an API key instead of signing in: the CLI's helper hands Git the same key
+  // every other command uses.
+  it.effect(scenarios.appGitApiKey.title, (context) =>
+    withHostedCase(
+      context,
+      Effect.gen(function* () {
+        const hosts = targetHosts(yield* Target);
+        const api = yield* Api,
+          actors = yield* Actors;
+        const tools = yield* appsCli;
+        const prefix = `/api/organizations/${actors.organization.id}/apps`;
+        const created = yield* api.request(actors.owner, "POST", prefix, {
+          name: `Key clone ${randomUUID().slice(0, 8)}`,
+          files: [{ path: "index.ts", content: 'export default "key";' }],
+        });
+        expect(created.status).toBe(200);
+        const app = yield* body(App, created);
+        yield* Effect.addFinalizer(() =>
+          api.request(actors.owner, "DELETE", `${prefix}/${app.id}`).pipe(Effect.orDie),
+        );
+        const remote = `${hosts.edge}/git/${actors.organization.id}/${app.slug}.git`;
+        // Not signed in, Git gets no credential.
+        expect((yield* tools.git(["ls-remote", remote])).code).not.toBe(0);
+        const issued = yield* api.request(actors.owner, "POST", "/api/auth/api-key/create", {
+          name: `Git key ${randomUUID().slice(0, 8)}`,
+        });
+        expect(issued.status).toBe(200);
+        const key = yield* body(
+          Schema.Struct({ key: Schema.RedactedFromValue(Schema.String), id: Schema.String }),
+          issued,
+        );
+        yield* Effect.addFinalizer(() =>
+          api
+            .request(actors.owner, "POST", "/api/auth/api-key/delete", { keyId: key.id })
+            .pipe(Effect.ignore),
+        );
+        yield* tools.withAccessToken(key.key);
+        const listed = yield* tools.git(["ls-remote", remote]);
+        expect(listed.code, listed.stderr).toBe(0);
+        expect(listed.stdout).toContain("refs/heads/main");
+      }),
+    ),
+  );
+
   // Git sends a stored credential from every helper before asking the next one, and stores what
   // the CLI's helper returns in all of them, as Git's default macOS configuration does with the
   // keychain. A copy kept past the access token's expiry is refused as a failed sign-in.

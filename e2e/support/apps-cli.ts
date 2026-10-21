@@ -12,6 +12,7 @@ import {
   FileSystem,
   Option,
   Path,
+  Redacted,
   Schedule,
   Schema,
   Stream,
@@ -319,11 +320,17 @@ export const appsCli = Effect.gen(function* () {
   const withoutOsStore = Effect.sync(() => {
     env.EXECUTOR_E2E_NO_OS_STORE = "1";
   });
+  /** Give every later command an API key, as automation does instead of signing in. */
+  const withAccessToken = (token: Redacted.Redacted<string>) =>
+    Effect.sync(() => {
+      env.EXECUTOR_ACCESS_TOKEN = Redacted.value(token);
+    });
   /** Whether anything reached the OS credential store stand-in. */
   const osStoreUsed = fs.exists(path.join(root, "store.json"));
   return {
     cli,
     git,
+    withAccessToken,
     login,
     deviceLogin,
     browserOpened,
