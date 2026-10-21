@@ -2,6 +2,7 @@
 // First, so the E2E runner's hooks own the clock before any other module reads it.
 import "./implementation/e2e-process.ts";
 import {
+  appFailureExitCode,
   appsCommand,
   describeAppFailure,
   encodeAppFailure,
@@ -105,7 +106,8 @@ NodeRuntime.runMain(
         if (failure !== undefined && !process.stdout.isTTY)
           yield* Console.log(encodeAppFailure(failure));
         yield* Effect.sync(() => {
-          process.exitCode = 1;
+          // A call that needs approval exits 2, so scripts can tell it from a failure.
+          process.exitCode = failure === undefined ? 1 : appFailureExitCode(failure);
         });
       });
     }),

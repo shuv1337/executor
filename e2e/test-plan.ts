@@ -302,6 +302,21 @@ export const scenarios = plan({
       local: na("Local Git remotes use the local server's own key."),
     },
   },
+  appsCliCall: {
+    fixtures: "actors",
+    file: "apps-cli-call.spec.ts",
+    title:
+      "executor apps call runs an app tool with an API key, takes a 2 MB input from a file or stdin, refuses input that is not a JSON object before any request, and reports a failing tool, a call that needs approval and a caller without access",
+    targets: {
+      "self-host": scheduled,
+      cloud: na(
+        "Cloud serves the same hosted server's tool-call route; self-host runs this scenario against it.",
+      ),
+      local: na(
+        "Local calls tools through the SDK's /v1 route; localAppsCliRelease calls one with the local key.",
+      ),
+    },
+  },
   appGitKeptCredentials: {
     fixtures: "actors",
     file: "app-git-remotes.spec.ts",
@@ -7861,7 +7876,7 @@ export const scenarios = plan({
   localAppsCliRelease: {
     file: "local-apps-cli.spec.ts",
     title:
-      "apps CLI prints the host's apps release, requires --files, and deploys the documented two-file app; the local Executor app pins the same release",
+      "apps CLI prints the host's apps release, requires --files, deploys the documented two-file app and calls its tool; the local Executor app pins the same release",
     targets: {
       local: scheduled,
       "self-host": na("The CLI's hosted path needs a browser OAuth login; local uses an API key."),

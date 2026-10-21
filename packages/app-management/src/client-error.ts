@@ -72,3 +72,33 @@ export class LoginFailed extends Schema.TaggedError<LoginFailed>()("LoginFailed"
     "storage",
   ]),
 }) {}
+
+/**
+ * `executor apps call` refused its input before any request: both --input and --input-file were
+ * given, the file could not be read, or the text is not one JSON object. Never holds the input.
+ */
+export class CallInputRejected extends Schema.TaggedError<CallInputRejected>()(
+  "CallInputRejected",
+  { detail: Schema.String },
+) {}
+
+/**
+ * The host saved the call as a pending approval request instead of running it. The CLI never
+ * answers it: a person approves it where the host presents approvals, and the caller collects the
+ * outcome there. Holds the request's identity and page, never the call's input.
+ */
+export class CallApprovalPending extends Schema.TaggedError<CallApprovalPending>()(
+  "CallApprovalPending",
+  {
+    requestId: Schema.String,
+    expiresAt: Schema.Number,
+    human: Schema.optional(Schema.Boolean),
+    approvalUrl: Schema.optional(Schema.String),
+  },
+) {}
+
+/** The tool ran and returned a result its app marked as an error; `value` is that result. */
+export class CallReturnedError extends Schema.TaggedError<CallReturnedError>()(
+  "CallReturnedError",
+  { value: Schema.Json },
+) {}
