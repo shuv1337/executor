@@ -264,40 +264,83 @@ const packageRuntime = Effect.gen(function* () {
   // code's pages stay resident. Every deploy and every cold app load creates an isolate, so the
   // process grew by about 9 MB for each app installed and never shrank. Keeping the code is bounded
   // by the modules' size.
-  const config = `using Workerd = import "/workerd/workerd.capnp";
-const config :Workerd.Config = (
- memory=(${memory}),
- v8Flags=["--expose-gc","--no-flush-liftoff-code"],
- extensions=[(modules=[(name="cloudflare-runtime:workflows-wrapped-binding",internal=true,esModule=embed "@@RUNTIME@@/workflow-binding.mjs")])],
- services=[
-  (name="product",worker=(
+  // One definition of each service, assembled into three configurations: the shared process
+  // (export, and EXECUTOR_APP_PROCESS=shared), and the product and app processes. App code runs in
+  // its own process so that one app holding workerd's only JavaScript thread stops the app process,
+  // which the host restarts, and never the product. The two talk over private Unix sockets that the
+  // host names on each command line: the product reaches `apps` over HTTP and capnweb, and the apps
+  // Worker calls back to the product's SelfOrigin and WorkflowCallbacks entrypoints.
+  const productWorker = (bindings: { readonly apps: string }) => `(name="product",worker=(
    compatibilityDate="2026-09-01",compatibilityFlags=["nodejs_compat"],
    modules=[(name="product.mjs",esModule=embed "@@RUNTIME@@/product.mjs"),(name="executor:pglite.wasm",wasm=embed "@@RUNTIME@@/pglite.wasm"),(name="executor:initdb.wasm",wasm=embed "@@RUNTIME@@/initdb.wasm"),(name="executor:pglite.data",data=embed "@@RUNTIME@@/pglite.data")],
-   bindings=[(name="PRODUCT",durableObjectNamespace="ExecutorProduct"),(name="NATIVE",service="native"),(name="LEGACY_DATABASE",service="legacy-data"),(name="BLOBS",service="builds"),(name="DASHBOARD",service="dashboard"),(name="PUBLIC_FETCH",service="public"),(name="PRIVATE_FETCH",service="internet"),(name="MOTEL",service="motel"),(name="SELF",service=(name="product",entrypoint="SelfOrigin")),(name="APPS",service="apps"),(name="UNSAFE_EVAL",unsafeEval=void)],
+   bindings=[(name="PRODUCT",durableObjectNamespace="ExecutorProduct"),(name="NATIVE",service="native"),(name="LEGACY_DATABASE",service="legacy-data"),(name="BLOBS",service="builds"),(name="DASHBOARD",service="dashboard"),(name="PUBLIC_FETCH",service="public"),(name="PRIVATE_FETCH",service="internet"),(name="MOTEL",service="motel"),(name="SELF",service=(name="product",entrypoint="SelfOrigin")),(name="APPS",service=${bindings.apps}),(name="UNSAFE_EVAL",unsafeEval=void)],
    durableObjectNamespaces=[(className="ExecutorProduct",uniqueKey="executor-product",enableSql=true,preventEviction=true)],durableObjectStorage=(localDisk="product-data")
-  )),
-  (name="apps",worker=(
+  ))`;
+  const appsWorker = (bindings: {
+    readonly self: string;
+    readonly host: string;
+  }) => `(name="apps",worker=(
    compatibilityDate="2026-07-30",compatibilityFlags=["nodejs_compat"],modules=[${moduleConfig.join(",")}],
-   bindings=[(name="LOADER",workerLoader=()),(name="DATA",durableObjectNamespace="AppDataSupervisor"),(name="AUTH",text="service-binding"),(name="CREDENTIAL_SECRET",fromEnvironment="EXECUTOR_CREDENTIAL_HANDLE_SECRET"),(name="APPS_PRIVATE_FETCH",json="@@APPS_PRIVATE_FETCH@@"),(name="APP_WORKERS",json="@@APP_WORKERS@@"),(name="APP_WORKER_IDLE_SECONDS",json="@@APP_WORKER_IDLE_SECONDS@@"),(name="PUBLIC_FETCH",service="public"),(name="SELF_ORIGIN",text=@@SELF_ORIGIN@@),(name="NPM_REGISTRY",text=@@NPM_REGISTRY@@),(name="SELF",service=(name="product",entrypoint="SelfOrigin")),(name="HOST",service=(name="product",entrypoint="WorkflowCallbacks")),(name="RUNS",wrapped=(moduleName="cloudflare-runtime:workflows-wrapped-binding",innerBindings=[(name="binding",service=(name="workflows",entrypoint="WorkflowBinding"))]))],
+   bindings=[(name="LOADER",workerLoader=()),(name="DATA",durableObjectNamespace="AppDataSupervisor"),(name="AUTH",text="service-binding"),(name="CREDENTIAL_SECRET",fromEnvironment="EXECUTOR_CREDENTIAL_HANDLE_SECRET"),(name="APPS_PRIVATE_FETCH",json="@@APPS_PRIVATE_FETCH@@"),(name="APP_WORKERS",json="@@APP_WORKERS@@"),(name="APP_WORKER_IDLE_SECONDS",json="@@APP_WORKER_IDLE_SECONDS@@"),(name="PUBLIC_FETCH",service="public"),(name="SELF_ORIGIN",text=@@SELF_ORIGIN@@),(name="NPM_REGISTRY",text=@@NPM_REGISTRY@@),(name="SELF",service=${bindings.self}),(name="HOST",service=${bindings.host}),(name="RUNS",wrapped=(moduleName="cloudflare-runtime:workflows-wrapped-binding",innerBindings=[(name="binding",service=(name="workflows",entrypoint="WorkflowBinding"))]))],
    durableObjectNamespaces=[(className="AppDataSupervisor",uniqueKey="executor-app-data",enableSql=true)],durableObjectStorage=(localDisk="app-data")
-  )),
-  (name="workflows",worker=(
+  ))`;
+  const workflowsWorker = `(name="workflows",worker=(
    compatibilityDate="2026-09-01",compatibilityFlags=["experimental","nodejs_compat"],modules=[${workflowModules.join(",")}],
    bindings=[(name="ENGINE",durableObjectNamespace="Engine"),(name="USER_WORKFLOW",service=(name="apps",entrypoint="AppWorkflows")),(name="BINDING_NAME",json=${JSON.stringify(JSON.stringify("executor-app-workflows"))}),(name="WORKFLOW_NAME",json=${JSON.stringify(JSON.stringify("executor-app-workflows"))})],
    durableObjectNamespaces=[${workflowEngines}],durableObjectStorage=(localDisk="workflow-data")
-  )),
-  (name="native",external=(address="unix:/tmp/executor-native.sock",http=())),
+  ))`;
+  const networks = `(name="public",network=(allow=["public"],tlsOptions=(trustBrowserCas=true,trustedCertificates=[@@EXTRA_CA_CERTIFICATES@@]))),
+  (name="internet",network=(allow=["public","private","local"],tlsOptions=(trustBrowserCas=true,trustedCertificates=[@@EXTRA_CA_CERTIFICATES@@])))`;
+  const productStores = `(name="native",external=(address="unix:/tmp/executor-native.sock",http=())),
   (name="motel",external=(address="unix:/tmp/executor-motel.sock",http=())),
-  (name="public",network=(allow=["public"],tlsOptions=(trustBrowserCas=true,trustedCertificates=[@@EXTRA_CA_CERTIFICATES@@]))),
-  (name="internet",network=(allow=["public","private","local"],tlsOptions=(trustBrowserCas=true,trustedCertificates=[@@EXTRA_CA_CERTIFICATES@@]))),
   (name="dashboard",disk=(path="@@RUNTIME@@/web")),
   (name="product-data",disk=(path="/app/data/product",writable=true,allowDotfiles=true)),
   (name="legacy-data",disk=(path="/app/data/hosted.pglite",allowDotfiles=true)),
-  (name="app-data",disk=(path="/app/data/workerd",writable=true,allowDotfiles=true)),
-  (name="workflow-data",disk=(path="/app/data/workerd/workflows",writable=true,allowDotfiles=true)),
-  (name="builds",disk=(path="/app/data/builds",writable=true))
+  (name="builds",disk=(path="/app/data/builds",writable=true))`;
+  const appStores = `(name="app-data",disk=(path="/app/data/workerd",writable=true,allowDotfiles=true)),
+  (name="workflow-data",disk=(path="/app/data/workerd/workflows",writable=true,allowDotfiles=true))`;
+  const header = `using Workerd = import "/workerd/workerd.capnp";
+const config :Workerd.Config = (
+ memory=(${memory}),
+ v8Flags=["--expose-gc","--no-flush-liftoff-code"],`;
+  const config = `${header}
+ extensions=[(modules=[(name="cloudflare-runtime:workflows-wrapped-binding",internal=true,esModule=embed "@@RUNTIME@@/workflow-binding.mjs")])],
+ services=[
+  ${productWorker({ apps: '"apps"' })},
+  ${appsWorker({ self: '(name="product",entrypoint="SelfOrigin")', host: '(name="product",entrypoint="WorkflowCallbacks")' })},
+  ${workflowsWorker},
+  ${productStores},
+  ${networks},
+  ${appStores}
  ],
  sockets=[(name="http",address="0.0.0.0:4400",http=(),service=@@PRODUCT_SERVICE@@)]
+);
+`;
+  const productConfig = `${header}
+ services=[
+  ${productWorker({ apps: '"apps"' })},
+  (name="apps",external=(address="unix:/tmp/executor-apps.sock",http=())),
+  ${productStores},
+  ${networks}
+ ],
+ sockets=[
+  (name="http",address="0.0.0.0:4400",http=(),service="product"),
+  (name="product-self",address="unix:/tmp/executor-product-self.sock",http=(),service=(name="product",entrypoint="SelfOrigin")),
+  (name="product-callbacks",address="unix:/tmp/executor-product-callbacks.sock",http=(),service=(name="product",entrypoint="WorkflowCallbacks"))
+ ]
+);
+`;
+  const appsConfig = `${header}
+ extensions=[(modules=[(name="cloudflare-runtime:workflows-wrapped-binding",internal=true,esModule=embed "@@RUNTIME@@/workflow-binding.mjs")])],
+ services=[
+  ${appsWorker({ self: '"product-self"', host: '"product-callbacks"' })},
+  ${workflowsWorker},
+  (name="product-self",external=(address="unix:/tmp/executor-product-self.sock",http=())),
+  (name="product-callbacks",external=(address="unix:/tmp/executor-product-callbacks.sock",http=())),
+  ${networks},
+  ${appStores}
+ ],
+ sockets=[(name="apps",address="unix:/tmp/executor-apps.sock",http=(),service="apps")]
 );
 `;
   // workerd runs a process's JavaScript on one thread. The collector indexes every span it stores,
@@ -371,6 +414,8 @@ const config :Workerd.Config = (
     inventory.sort().join("\n") + "\n",
   );
   yield* fs.writeFileString(path.join(output, "workerd.capnp"), config);
+  yield* fs.writeFileString(path.join(output, "product.capnp"), productConfig);
+  yield* fs.writeFileString(path.join(output, "apps.capnp"), appsConfig);
   yield* fs.writeFileString(path.join(output, "motel.capnp"), motelConfig);
   // Count real files once, including native assets, and reject any link back to
   // the build tree. This budget covers both supported Linux architectures.

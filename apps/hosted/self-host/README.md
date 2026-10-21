@@ -278,17 +278,31 @@ startup and health.
 
 ## Unresponsive app code
 
-The product, every app and the workflow engine share one workerd process, and workerd runs a
-process's JavaScript on one thread. An app that loops without awaiting holds that thread, so the
-dashboard, MCP and every other app stop answering, and no timeout inside workerd can fire. The
-open-source workerd does not enforce CPU limits.
+workerd runs a process's JavaScript on one thread, and the open-source workerd does not enforce CPU
+limits. App code therefore runs in its own workerd process: the host starts an app process (the
+apps runner, app data and the workflow engine) beside the product process (the product, its
+database and the dashboard), and the two talk over private Unix sockets in the host's temporary
+directory.
 
-The host bounds that outage. Once the product has answered its first health check, the host probes
-`/health` on the product's private socket every `EXECUTOR_WATCHDOG_INTERVAL` seconds (default 10).
-After `EXECUTOR_WATCHDOG_FAILURES` failed probes in a row (default 9, about 90 seconds), it logs
-`Executor watchdog: the product did not answer …`, kills workerd and exits non-zero. Run the
-container with a restart policy such as `restart: unless-stopped` (the bundled compose file sets
-it), so a fresh process starts. Set `EXECUTOR_WATCHDOG=off` to turn it off.
+An app that loops without awaiting stops only the app process. Once that process has answered, the
+host probes it every `EXECUTOR_APP_WATCHDOG_INTERVAL` seconds (default 3). After
+`EXECUTOR_APP_WATCHDOG_FAILURES` silent probes in a row (default 10, about 30 seconds), it logs
+`Executor watchdog: the app process did not answer …` and restarts that process alone. The
+dashboard, API and MCP keep answering; calls to apps fail until the app process is back, and the
+call that was running when it stopped returns an error. Writes an app committed before the restart
+are kept; a transaction still open in the stopped call is not. Treat an interrupted tool call or
+workflow step as possibly run once already, and use idempotency keys for external effects.
 
-A tool call that loops is cut off by the restart. A workflow step that loops runs again when its
-run resumes, so the restart repeats; terminate that run, or fix and redeploy the app.
+A workflow step that stops the process on every attempt ends its run once it has used its retry
+limit (`retries.limit + 1` attempts, 6 by default), instead of running again after every restart.
+
+The product process has its own watchdog. Once the product has answered its first health check, the
+host probes `/health` every `EXECUTOR_WATCHDOG_INTERVAL` seconds (default 10). After
+`EXECUTOR_WATCHDOG_FAILURES` failed probes in a row (default 9, about 90 seconds), it kills workerd
+and exits non-zero. Run the container with a restart policy such as `restart: unless-stopped` (the
+bundled compose file sets it), so a fresh process starts. `EXECUTOR_WATCHDOG=off` turns both
+watchdogs off.
+
+`EXECUTOR_APP_PROCESS=shared` runs app code in the product's process as earlier releases did; then
+only the product watchdog applies, and a looping app restarts the whole host. Exports always use
+one process.

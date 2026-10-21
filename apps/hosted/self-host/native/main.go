@@ -568,6 +568,22 @@ func serve(mode string) error {
 	if err != nil {
 		return err
 	}
+	// Every substitution is recorded, so the product and app process configurations get the same.
+	var replacements [][2][]byte
+	substitute := func(template, old, value []byte) []byte {
+		replacements = append(replacements, [2][]byte{old, value})
+		return bytes.ReplaceAll(template, old, value)
+	}
+	render := func(name string) ([]byte, error) {
+		template, err := os.ReadFile(filepath.Join(runtime, name))
+		if err != nil {
+			return nil, err
+		}
+		for _, pair := range replacements {
+			template = bytes.ReplaceAll(template, pair[0], pair[1])
+		}
+		return template, nil
+	}
 	// The generated file contains paths, the dashboard origin, the npm registry and a network-policy boolean, never keys.
 	// App requests for the dashboard origin reach the product through a service binding, so the
 	// bundled Executor app never needs private fetch. Other private destinations are an explicit opt-in.
@@ -578,7 +594,7 @@ func serve(mode string) error {
 	if privateFetch != "true" && privateFetch != "false" {
 		return errors.New("EXECUTOR_APPS_ALLOW_PRIVATE_FETCH must be true or false")
 	}
-	config = bytes.ReplaceAll(config, []byte("@@APPS_PRIVATE_FETCH@@"), []byte(privateFetch))
+	config = substitute(config, []byte("@@APPS_PRIVATE_FETCH@@"), []byte(privateFetch))
 	// The most app Workers workerd keeps loaded; the apps Worker applies its default for null.
 	appWorkers := "null"
 	if value := values["EXECUTOR_APP_WORKERS"]; value != "" {
@@ -588,7 +604,7 @@ func serve(mode string) error {
 		}
 		appWorkers = strconv.Itoa(number)
 	}
-	config = bytes.ReplaceAll(config, []byte("@@APP_WORKERS@@"), []byte(appWorkers))
+	config = substitute(config, []byte("@@APP_WORKERS@@"), []byte(appWorkers))
 	// Seconds an idle app Worker stays loaded; zero turns idle unloading off, null keeps the default.
 	appWorkerIdle := "null"
 	if value := values["EXECUTOR_APP_WORKER_IDLE_SECONDS"]; value != "" {
@@ -598,9 +614,9 @@ func serve(mode string) error {
 		}
 		appWorkerIdle = strconv.Itoa(number)
 	}
-	config = bytes.ReplaceAll(config, []byte("@@APP_WORKER_IDLE_SECONDS@@"), []byte(appWorkerIdle))
-	config = bytes.ReplaceAll(config, []byte("@@MEMORY_PRESSURE_MB@@"), []byte(strconv.FormatUint(memoryPressureMiB("/sys/fs/cgroup/memory.max"), 10)))
-	config = bytes.ReplaceAll(config, []byte("@@SELF_ORIGIN@@"), []byte(strconv.Quote(values["BETTER_AUTH_URL"])))
+	config = substitute(config, []byte("@@APP_WORKER_IDLE_SECONDS@@"), []byte(appWorkerIdle))
+	config = substitute(config, []byte("@@MEMORY_PRESSURE_MB@@"), []byte(strconv.FormatUint(memoryPressureMiB("/sys/fs/cgroup/memory.max"), 10)))
+	config = substitute(config, []byte("@@SELF_ORIGIN@@"), []byte(strconv.Quote(values["BETTER_AUTH_URL"])))
 	// App builds install packages from this registry; empty selects the public registry.
 	registry := values["EXECUTOR_NPM_REGISTRY"]
 	if registry != "" {
@@ -609,13 +625,13 @@ func serve(mode string) error {
 			return errors.New("EXECUTOR_NPM_REGISTRY must be an HTTP(S) URL")
 		}
 	}
-	config = bytes.ReplaceAll(config, []byte("@@NPM_REGISTRY@@"), []byte(strconv.Quote(registry)))
-	config = bytes.ReplaceAll(config, []byte("@@RUNTIME@@"), []byte(strings.Trim(strconv.Quote(runtime), "\"")))
+	config = substitute(config, []byte("@@NPM_REGISTRY@@"), []byte(strconv.Quote(registry)))
+	config = substitute(config, []byte("@@RUNTIME@@"), []byte(strings.Trim(strconv.Quote(runtime), "\"")))
 	service := `"product"`
 	if mode == "export" {
 		service = `(name="product",entrypoint="ProductExport")`
 	}
-	config = bytes.ReplaceAll(config, []byte("@@PRODUCT_SERVICE@@"), []byte(service))
+	config = substitute(config, []byte("@@PRODUCT_SERVICE@@"), []byte(service))
 	certificates := []string{}
 	if path := os.Getenv("NODE_EXTRA_CA_CERTS"); path != "" {
 		bundle, err := os.ReadFile(path)
@@ -634,7 +650,7 @@ func serve(mode string) error {
 			bundle = rest
 		}
 	}
-	config = bytes.ReplaceAll(config, []byte("@@EXTRA_CA_CERTIFICATES@@"), []byte(strings.Join(certificates, ",")))
+	config = substitute(config, []byte("@@EXTRA_CA_CERTIFICATES@@"), []byte(strings.Join(certificates, ",")))
 	configPath := filepath.Join(temporary, "workerd.capnp")
 	if err = os.WriteFile(configPath, config, 0600); err != nil {
 		return err
@@ -649,9 +665,40 @@ func serve(mode string) error {
 	// The socket lives in this host's own temporary directory, so containers that share TMPDIR and
 	// mount their product volumes at the same path never share or remove each other's collector.
 	collector := filepath.Join(temporary, "motel.sock")
+	// App code runs in its own workerd process unless EXECUTOR_APP_PROCESS=shared, or while exporting.
+	// One app holding a process's only JavaScript thread then stops that process alone: its
+	// watchdog restarts it, and the product, dashboard and MCP keep answering.
+	appProcess := setting("EXECUTOR_APP_PROCESS", "separate")
+	if appProcess != "separate" && appProcess != "shared" {
+		return errors.New("EXECUTOR_APP_PROCESS must be separate or shared")
+	}
+	separate := appProcess == "separate" && mode != "export"
+	appsSocket := filepath.Join(temporary, "apps.sock")
+	selfSocket := filepath.Join(temporary, "product-self.sock")
+	callbacksSocket := filepath.Join(temporary, "product-callbacks.sock")
+	appsConfigPath := filepath.Join(temporary, "apps.capnp")
+	if separate {
+		for name, target := range map[string]string{"product.capnp": filepath.Join(temporary, "product.capnp"), "apps.capnp": appsConfigPath} {
+			rendered, err := render(name)
+			if err != nil {
+				return err
+			}
+			if err = os.WriteFile(target, rendered, 0600); err != nil {
+				return err
+			}
+		}
+		configPath = filepath.Join(temporary, "product.capnp")
+	}
 	args := []string{"serve", configPath, "-I/", "--experimental", "--external-addr=native=unix:" + socket, "--external-addr=motel=unix:" + collector, "--socket-addr=http=unix:" + filepath.Join(temporary, "product.sock")}
+	appPaths := map[string]bool{"app-data": true, "workflow-data": true}
 	for name, path := range paths {
+		if separate && appPaths[name] {
+			continue
+		}
 		args = append(args, "--directory-path="+name+"="+path)
+	}
+	if separate {
+		args = append(args, "--external-addr=apps=unix:"+appsSocket, "--socket-addr=product-self=unix:"+selfSocket, "--socket-addr=product-callbacks=unix:"+callbacksSocket)
 	}
 	if mode == "export" {
 		args = append(args, "--socket-addr=http=unix:"+filepath.Join(temporary, "export.sock"))
@@ -676,8 +723,28 @@ func serve(mode string) error {
 	// environment, never in the configuration file. Handles sealed under the constant earlier
 	// images used are refused after the upgrade; apps get new ones on their next invocation.
 	// Only the product process gets it; the Motel collector never sees it.
-	command.Env = append(command.Env, "EXECUTOR_CREDENTIAL_HANDLE_SECRET="+credentialHandleSecret(values["EXECUTOR_ENCRYPTION_KEY"]))
+	handleSecret := "EXECUTOR_CREDENTIAL_HANDLE_SECRET=" + credentialHandleSecret(values["EXECUTOR_ENCRYPTION_KEY"])
+	stopApps, restartApps := func() {}, func() {}
+	if separate {
+		// Only the app process seals handles, so only it gets the secret. It starts first; product
+		// calls to apps fail as disconnected until it listens.
+		stopApps, restartApps = superviseProcess("App process", func() *exec.Cmd {
+			// A process that exited leaves its socket file behind; the next one binds the same path.
+			os.Remove(appsSocket)
+			appArgs := []string{"serve", appsConfigPath, "-I/", "--experimental", "--socket-addr=apps=unix:" + appsSocket, "--external-addr=product-self=unix:" + selfSocket, "--external-addr=product-callbacks=unix:" + callbacksSocket}
+			for name := range appPaths {
+				appArgs = append(appArgs, "--directory-path="+name+"="+paths[name])
+			}
+			apps := workerd(appArgs...)
+			apps.Env = append(apps.Env, handleSecret)
+			return apps
+		}, time.Second, 30*time.Second, time.After)
+		defer stopApps()
+	} else {
+		command.Env = append(command.Env, handleSecret)
+	}
 	if err = command.Start(); err != nil {
+		stopApps()
 		return err
 	}
 	stopped := make(chan error, 1)
@@ -752,6 +819,25 @@ func serve(mode string) error {
 			fmt.Fprintf(os.Stderr, "Executor watchdog: the product did not answer %d health checks in a row (every %s); workerd is unresponsive, restarting it\n", failures, interval)
 			command.Process.Kill()
 		})
+	}
+	// The app process has its own watchdog. Any answer from its socket shows its thread is free,
+	// even a refusal. After a run of silent probes it restarts that process alone, then re-arms
+	// once the new process answers.
+	if interval, failures, enabled := appWatchdogSettings(); separate && enabled {
+		probe := anyAnswer(appsSocket, min(interval, 5*time.Second))
+		go func() {
+			for {
+				stalled := false
+				watchdog(probe, interval, failures, time.After, watchdogDone, func() {
+					stalled = true
+					fmt.Fprintf(os.Stderr, "Executor watchdog: the app process did not answer %d health checks in a row (every %s); restarting it, the product keeps running\n", failures, interval)
+					restartApps()
+				})
+				if !stalled {
+					return
+				}
+			}
+		}()
 	}
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
@@ -878,6 +964,46 @@ func watchdogSettings() (time.Duration, int, bool) {
 	return time.Duration(seconds * float64(time.Second)), failures, true
 }
 
+// appWatchdogSettings reads EXECUTOR_APP_WATCHDOG_INTERVAL (seconds, default 3) and
+// EXECUTOR_APP_WATCHDOG_FAILURES (default 10, about 30 seconds). EXECUTOR_WATCHDOG=off turns it off.
+func appWatchdogSettings() (time.Duration, int, bool) {
+	if strings.EqualFold(setting("EXECUTOR_WATCHDOG", "on"), "off") {
+		return 0, 0, false
+	}
+	seconds, err := strconv.ParseFloat(setting("EXECUTOR_APP_WATCHDOG_INTERVAL", "3"), 64)
+	if err != nil || seconds <= 0 {
+		seconds = 3
+	}
+	failures, err := strconv.Atoi(setting("EXECUTOR_APP_WATCHDOG_FAILURES", "10"))
+	if err != nil || failures < 1 {
+		failures = 10
+	}
+	return time.Duration(seconds * float64(time.Second)), failures, true
+}
+
+// anyAnswer reports whether a process answered any HTTP response on its socket within timeout.
+// Its JavaScript thread is free whenever it answers, even when it refuses the request.
+func anyAnswer(socket string, timeout time.Duration) func() bool {
+	client := http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", socket)
+			},
+			DisableKeepAlives: true,
+		},
+	}
+	return func() bool {
+		response, err := client.Get("http://apps/health")
+		if err != nil {
+			return false
+		}
+		io.Copy(io.Discard, response.Body)
+		response.Body.Close()
+		return true
+	}
+}
+
 // productProbe asks the product's own socket for /health, bypassing the public proxy, and
 // reports whether it answered 200 within timeout.
 func productProbe(socket string, timeout time.Duration) func() bool {
@@ -931,13 +1057,22 @@ func watchdog(probe func() bool, interval time.Duration, failures int, after fun
 	}
 }
 
-// supervise keeps an auxiliary process running beside the product: it restarts the process
+// supervise keeps the telemetry collector running beside the product; see superviseProcess.
+func supervise(newCommand func() *exec.Cmd, minDelay, maxDelay time.Duration, after func(time.Duration) <-chan time.Time) func() {
+	stop, _ := superviseProcess("Telemetry collector", newCommand, minDelay, maxDelay, after)
+	return stop
+}
+
+// superviseProcess keeps an auxiliary process running beside the product: it restarts the process
 // after an exit, waiting from minDelay up to maxDelay between attempts, and the product never
 // waits for it. A process that ran longer than maxDelay restarts after minDelay again. after
-// starts each wait. The returned function stops the process and waits for it to exit.
-func supervise(newCommand func() *exec.Cmd, minDelay, maxDelay time.Duration, after func(time.Duration) <-chan time.Time) func() {
+// starts each wait. It returns a function that stops the process and waits for it to exit, and one
+// that kills the running process so it restarts.
+func superviseProcess(name string, newCommand func() *exec.Cmd, minDelay, maxDelay time.Duration, after func(time.Duration) <-chan time.Time) (func(), func()) {
 	done := make(chan struct{})
 	finished := make(chan struct{})
+	var mutex sync.Mutex
+	var current *exec.Cmd
 	go func() {
 		defer close(finished)
 		delay := minDelay
@@ -945,13 +1080,16 @@ func supervise(newCommand func() *exec.Cmd, minDelay, maxDelay time.Duration, af
 			command := newCommand()
 			started := time.Now()
 			if err := command.Start(); err != nil {
-				fmt.Fprintln(os.Stderr, "Telemetry collector could not start:", err)
+				fmt.Fprintln(os.Stderr, name+" could not start:", err)
 			} else {
+				mutex.Lock()
+				current = command
+				mutex.Unlock()
 				exited := make(chan struct{})
 				go func() { command.Wait(); close(exited) }()
 				select {
 				case <-exited:
-					fmt.Fprintln(os.Stderr, "Telemetry collector stopped; restarting")
+					fmt.Fprintln(os.Stderr, name+" stopped; restarting")
 				case <-done:
 					command.Process.Signal(syscall.SIGTERM)
 					select {
@@ -962,6 +1100,9 @@ func supervise(newCommand func() *exec.Cmd, minDelay, maxDelay time.Duration, af
 					}
 					return
 				}
+				mutex.Lock()
+				current = nil
+				mutex.Unlock()
 			}
 			if time.Since(started) > maxDelay {
 				delay = minDelay
@@ -975,10 +1116,18 @@ func supervise(newCommand func() *exec.Cmd, minDelay, maxDelay time.Duration, af
 		}
 	}()
 	var once sync.Once
-	return func() {
+	stop := func() {
 		once.Do(func() { close(done) })
 		<-finished
 	}
+	kill := func() {
+		mutex.Lock()
+		defer mutex.Unlock()
+		if current != nil && current.Process != nil {
+			current.Process.Kill()
+		}
+	}
+	return stop, kill
 }
 
 func main() {
