@@ -306,7 +306,7 @@ export const scenarios = plan({
     fixtures: "actors",
     file: "apps-cli-call.spec.ts",
     title:
-      "executor apps call runs an app tool with an API key, takes a 2 MB input from a file or stdin, refuses input that is not a JSON object before any request, and reports a failing tool, a call that needs approval and a caller without access",
+      "executor apps call runs an app tool with an API key, takes a 2 MB input from a file or stdin, refuses an input over 32 MiB with its size and input that is not a JSON object before any request, and reports a failing tool, a call that needs approval and a caller without access",
     targets: {
       "self-host": scheduled,
       cloud: na(
@@ -1909,7 +1909,8 @@ export const scenarios = plan({
   resourceAccess: {
     fixtures: "actors",
     file: "resource-access.spec.ts",
-    title: "Groups enforce private app access and live membership changes",
+    title:
+      "Groups enforce private app access and live membership changes, and a group audience always keeps the app's creator and the organization's owner",
     targets: {
       "self-host": scheduled,
       cloud: scheduled,

@@ -229,6 +229,9 @@ const asRequester = <A, E, R>(requester: Caller | undefined, work: Effect.Effect
  * The verified identity an invocation of this build receives. Builds that do not declare
  * callerIdentity get neither field, so their bundles never see JSON they would reject.
  */
+/** The largest tool input, as UTF-8 JSON, that a call accepts. */
+export const toolInputLimitBytes = 32 * 1048576;
+
 export const callerContext = (
   state: {
     readonly app: { readonly owner: string };
@@ -1424,10 +1427,11 @@ export const makeTools = (
           Effect.mapError(() => new RequestInvalid()),
         );
         // Round-trip before any async lookup: later caller mutations cannot change the dispatched or saved arguments.
-        const args = yield* Schema.encodeEffect(Schema.fromJsonString(Json))(
+        const encoded = yield* Schema.encodeEffect(Schema.fromJsonString(Json))(
           parsed.input === undefined ? {} : parsed.input,
-        ).pipe(
-          Effect.flatMap(Schema.decodeUnknownEffect(Schema.fromJsonString(Json))),
+        ).pipe(Effect.mapError(() => new RequestInvalid()));
+        const inputBytes = new TextEncoder().encode(encoded).byteLength;
+        const args = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Json))(encoded).pipe(
           Effect.mapError(() => new RequestInvalid()),
         );
         const { ahead, state } = yield* Effect.gen(function* () {
@@ -1447,6 +1451,15 @@ export const makeTools = (
           Effect.provideService(GrantReadAhead, grants),
         );
         const identity = { app: state.app.id, version: state.version.id, tool: parsed.tool };
+        // Larger inputs fail inside the app runtime's transport as an unreadable result, after the
+        // call may have started; refuse them here, before any app code runs, with the reason.
+        if (inputBytes > toolInputLimitBytes)
+          return yield* new InputInvalid({
+            ...identity,
+            problems: [
+              `The input is ${(inputBytes / 1048576).toFixed(1)} MiB; a tool call's input is limited to ${toolInputLimitBytes / 1048576} MiB. Split it into smaller calls.`,
+            ],
+          });
         yield* Effect.annotateCurrentSpan({
           "executor.app.id": state.app.id,
           "executor.deployment.id": state.version.id,

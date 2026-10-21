@@ -625,10 +625,16 @@ connection. The connection's `runsAs` names the account the agent's calls use, s
 that account in `ctx.user.accounts`, and `ctx.caller.provenance` names the connection for logs.
 A connection can only narrow its owner's own access: it never grants another person's account.
 
-An organization admin creates connections without a browser through the Executor app's
-`mcpConnections.create`, `list`, `update` and `revoke` tools, or the same routes under
-`/api/organizations/:organization/mcp-connections`, with an API key or a full-access API grant.
-Members manage their own from the dashboard. Every change an API credential makes is logged.
+An organization admin creates connections without a browser through the routes under
+`/api/organizations/:organization/mcp-connections` (`list`, `create`, `update`, `revoke`), with
+their own API key or a full-access API grant, or in the dashboard. Members manage their own from
+the dashboard. Every change an API credential makes is logged.
+
+These routes are deliberately not tools. Every MCP caller is an agent (`ctx.caller.kind` is
+`"agent"`, even when a person drives the client), and the API refuses MCP tokens here, so an agent
+cannot create, widen or revoke connections. A tool limited to human owners and admins would never
+be callable over MCP, so connection management stays with people in the dashboard and with admin
+API keys.
 
 An agent then connects to the connection's `url` (`/mcp?connection=<id>`) with an OAuth grant, or
 with its owner's API key: at that URL the key runs with only the connection's apps, tools and
