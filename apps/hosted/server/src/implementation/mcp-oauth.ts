@@ -31,6 +31,23 @@ import {
 import { ConnectedAgent, ConnectedAgentNotFound } from "@executor-js/mcp-auth/agents";
 import { OrganizationId, OrganizationRole, organizationOwner } from "../contracts/organization.ts";
 const Member = Schema.Struct({ role: OrganizationRole });
+/** The user's email for `ctx.approvedBy` on the browser approval page; null when unreadable. */
+const userEmail = (context: GenericEndpointContext["context"], userId: string) =>
+  authCall(() =>
+    context.adapter.findOne({
+      model: "user",
+      where: [{ field: "id", value: userId }],
+      select: ["email"],
+    }),
+  ).pipe(
+    Effect.map((row) =>
+      Schema.decodeUnknownOption(Schema.Struct({ email: Schema.String }))(row).pipe(
+        Option.match({ onNone: () => null, onSome: ({ email }) => email }),
+      ),
+    ),
+    Effect.orElseSucceed(() => null),
+  );
+
 const membership = (
   context: GenericEndpointContext["context"],
   userId: string,
@@ -160,6 +177,7 @@ const projectPatAccess = (
     const member = yield* membership(ctx.context, identity.userId, organization);
     return McpAccess.make({
       userId: identity.userId,
+      email: yield* userEmail(ctx.context, identity.userId),
       clientId: `pat:${identity.key.id}`,
       grant: {
         id: patGrantId({ token: identity.key.id, organization, mode }),
@@ -197,6 +215,7 @@ export const mcpOAuthPlugins = (options: HostedOAuthOptions) => {
       const member = yield* membership(ctx.context, grant.userId, organization);
       return McpAccess.make({
         userId: grant.userId,
+        email: yield* userEmail(ctx.context, grant.userId),
         clientId: grant.clientId,
         grant: grant.grant,
         access: { organization, owner: organizationOwner(organization), role: member.role },
