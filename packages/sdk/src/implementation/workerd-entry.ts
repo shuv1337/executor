@@ -11,7 +11,7 @@ import type {
   WebSocket as NativeWebSocket,
 } from "@cloudflare/workers-types";
 import { RpcTarget, newWorkersRpcResponse, type RpcStub } from "capnweb";
-import { Cause, Effect, Redacted, Schema } from "effect";
+import { Cause, Effect, Option, Redacted, Schema } from "effect";
 import {
   DeclaredRequirements,
   HostRequirementsError,
@@ -85,11 +85,16 @@ interface NativeStepPort {
   do(
     name: string,
     options: WorkflowStepOptions,
-    work: () => Promise<Schema.Json>,
+    work: (context?: unknown) => Promise<Schema.Json>,
   ): Promise<unknown>;
   sleep(name: string, duration: WorkflowDuration): Promise<void>;
   sleepUntil(name: string, timestamp: number): Promise<void>;
 }
+/** What the engine passes a step's callback: the attempt about to run and the step's settings. */
+const EngineStepContext = Schema.Struct({
+  attempt: Schema.Number,
+  config: Schema.Struct({ retries: Schema.Struct({ limit: Schema.Number }) }),
+});
 const NativeStep = Schema.declare(
   (value): value is NativeStepPort =>
     ((typeof value === "object" && value !== null) || typeof value === "function") &&
@@ -451,8 +456,22 @@ export class AppWorkflows extends WorkflowEntrypoint<Environment, { run: string 
             driver: {
               do: (name, options, work) =>
                 native(() =>
-                  nativeStep.do(name, options, () =>
-                    Effect.runPromise(
+                  nativeStep.do(name, options, (context) => {
+                    // The engine counts an attempt before running it, and after its process is
+                    // killed it marks that attempt failed and runs the step again without checking
+                    // the step's retry limit. A step that keeps killing the process would then
+                    // loop forever, so an attempt past the limit fails the run instead.
+                    const attempt = Schema.decodeUnknownOption(EngineStepContext)(context);
+                    if (
+                      Option.isSome(attempt) &&
+                      attempt.value.attempt > attempt.value.config.retries.limit + 1
+                    )
+                      return Promise.reject(
+                        new NonRetryableError(
+                          `Step "${name}" did not finish in ${attempt.value.config.retries.limit + 1} attempts; its process stopped or restarted during each one.`,
+                        ),
+                      );
+                    return Effect.runPromise(
                       work().pipe(
                         Effect.catch((error) =>
                           Effect.die(
@@ -462,8 +481,8 @@ export class AppWorkflows extends WorkflowEntrypoint<Environment, { run: string 
                           ),
                         ),
                       ),
-                    ),
-                  ),
+                    );
+                  }),
                 ).pipe(
                   Effect.flatMap(Schema.decodeUnknownEffect(WorkflowValue)),
                   Effect.mapError(decodeWorkflowFailure),

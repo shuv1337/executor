@@ -41,7 +41,7 @@ export const bindingWorkerdApps = (options: {
     );
   const rpc = <A, E>(
     work: (api: RpcStub<WorkerdAppApi>, signal: AbortSignal) => Effect.Effect<A, E>,
-  ) =>
+  ): Effect.Effect<A, E | RuntimeProtocolFailed> =>
     Effect.scoped(
       Effect.gen(function* () {
         const lifetime = yield* Effect.acquireRelease(
@@ -49,6 +49,8 @@ export const bindingWorkerdApps = (options: {
           (controller) => Effect.sync(() => controller.abort()),
         );
         const socket = yield* connect("/rpc");
+        // The session breaks when the app process stops, such as when its watchdog restarts it.
+        let broken = false;
         const peer = yield* Effect.acquireRelease(
           Effect.sync(() => {
             // SAFETY: workerd sockets implement Cap'n Web's EventTarget, send and close
@@ -58,7 +60,10 @@ export const bindingWorkerdApps = (options: {
               undefined,
               { onSendError: () => new Error("App host callback failed") },
             );
-            peer.onRpcBroken(() => lifetime.abort());
+            peer.onRpcBroken(() => {
+              broken = true;
+              lifetime.abort();
+            });
             return peer;
           }),
           (peer) =>
@@ -71,7 +76,14 @@ export const bindingWorkerdApps = (options: {
               }
             }).pipe(Effect.catchCause(() => Effect.void)),
         );
-        return yield* work(peer, lifetime.signal);
+        // A call cut off by a broken session fails as `disconnected`, whatever the stub reported.
+        return yield* work(peer, lifetime.signal).pipe(
+          Effect.catchCause((cause): Effect.Effect<never, E | RuntimeProtocolFailed> =>
+            broken && !Cause.hasInterrupts(cause)
+              ? Effect.fail(new RuntimeProtocolFailed({ reason: "disconnected" }))
+              : Effect.failCause(cause),
+          ),
+        );
       }),
     );
   const changes = (app: string) =>

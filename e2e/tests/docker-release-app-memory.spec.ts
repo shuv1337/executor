@@ -41,10 +41,11 @@ it.live(
     Effect.scoped(
       Effect.gen(function* () {
         const server = yield* releasedServer;
-        // The product's workerd process; the telemetry collector runs its own.
+        // The workerd process that compiles and loads apps: the app process, or the one shared
+        // process when app code runs with the product. The collector runs its own.
         const executable = server
           .exec(
-            'for process in /proc/[0-9]*; do read name < "$process/comm"; [ "$name" = workerd ] || continue; case "$(cat "$process/cmdline")" in *workerd.capnp*) cat "$process/smaps";; esac; done',
+            'for process in /proc/[0-9]*; do read name < "$process/comm"; [ "$name" = workerd ] || continue; case "$(cat "$process/cmdline")" in *apps.capnp*|*workerd.capnp*) cat "$process/smaps";; esac; done',
           )
           .pipe(Effect.map(executableKilobytes));
         const deploy = (count: number, from: number) =>
@@ -55,7 +56,7 @@ it.live(
         // The first deploys compile the parts of the server's code they are the first to use.
         yield* deploy(3, 0);
         const before = yield* executable;
-        expect(before, "the product's workerd process is found").toBeGreaterThan(0);
+        expect(before, "the app's workerd process is found").toBeGreaterThan(0);
         const apps = 10;
         yield* deploy(apps, 3);
         const grown = (yield* executable) - before;
