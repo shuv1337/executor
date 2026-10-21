@@ -12,6 +12,7 @@ import { connectionToolListAtom } from "../../contracts/apps.ts";
 import {
   mcpAgentsAtom,
   mcpConnectionsAtom,
+  mintMcpConnectionKeyAtom,
   revokeMcpAgentAtom,
   revokeMcpConnectionAtom,
   saveMcpConnectionAtom,
@@ -78,6 +79,7 @@ export function ConnectPage() {
       connections={mcpConnectionsAtom(organization)}
       save={saveMcpConnectionAtom(organization)}
       revoke={revokeMcpConnectionAtom(organization)}
+      mintKey={mintMcpConnectionKeyAtom(organization)}
       Failure={HostedFailure}
       docs={docs}
       agents={

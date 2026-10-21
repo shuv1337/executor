@@ -11,7 +11,10 @@ import {
 import type { ConnectedAgent } from "@executor-js/mcp-auth/agents";
 import type { ConnectionId } from "@executor-js/mcp-auth/connections";
 import { GrantId } from "@executor-js/mcp-auth/grants";
-import type { ConnectionSave } from "@executor-js/ui/contracts/scoped-connections";
+import type {
+  ConnectionKeyRequest,
+  ConnectionSave,
+} from "@executor-js/ui/contracts/scoped-connections";
 import { acknowledge, acknowledgedQuery, upsert } from "@executor-js/ui/contracts/mutations";
 import { HostedClient } from "./api.ts";
 import { resourceInventoryAtom } from "./resource-access.ts";
@@ -39,6 +42,17 @@ export const saveMcpConnectionAtom = Atom.family((organization: OrganizationRefe
       get.refresh(resourceInventoryAtom(organization));
       return saved;
     }),
+  ),
+);
+/** Mint a key bound to one connection; the secret is returned only by this call. */
+export const mintMcpConnectionKeyAtom = Atom.family((organization: OrganizationReference) =>
+  HostedClient.runtime.fn(({ connection, expiresInSeconds }: ConnectionKeyRequest) =>
+    Effect.flatMap(HostedClient, (client) =>
+      client.mcpConnections.mintKey({
+        params: { organization, connection },
+        payload: { expiresInSeconds },
+      }),
+    ),
   ),
 );
 /** Remove the row only after the server revoked the connection and its grants. */

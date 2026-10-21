@@ -7286,7 +7286,7 @@ export const scenarios = plan({
     fixtures: "actors",
     file: "connection-keys.spec.ts",
     title:
-      "a connection key minted by its connection's owner expires, works only at that connection's MCP URL, is refused by the API and elsewhere, dies with the connection and is audited",
+      "a connection key minted by its connection's owner, through the API or the dashboard, expires, works only at that connection's MCP URL, is refused by the API and elsewhere, dies with the connection and is audited",
     targets: {
       "self-host": scheduled,
       cloud: scheduled,
