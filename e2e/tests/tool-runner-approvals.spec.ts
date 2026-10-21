@@ -435,7 +435,7 @@ layer(HostedLive, { excludeTestServices: true })("Hosted tool runner approvals",
         });
         expect(notice.slice(0, 2)).toEqual([
           [
-            "Another person started this run from the Tools tab, so only they can review or answer it.",
+            "Another person started this run, from the Tools tab or an app's page, so only they can review or answer it.",
             "Leave this request to them. To make this call yourself, run the tool again.",
           ],
           0,

@@ -17,7 +17,13 @@ import { AsyncResult, Atom } from "effect/reactivity";
 import { externalTrace, pendingSpan } from "@executor-js/telemetry";
 import { FetchHttpClient, HttpClientError } from "effect/http";
 import { HttpApiClient } from "effect/http-api";
-import { AppUiApi, UiContext, UiVersionChanged, UiFailed } from "../contracts/ui.ts";
+import {
+  AppUiApi,
+  UiContext,
+  UiVersionChanged,
+  UiFailed,
+  type UiApprovalStatus,
+} from "../contracts/ui.ts";
 import { AppQueryFailed, type OperationReference } from "../contracts/live.ts";
 import { JsonValue } from "../contracts/schema.ts";
 import { decoderOf, type Schema } from "./schema.ts";
@@ -125,7 +131,11 @@ export const createAppClient = () => {
   ) =>
     Effect.gen(function* () {
       const api = yield* client;
-      const value = yield* api.ui[kind]({ payload: yield* payload(name, input) });
+      const base = yield* payload(name, input);
+      // This client follows saved approvals, so the host may save a gated mutation for review.
+      const value = yield* api.ui[kind]({
+        payload: kind === "mutate" ? { ...base, acceptsApproval: true } : base,
+      });
       return yield* EffectSchema.decodeUnknownEffect(decoderOf(output))(value);
     }).pipe(
       Effect.tapErrorTag("UiDeploymentChanged", () => versionChanged),
@@ -325,12 +335,28 @@ export const createAppClient = () => {
       input: NoInfer<Input>,
       output: Schema<NoInfer<Output>, boolean>,
     ) => runtime.runPromise(request("query", reference.name, input, output)),
-    /** Execute a write once in this client's queue. Success acknowledges the write; queries reconcile afterward. */
+    /**
+     * Execute a write once in this client's queue. Success acknowledges the write; queries reconcile
+     * afterward. A mutation whose approval policy asks for a decision rejects with a `UiFailed` of
+     * reason `approval_required`; on hosts that save it for review the error's `approval` names the
+     * request and the dashboard page where the signed-in person approves it. The page cannot.
+     */
     mutate: <Input, Output>(
       reference: OperationReference<Input, Output, "mutation">,
       input: NoInfer<Input>,
       output: Schema<NoInfer<Output>, boolean>,
     ) => optimistic.mutation(reference, output)(input),
+    /**
+     * Whether a mutation saved for review still waits for the signed-in person's answer. Anything
+     * else, approved, declined, expired or unknown, is `settled`; queries show its outcome.
+     */
+    approvalStatus: (requestId: string): Promise<UiApprovalStatus> =>
+      runtime.runPromise(
+        Effect.gen(function* () {
+          const api = yield* client;
+          return yield* api.ui.approvalStatus({ payload: { requestId } });
+        }).pipe(Effect.withSpan("ui.app.approval_status")),
+      ),
     /** Create a callable mutation with optional withOptimisticUpdate projections over mounted queries. */
     mutation: optimistic.mutation,
     /** Share a live query across mounts and reconcile optimistic changes against fresh server reads. */

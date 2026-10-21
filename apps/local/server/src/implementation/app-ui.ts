@@ -119,6 +119,8 @@ export const appUi = (
           Effect.flatMap((input) => safeOperation(executor.appData.mutate(input))),
         ),
       )
+      // Local pages save no requests for review, so none of them is ever waiting.
+      .handle("approvalStatus", () => authorize.pipe(Effect.as({ status: "settled" as const })))
       .handle("subscribe", ({ payload }) =>
         Effect.gen(function* () {
           const input = yield* operation(payload);

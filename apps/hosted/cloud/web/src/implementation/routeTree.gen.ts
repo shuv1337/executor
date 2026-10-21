@@ -48,6 +48,7 @@ import { Route as OrgOrganizationSlugAppsAppIdSetupRouteImport } from './routes/
 import { Route as OrgOrganizationSlugAppsAddIndexRouteImport } from './routes/org.$organizationSlug.apps.add.index'
 import { Route as OrgOrganizationSlugAppsAddCustomRouteImport } from './routes/org.$organizationSlug.apps.add.custom'
 import { Route as OrgOrganizationSlugWebhooksAppIdSubscriptionIdRouteImport } from './routes/org.$organizationSlug.webhooks.$appId.$subscriptionId'
+import { Route as OrgOrganizationSlugAppsAppIdApproveRequestIdRouteImport } from './routes/org.$organizationSlug.apps.$appId_.approve.$requestId'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
@@ -265,6 +266,12 @@ const OrgOrganizationSlugWebhooksAppIdSubscriptionIdRoute =
     path: '/webhooks/$appId/$subscriptionId',
     getParentRoute: () => OrgOrganizationSlugRoute,
   } as any)
+const OrgOrganizationSlugAppsAppIdApproveRequestIdRoute =
+  OrgOrganizationSlugAppsAppIdApproveRequestIdRouteImport.update({
+    id: '/apps/$appId_/approve/$requestId',
+    path: '/apps/$appId/approve/$requestId',
+    getParentRoute: () => OrgOrganizationSlugRoute,
+  } as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
@@ -306,6 +313,7 @@ export interface FileRoutesByFullPath {
   '/org/$organizationSlug/apps/add/custom': typeof OrgOrganizationSlugAppsAddCustomRoute
   '/org/$organizationSlug/webhooks/$appId/$subscriptionId': typeof OrgOrganizationSlugWebhooksAppIdSubscriptionIdRoute
   '/org/$organizationSlug/apps/add/': typeof OrgOrganizationSlugAppsAddIndexRoute
+  '/org/$organizationSlug/apps/$appId/approve/$requestId': typeof OrgOrganizationSlugAppsAppIdApproveRequestIdRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
@@ -344,6 +352,7 @@ export interface FileRoutesByTo {
   '/org/$organizationSlug/apps/add/custom': typeof OrgOrganizationSlugAppsAddCustomRoute
   '/org/$organizationSlug/webhooks/$appId/$subscriptionId': typeof OrgOrganizationSlugWebhooksAppIdSubscriptionIdRoute
   '/org/$organizationSlug/apps/add': typeof OrgOrganizationSlugAppsAddIndexRoute
+  '/org/$organizationSlug/apps/$appId/approve/$requestId': typeof OrgOrganizationSlugAppsAppIdApproveRequestIdRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -386,6 +395,7 @@ export interface FileRoutesById {
   '/org/$organizationSlug/apps/add/custom': typeof OrgOrganizationSlugAppsAddCustomRoute
   '/org/$organizationSlug/webhooks/$appId/$subscriptionId': typeof OrgOrganizationSlugWebhooksAppIdSubscriptionIdRoute
   '/org/$organizationSlug/apps/add/': typeof OrgOrganizationSlugAppsAddIndexRoute
+  '/org/$organizationSlug/apps/$appId_/approve/$requestId': typeof OrgOrganizationSlugAppsAppIdApproveRequestIdRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -429,6 +439,7 @@ export interface FileRouteTypes {
     | '/org/$organizationSlug/apps/add/custom'
     | '/org/$organizationSlug/webhooks/$appId/$subscriptionId'
     | '/org/$organizationSlug/apps/add/'
+    | '/org/$organizationSlug/apps/$appId/approve/$requestId'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
@@ -467,6 +478,7 @@ export interface FileRouteTypes {
     | '/org/$organizationSlug/apps/add/custom'
     | '/org/$organizationSlug/webhooks/$appId/$subscriptionId'
     | '/org/$organizationSlug/apps/add'
+    | '/org/$organizationSlug/apps/$appId/approve/$requestId'
   id:
     | '__root__'
     | '/'
@@ -508,6 +520,7 @@ export interface FileRouteTypes {
     | '/org/$organizationSlug/apps/add/custom'
     | '/org/$organizationSlug/webhooks/$appId/$subscriptionId'
     | '/org/$organizationSlug/apps/add/'
+    | '/org/$organizationSlug/apps/$appId_/approve/$requestId'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -803,6 +816,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof OrgOrganizationSlugWebhooksAppIdSubscriptionIdRouteImport
       parentRoute: typeof OrgOrganizationSlugRoute
     }
+    '/org/$organizationSlug/apps/$appId_/approve/$requestId': {
+      id: '/org/$organizationSlug/apps/$appId_/approve/$requestId'
+      path: '/apps/$appId/approve/$requestId'
+      fullPath: '/org/$organizationSlug/apps/$appId/approve/$requestId'
+      preLoaderRoute: typeof OrgOrganizationSlugAppsAppIdApproveRequestIdRouteImport
+      parentRoute: typeof OrgOrganizationSlugRoute
+    }
   }
 }
 
@@ -841,6 +861,7 @@ interface OrgOrganizationSlugRouteChildren {
   OrgOrganizationSlugAppsAddCustomRoute: typeof OrgOrganizationSlugAppsAddCustomRoute
   OrgOrganizationSlugWebhooksAppIdSubscriptionIdRoute: typeof OrgOrganizationSlugWebhooksAppIdSubscriptionIdRoute
   OrgOrganizationSlugAppsAddIndexRoute: typeof OrgOrganizationSlugAppsAddIndexRoute
+  OrgOrganizationSlugAppsAppIdApproveRequestIdRoute: typeof OrgOrganizationSlugAppsAppIdApproveRequestIdRoute
 }
 
 const OrgOrganizationSlugRouteChildren: OrgOrganizationSlugRouteChildren = {
@@ -866,6 +887,8 @@ const OrgOrganizationSlugRouteChildren: OrgOrganizationSlugRouteChildren = {
   OrgOrganizationSlugWebhooksAppIdSubscriptionIdRoute:
     OrgOrganizationSlugWebhooksAppIdSubscriptionIdRoute,
   OrgOrganizationSlugAppsAddIndexRoute: OrgOrganizationSlugAppsAddIndexRoute,
+  OrgOrganizationSlugAppsAppIdApproveRequestIdRoute:
+    OrgOrganizationSlugAppsAppIdApproveRequestIdRoute,
 }
 
 const OrgOrganizationSlugRouteWithChildren =
