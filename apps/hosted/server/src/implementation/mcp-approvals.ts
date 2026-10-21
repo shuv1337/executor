@@ -18,6 +18,7 @@ import type { McpAccess } from "../contracts/mcp.ts";
 import { mcpSessionKey } from "./mcp-http.ts";
 import { HostedExecutor } from "../contracts/executor.ts";
 import { hostedMcpBackend } from "./mcp.ts";
+import { personApprover, personCaller } from "./caller.ts";
 
 import { HostedApprovalQuery } from "../contracts/mcp-browser.ts";
 const browserAccess = Effect.gen(function* () {
@@ -43,8 +44,9 @@ const browserAccess = Effect.gen(function* () {
   const address = yield* Schema.decodeUnknownEffect(BrowserApprovalAddress)({
     sessionId: query.sessionId,
     requestId: url.pathname.split("/").at(-1),
+    ...(query.mode === undefined ? {} : { mode: query.mode }),
   });
-  return { access, address };
+  return { access, address, issuer: auth.issuer };
 }).pipe(
   Effect.catchTags({
     AuthenticationUnavailable: () => Effect.succeed(HttpServerResponse.empty({ status: 503 })),
@@ -59,13 +61,14 @@ export const browserMcpRequest = <E, R>(
   handle: (
     access: McpAccess,
     address: BrowserApprovalAddress,
+    issuer: string,
   ) => Effect.Effect<HttpServerResponse.HttpServerResponse, E, R>,
 ) =>
   browserAccess.pipe(
     Effect.flatMap((scope) =>
       HttpServerResponse.isHttpServerResponse(scope)
         ? Effect.succeed(scope)
-        : handle(scope.access, scope.address),
+        : handle(scope.access, scope.address, scope.issuer),
     ),
     Effect.map((response) =>
       response.pipe(
@@ -80,10 +83,17 @@ export const hostedMcpApproval = (
   approvals: BrowserApprovals,
   access: McpAccess,
   address: BrowserApprovalAddress,
+  issuer?: string,
 ) =>
   Effect.gen(function* () {
     const request = yield* HttpServerRequest.HttpServerRequest;
-    if (!permitsBrowserApproval(access.grant)) return HttpServerResponse.empty({ status: 403 });
+    // A model-mode grant's page answers only its own programs' requests that require a person;
+    // the model-mode address cannot reach a browser-mode session.
+    const permitted =
+      address.mode === "model"
+        ? access.grant.target.kind === "mcp" && access.grant.target.mode === "model"
+        : permitsBrowserApproval(access.grant);
+    if (!permitted) return HttpServerResponse.empty({ status: 403 });
     const caller = mcpSessionKey(access);
     const view = yield* approvals.get(caller, address);
     if (view.status === "pending") {
@@ -125,7 +135,14 @@ export const hostedMcpApproval = (
       return HttpServerResponse.jsonUnsafe({ ...view, appName: app.name });
     }
     const answer = yield* HttpServerRequest.schemaBodyJson(BrowserApprovalAnswer);
-    return HttpServerResponse.jsonUnsafe(yield* approvals.answer(caller, address, answer.response));
+    // The signed-in person on this page approved it, whichever client asked.
+    const approver = personApprover(
+      personCaller(access, access.access.organization, issuer ?? "", "ui"),
+      "browser",
+    );
+    return HttpServerResponse.jsonUnsafe(
+      yield* approvals.answer(caller, address, answer.response, approver),
+    );
   }).pipe(
     Effect.catchTags({
       SchemaError: () => Effect.succeed(HttpServerResponse.empty({ status: 400 })),

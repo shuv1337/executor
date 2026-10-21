@@ -49,10 +49,13 @@ export const executeNative = (
               orElse: () => Effect.fail(new NativeElicitationFailed({ reason: "expired" })),
             }),
           );
-          return yield* executions.resume(caller, backend, {
-            requestId: request.requestId,
-            response,
-          });
+          // The client showed its user this form, so the answer is a person's.
+          return yield* executions.resume(
+            caller,
+            backend,
+            { requestId: request.requestId, response },
+            { method: "native" },
+          );
         }).pipe(Effect.ensuring(executions.discard(caller, request.requestId)));
       }
       return result;

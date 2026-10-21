@@ -59,10 +59,10 @@ export const selfHostMcp = Effect.gen(function* () {
       ),
     ),
   );
-  const approvals = browserMcpRequest((access, address) =>
+  const approvals = browserMcpRequest((access, address, issuer) =>
     Effect.gen(function* () {
       const host = yield* RcMap.get(sessions, mcpSessionKey(access));
-      return yield* hostedMcpApproval(host.approvals, access, address);
+      return yield* hostedMcpApproval(host.approvals, access, address, issuer);
     }).pipe(
       Effect.catchTag("ExceededCapacityError", () =>
         Effect.succeed(HttpServerResponse.empty({ status: 503 })),

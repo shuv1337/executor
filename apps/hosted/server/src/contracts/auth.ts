@@ -13,6 +13,8 @@ export const Principal = Schema.Struct({
   userId: Schema.String.pipe(Schema.brand("HostedUserId")),
   sessionId: Schema.String.pipe(Schema.brand("HostedSessionId")),
   name: Schema.String,
+  /** The signed-in user's email, for `ctx.caller`. */
+  email: Schema.optionalKey(Schema.NullOr(Schema.String)),
 });
 export type Principal = typeof Principal.Type;
 
@@ -72,6 +74,8 @@ export type AuthenticationUnavailable = typeof AuthenticationUnavailable.Type;
 /** Verified API identity. API keys and OAuth both retain live organization membership. */
 export interface ApiAccess {
   readonly userId: string;
+  /** The user's email, for `ctx.caller`; absent where the authenticator does not load it. */
+  readonly email?: string | null;
   readonly access: OrganizationAccess;
   readonly organizationSlug: string;
   readonly policy: AuthorizationPolicy;

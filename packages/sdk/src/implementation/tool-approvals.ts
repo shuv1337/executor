@@ -1,5 +1,5 @@
 /** Pending tool calls are encrypted; consumption clears their payload before external work. */
-import { approvalElicitation, type ApprovalResponse } from "apps/contracts";
+import { approvalElicitation, ApprovedBy, Caller, type ApprovalResponse } from "apps/contracts";
 import { Clock, type Crypto, Effect, Redacted, Schema } from "effect";
 import {
   defaultToolApprovalLimits,
@@ -28,7 +28,19 @@ export const ApprovalPayload = Schema.Struct({
   invocation: ToolInvocation,
   originalInput: Json,
   issuer: Schema.optional(ToolApprovalIssuer),
+  /** The requester, so the approved call runs as them. Absent on requests saved before it. */
+  caller: Schema.optional(Caller),
+  /** Only a person may approve it. */
+  human: Schema.optional(Schema.Literal(true)),
 });
+
+/** Answers that count as a person's for a tool that requires one. An MCP client's own confirmation does not. */
+const personal = (approver: ApprovedBy | undefined) =>
+  approver !== undefined &&
+  approver.kind === "human" &&
+  (approver.method === "native" ||
+    approver.method === "browser" ||
+    approver.method === "dashboard");
 const Record = Schema.Struct({
   id: ApprovalRequestId,
   owner: OwnerId,
@@ -106,6 +118,7 @@ export function makeToolApprovals(
       invocation: ToolInvocation,
       originalInput: Json,
       issuer: ToolApprovalIssuer | undefined,
+      requester: { readonly caller?: Caller; readonly human?: true } = {},
     ) =>
       Effect.gen(function* () {
         yield* prune(invocation.owner);
@@ -118,6 +131,8 @@ export function makeToolApprovals(
           invocation,
           originalInput,
           ...(issuer === undefined ? {} : { issuer }),
+          ...(requester.caller === undefined ? {} : { caller: requester.caller }),
+          ...(requester.human === undefined ? {} : { human: requester.human }),
         }).pipe(
           Effect.flatMap(Schema.decodeUnknownEffect(JsonObject)),
           Effect.mapError(() => new StorageError()),
@@ -140,6 +155,7 @@ export function makeToolApprovals(
           invocation,
           elicitation: approvalElicitation(invocation.tool, invocation.input),
           expiresAt: expiresAt.getTime(),
+          ...(requester.human === undefined ? {} : { human: requester.human }),
         };
       }),
     resume: (
@@ -149,9 +165,11 @@ export function makeToolApprovals(
         owner?: OwnerId | undefined;
       },
       issuer: ToolApprovalIssuer | undefined,
+      approver: ApprovedBy | undefined,
       execute: (
         invocation: ToolInvocation,
         originalInput: Json,
+        requester: Caller | undefined,
       ) => Effect.Effect<ToolResumeResult, StorageError | CredentialsError>,
     ) =>
       Effect.gen(function* () {
@@ -162,8 +180,19 @@ export function makeToolApprovals(
         // flow consumes nothing. A pending payload never changes, so the check holds at the claim.
         // A consumed request has no payload left and reports already-consumed below.
         const found = yield* read(input.requestId, input.owner);
-        if (found.status === "pending" && (yield* decrypt(found)).issuer !== issuer)
-          return yield* new ToolApprovalNotFound({ requestId: input.requestId });
+        if (found.status === "pending") {
+          const pending = yield* decrypt(found);
+          if (pending.issuer !== issuer)
+            return yield* new ToolApprovalNotFound({ requestId: input.requestId });
+          // A tool that requires a person refuses an agent's acceptance and keeps the request
+          // pending, so the person can still approve it. Declining or cancelling needs no person.
+          if (pending.human === true && input.response.action === "accept" && !personal(approver))
+            return {
+              status: "failed" as const,
+              requestId: input.requestId,
+              reason: "human-approval-required" as const,
+            };
+        }
         const claim = yield* next;
         const consumed = yield* transaction(db, () =>
           Effect.gen(function* () {
@@ -214,7 +243,7 @@ export function makeToolApprovals(
           return { status: "cancelled" as const, requestId: input.requestId };
         const payload = yield* decrypt(consumed.original);
         // The consume commits before dispatch. A crash, interruption or lost response never makes it retryable.
-        return yield* execute(payload.invocation, payload.originalInput);
+        return yield* execute(payload.invocation, payload.originalInput, payload.caller);
       }),
   };
 }

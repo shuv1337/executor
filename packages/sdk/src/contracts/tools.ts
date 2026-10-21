@@ -12,6 +12,8 @@ import {
   ProviderError,
   SkillLoadFailed,
   UpstreamError,
+  type ApprovalMethod,
+  type ApprovedBy,
 } from "apps/contracts";
 import { ApiError } from "@executor-js/utils/api-error";
 import { type ErrorPresentation, UserFacingError } from "@executor-js/utils/user-facing-error";
@@ -80,6 +82,16 @@ export type ToolApprovalIssuer = typeof ToolApprovalIssuer.Type;
 export interface ToolInvocationOptions {
   readonly elicitation?: ElicitationHandler;
   readonly issuer?: ToolApprovalIssuer;
+  /**
+   * Who answered the approval a resume carries out, and how. Without it the resumer counts as the
+   * approver by `model` delivery, which never satisfies a tool that requires a person.
+   */
+  readonly approver?: ApprovedBy;
+  /**
+   * How the resumer's answer reached Executor, when no `approver` is given. `native`, `browser`
+   * and `dashboard` answers come from a person; `model` and `client` answers may come from an agent.
+   */
+  readonly approvalMethod?: ApprovalMethod;
 }
 /** How an in-process caller with its own wait bound reads a tool listing. Not an HTTP input. */
 export interface ToolListOptions extends CatalogReadOptions {
@@ -1646,6 +1658,10 @@ export const ToolPending = Schema.Struct({
   invocation: ToolInvocation,
   elicitation: ApprovalElicitation,
   expiresAt: Schema.Number,
+  /** Only a person may approve it: an agent's own answer is refused without consuming it. */
+  human: Schema.optionalKey(Schema.Literal(true)),
+  /** Where a person approves a request that requires one, when the transport offers a page. */
+  approvalUrl: Schema.optionalKey(Schema.String),
 });
 /** Public outcome of an initial call. */
 export const ToolCallResult = Schema.Union([ToolCompleted, ToolPending]);
@@ -1707,6 +1723,15 @@ export const ToolResumeResult = Schema.Union([
     status: Schema.Literal("failed"),
     requestId: ApprovalRequestId,
     reason: Schema.Literals(["expired", "context-changed"]),
+  }),
+  /**
+   * The tool requires a person to approve and this answer came from an agent. The request stays
+   * pending, so a person can still approve it through the browser page, dashboard or client form.
+   */
+  Schema.Struct({
+    status: Schema.Literal("failed"),
+    requestId: ApprovalRequestId,
+    reason: Schema.Literal("human-approval-required"),
   }),
   /** Resuming the approved call failed with the error a live call reports. */
   Schema.Struct({

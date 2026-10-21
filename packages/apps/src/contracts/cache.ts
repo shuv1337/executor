@@ -44,6 +44,12 @@ export interface AppCache {
    * entries; reconnecting or replacing the account's credentials starts an empty scope.
    */
   readonly forAccount: (account: { readonly id: string }) => AppCache;
+  /**
+   * Scope entries to the user this invocation acts for. Use it for anything computed from who is
+   * calling: the shared scope serves every caller of the app. Throws during discovery, which has
+   * no caller.
+   */
+  readonly forCaller: () => AppCache;
 }
 
 /**

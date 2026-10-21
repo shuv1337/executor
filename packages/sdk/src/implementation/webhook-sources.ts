@@ -6,7 +6,8 @@ import { AppProviderFailed } from "../contracts/tools.ts";
 import { Clock, Effect, Exit, Result, Schema, type Crypto } from "effect";
 import { AccountRequired, AccountSelectionInvalid } from "../contracts/apps.ts";
 import { AccountNotFound } from "../contracts/account.ts";
-import { CurrentActor, type ResourceLifecycle } from "../contracts/executor.ts";
+import { systemCaller } from "./caller.ts";
+import { CurrentActor, CurrentCaller, type ResourceLifecycle } from "../contracts/executor.ts";
 import { OAuthReconnectRequired } from "../contracts/oauth.ts";
 import {
   LinkWebhookSource,
@@ -274,6 +275,10 @@ export const makeWebhookSources = (
                 }
             }).pipe(
               Effect.provideService(CurrentActor, current.actor ?? undefined),
+              Effect.provideService(
+                CurrentCaller,
+                systemCaller("webhook", current.actor ?? undefined),
+              ),
               Effect.timeout("90 seconds"),
               Effect.result,
             );
@@ -393,6 +398,7 @@ export const makeWebhookSources = (
       Effect.catchIf(Schema.is(AccountRequired), () => Effect.succeed(true)),
       Effect.catch(() => Effect.succeed(false)),
       Effect.provideService(CurrentActor, row.actor ?? undefined),
+      Effect.provideService(CurrentCaller, systemCaller("webhook", row.actor ?? undefined)),
     );
 
   return {

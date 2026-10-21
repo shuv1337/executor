@@ -41,6 +41,7 @@ import {
   executorHandlers,
   webhookCallback,
   CurrentActor,
+  CurrentCaller,
   hostedExecutorOrigin,
   remoteRegistry,
 } from "@executor-js/sdk/core";
@@ -93,6 +94,7 @@ import { LocalExecutorApi, localManagementDocument } from "../contracts/manageme
 import { nativeRepositories } from "@executor-js/app-source/node";
 import { feedbackDisabled } from "@executor-js/telemetry/product-analytics";
 import { LocalFeedbackApi } from "../contracts/feedback.ts";
+import type { Caller } from "apps/contracts";
 import { localAnalytics, observeLocalExecutor, scheduleAnalytics } from "./product-analytics.ts";
 import {
   linkedOperation,
@@ -108,6 +110,19 @@ const annotatedSkillReads = (skills: Executor["skills"]): Executor["skills"] => 
   ...skills,
   read: (input) => skills.read(input).pipe(Effect.tap(annotateSkillRead)),
 });
+
+/** The one local subject: an agent over MCP, otherwise the person using the dashboard or an app's page. */
+const localCaller = (url: string, app: boolean): Caller => {
+  const mcp = !app && new URL(url, "http://local.invalid").pathname.startsWith("/mcp");
+  return {
+    kind: mcp ? "agent" : "human",
+    subject: localActor,
+    issuer: null,
+    email: null,
+    organizationId: null,
+    channel: app ? "ui" : mcp ? "mcp" : "dashboard",
+  };
+};
 
 export const localApi = (
   config: ServerConfig,
@@ -550,9 +565,10 @@ export const localApi = (
         withHostPipeline(
           Effect.gen(function* () {
             const request = yield* HttpServerRequest.HttpServerRequest;
-            return yield* appFromHost(request.headers.host, config.port) === undefined
-              ? productHandler
-              : appHandler.pipe(requestTiming);
+            const app = appFromHost(request.headers.host, config.port) !== undefined;
+            return yield* (app ? appHandler.pipe(requestTiming) : productHandler).pipe(
+              Effect.provideService(CurrentCaller, localCaller(request.url, app)),
+            );
           }).pipe(
             recordRequestRejections,
             // Every request acts as the one local subject; background work runs as its saved actor.

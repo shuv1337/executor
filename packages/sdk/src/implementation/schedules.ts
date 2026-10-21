@@ -1,7 +1,13 @@
 /** Persisted scheduling transitions. App code and external effects run only after a claim commits. */
 import { Clock, Cron, Effect, Option, Result, Schema, SchemaAST, type Crypto } from "effect";
 import { ScheduleTiming } from "apps/contracts";
-import { CurrentActor, type Executor, type ResourceLifecycle } from "../contracts/executor.ts";
+import { systemCaller } from "./caller.ts";
+import {
+  CurrentActor,
+  CurrentCaller,
+  type Executor,
+  type ResourceLifecycle,
+} from "../contracts/executor.ts";
 import { AccountRequired } from "../contracts/apps.ts";
 import {
   StorageError,
@@ -105,7 +111,10 @@ export const makeSchedules = (
     backgroundAccounts(db, lifecycle, {
       app: setting.app,
       actor: setting.actor ?? undefined,
-    }).pipe(Effect.provideService(CurrentActor, setting.actor ?? undefined));
+    }).pipe(
+      Effect.provideService(CurrentActor, setting.actor ?? undefined),
+      Effect.provideService(CurrentCaller, systemCaller("schedule", setting.actor ?? undefined)),
+    );
   /**
    * What a schedule waits on: a plain requirement its actor links no account for, or a stored
    * grant that must reconnect. Any other problem is left to the run, which reports it.
@@ -123,6 +132,7 @@ export const makeSchedules = (
         Schema.is(StorageError)(error) ? Effect.fail(error) : Effect.succeed(undefined),
       ),
       Effect.provideService(CurrentActor, setting.actor ?? undefined),
+      Effect.provideService(CurrentCaller, systemCaller("schedule", setting.actor ?? undefined)),
     );
   const savedFor = (app: AppId) =>
     query(() => db.findMany("schedules", { where: (b) => b("app", "=", app) })).pipe(
@@ -162,7 +172,10 @@ export const makeSchedules = (
       const accounts = yield* accountsFor(input);
       const declared = yield* tools
         .scheduled({ app: input.app, accounts })
-        .pipe(Effect.provideService(CurrentActor, input.actor ?? undefined));
+        .pipe(
+          Effect.provideService(CurrentActor, input.actor ?? undefined),
+          Effect.provideService(CurrentCaller, systemCaller("schedule", input.actor ?? undefined)),
+        );
       const found = declared.items.find(
         (item) => item.name === input.name && (item.scope === "app") === (input.actor === null),
       );
@@ -363,7 +376,13 @@ export const makeSchedules = (
             (yield* unlessEvaluated(
               tools
                 .scheduled({ app, accounts: accounts.value })
-                .pipe(Effect.provideService(CurrentActor, setting.actor ?? undefined)),
+                .pipe(
+                  Effect.provideService(CurrentActor, setting.actor ?? undefined),
+                  Effect.provideService(
+                    CurrentCaller,
+                    systemCaller("schedule", setting.actor ?? undefined),
+                  ),
+                ),
             ));
           evaluations.set(key, declared);
           if (Option.isNone(declared)) return undefined;
@@ -735,7 +754,13 @@ export const makeSchedules = (
                       owner: pending.owner,
                       response: { action: answer },
                     })
-                    .pipe(Effect.provideService(CurrentActor, settings.actor ?? undefined));
+                    .pipe(
+                      Effect.provideService(CurrentActor, settings.actor ?? undefined),
+                      Effect.provideService(
+                        CurrentCaller,
+                        systemCaller("schedule", settings.actor ?? undefined),
+                      ),
+                    );
                   yield* complete(claim, response);
                 }).pipe(
                   Effect.withErrorReporting,
@@ -987,6 +1012,10 @@ export const makeSchedules = (
                   // Every account the run resolves is checked against the saved actor; an app
                   // schedule has none and runs with the app's accounts.
                   Effect.provideService(CurrentActor, setting.actor ?? undefined),
+                  Effect.provideService(
+                    CurrentCaller,
+                    systemCaller("schedule", setting.actor ?? undefined),
+                  ),
                   Effect.provideService(InvocationRun, claim.id),
                   Effect.withSpan("schedule.run", {
                     attributes: {

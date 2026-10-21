@@ -14,6 +14,8 @@ import {
   exactApprovalElicitation,
   type ElicitationResponse,
   type ElicitationHandler,
+  type ApprovalMethod,
+  type ApprovedBy,
 } from "apps/contracts";
 import { prepareElicitation } from "apps/effect";
 import {
@@ -178,6 +180,8 @@ export const makeExecutions = (
     /** Ended runs whose tools are still being cancelled; they count toward the execution limit. */
     const closing = new Set<Run>();
     const requests = new Map<InteractionId, Pending>();
+    /** The person who answered a request on the browser page, kept until the answer is used. */
+    const browserApprovers = new Map<InteractionId, ApprovedBy>();
     /**
      * Why each recently pending request stopped being pending, kept for its caller only, so a late
      * resume learns whether it was answered, expired or ended rather than only that it is gone.
@@ -408,6 +412,7 @@ export const makeExecutions = (
           request,
           { action: "accept" },
           {
+            approvalMethod: "client",
             elicitation: elicitation(
               run,
               operation,
@@ -546,7 +551,8 @@ export const makeExecutions = (
                     Effect.flatMap((result): Effect.Effect<ToolCallResult, Error> =>
                       result.status === "completed"
                         ? Effect.succeed(result)
-                        : run.approval === "client"
+                        : // A tool that requires a person is asked, even when the client confirmed the call.
+                          run.approval === "client" && result.human !== true
                           ? approveNow(run, backend, operation, result)
                           : offer(run, backend, result),
                     ),
@@ -697,6 +703,7 @@ export const makeExecutions = (
         caller: string,
         id: InteractionId,
         input: ElicitationResponse,
+        approver?: ApprovedBy,
       ): Effect.Effect<BrowserApprovalAcknowledgement, ElicitationResponseInvalid> =>
         Effect.gen(function* () {
           const pending = yield* current(caller, id);
@@ -704,8 +711,16 @@ export const makeExecutions = (
           if (yield* Deferred.isDone(pending.browserAnswer)) return { status: "answered" };
           const response = yield* pending.respond(input);
           if ((yield* current(caller, id)) !== pending) return { status: "unavailable" };
+          if (approver !== undefined) browserApprovers.set(id, approver);
           yield* Deferred.succeed(pending.browserAnswer, response);
           return { status: "answered" };
+        }),
+      /** Who answered a request on the browser page; read once, by the resume that uses the answer. */
+      browserApprover: (id: InteractionId) =>
+        Effect.sync(() => {
+          const approver = browserApprovers.get(id);
+          browserApprovers.delete(id);
+          return approver;
         }),
       /** Wait without claiming the program. Cancellation or a polling deadline leaves the interaction intact. */
       browserAnswer: (caller: string, id: InteractionId, pollMs: number) =>
@@ -816,6 +831,10 @@ export const makeExecutions = (
         caller: string,
         backend: McpBackend<Error>,
         unparsed: typeof ResumeInput.Type,
+        /** How the answer reached Executor, and who gave it when the host knows. */
+        answer: { readonly method: ApprovalMethod; readonly approver?: ApprovedBy } = {
+          method: "model",
+        },
       ): Effect.Effect<McpExecutionResult, ElicitationResponseInvalid> =>
         Effect.gen(function* () {
           const input = yield* Schema.decodeUnknownEffect(ResumeInput)(unparsed, {
@@ -840,6 +859,17 @@ export const makeExecutions = (
             return unavailable(caller, input.requestId);
           }
           if (run.busy) return { status: "busy", requestId: input.requestId };
+          // A tool that requires a person refuses an agent's acceptance. The request stays
+          // pending and is returned again, with the page a person can approve it on.
+          if (
+            pending.kind === "approval" &&
+            pending.request.human === true &&
+            response.action === "accept" &&
+            answer.method !== "native" &&
+            answer.method !== "browser" &&
+            answer.method !== "dashboard"
+          )
+            return pending.request;
           run.busy = true;
           forget(pending, "answered");
           if (pending.kind === "approval") approvalWait(run, pending.call, false);
@@ -848,6 +878,8 @@ export const makeExecutions = (
               launch(run, backend, (active, operation) =>
                 active
                   .resumeInvocation(pending.request, response, {
+                    approvalMethod: answer.method,
+                    ...(answer.approver === undefined ? {} : { approver: answer.approver }),
                     elicitation: elicitation(
                       run,
                       operation,

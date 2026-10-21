@@ -87,6 +87,14 @@ export interface InvocationServices {
   readonly fetch: (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
   /** Host cancellation for this invocation. Pass it to fetch and other interruptible APIs. */
   readonly signal: AbortSignal;
+  /**
+   * Who started this invocation, as the host verified it. On a resumed approval this is still the
+   * original requester. Undefined during discovery and on hosts that do not provide identity.
+   * Cache caller-specific data under `cache.forCaller()`, never under a shared key.
+   */
+  readonly caller: Readonly<import("./protocols/current.ts").Caller> | undefined;
+  /** Who approved the call, when this invocation resumes an approval request. */
+  readonly approvedBy: Readonly<import("./protocols/current.ts").ApprovedBy> | undefined;
 }
 
 /** The app's own accounts, linked for everyone by its managers. Every invocation has them. */

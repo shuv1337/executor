@@ -39,6 +39,7 @@ import type {
   StorageError,
 } from "./shared.ts";
 import type { BlobStorage } from "./blobs.ts";
+import type { Caller } from "apps/contracts";
 import { RepositoryHost, type RepositoryBackend } from "./source.ts";
 import type { RegistryOptions } from "./registry.ts";
 import type { CatalogReadOptions } from "./declarations.ts";
@@ -50,6 +51,15 @@ import type { CatalogReadOptions } from "./declarations.ts";
  * Never supplied by authored code.
  */
 export const CurrentActor = Context.Reference<string | undefined>("executor/CurrentActor", {
+  defaultValue: () => undefined,
+});
+
+/**
+ * The verified caller apps see as `ctx.caller`. Products provide it beside `CurrentActor` where a
+ * caller starts an operation; the SDK provides a system caller around background work. When it is
+ * unset the SDK derives one from `CurrentActor`. Never supplied by authored code.
+ */
+export const CurrentCaller = Context.Reference<Caller | undefined>("executor/CurrentCaller", {
   defaultValue: () => undefined,
 });
 

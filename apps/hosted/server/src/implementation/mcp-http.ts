@@ -4,6 +4,8 @@ import { requiresToolMetadata } from "@executor-js/authorization";
 import { grantAuthorization } from "@executor-js/mcp-auth";
 import { GroupDatabase } from "../contracts/groups.ts";
 import { CurrentUserId } from "../contracts/auth.ts";
+import { CurrentCaller } from "@executor-js/sdk/core";
+import { mcpCaller } from "./caller.ts";
 import {
   restrictMcpBackend,
   deliveryRefusal,
@@ -190,6 +192,7 @@ export const dispatchHostedMcp = <E, R>(
           Effect.provideService(CurrentOrganization, fresh.access),
           Effect.provideService(CurrentAuthorization, grantAuthorization(fresh.grant.policy)),
           Effect.provideService(CurrentUserId, fresh.userId),
+          Effect.provideService(CurrentCaller, mcpCaller(fresh, authentication.issuer)),
           Effect.provideService(CurrentMcpGrant, fresh.grant.id),
         );
         return restrictMcpBackend<RequestError, never>(backend, Effect.succeed(fresh.grant));
@@ -419,6 +422,7 @@ export const dispatchHostedMcp = <E, R>(
         const url = new URL(`/mcp/approve/${address.requestId}`, authentication.origin);
         url.searchParams.set("sessionId", address.sessionId);
         url.searchParams.set("grantId", access.grant.id);
+        if (address.mode !== undefined) url.searchParams.set("mode", address.mode);
         return url.toString();
       }),
       Effect.provideService(RequestCaller, mcpSessionKey(access)),

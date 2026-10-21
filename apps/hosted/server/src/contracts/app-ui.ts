@@ -113,6 +113,8 @@ export const AppUiGrant = Schema.Struct({
   target: AppUiTarget,
   parent: Principal.fields.sessionId,
   user: Principal.fields.userId,
+  /** The signed-in user's email when the grant was issued, for `ctx.caller`. */
+  email: Schema.optionalKey(Schema.NullOr(Schema.String)),
 });
 /** App sessions retain only scoped authority; every use checks current login and membership. */
 export const AppUiSession = Schema.Struct({
@@ -120,6 +122,7 @@ export const AppUiSession = Schema.Struct({
   target: AppUiTarget,
   parent: Principal.fields.sessionId,
   user: Principal.fields.userId,
+  email: Schema.optionalKey(Schema.NullOr(Schema.String)),
 });
 /** Versioned records live in Better Auth's existing expiring verification store. */
 export const AppUiRecord = Schema.Union([AppUiAttempt, AppUiGrant, AppUiSession]);
@@ -175,7 +178,10 @@ export class HostedAppSessions extends Context.Service<
     readonly current: (
       target: AppUiTarget,
       token: typeof AppSignInCode.Type,
-    ) => Effect.Effect<{ readonly userId: string }, UiUnauthorized | UiForbidden | UiFailed>;
+    ) => Effect.Effect<
+      { readonly userId: string; readonly email: string | null },
+      UiUnauthorized | UiForbidden | UiFailed
+    >;
   }
 >()("hosted/AppSessions") {}
 

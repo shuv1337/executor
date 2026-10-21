@@ -46,6 +46,8 @@ import {
   type ResolvedAccountSlots,
   HostError,
   TrustedToolApproval,
+  ApprovedBy,
+  Caller,
   type AppHandler,
   type HostContext,
 } from "../contracts/host.ts";
@@ -232,6 +234,7 @@ function requirements(
         skillSources: true,
         scheduledTools: true,
         sharedDefinitions: true,
+        callerIdentity: true,
       },
       ...(sql ? { sql: true } : {}),
       ...(events === undefined || Object.keys(events).length === 0
@@ -590,6 +593,23 @@ function dispatch(
       const files = yield* Schema.decodeUnknownEffect(Schema.Array(SkillFile))(
         context.files ?? [],
       ).pipe(Effect.mapError(() => new HostDeclarationInvalid()));
+      // The host's verified identity. Frozen, so app code cannot rewrite who called it.
+      const caller =
+        context.caller === undefined
+          ? undefined
+          : Object.freeze(
+              yield* Schema.decodeUnknownEffect(Caller)(context.caller).pipe(
+                Effect.mapError(() => new HostInputInvalid()),
+              ),
+            );
+      const approvedBy =
+        context.approvedBy === undefined
+          ? undefined
+          : Object.freeze(
+              yield* Schema.decodeUnknownEffect(ApprovedBy)(context.approvedBy).pipe(
+                Effect.mapError(() => new HostInputInvalid()),
+              ),
+            );
       // Counts cache commands, so a skill read can tell whether its loader used the app cache.
       let cacheCommands = 0;
       const hostCache = context.cache ?? unavailableCache;
@@ -608,6 +628,7 @@ function dispatch(
           invocationSignal,
           telemetry.context,
           deadline,
+          caller,
         ),
         files,
         ...(yield* bindAccounts(native.accounts, declared, context).pipe(
@@ -617,6 +638,8 @@ function dispatch(
         signal: invocationSignal,
         fetch: yield* appInvocationFetch(fetching.signal),
         elicit: makeElicit(delivery, invocationSignal, telemetry.context),
+        caller,
+        approvedBy,
       };
       // Every bound account may be named; only the caller's count when an emit names none.
       const attributable = userAccountIds(bound);
@@ -726,10 +749,15 @@ function dispatch(
                     Redacted.value(current.accounts),
                     signal,
                     (yield* captureTelemetry).context,
+                    undefined,
+                    caller,
                   ),
                   files,
                   fetch: yield* appInvocationFetch(signal),
                   signal,
+                  // A step runs as the workflow's run: its host-sent caller, never an approver.
+                  caller,
+                  approvedBy: undefined,
                   runId: execution.runId,
                   stepId,
                   idempotencyKey: stepId,
@@ -812,6 +840,8 @@ function dispatch(
             workflows: workflowControls,
             signal: bound.signal,
             fetch: bound.fetch,
+            caller: bound.caller,
+            approvedBy: bound.approvedBy,
             sql: session.writer,
             events: emitter("sourceAccount" in request ? request.sourceAccount : undefined),
           },
@@ -869,9 +899,21 @@ function dispatch(
         }
       } else if (tool.approval !== undefined) {
         const approval = tool.approval;
+        const approvalRequired = (human: boolean) =>
+          safe(() => Schema.decodeUnknownEffect(JsonValue)(input), new HostInputInvalid()).pipe(
+            Effect.flatMap((input) =>
+              Effect.fail(
+                new HostToolApprovalRequired({
+                  input,
+                  elicitation: approvalElicitation(toolName, input),
+                  ...(human ? { human: true as const } : {}),
+                }),
+              ),
+            ),
+          );
         const decision = yield* safe(
           () =>
-            approval({ toolName, toolInput: input, signal: invocationSignal }).pipe(
+            approval({ toolName, toolInput: input, signal: invocationSignal, caller }).pipe(
               Effect.withSpan("app.tool.approval", {
                 attributes: { "executor.tool.name": toolName },
               }),
@@ -882,18 +924,8 @@ function dispatch(
         yield* Match.value(decision).pipe(
           Match.when("approved", () => Effect.void),
           Match.when("denied", () => Effect.fail(new HostToolBlocked())),
-          Match.when("user-approval", () =>
-            safe(() => Schema.decodeUnknownEffect(JsonValue)(input), new HostInputInvalid()).pipe(
-              Effect.flatMap((input) =>
-                Effect.fail(
-                  new HostToolApprovalRequired({
-                    input,
-                    elicitation: approvalElicitation(toolName, input),
-                  }),
-                ),
-              ),
-            ),
-          ),
+          Match.when("user-approval", () => approvalRequired(false)),
+          Match.when("human-approval", () => approvalRequired(true)),
           Match.exhaustive,
         );
       }

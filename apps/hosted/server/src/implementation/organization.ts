@@ -14,7 +14,8 @@ import {
   permitsApp,
   permittedAppIds,
 } from "@executor-js/authorization";
-import { AppId } from "@executor-js/sdk/core";
+import { AppId, CurrentCaller } from "@executor-js/sdk/core";
+import { apiCaller, personCaller } from "./caller.ts";
 import { Context } from "effect";
 import { currentResourceAuthority, visibleAccountsAs, visibleAppsAs } from "./resource-policy.ts";
 import { readOrganizationIconUpload } from "./organization-icons.ts";
@@ -147,6 +148,7 @@ export const withOrganizationRequest = <E, R>(
         Effect.provideService(CurrentOrganization, grant.access),
         Effect.provideService(CurrentOrganizationNamespace, scope),
         Effect.provideService(CurrentUserId, grant.userId),
+        Effect.provideService(CurrentCaller, apiCaller(grant, api.issuer)),
         Effect.provideService(CurrentUsage, { source: "api" }),
       )).pipe(HttpServerResponse.setHeader("cache-control", "no-store"));
     }
@@ -176,6 +178,10 @@ export const withOrganizationRequest = <E, R>(
       Effect.provideService(CurrentOrganization, access),
       Effect.provideService(CurrentOrganizationNamespace, scope),
       Effect.provideService(CurrentUserId, principal.userId),
+      Effect.provideService(
+        CurrentCaller,
+        personCaller(principal, organization, auth.origin, "dashboard"),
+      ),
       Effect.provideService(CurrentUsage, { source: "dashboard" }),
       Effect.provideService(CurrentPrincipal, principal),
       Effect.provideService(CurrentAuthorization, fullAuthority),

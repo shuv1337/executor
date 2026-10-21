@@ -16,6 +16,8 @@ import {
   VersionId,
   VersionNotFound,
   invocationEntries,
+  CurrentCaller,
+  AppDataApprovalRequired,
   type App,
   type VersionMetadata,
 } from "@executor-js/sdk/core";
@@ -61,6 +63,7 @@ import {
   type OrganizationAccess,
 } from "../contracts/organization.ts";
 import { callerAccounts, stillLinked } from "./app-accounts.ts";
+import { personCaller } from "./caller.ts";
 import type { appAddresses } from "./app-addresses.ts";
 
 /** Authorization belongs to one HTTP request, never a shared or timed cache. */
@@ -69,7 +72,10 @@ class CurrentAppUi extends Context.Service<
   {
     readonly target: AppUiTarget;
     readonly app: App;
-    readonly access: OrganizationAccess & { readonly userId: string };
+    readonly access: OrganizationAccess & {
+      readonly userId: string;
+      readonly email: string | null;
+    };
   }
 >()("hosted/CurrentAppUi") {}
 
@@ -189,9 +195,12 @@ export const hostedAppUi = <R = never>(
           Schema.is(OrganizationForbidden)(error) ? new UiForbidden() : unavailable(),
         ),
       );
-      return { ...resolved, access, app };
+      return { ...resolved, access: { ...access, email: identity.email }, app };
     });
   const authorize = Effect.flatMap(target, authorizeTarget);
+  /** The signed-in person using the app's own UI. */
+  const uiCaller = (current: typeof CurrentAppUi.Service) =>
+    personCaller(current.access, current.access.organization, addresses.dashboardOrigin, "ui");
   const assets = (version: VersionMetadata, path: string) =>
     Effect.gen(function* () {
       const runtime = yield* HostedAppRuntime;
@@ -336,7 +345,9 @@ export const hostedAppUi = <R = never>(
             Schema.is(AccountSelectionInvalid)(error) ||
             Schema.is(OAuthReconnectRequired)(error)
               ? "account_required"
-              : "operation_failed",
+              : Schema.is(AppDataApprovalRequired)(error)
+                ? "approval_required"
+                : "operation_failed",
         });
   /**
    * Each call runs with the caller's linked accounts, resolved again from their links; the page
@@ -374,6 +385,7 @@ export const hostedAppUi = <R = never>(
         Effect.provideService(CurrentOrganization, current.access),
         Effect.provideService(CurrentAuthorization, fullAuthority),
         Effect.provideService(CurrentUserId, current.access.userId),
+        Effect.provideService(CurrentCaller, uiCaller(current)),
         Effect.provideService(CurrentUsage, { source: "app_ui" }),
         Effect.mapError(dataFailure),
       );
@@ -412,6 +424,7 @@ export const hostedAppUi = <R = never>(
             .subscribe(input)
             .pipe(
               Effect.provideService(CurrentUserId, current.access.userId),
+              Effect.provideService(CurrentCaller, uiCaller(current)),
               Effect.provideService(CurrentOrganization, current.access),
               Effect.provideService(CurrentUsage, { source: "app_ui" }),
               Effect.mapError(dataFailure),
@@ -419,6 +432,7 @@ export const hostedAppUi = <R = never>(
           return Stream.merge(
             source.pipe(
               Stream.provideService(CurrentUserId, current.access.userId),
+              Stream.provideService(CurrentCaller, uiCaller(current)),
               Stream.provideService(CurrentOrganization, current.access),
               Stream.provideService(GroupDatabase, groups),
               // A re-executed query can notice revocation before the heartbeat.

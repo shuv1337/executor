@@ -117,6 +117,8 @@ import {
   ResolvedAccounts,
   type SkillCatalogResponse,
   type TrustedToolApproval,
+  type ApprovedBy,
+  type Caller,
 } from "./protocols/current.ts";
 export { DeclaredRequirements, HostRequest } from "./protocols/current.ts";
 /**
@@ -133,6 +135,12 @@ export {
   ResolvedAccounts,
   ResolvedAccountSlots,
   TrustedToolApproval,
+  ApprovalMethod,
+  ApprovedBy,
+  Caller,
+  CallerChannel,
+  CallerKind,
+  CallerProvenance,
   InvocationDeadline,
   HostedTool,
   HostedToolSummary,
@@ -221,6 +229,10 @@ export interface HostContext {
   /** Trusted in-process tracing capability; never decoded from a public request. */
   readonly telemetry?: InvocationTelemetry;
   readonly approval?: TrustedToolApproval;
+  /** The verified caller. Hosts send it only to builds that declare callerIdentity. */
+  readonly caller?: Caller;
+  /** Who answered the approval a resumed call runs under; `caller` stays the requester. */
+  readonly approvedBy?: ApprovedBy;
   /** The data facet's SQLite storage, for apps that declare `sql`. Never exposed to app code. */
   readonly storage?: AppSqlStorage;
   /** The invocation's accounts as the host resolved them; see `HostAccount`. */

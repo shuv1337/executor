@@ -16,6 +16,8 @@ import { AuthenticationUnavailable } from "./auth.ts";
 /** MCP authority from OAuth or a PAT and current membership. Tokens never become browser sessions. */
 export const McpAccess = Schema.Struct({
   userId: Schema.NonEmptyString,
+  /** The user's email, for `ctx.caller`; null when the account has none. */
+  email: Schema.optionalKey(Schema.NullOr(Schema.String)),
   clientId: Schema.NonEmptyString,
   access: OrganizationAccess,
   grant: Grant,

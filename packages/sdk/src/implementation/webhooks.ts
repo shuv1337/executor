@@ -1,7 +1,8 @@
 import { ProviderError } from "apps/contracts";
 import { appProviderFailure } from "./provider-error.ts";
 import { AppProviderFailed, mayHaveWritten } from "../contracts/tools.ts";
-import { CurrentActor, type ResourceLifecycle } from "../contracts/executor.ts";
+import { systemCaller } from "./caller.ts";
+import { CurrentActor, CurrentCaller, type ResourceLifecycle } from "../contracts/executor.ts";
 import type { WorkflowHostControls } from "apps/contracts";
 import { CompleteWebhookSetup, WebhookSetupView } from "../contracts/webhook-setup.ts";
 /** Persist intent before upstream work. Explicit reconciliation uses a bounded, compare-and-swap lease. */
@@ -38,7 +39,13 @@ import type { Runtime } from "../contracts/runtime.ts";
 import type { ExecutorDatabase } from "./storage.ts";
 import type { makeOAuth } from "./oauth.ts";
 import { database, query, transaction } from "./database.ts";
-import { snapshot, resolve, resolveRemoval, type InvocationSnapshot } from "./tools.ts";
+import {
+  callerContext,
+  snapshot,
+  resolve,
+  resolveRemoval,
+  type InvocationSnapshot,
+} from "./tools.ts";
 import { storedAccount } from "./accounts.ts";
 import { storedApp, storedVersion } from "./apps.ts";
 import { backgroundAccounts } from "./background-accounts.ts";
@@ -148,7 +155,10 @@ export const makeWebhooks = (
         source: row.sourceAccount,
       });
       return yield* snapshot(db, { app: row.app, version: row.version, accounts });
-    }).pipe(Effect.provideService(CurrentActor, row.actor ?? undefined));
+    }).pipe(
+      Effect.provideService(CurrentActor, row.actor ?? undefined),
+      Effect.provideService(CurrentCaller, systemCaller("webhook", row.actor ?? undefined)),
+    );
   /**
    * The registration's pinned version and the accounts it ran with, as the actor it ran as.
    * Removing it uses only them: the subscription may have moved to another actor since, and the
@@ -163,7 +173,13 @@ export const makeWebhooks = (
         accounts: registration.accounts,
         scope: registration.actor === null ? "app" : "user",
       },
-    }).pipe(Effect.provideService(CurrentActor, registration.actor ?? undefined));
+    }).pipe(
+      Effect.provideService(CurrentActor, registration.actor ?? undefined),
+      Effect.provideService(
+        CurrentCaller,
+        systemCaller("webhook", registration.actor ?? undefined),
+      ),
+    );
   /**
    * Whether the product still lets the registration remove what it registered with every account
    * it ran with (`ResourceLifecycle.removalResolving`): the user accounts by the registration's
@@ -177,7 +193,13 @@ export const makeWebhooks = (
       if (lifecycle === undefined || (user.length === 0 && appUses.length === 0)) return true;
       const allowed = yield* lifecycle
         .removalResolving({ id: state.app.id, owner: state.app.owner }, user, appUses)
-        .pipe(Effect.provideService(CurrentActor, registration.actor ?? undefined));
+        .pipe(
+          Effect.provideService(CurrentActor, registration.actor ?? undefined),
+          Effect.provideService(
+            CurrentCaller,
+            systemCaller("webhook", registration.actor ?? undefined),
+          ),
+        );
       return [...user, ...appUses.map(({ account }) => account)].every((account) =>
         allowed.has(account.id),
       );
@@ -231,6 +253,7 @@ export const makeWebhooks = (
       const state = known ?? (yield* subscriptionState(row));
       const context = yield* resolve(state, resolveAccount).pipe(
         Effect.provideService(CurrentActor, state.actor),
+        Effect.provideService(CurrentCaller, systemCaller("webhook", state.actor)),
       );
       return yield* call(row, command, state, context);
     });
@@ -247,6 +270,8 @@ export const makeWebhooks = (
         build: state.version.build,
         database: ownsDatabase(state.version.requirements),
         ...context,
+        // Deliveries run as the host's webhook, for the person whose account it watches, if any.
+        ...callerContext({ ...state, caller: systemCaller("webhook", state.actor) }),
         ...(workflows === undefined ? {} : { workflowControls: workflows(state) }),
         command,
       })
@@ -354,6 +379,7 @@ export const makeWebhooks = (
                     ? yield* resolveRemoval(state, resolveAccount).pipe(
                         // The registration's actor, not the subscription's.
                         Effect.provideService(CurrentActor, state.actor),
+                        Effect.provideService(CurrentCaller, systemCaller("webhook", state.actor)),
                         Effect.catchTag("AccountUseRefused", () => Effect.succeed(undefined)),
                       )
                     : undefined;
@@ -468,9 +494,11 @@ export const makeWebhooks = (
       }).pipe(
         Effect.flatMap((accounts) => snapshot(db, { app: app.id, version: version.id, accounts })),
         Effect.provideService(CurrentActor, actor),
+        Effect.provideService(CurrentCaller, systemCaller("webhook", actor)),
       );
       const context = yield* resolve(state, resolveAccount).pipe(
         Effect.provideService(CurrentActor, actor),
+        Effect.provideService(CurrentCaller, systemCaller("webhook", actor)),
       );
       const catalog = yield* runtime
         .webhook({
