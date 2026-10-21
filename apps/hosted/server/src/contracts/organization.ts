@@ -26,7 +26,13 @@ import {
   UploadedOrganizationIcon,
   type OrganizationIconContentType,
 } from "./organization-icon.ts";
-import { AuthenticationUnavailable, Forbidden, Unauthorized, RequireUser } from "./auth.ts";
+import {
+  AuthenticationUnavailable,
+  ConnectionKeyRefused,
+  Forbidden,
+  Unauthorized,
+  RequireUser,
+} from "./auth.ts";
 
 /** Better Auth organization identity; never a caller-selected SDK owner. */
 export const OrganizationId = Schema.NonEmptyString.pipe(Schema.brand("OrganizationId"));
@@ -128,7 +134,13 @@ export class RequireOrganization extends HttpApiMiddleware.Service<
   RequireOrganization,
   { provides: CurrentOrganization | CurrentOrganizationNamespace }
 >()("hosted/RequireOrganization", {
-  error: [Unauthorized, Forbidden, AuthenticationUnavailable, OrganizationForbidden],
+  error: [
+    Unauthorized,
+    Forbidden,
+    AuthenticationUnavailable,
+    OrganizationForbidden,
+    ConnectionKeyRefused,
+  ],
 }) {}
 
 /** Product-owned mapping; the core SDK treats the result as an opaque owner. */

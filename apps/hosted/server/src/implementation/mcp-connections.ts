@@ -33,7 +33,10 @@ const owner = Effect.gen(function* () {
  * of those, only an organization admin's or owner's may manage connections. Every bearer change is
  * logged, as connections decide which accounts an agent runs as.
  */
-const manager = (action: "list" | "create" | "update" | "revoke", connection?: string) =>
+const manager = (
+  action: "list" | "create" | "update" | "revoke" | "mint-key",
+  connection?: string,
+) =>
   Effect.gen(function* () {
     const current = yield* owner;
     const person = yield* Effect.serviceOption(CurrentPrincipal);
@@ -41,7 +44,8 @@ const manager = (action: "list" | "create" | "update" | "revoke", connection?: s
     const organization = yield* CurrentOrganization;
     if (organization.role !== "admin" && organization.role !== "owner")
       return yield* new OrganizationForbidden();
-    if (action !== "list")
+    // Minting records its own audit line for every caller, with the key it made.
+    if (action !== "list" && action !== "mint-key")
       yield* Effect.logInfo("MCP connection changed with an API credential").pipe(
         Effect.annotateLogs({
           "executor.audit": "mcp-connection",
@@ -195,6 +199,41 @@ export const hostedMcpConnectionHandlers = HttpApiBuilder.group(
           Effect.flatMap(manager("revoke", params.connection), (current) =>
             auth.connections.revoke(current, params.connection),
           ),
+        )
+        .handle("mintKey", ({ params, payload }) =>
+          Effect.gen(function* () {
+            // Only the connection's owner: the store mints only for the caller's own standing
+            // connection, and reports any other as not found.
+            const current = yield* manager("mint-key", params.connection);
+            const minted = yield* auth.connections.mintKey(current, {
+              id: params.connection,
+              name: payload.name ?? `Connection key: ${params.connection}`,
+              expiresIn: payload.expiresInSeconds,
+            });
+            const person = yield* Effect.serviceOption(CurrentPrincipal);
+            yield* Effect.logInfo("MCP connection key minted").pipe(
+              Effect.annotateLogs({
+                "executor.audit": "mcp-connection-key",
+                "executor.audit.action": "mint",
+                "executor.audit.via": Option.isSome(person) ? "browser" : "api-credential",
+                "executor.user.id": current.userId,
+                "executor.organization.id": current.resource,
+                "executor.mcp.connection": params.connection,
+                "executor.api_key.id": minted.id,
+                "executor.api_key.expires_at": minted.expiresAt,
+              }),
+            );
+            return {
+              id: minted.id,
+              key: minted.key,
+              connection: params.connection,
+              url: mcpResource(auth.resourceOrigins.mcp[0], {
+                mode: "model",
+                connection: params.connection,
+              }),
+              expiresAt: minted.expiresAt,
+            };
+          }),
         )
         .handle("agents", () =>
           Effect.flatMap(owner, (current) => auth.connections.agents(current)),

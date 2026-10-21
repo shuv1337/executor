@@ -32,6 +32,21 @@ export const Unauthorized = UserFacingError.define({
 });
 /** Parsed Unauthorized failure. */
 export type Unauthorized = typeof Unauthorized.Type;
+/** A key bound to one scoped MCP connection was sent to the Executor API, which never accepts it. */
+export const ConnectionKeyRefused = UserFacingError.define({
+  tag: "ConnectionKeyRefused",
+  status: 403,
+  title: "Connection key",
+  description:
+    "This key belongs to one scoped MCP connection and works only at that connection's MCP URL, never with the Executor API.",
+  recovery: {
+    action: "Use an API key or an API grant for the Executor API, then retry.",
+    instructions:
+      "A connection key is bound to one scoped MCP connection's URL (/mcp?connection=<id>). Call the Executor API with a personal API key or an OAuth API grant instead. Do not bypass authorization.",
+  },
+});
+/** Parsed ConnectionKeyRefused failure. */
+export type ConnectionKeyRefused = typeof ConnectionKeyRefused.Type;
 /** Cookie-authenticated writes must come from this deployment's browser origin. */
 export const Forbidden = UserFacingError.define({
   tag: "Forbidden",
@@ -97,7 +112,10 @@ export class ApiAuthentication extends Context.Service<
     readonly authenticate: (
       headers: Headers,
       organization?: OrganizationReference,
-    ) => Effect.Effect<ApiAccess, Unauthorized | OrganizationForbidden | AuthenticationUnavailable>;
+    ) => Effect.Effect<
+      ApiAccess,
+      Unauthorized | OrganizationForbidden | ConnectionKeyRefused | AuthenticationUnavailable
+    >;
   }
 >()("hosted/ApiAuthentication") {}
 

@@ -98,6 +98,7 @@ const message = Match.type<AppUiError>().pipe(
         Match.exhaustive,
       ),
     OrganizationForbidden: () => "You do not have access to this app.",
+    ConnectionKeyRefused: () => "This key works only at its MCP connection's URL.",
     AppNotFound: () => "This app no longer exists.",
     AppNotDeployed: () => "Deploy this app before opening its page.",
     VersionNotFound: () => "This app’s version is no longer available. Reload the app.",

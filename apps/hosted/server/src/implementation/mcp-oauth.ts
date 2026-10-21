@@ -1,5 +1,10 @@
 import { ApiKeyId } from "../contracts/api-keys.ts";
-import { browserPersonalTokenAccess, apiKeyAccess, requirePinnedOrganization } from "./api-keys.ts";
+import {
+  apiKeys,
+  browserPersonalTokenAccess,
+  apiKeyAccess,
+  requirePinnedOrganization,
+} from "./api-keys.ts";
 import {
   ApprovalMode,
   ConnectionId as ConnectionIdSchema,
@@ -187,6 +192,11 @@ const ConnectionPolicyJson = Schema.Union([
   ConnectionPolicy,
   Schema.fromJsonString(ConnectionPolicy),
 ]);
+/** A key's stored metadata, as JSON text or JSON, naming the connection it is bound to. */
+const BoundKeyMetadata = Schema.Union([
+  Schema.Struct({ connection: Schema.String }),
+  Schema.fromJsonString(Schema.Struct({ connection: Schema.String })),
+]);
 /** Stable metadata identifies the PAT/organization/mode partition; it is never a credential. */
 const projectPatAccess = (
   ctx: GenericEndpointContext,
@@ -312,6 +322,83 @@ export const mcpOAuthPlugins = (options: HostedOAuthOptions) => {
           return { id: decoded.value };
         },
       ),
+      // A key bound to one scoped connection, minted for its owner while it stands. Its metadata
+      // pins the organization and the connection; bearer checks refuse it anywhere else.
+      mintMcpConnectionKey: createAuthEndpoint(
+        "/mcp/connection-keys/mint",
+        {
+          method: "POST",
+          body: Schema.toStandardSchemaV1(
+            Schema.Struct({
+              userId: Schema.String,
+              resource: OrganizationId,
+              id: ConnectionIdSchema,
+              name: Schema.String,
+              expiresIn: Schema.Number,
+            }),
+          ),
+          metadata: { SERVER_ONLY: true },
+        },
+        async (ctx) => {
+          const row = await ctx.context.adapter.findOne({
+            model: "mcpConnection",
+            where: [{ field: "id", value: ctx.body.id }],
+          });
+          const stored = Schema.decodeUnknownOption(StoredConnection)(row).pipe(
+            Option.filter(
+              (connection) =>
+                connection.revoked === false &&
+                connection.userId === ctx.body.userId &&
+                connection.resource === ctx.body.resource,
+            ),
+          );
+          if (Option.isNone(stored)) throw new APIError("NOT_FOUND");
+          const created = await apiKeys.endpoints.createApiKey({
+            context: ctx.context,
+            body: {
+              userId: ctx.body.userId,
+              name: ctx.body.name,
+              expiresIn: ctx.body.expiresIn,
+              metadata: { organization: ctx.body.resource, connection: ctx.body.id },
+            },
+          });
+          if (!(created.expiresAt instanceof Date)) throw new APIError("INTERNAL_SERVER_ERROR");
+          return { id: created.id, key: created.key, expiresAt: created.expiresAt.toISOString() };
+        },
+      ),
+      // Revoking a connection deletes the keys bound to it; bearer checks already refuse them.
+      revokeMcpConnectionKeys: createAuthEndpoint(
+        "/mcp/connection-keys/revoke",
+        {
+          method: "POST",
+          body: Schema.toStandardSchemaV1(
+            Schema.Struct({
+              userId: Schema.String,
+              resource: Schema.String,
+              id: ConnectionIdSchema,
+            }),
+          ),
+          metadata: { SERVER_ONLY: true },
+        },
+        async (ctx) => {
+          const keys = await ctx.context.adapter.findMany<{ id: string; metadata: unknown }>({
+            model: "apikey",
+            where: [{ field: "referenceId", value: ctx.body.userId }],
+          });
+          const bound = keys.filter((key) =>
+            Option.match(Schema.decodeUnknownOption(BoundKeyMetadata)(key.metadata), {
+              onNone: () => false,
+              onSome: (metadata) => metadata.connection === ctx.body.id,
+            }),
+          );
+          for (const key of bound)
+            await ctx.context.adapter.delete({
+              model: "apikey",
+              where: [{ field: "id", value: key.id }],
+            });
+          return { deleted: bound.length };
+        },
+      ),
       getMcpBrowserAccess: createAuthEndpoint(
         "/mcp/browser-access",
         {
@@ -375,7 +462,19 @@ export interface McpConnectionApi {
   readonly revokeMcpAgent: (input: {
     body: { userId: string; resource: string; id: string };
   }) => Promise<unknown>;
+  readonly mintMcpConnectionKey: (input: {
+    body: { userId: string; resource: string; id: string; name: string; expiresIn: number };
+  }) => Promise<unknown>;
+  readonly revokeMcpConnectionKeys: (input: {
+    body: { userId: string; resource: string; id: string };
+  }) => Promise<unknown>;
 }
+/** A minted connection key: the only response that contains its secret. */
+const MintedConnectionKey = Schema.Struct({
+  id: Schema.String,
+  key: Schema.String,
+  expiresAt: Schema.String,
+});
 const storeFailure = (cause: unknown) =>
   isAPIError(cause) ? cause.statusCode : ("unavailable" as const);
 /**
@@ -424,10 +523,28 @@ export const mcpConnectionStore = (
         (api) => api.revokeMcpConnection({ body: { ...owner, id } }),
         Schema.Struct({ revoked: Schema.Literal(true) }),
       ).pipe(
+        // Then delete the keys minted for it, which already stopped working with it.
+        Effect.andThen(
+          request(
+            (api) => api.revokeMcpConnectionKeys({ body: { ...owner, id } }),
+            Schema.Struct({ deleted: Schema.Number }),
+          ),
+        ),
         Effect.asVoid,
         Effect.mapError((status) =>
           status === 404
             ? new ConnectionNotFound({ connection: id })
+            : new AuthenticationUnavailable(),
+        ),
+      ),
+    mintKey: (owner, input) =>
+      request(
+        (api) => api.mintMcpConnectionKey({ body: { ...owner, ...input } }),
+        MintedConnectionKey,
+      ).pipe(
+        Effect.mapError((status) =>
+          status === 404
+            ? new ConnectionNotFound({ connection: input.id })
             : new AuthenticationUnavailable(),
         ),
       ),

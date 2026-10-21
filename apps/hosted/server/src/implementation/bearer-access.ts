@@ -37,7 +37,11 @@ import {
   type OrganizationAccess,
 } from "../contracts/organization.ts";
 import { McpAccess, McpForbidden, McpForbiddenReason, McpUnauthorized } from "../contracts/mcp.ts";
-import { AuthenticationUnavailable, Unauthorized } from "../contracts/auth.ts";
+import {
+  AuthenticationUnavailable,
+  ConnectionKeyRefused,
+  Unauthorized,
+} from "../contracts/auth.ts";
 import { OrganizationForbidden } from "../contracts/organization.ts";
 import { isApiKey } from "./api-keys.ts";
 import { patGrantId, type HostedOAuthOrigins } from "./mcp-oauth.ts";
@@ -544,6 +548,8 @@ const patAccess = (sql: SqlClient.SqlClient, token: string, request: BearerReque
       id,
       access: { organization, owner: organizationOwner(organization), role },
       organizationSlug: membership?.slug ?? null,
+      /** The scoped connection this key is bound to, if it was minted for one. */
+      connection: metadata?.connection,
     };
   });
 
@@ -605,6 +611,9 @@ export const mcpBearerAccess = (
       });
     }
     const key = yield* patAccess(sql, token, request);
+    // A connection key works only at its own connection's URL.
+    if (key.connection !== undefined && request.connection !== key.connection)
+      return yield* forbidden("connection_key");
     const mode = request.mode ?? "model";
     // At a connection's URL a PAT runs with that connection's narrower policy, as its OAuth grants
     // do, when the connection is its user's own and stands. Otherwise the PAT keeps its unscoped
@@ -618,6 +627,8 @@ export const mcpBearerAccess = (
             key.userId,
             key.access.organization,
           ).pipe(Effect.mapError(() => unavailable));
+    // A connection key dies with its connection: it has no unscoped grant to fall back on.
+    if (key.connection !== undefined && Option.isNone(scoped)) return yield* unauthorized;
     const connection = Option.isSome(scoped) ? request.connection : undefined;
     const policy: GrantPolicy = Option.getOrElse(scoped, () => ({ kind: "all" }) as const);
     return McpAccess.make({
@@ -656,6 +667,11 @@ export const apiBearerAccess = (origins: HostedOAuthOrigins, request: BearerRequ
       readonly organizationSlug: string | null;
     } = isApiKey(token)
       ? yield* patAccess(sql, token, request).pipe(
+          // The API never accepts a key bound to an MCP connection.
+          Effect.filterOrFail(
+            (key) => key.connection === undefined,
+            () => forbidden("connection_key"),
+          ),
           Effect.map((key) => ({
             userId: key.userId,
             email: key.email,
@@ -684,6 +700,8 @@ export const apiBearerAccess = (origins: HostedOAuthOrigins, request: BearerRequ
         ? new Unauthorized()
         : reason === "unavailable"
           ? new AuthenticationUnavailable()
-          : new OrganizationForbidden(),
+          : reason === "connection_key"
+            ? new ConnectionKeyRefused()
+            : new OrganizationForbidden(),
     ),
   );
