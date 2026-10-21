@@ -4,7 +4,9 @@ import { BrowserSessionId } from "@executor-js/mcp/browser";
 import { GrantId } from "@executor-js/mcp-auth";
 export const HostedApprovalQuery = Schema.Struct({
   sessionId: BrowserSessionId,
-  grantId: GrantId,
+  /** The grant, sealed by the host; links issued before references existed name it as `grantId`. */
+  grant: Schema.optionalKey(Schema.NonEmptyString),
+  grantId: Schema.optionalKey(GrantId),
   /** A model-mode request that requires a person. */
   mode: Schema.optionalKey(Schema.Literal("model")),
 });

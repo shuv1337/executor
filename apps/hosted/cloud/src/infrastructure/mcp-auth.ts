@@ -2,6 +2,7 @@
 import {
   AuthenticationUnavailable,
   McpAuthentication,
+  McpUnauthorized,
   authOptions,
   type HostedOAuthOrigins,
   mcpBrowserGrantError,
@@ -53,6 +54,8 @@ const mcpGrantAuth = (
 type McpGrantApi = Pick<
   ReturnType<typeof mcpGrantAuth>["api"],
   | "getMcpBrowserAccess"
+  | "sealMcpGrantRef"
+  | "openMcpGrantRef"
   | "getOAuthServerConfig"
   | "listMcpConnections"
   | "createMcpConnection"
@@ -83,6 +86,27 @@ export const mcpAuthentication = (
               Effect.annotateCurrentSpan("executor.organization.id", access.organization),
             ),
             Effect.withSpan("auth.authenticate"),
+          ),
+        sealGrant: (id) =>
+          bound.pipe(
+            Effect.flatMap(([instance, bind]) =>
+              Effect.tryPromise({
+                try: () => bind(() => instance.api.sealMcpGrantRef({ body: { id } })),
+                catch: () => new AuthenticationUnavailable(),
+              }),
+            ),
+            Effect.map(({ ref }) => ref),
+          ),
+        openGrant: (ref) =>
+          bound.pipe(
+            Effect.flatMap(([instance, bind]) =>
+              Effect.tryPromise({
+                try: () => bind(() => instance.api.openMcpGrantRef({ body: { ref } })),
+                catch: mcpBrowserGrantError,
+              }),
+            ),
+            Effect.map(({ id }) => id),
+            Effect.catchTag("McpApprovalForbidden", () => Effect.fail(new McpUnauthorized())),
           ),
         browserGrant: (headers, id) =>
           bound.pipe(

@@ -11,7 +11,7 @@ import {
 } from "@executor-js/mcp/browser";
 import { Effect, Schema } from "effect";
 import { HttpServerRequest, HttpServerResponse } from "effect/http";
-import { McpAuthentication } from "../contracts/mcp.ts";
+import { McpAuthentication, McpUnauthorized } from "../contracts/mcp.ts";
 import { restrictMcpBackend, permitsBrowserApproval } from "@executor-js/mcp-auth";
 import { CurrentOrganization } from "../contracts/organization.ts";
 import type { McpAccess } from "../contracts/mcp.ts";
@@ -40,7 +40,14 @@ const browserAccess = Effect.gen(function* () {
   );
   // The incoming Origin was checked above. Internal cookie verification also needs it on GET.
   headers.set("origin", auth.origin);
-  const access = yield* auth.browserGrant(headers, query.grantId);
+  // The grant comes from the link's sealed reference, or from an older link's grant ID.
+  const grantId =
+    query.grant !== undefined
+      ? yield* auth.openGrant(query.grant)
+      : query.grantId !== undefined
+        ? query.grantId
+        : yield* new McpUnauthorized();
+  const access = yield* auth.browserGrant(headers, grantId);
   const address = yield* Schema.decodeUnknownEffect(BrowserApprovalAddress)({
     sessionId: query.sessionId,
     requestId: url.pathname.split("/").at(-1),

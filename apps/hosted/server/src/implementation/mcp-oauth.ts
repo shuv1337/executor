@@ -12,6 +12,7 @@ import {
 /** Hosted membership composes with the shared OAuth grant lifecycle. */
 import type { BetterAuthPlugin, GenericEndpointContext } from "@better-auth/core";
 import { APIError, createAuthEndpoint, isAPIError } from "better-auth/api";
+import { symmetricDecrypt, symmetricEncrypt } from "better-auth/crypto";
 import { Effect, Option, Schema } from "effect";
 import {
   grantOAuthPlugins,
@@ -282,6 +283,35 @@ export const mcpOAuthPlugins = (options: HostedOAuthOptions) => {
   const hosted = {
     id: "executor-hosted-grants",
     endpoints: {
+      // Approval links name their grant by an opaque reference sealed with the instance secret, so
+      // a link, or a log or history that saw it, never shows the grant or its API key's ID.
+      sealMcpGrantRef: createAuthEndpoint(
+        "/mcp/grant-ref/seal",
+        {
+          method: "POST",
+          body: Schema.toStandardSchemaV1(Schema.Struct({ id: GrantId })),
+          metadata: { SERVER_ONLY: true },
+        },
+        async (ctx) => ({
+          ref: await symmetricEncrypt({ key: ctx.context.secret, data: ctx.body.id }),
+        }),
+      ),
+      openMcpGrantRef: createAuthEndpoint(
+        "/mcp/grant-ref/open",
+        {
+          method: "POST",
+          body: Schema.toStandardSchemaV1(Schema.Struct({ ref: Schema.String })),
+          metadata: { SERVER_ONLY: true },
+        },
+        async (ctx) => {
+          const id = await symmetricDecrypt({ key: ctx.context.secret, data: ctx.body.ref }).catch(
+            () => undefined,
+          );
+          const decoded = Schema.decodeUnknownOption(GrantId)(id);
+          if (Option.isNone(decoded)) throw new APIError("UNAUTHORIZED");
+          return { id: decoded.value };
+        },
+      ),
       getMcpBrowserAccess: createAuthEndpoint(
         "/mcp/browser-access",
         {

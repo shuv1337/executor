@@ -3,7 +3,7 @@ import { CurrentUsage } from "../contracts/product-analytics.ts";
 import { requiresToolMetadata } from "@executor-js/authorization";
 import { grantAuthorization } from "@executor-js/mcp-auth";
 import { GroupDatabase } from "../contracts/groups.ts";
-import { CurrentUserId } from "../contracts/auth.ts";
+import { AuthenticationUnavailable, CurrentUserId } from "../contracts/auth.ts";
 import { CurrentCaller } from "@executor-js/sdk/core";
 import { mcpCaller } from "./caller.ts";
 import {
@@ -105,7 +105,10 @@ const RequestBackend = Context.Reference<McpBackend<RequestError>>("hosted/McpRe
   }),
 });
 const RequestApprovalUrl = Context.Reference<
-  ((address: import("@executor-js/mcp/browser").BrowserApprovalAddress) => string) | undefined
+  | ((
+      address: import("@executor-js/mcp/browser").BrowserApprovalAddress,
+    ) => Effect.Effect<string, AuthenticationUnavailable>)
+  | undefined
 >("hosted/McpApprovalUrl", { defaultValue: () => undefined });
 const requestBackend: McpBackend<RequestError> = {
   listSkills: (input, options) =>
@@ -155,7 +158,7 @@ export const makeHostedMcp = (
         Effect.flatMap(RequestApprovalUrl, (url) =>
           url === undefined
             ? Effect.die("Browser approval URL requires an authenticated MCP request")
-            : Effect.succeed(url(address)),
+            : url(address).pipe(Effect.orDie),
         ),
     },
   }).pipe(Effect.orDie);
@@ -423,13 +426,19 @@ export const dispatchHostedMcp = <E, R>(
     };
     return yield* handler.pipe(
       Effect.provideService(RequestBackend, authorized),
-      Effect.provideService(RequestApprovalUrl, (address) => {
-        const url = new URL(`/mcp/approve/${address.requestId}`, authentication.origin);
-        url.searchParams.set("sessionId", address.sessionId);
-        url.searchParams.set("grantId", access.grant.id);
-        if (address.mode !== undefined) url.searchParams.set("mode", address.mode);
-        return url.toString();
-      }),
+      // The link names its grant only by an opaque reference: a grant ID can name an API key, and
+      // links are pasted into chats and kept in histories and logs.
+      Effect.provideService(RequestApprovalUrl, (address) =>
+        authentication.sealGrant(access.grant.id).pipe(
+          Effect.map((ref) => {
+            const url = new URL(`/mcp/approve/${address.requestId}`, authentication.origin);
+            url.searchParams.set("sessionId", address.sessionId);
+            url.searchParams.set("grant", ref);
+            if (address.mode !== undefined) url.searchParams.set("mode", address.mode);
+            return url.toString();
+          }),
+        ),
+      ),
       Effect.provideService(RequestCaller, mcpSessionKey(access)),
       Effect.provideService(CurrentUsage, { source: "mcp", client_id: access.clientId }),
     );
