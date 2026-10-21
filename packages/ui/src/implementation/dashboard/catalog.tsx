@@ -28,6 +28,40 @@ import { Input } from "../components/input.tsx";
 import { useIncrementalList } from "./incremental-list.tsx";
 
 /**
+ * The installed copy of each catalog package, by package name. Installs record the catalog package
+ * as their copy origin, so the most recent copy of a package is the one a catalog row leads to.
+ */
+export function installedCatalogApps(apps: readonly App[] | undefined): ReadonlyMap<string, App> {
+  const installed = new Map<string, App>();
+  for (const app of apps ?? []) {
+    const name = app.copiedFrom?.name;
+    const latest = name === undefined ? undefined : installed.get(name);
+    if (name !== undefined && (!latest || app.createdAt > latest.createdAt))
+      installed.set(name, app);
+  }
+  return installed;
+}
+
+/** Runs one catalog entry's install and resolves with that entry's own result. */
+export function useCatalogInstall<IE>(
+  mutation: (entry: string) => MutationProps<InstallApp, DeployedApp, IE>["mutation"],
+) {
+  const registry = useContext(RegistryContext);
+  return async (entry: CatalogEntry, input: InstallApp) => {
+    const command = mutation(entry.id);
+    const release = registry.mount(command);
+    try {
+      registry.set(command, input);
+      return await Effect.runPromiseExit(
+        AtomRegistry.getResult(registry, command, { suspendOnWaiting: true }),
+      );
+    } finally {
+      release();
+    }
+  };
+}
+
+/**
  * Official apps available to add, in the feed's order. On hosts that publish inside the
  * organization (this fork's self-host), the organization's published apps are listed above them.
  * Catalog apps are vetted, so each row installs its own source under the catalog name. Only a name
@@ -64,28 +98,10 @@ export function CatalogPage<E, IE, P = never>({
   readonly onPublication?: ((publication: typeof Publication.Type) => void) | undefined;
 }) {
   const result = useAtomValue(query);
-  const apps = Option.getOrUndefined(AsyncResult.value(useAtomValue(inventory)))?.apps;
-  const installedByPackage = new Map<string, App>();
-  for (const app of apps ?? []) {
-    const name = app.copiedFrom?.name;
-    const latest = name === undefined ? undefined : installedByPackage.get(name);
-    if (name !== undefined && (!latest || app.createdAt > latest.createdAt))
-      installedByPackage.set(name, app);
-  }
-  const registry = useContext(RegistryContext);
-  /** Runs one entry's install and resolves with that entry's own result. */
-  const install = async (entry: CatalogEntry, input: InstallApp) => {
-    const command = mutation(entry.id);
-    const release = registry.mount(command);
-    try {
-      registry.set(command, input);
-      return await Effect.runPromiseExit(
-        AtomRegistry.getResult(registry, command, { suspendOnWaiting: true }),
-      );
-    } finally {
-      release();
-    }
-  };
+  const installedByPackage = installedCatalogApps(
+    Option.getOrUndefined(AsyncResult.value(useAtomValue(inventory)))?.apps,
+  );
+  const install = useCatalogInstall(mutation);
   const [adding, setAdding] = useState<ReadonlySet<string>>(new Set());
   const [failure, setFailure] = useState<Cause.Cause<IE>>();
   const [conflict, setConflict] = useState<{
