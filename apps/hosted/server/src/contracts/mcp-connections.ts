@@ -1,4 +1,9 @@
-/** A member's own scoped MCP connections and connected agents in one organization. Browser sessions only. */
+/**
+ * A member's own scoped MCP connections and connected agents in one organization. Browser sessions
+ * manage both. An organization admin's full-authority API key or API grant may also list, create,
+ * update and revoke the admin's own connections, so agents can be provisioned without a browser;
+ * connected agents stay browser-only.
+ */
 import {
   AccountNotFound,
   AccountSelectionInvalid,
@@ -40,16 +45,17 @@ const saveErrors = [
   AccountNotFound,
   AccountSelectionInvalid,
 ] as const;
-/** Bearer credentials, including a connection's own grants, cannot manage connections. */
+/**
+ * MCP grants, including a connection's own, cannot manage connections: the API refuses MCP tokens.
+ * Connections only narrow their owner's own access, so an admin key cannot widen anything.
+ */
 export const HostedMcpConnections = HttpApiGroup.make("mcpConnections")
   .add(
     HttpApiEndpoint.get("list", path, {
       params: organization,
       success: Schema.Array(ConnectionView),
       error: errors,
-    })
-      .annotate(RequiredAction, "manage")
-      .middleware(RequireUser),
+    }).annotate(RequiredAction, "manage"),
   )
   .add(
     HttpApiEndpoint.post("create", path, {
@@ -57,9 +63,7 @@ export const HostedMcpConnections = HttpApiGroup.make("mcpConnections")
       payload: ConnectionInput,
       success: ConnectionView,
       error: [...saveErrors, ConnectionIdTaken],
-    })
-      .annotate(RequiredAction, "manage")
-      .middleware(RequireUser),
+    }).annotate(RequiredAction, "manage"),
   )
   .add(
     HttpApiEndpoint.put("update", `${path}/:connection`, {
@@ -70,18 +74,14 @@ export const HostedMcpConnections = HttpApiGroup.make("mcpConnections")
       }),
       success: ConnectionView,
       error: [...saveErrors, ConnectionNotFound],
-    })
-      .annotate(RequiredAction, "manage")
-      .middleware(RequireUser),
+    }).annotate(RequiredAction, "manage"),
   )
   .add(
     HttpApiEndpoint.post("revoke", `${path}/:connection/revoke`, {
       params: connection,
       success: Schema.Void,
       error: [...errors, ConnectionNotFound],
-    })
-      .annotate(RequiredAction, "manage")
-      .middleware(RequireUser),
+    }).annotate(RequiredAction, "manage"),
   )
   .add(
     HttpApiEndpoint.get("agents", agentsPath, {

@@ -292,6 +292,16 @@ export const scenarios = plan({
       local: na("Local signs the CLI in with an API key, not a saved session."),
     },
   },
+  appGitApiKey: {
+    fixtures: "actors",
+    file: "app-git-remotes.spec.ts",
+    title: "the CLI's Git helper uses EXECUTOR_ACCESS_TOKEN instead of a sign-in",
+    targets: {
+      "self-host": scheduled,
+      cloud: scheduled,
+      local: na("Local Git remotes use the local server's own key."),
+    },
+  },
   appGitKeptCredentials: {
     fixtures: "actors",
     file: "app-git-remotes.spec.ts",
@@ -7232,6 +7242,28 @@ export const scenarios = plan({
       local: scheduled,
       "self-host": na("Hosted app account links have their own scenarios."),
       cloud: na("Hosted app account links have their own scenarios."),
+    },
+  },
+  sharedAppAccountHandoff: {
+    fixtures: "actors",
+    file: "shared-app-account-handoff.spec.ts",
+    title:
+      "a member's shared key becomes an app's own account when an editor links it, and runs every caller's calls",
+    targets: {
+      "self-host": scheduled,
+      cloud: scheduled,
+      local: na("Local has one subject, so there is no other member's account to share."),
+    },
+  },
+  connectionApiKeys: {
+    fixtures: "actors",
+    file: "connection-api-keys.spec.ts",
+    title:
+      "an admin's API key creates, uses and revokes a scoped connection without a browser, and a member's key cannot",
+    targets: {
+      "self-host": scheduled,
+      cloud: scheduled,
+      local: na("Local has one subject and no organization roles or API keys."),
     },
   },
   callerIdentity: {

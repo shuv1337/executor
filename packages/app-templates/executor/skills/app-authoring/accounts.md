@@ -617,3 +617,22 @@ without a caller for the app's background work, such as an app schedule, so its
 `.many()` requirement, or return no tools without a caller. Keep
 writes inside tool handlers; do not register webhooks or perform mutations in
 the factory. Build output retains code, not a permanent tool catalog.
+
+## One identity per agent
+
+To tell agents apart inside an app, give each agent its own account and its own scoped MCP
+connection. The connection's `runsAs` names the account the agent's calls use, so the app sees
+that account in `ctx.user.accounts`, and `ctx.caller.provenance` names the connection for logs.
+A connection can only narrow its owner's own access: it never grants another person's account.
+
+An organization admin creates connections without a browser through the Executor app's
+`mcpConnections.create`, `list`, `update` and `revoke` tools, or the same routes under
+`/api/organizations/:organization/mcp-connections`, with an API key or a full-access API grant.
+Members manage their own from the dashboard. Every change an API credential makes is logged.
+
+An agent then connects to the connection's `url` (`/mcp?connection=<id>`) with an OAuth grant, or
+with its owner's API key: at that URL the key runs with only the connection's apps, tools and
+`runsAs` accounts. Revoking the connection stops both at once.
+
+For one key that runs an app for everyone, a member can connect it as a shared account, and
+someone who can edit the app links it to the app's own requirement with `appAccounts.appLink`.

@@ -138,6 +138,8 @@ export class McpAuthentication extends Context.Service<
       headers: Headers,
       mode?: ApprovalMode,
       organization?: OrganizationReference,
+      /** The scoped connection the MCP URL names. A PAT there runs with its narrower policy. */
+      connection?: ConnectionId,
     ) => Effect.Effect<McpAccess, McpUnauthorized | McpForbidden | AuthenticationUnavailable>;
     readonly browserGrant: (
       headers: Headers,

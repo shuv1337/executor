@@ -7,10 +7,10 @@ import {
 } from "@executor-js/mcp-auth/connections";
 import { mcpResource } from "@executor-js/mcp-auth";
 import type { App, Executor, OwnerId } from "@executor-js/sdk/core";
-import { Effect } from "effect";
+import { Effect, Option } from "effect";
 import { HttpApiBuilder } from "effect/http-api";
 import { HostedApi } from "../contracts/api.ts";
-import { CurrentUserId } from "../contracts/auth.ts";
+import { CurrentPrincipal, CurrentUserId } from "../contracts/auth.ts";
 import { HostedExecutor } from "../contracts/executor.ts";
 import { McpAuthentication } from "../contracts/mcp.ts";
 import { CurrentOrganization, OrganizationForbidden } from "../contracts/organization.ts";
@@ -25,6 +25,34 @@ const owner = Effect.gen(function* () {
   if (userId === undefined) return yield* new OrganizationForbidden();
   return { userId, resource: organization.organization };
 });
+
+/**
+ * Who may change connections through this request. A signed-in person manages their own. Without a
+ * browser session the request carried a bearer that RequireOrganization accepted for `manage`, so it
+ * holds its user's full authority (an API key or a full API grant; MCP tokens never reach the API);
+ * of those, only an organization admin's or owner's may manage connections. Every bearer change is
+ * logged, as connections decide which accounts an agent runs as.
+ */
+const manager = (action: "list" | "create" | "update" | "revoke", connection?: string) =>
+  Effect.gen(function* () {
+    const current = yield* owner;
+    const person = yield* Effect.serviceOption(CurrentPrincipal);
+    if (Option.isSome(person)) return current;
+    const organization = yield* CurrentOrganization;
+    if (organization.role !== "admin" && organization.role !== "owner")
+      return yield* new OrganizationForbidden();
+    if (action !== "list")
+      yield* Effect.logInfo("MCP connection changed with an API credential").pipe(
+        Effect.annotateLogs({
+          "executor.audit": "mcp-connection",
+          "executor.audit.action": action,
+          "executor.user.id": current.userId,
+          "executor.organization.id": current.resource,
+          ...(connection === undefined ? {} : { "executor.mcp.connection": connection }),
+        }),
+      );
+    return current;
+  });
 
 /**
  * Check one app's runs-as targets. An account target the member has not linked to any of the app's
@@ -116,7 +144,7 @@ const resolvePolicy = (apps: readonly ConnectionApp[]) =>
     };
   });
 
-/** RequireUser rejects bearer credentials; RequireOrganization checks current membership. */
+/** RequireOrganization checks current membership; `manager` limits API credentials to admins. */
 export const hostedMcpConnectionHandlers = HttpApiBuilder.group(
   HostedApi,
   "mcpConnections",
@@ -129,15 +157,16 @@ export const hostedMcpConnectionHandlers = HttpApiBuilder.group(
       });
       return handlers
         .handle("list", () =>
-          Effect.flatMap(owner, (current) => auth.connections.list(current)).pipe(
+          Effect.flatMap(manager("list"), (current) => auth.connections.list(current)).pipe(
             Effect.map((connections) => connections.map(view)),
           ),
         )
         .handle("create", ({ payload }) =>
           Effect.gen(function* () {
+            const current = yield* manager("create", payload.id);
             const policy = yield* resolvePolicy(payload.apps);
             return view(
-              yield* auth.connections.create(yield* owner, {
+              yield* auth.connections.create(current, {
                 id: payload.id,
                 name: payload.name,
                 policy,
@@ -148,12 +177,13 @@ export const hostedMcpConnectionHandlers = HttpApiBuilder.group(
         .handle("update", ({ params, payload }) =>
           Effect.gen(function* () {
             // Check ownership before linking any account for this connection.
-            const existing = yield* auth.connections.list(yield* owner);
+            const current = yield* manager("update", params.connection);
+            const existing = yield* auth.connections.list(current);
             if (!existing.some((connection) => connection.id === params.connection))
               return yield* new ConnectionNotFound({ connection: params.connection });
             const policy = yield* resolvePolicy(payload.apps);
             return view(
-              yield* auth.connections.update(yield* owner, {
+              yield* auth.connections.update(current, {
                 id: params.connection,
                 name: payload.name,
                 policy,
@@ -162,7 +192,9 @@ export const hostedMcpConnectionHandlers = HttpApiBuilder.group(
           }),
         )
         .handle("revoke", ({ params }) =>
-          Effect.flatMap(owner, (current) => auth.connections.revoke(current, params.connection)),
+          Effect.flatMap(manager("revoke", params.connection), (current) =>
+            auth.connections.revoke(current, params.connection),
+          ),
         )
         .handle("agents", () =>
           Effect.flatMap(owner, (current) => auth.connections.agents(current)),

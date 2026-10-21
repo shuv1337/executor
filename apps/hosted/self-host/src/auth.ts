@@ -100,8 +100,8 @@ export const selfHostAuth = Effect.gen(function* () {
   });
   const mcpIdentity = Layer.succeed(McpAuthentication, {
     ...origins,
-    authenticate: (headers, mode, organization) =>
-      mcpBearerAccess(origins, { headers, mode, organization }).pipe(
+    authenticate: (headers, mode, organization, connection) =>
+      mcpBearerAccess(origins, { headers, mode, organization, connection }).pipe(
         Effect.provideService(SqlClient.SqlClient, sql),
         Effect.tap(({ access }) =>
           Effect.annotateCurrentSpan("executor.organization.id", access.organization),

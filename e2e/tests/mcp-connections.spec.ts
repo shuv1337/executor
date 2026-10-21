@@ -107,7 +107,7 @@ layer(HostedLive, { excludeTestServices: true })("Scoped MCP connections", (it) 
         expect(connection.policy.apps).toEqual([
           { app: app.id, runsAs: [{ kind: "app" }], tools: { kind: "readOnly" } },
         ]);
-        // Bearer credentials cannot manage connections, including a full-access grant.
+        // MCP grants cannot manage connections, including a full-access one: the API refuses MCP tokens.
         yield* browser.login(actors.owner);
         const full = yield* evidence.step(
           "Authorize the full-access URL for comparison",
