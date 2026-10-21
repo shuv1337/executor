@@ -1,4 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react";
+import { AppId } from "@executor-js/sdk";
+import { Option, Schema } from "effect";
 import { useHydrated } from "@executor-js/ui/hooks/hydrated";
 import { OrganizationSettingsPending } from "./organization-settings-pending.tsx";
 import { Skeleton } from "@executor-js/ui/components/skeleton";
@@ -56,6 +58,29 @@ export function ScheduledApprovalFrame({
         className="mb-4 inline-flex text-sm text-muted-foreground"
       >
         Back to approvals
+      </Link>
+      {children}
+    </main>
+  );
+}
+/** An app page's saved request opens beside a link back to its app. */
+export function AppApprovalFrame({
+  organizationSlug,
+  appId,
+  children,
+}: {
+  readonly organizationSlug: string;
+  readonly appId: AppId;
+  readonly children: ReactNode;
+}) {
+  return (
+    <main className="mx-auto w-full max-w-2xl p-4 md:p-6">
+      <Link
+        to="/org/$organizationSlug/apps/$appId"
+        params={{ organizationSlug, appId }}
+        className="mb-4 inline-flex text-sm text-muted-foreground"
+      >
+        Back to app
       </Link>
       {children}
     </main>
@@ -134,6 +159,15 @@ export function PagePending({
         }
       />
     );
+  }
+  if (page === "apps" && action === "approve" && item !== undefined) {
+    const appId = Schema.decodeUnknownOption(AppId)(item);
+    if (Option.isSome(appId))
+      return (
+        <AppApprovalFrame organizationSlug={organizationSlug} appId={appId.value}>
+          <ApprovalCardPending />
+        </AppApprovalFrame>
+      );
   }
   if (page === "apps" && item === undefined)
     return (

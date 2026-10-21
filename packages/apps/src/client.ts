@@ -7,6 +7,7 @@ export {
   type QueryTransport,
 } from "./contracts/live.ts";
 export { createAppClient } from "./implementation/ui-client.ts";
+export { UiFailed, type UiApproval, type UiApprovalStatus } from "./contracts/ui.ts";
 
 export type {
   AppMutation,

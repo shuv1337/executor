@@ -4856,6 +4856,18 @@ export const scenarios = plan({
       local: na("Hosted discovery-to-browser journey; local skills have separate MCP coverage."),
     },
   },
+  appPageApprovals: {
+    fixtures: "actors",
+    file: "app-page-approvals.spec.ts",
+    appOrigin: true,
+    title:
+      "an app page's approval-gated mutation waits for the signed-in person to approve it on the dashboard",
+    targets: {
+      "self-host": scheduled,
+      cloud: scheduled,
+      local: na("Local saves no app page requests for review; its pages report approval_required."),
+    },
+  },
   appPendingWrites: {
     fixtures: "actors",
     file: "app-pending-writes.spec.ts",

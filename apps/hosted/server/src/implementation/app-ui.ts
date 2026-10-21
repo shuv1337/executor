@@ -18,6 +18,9 @@ import {
   invocationEntries,
   CurrentCaller,
   AppDataApprovalRequired,
+  ApprovalRequestId,
+  ToolName,
+  type AppDataInput,
   type App,
   type VersionMetadata,
 } from "@executor-js/sdk/core";
@@ -64,6 +67,7 @@ import {
 } from "../contracts/organization.ts";
 import { callerAccounts, stillLinked } from "./app-accounts.ts";
 import { personCaller } from "./caller.ts";
+import { dashboardIssuer, savePageRun } from "./tools.ts";
 import type { appAddresses } from "./app-addresses.ts";
 
 /** Authorization belongs to one HTTP request, never a shared or timed cache. */
@@ -376,24 +380,98 @@ export const hostedAppUi = <R = never>(
         },
       };
     });
-  const data = (kind: "query" | "mutate", payload: typeof UiOperation.Type) =>
-    Effect.gen(function* () {
-      const current = yield* CurrentAppUi;
-      const { input } = yield* dataInput(payload, current);
-      const executor = yield* Effect.flatten(HostedExecutor).pipe(Effect.mapError(unavailable));
-      return yield* executor.appData[kind](input).pipe(
+  /** The dashboard page, on the dashboard's origin, where the person reviews a saved mutation. */
+  const reviewUrl = (current: typeof CurrentAppUi.Service, requestId: string) =>
+    new URL(
+      `/org/${encodeURIComponent(current.target.slug)}/apps/${encodeURIComponent(current.app.id)}/approve/${encodeURIComponent(requestId)}`,
+      addresses.dashboardOrigin,
+    ).href;
+  /** The page's operations run as the signed-in person, through the app's own UI channel. */
+  const asUiCaller =
+    (current: typeof CurrentAppUi.Service) =>
+    <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+      effect.pipe(
         Effect.provideService(CurrentOrganization, current.access),
         Effect.provideService(CurrentAuthorization, fullAuthority),
         Effect.provideService(CurrentUserId, current.access.userId),
         Effect.provideService(CurrentCaller, uiCaller(current)),
         Effect.provideService(CurrentUsage, { source: "app_ui" }),
-        Effect.mapError(dataFailure),
       );
+  /**
+   * A mutation whose policy asks for approval is saved as the signed-in person's own dashboard run,
+   * with the same checks as one, and the page learns only its ID and review page. The person
+   * answers it on their dashboard; nothing on the app's origin can. A policy that no longer asks
+   * runs the mutation, and the page receives its result.
+   */
+  const savedForReview = (current: typeof CurrentAppUi.Service, input: AppDataInput) =>
+    savePageRun(
+      {
+        app: input.app,
+        tool: ToolName.make(input.name),
+        kind: "mutation",
+        version: input.version,
+        input: input.input,
+      },
+      current.access.userId,
+    ).pipe(
+      Effect.flatMap((result) =>
+        result.status === "approval-required"
+          ? Effect.fail(
+              new UiFailed({
+                reason: "approval_required",
+                approval: {
+                  requestId: result.requestId,
+                  url: reviewUrl(current, result.requestId),
+                },
+              }),
+            )
+          : Effect.succeed(result.value),
+      ),
+    );
+  const data = (kind: "query" | "mutate", payload: typeof UiOperation.Type) =>
+    Effect.gen(function* () {
+      const current = yield* CurrentAppUi;
+      const { input } = yield* dataInput(payload, current);
+      const executor = yield* Effect.flatten(HostedExecutor).pipe(Effect.mapError(unavailable));
+      if (kind === "query")
+        return yield* executor.appData
+          .query(input)
+          .pipe(asUiCaller(current), Effect.mapError(dataFailure));
+      return yield* executor.appData.mutate(input).pipe(
+        Effect.catchTag("AppDataApprovalRequired", () => savedForReview(current, input)),
+        asUiCaller(current),
+        Effect.mapError((error) => (Schema.is(UiFailed)(error) ? error : dataFailure(error))),
+      );
+    });
+  /**
+   * Whether the signed-in person's own saved request from this app still waits for their answer.
+   * Every other request reads as settled, and nothing of a request is returned.
+   */
+  const approvalStatus = (requestId: string) =>
+    Effect.gen(function* () {
+      const current = yield* CurrentAppUi;
+      const settled = { status: "settled" as const };
+      const id = Schema.decodeUnknownOption(ApprovalRequestId)(requestId);
+      if (Option.isNone(id)) return settled;
+      const executor = yield* Effect.flatten(HostedExecutor).pipe(Effect.mapError(unavailable));
+      const pending = yield* executor.tools
+        .approval({ requestId: id.value, owner: current.access.owner })
+        .pipe(
+          Effect.map(Option.some),
+          Effect.catchTag("ToolApprovalNotFound", () => Effect.succeed(Option.none())),
+          Effect.mapError(unavailable),
+        );
+      return Option.isSome(pending) &&
+        pending.value.issuer === dashboardIssuer(current.access.userId) &&
+        pending.value.invocation.app === current.app.id
+        ? { status: "pending" as const }
+        : settled;
     });
   const calls = HttpApiBuilder.group(AppUiApi, "ui", (handlers) =>
     handlers
       .handle("query", ({ payload }) => data("query", payload))
       .handle("mutate", ({ payload }) => data("mutate", payload))
+      .handle("approvalStatus", ({ payload }) => approvalStatus(payload.requestId))
       .handle("subscribe", ({ payload }) =>
         Effect.gen(function* () {
           const current = yield* CurrentAppUi;

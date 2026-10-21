@@ -86,10 +86,27 @@ its own files; activating an older version serves its files again.
 `useAppQuery(atom)` returns `{ data, pending, error }`, never the query data directly.
 `data` is `undefined` until a successful result. `pending` means no result has arrived.
 `error` is an optional safe message. Keep an existing result visible during a failed refresh.
-The page cannot pause for approval: an operation whose approval policy asks for one
-fails with reason `approval_required` and does not run. Run such operations as tool
-calls, or give the page an operation without that policy. The operation's `ctx.caller`
-is the signed-in person, with channel `ui`.
+The page cannot approve anything itself. A mutation whose approval policy asks for one
+does not run: `client.mutate` rejects with a `UiFailed` of reason `approval_required`.
+On hosted Executor the error's `approval` holds `{ requestId, url }`: the request is
+saved as the signed-in person's own run, and `url` opens its review on the dashboard,
+where only that person approves or declines it. Link to `url` (open it in a new tab),
+then poll `client.approvalStatus(requestId)`, which returns `{ status: "pending" }`
+until it is answered or expires and `{ status: "settled" }` after; queries show the
+outcome. Approval runs the saved call once, as the person, with `ctx.approvedBy` set.
+Queries that need approval, and local Executor, fail without `approval`; run those as
+tool calls. The operation's `ctx.caller` is the signed-in person, with channel `ui`.
+
+```tsx
+try {
+  await resolve({ id });
+} catch (error) {
+  if (error instanceof UiFailed && error.approval !== undefined) {
+    window.open(error.approval.url, "_blank", "noopener");
+    // later: (await client.approvalStatus(error.approval.requestId)).status === "settled"
+  } else throw error;
+}
+```
 
 ```tsx
 const { data, pending, error } = useAppQuery(todosAtom);

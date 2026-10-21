@@ -85,13 +85,25 @@ export class UiVersionChanged extends Schema.TaggedError<UiVersionChanged>()(
   {},
   { httpApiStatus: 409 },
 ) {}
+/**
+ * A gated mutation the host saved for the signed-in person to review. The page learns only the
+ * request's ID and the dashboard page where that person approves or declines it; the page itself
+ * has no way to answer it.
+ */
+export const UiApproval = Schema.Struct({
+  requestId: Schema.NonEmptyString,
+  /** The review page on the host's dashboard origin, never the app's own origin. */
+  url: Schema.NonEmptyString,
+});
+export type UiApproval = typeof UiApproval.Type;
 /** Safe app failure without account fields, author exceptions or upstream responses. */
 export class UiFailed extends Schema.TaggedError<UiFailed>()(
   "UiFailed",
   {
     /**
-     * `approval_required`: the operation's approval policy asked for a decision, which a call from
-     * the page cannot pause for; it did not run past its policy.
+     * `approval_required`: the operation's approval policy asked for a decision; it did not run
+     * past its policy. A mutation the host saved for review carries `approval`; a query, or a host
+     * that cannot save it, carries none.
      */
     reason: Schema.Literals([
       "unavailable",
@@ -99,9 +111,21 @@ export class UiFailed extends Schema.TaggedError<UiFailed>()(
       "account_required",
       "approval_required",
     ]),
+    approval: Schema.optionalKey(UiApproval),
   },
   { httpApiStatus: 422 },
 ) {}
+/** The page asks about one saved request by ID. */
+export const UiApprovalStatusRequest = Schema.Struct({ requestId: Schema.NonEmptyString });
+/**
+ * `pending` while the signed-in person's own saved request waits for their answer. Anything else,
+ * answered, expired, unknown or another person's, is `settled`, so the status tells the page
+ * nothing about requests that are not this person's.
+ */
+export const UiApprovalStatus = Schema.Struct({
+  status: Schema.Literals(["pending", "settled"]),
+});
+export type UiApprovalStatus = typeof UiApprovalStatus.Type;
 /** Every live stream carries heartbeats so the browser can detect a lost connection. */
 export const UiSnapshot = Schema.Union([
   Schema.Struct({
@@ -127,6 +151,13 @@ export const AppUiApi = HttpApi.make("app-ui").add(
       HttpApiEndpoint.post("mutate", "/_executor/api/mutate", {
         payload: UiOperation,
         success: JsonValue,
+        error: errors,
+      }),
+    )
+    .add(
+      HttpApiEndpoint.post("approvalStatus", "/_executor/api/approval-status", {
+        payload: UiApprovalStatusRequest,
+        success: UiApprovalStatus,
         error: errors,
       }),
     )

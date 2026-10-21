@@ -1,4 +1,10 @@
-import { AccountConnectionId, AccountId, AppId, WebhookId } from "@executor-js/sdk";
+import {
+  AccountConnectionId,
+  AccountId,
+  AppId,
+  ApprovalRequestId,
+  WebhookId,
+} from "@executor-js/sdk";
 import { notFound } from "@tanstack/react-router";
 import { Option, Schema } from "effect";
 
@@ -15,6 +21,17 @@ const decodeParam = <S extends Schema.ConstraintDecoder<unknown>>(
 /** Reject malformed app URLs before mounting any app reads. */
 export function parseAppParams(params: { readonly appId: string }) {
   return { appId: decodeParam(AppId, params.appId) };
+}
+
+/** Reject malformed review URLs for an app page's saved request before reading it. */
+export function parseAppApprovalParams(params: {
+  readonly appId: string;
+  readonly requestId: string;
+}) {
+  return {
+    appId: decodeParam(AppId, params.appId),
+    requestId: decodeParam(ApprovalRequestId, params.requestId),
+  };
 }
 
 /** Reject malformed account URLs before mounting any account reads. */

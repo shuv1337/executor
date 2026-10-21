@@ -150,13 +150,15 @@ export function hostedPageTitle(
   if (page === "webhooks") return "Webhook setup";
   if (page === "connections") return "Connect account";
   if (page === "apps")
-    return item === "add"
-      ? action === "custom"
-        ? "Add custom app"
-        : "Add app"
-      : item
-        ? "App"
-        : "Apps";
+    return action === "approve"
+      ? "Review request"
+      : item === "add"
+        ? action === "custom"
+          ? "Add custom app"
+          : "Add app"
+        : item
+          ? "App"
+          : "Apps";
   if (page === "accounts") return "Accounts";
   return "Dashboard";
 }

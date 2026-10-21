@@ -177,8 +177,17 @@ const dashboardRun = Effect.gen(function* () {
   yield* browserOnly;
   const user = yield* CurrentUserId;
   if (user === undefined) return yield* new Forbidden();
-  return ToolApprovalIssuer.make(`dashboard:${user}`);
+  return dashboardIssuer(user);
 });
+/** The issuer of a person's own dashboard run; only that person's dashboard reads or answers it. */
+export const dashboardIssuer = (user: string) => ToolApprovalIssuer.make(`dashboard:${user}`);
+/**
+ * A gated mutation from an app's own page, saved as the signed-in person's own dashboard run with
+ * the same checks as one. The page's request has no API credential and its caller is that person,
+ * so the review and answer happen only on their dashboard, never on the app's origin.
+ */
+export const savePageRun = (input: Parameters<Executor["tools"]["call"]>[0], user: string) =>
+  startTool(input, { issuer: dashboardIssuer(user) });
 /** The signed-in person is the runner, so a call that needs approval waits for their review. */
 const runTool = (input: Parameters<Executor["tools"]["call"]>[0]) =>
   Effect.flatMap(dashboardRun, (issuer) => startTool(input, { issuer })).pipe(
