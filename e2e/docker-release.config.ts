@@ -8,6 +8,7 @@ export default defineConfig({
       "e2e/tests/docker-release-workflow-memory.spec.ts",
       "e2e/tests/docker-release-workflow-restart.spec.ts",
       "e2e/tests/docker-release-workflow-stopped.spec.ts",
+      "e2e/tests/docker-release-watchdog.spec.ts",
       "e2e/tests/docker-oauth-renewal.spec.ts",
       "e2e/tests/workflow-engine.spec.ts",
     ],

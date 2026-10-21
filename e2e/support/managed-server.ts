@@ -160,7 +160,10 @@ export const startManagedServer = (
       EXECUTOR_ENVIRONMENT: "e2e",
       EXECUTOR_BUILD_VERSION: target.metadata.commit,
       EXECUTOR_WORKER_BUNDLE: path.resolve(".local/test-runtime/host.json"),
-      ...(Option.isSome(npmRegistry) ? { EXECUTOR_NPM_REGISTRY: npmRegistry.value } : {}),
+      // With a trailing slash, as operators often write it: the host must not request `//apps`.
+      ...(Option.isSome(npmRegistry)
+        ? { EXECUTOR_NPM_REGISTRY: `${npmRegistry.value.replace(/\/+$/u, "")}/` }
+        : {}),
       ...(Option.isSome(catalogs)
         ? {
             EXECUTOR_CATALOG_URL: `${catalogs.value}/catalog/index.json`,

@@ -17,7 +17,9 @@ const Package = Schema.Struct({
  */
 export const workerDependencies = (filesystem: InMemoryFileSystem, host: WorkerHost) =>
   Effect.gen(function* () {
-    const { registry } = host;
+    // The installer appends `/<name>` to the registry; a configured trailing slash would request
+    // `//<name>`, which registries such as Verdaccio answer with 404.
+    const registry = host.registry?.replace(/\/+$/u, "");
     const manifest = filesystem.read("package.json");
     const dependencies =
       manifest === null

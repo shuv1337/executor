@@ -286,6 +286,7 @@ layer(HostedLive, { excludeTestServices: true })("Caller identity", (it) => {
           kind: "human",
           method: "browser",
           channel: "ui",
+          email: "member@example.test",
           subject: done.caller.subject,
         });
       }).pipe(Effect.provide(McpClient.layer)),

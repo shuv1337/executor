@@ -275,3 +275,20 @@ cache. The Compose commands above build from source and do not depend on the
 published container image. For the published installation, use
 `docker logs --tail 100 executor-v2` and `docker inspect executor-v2` to inspect
 startup and health.
+
+## Unresponsive app code
+
+The product, every app and the workflow engine share one workerd process, and workerd runs a
+process's JavaScript on one thread. An app that loops without awaiting holds that thread, so the
+dashboard, MCP and every other app stop answering, and no timeout inside workerd can fire. The
+open-source workerd does not enforce CPU limits.
+
+The host bounds that outage. Once the product has answered its first health check, the host probes
+`/health` on the product's private socket every `EXECUTOR_WATCHDOG_INTERVAL` seconds (default 10).
+After `EXECUTOR_WATCHDOG_FAILURES` failed probes in a row (default 9, about 90 seconds), it logs
+`Executor watchdog: the product did not answer …`, kills workerd and exits non-zero. Run the
+container with a restart policy such as `restart: unless-stopped` (the bundled compose file sets
+it), so a fresh process starts. Set `EXECUTOR_WATCHDOG=off` to turn it off.
+
+A tool call that loops is cut off by the restart. A workflow step that loops runs again when its
+run resumes, so the restart repeats; terminate that run, or fix and redeploy the app.
