@@ -276,3 +276,103 @@ func TestMemoryPressureIsSixtyPercentOfTheCgroupLimit(t *testing.T) {
 		}
 	}
 }
+
+// immediate fires every watchdog wait at once, so a sequence of probe results drives it.
+func immediate(time.Duration) <-chan time.Time {
+	tick := make(chan time.Time, 1)
+	tick <- time.Time{}
+	return tick
+}
+
+func runWatchdog(results []bool, failures int) (stalled bool, probes int) {
+	done := make(chan struct{})
+	var stop sync.Once
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		watchdog(func() bool {
+			if probes >= len(results) {
+				// Past the script: stop as if the host were shutting down.
+				stop.Do(func() { close(done) })
+				return true
+			}
+			result := results[probes]
+			probes++
+			return result
+		}, time.Second, failures, immediate, done, func() { stalled = true })
+	}()
+	select {
+	case <-finished:
+	case <-time.After(5 * time.Second):
+		panic("watchdog did not return")
+	}
+	stop.Do(func() { close(done) })
+	return stalled, probes
+}
+
+func TestWatchdogWaitsForTheFirstAnswerBeforeCounting(t *testing.T) {
+	stalled, _ := runWatchdog([]bool{false, false, false, false, false}, 3)
+	if stalled {
+		t.Fatal("a product that never answered yet (startup, migrations) must not be killed")
+	}
+}
+
+func TestWatchdogKillsAfterConsecutiveFailures(t *testing.T) {
+	stalled, probes := runWatchdog([]bool{true, false, false, false, true}, 3)
+	if !stalled || probes != 4 {
+		t.Fatalf("expected a stall on the third failure in a row, got stalled=%v after %d probes", stalled, probes)
+	}
+}
+
+func TestWatchdogResetsOnAnAnswer(t *testing.T) {
+	stalled, _ := runWatchdog([]bool{true, false, false, true, false, false, true}, 3)
+	if stalled {
+		t.Fatal("failures separated by an answer must not add up")
+	}
+}
+
+func TestWatchdogStopsWhenTheHostStops(t *testing.T) {
+	done := make(chan struct{})
+	close(done)
+	stalled := false
+	watchdog(func() bool { return false }, time.Second, 1, func(time.Duration) <-chan time.Time { return make(chan time.Time) }, done, func() { stalled = true })
+	if stalled {
+		t.Fatal("a stopping host must not report a stall")
+	}
+}
+
+func TestProductProbeReportsOnlyOK(t *testing.T) {
+	// Unix socket paths are short on macOS; t.TempDir() can exceed the limit.
+	dir, err := os.MkdirTemp("/tmp", "wd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	socket := filepath.Join(dir, "product.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := http.StatusOK
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/health" {
+			http.NotFound(w, r)
+			return
+		}
+		w.WriteHeader(status)
+	})}
+	go server.Serve(listener)
+	defer server.Close()
+	probe := productProbe(socket, time.Second)
+	if !probe() {
+		t.Fatal("a 200 from /health is an answer")
+	}
+	status = http.StatusServiceUnavailable
+	if probe() {
+		t.Fatal("a non-200 is not an answer")
+	}
+	server.Close()
+	if probe() {
+		t.Fatal("a closed socket is not an answer")
+	}
+}

@@ -739,6 +739,20 @@ func serve(mode string) error {
 	public := &http.Server{Handler: publicHandler(proxy), ReadHeaderTimeout: 10 * time.Second}
 	defer public.Close()
 	go func() { serverError <- public.Serve(publicListener) }()
+	// One app isolate in a synchronous loop holds workerd's only JavaScript thread, so the product
+	// and every other app stop answering and no timeout inside workerd can fire. OSS workerd does
+	// not enforce CPU limits, so the host bounds the outage instead: once the product has answered,
+	// a run of failed health probes kills workerd, this host exits non-zero, and the container's
+	// restart policy starts a fresh process.
+	watchdogDone := make(chan struct{})
+	defer close(watchdogDone)
+	if interval, failures, enabled := watchdogSettings(); enabled {
+		probe := productProbe(filepath.Join(temporary, "product.sock"), min(interval, 5*time.Second))
+		go watchdog(probe, interval, failures, time.After, watchdogDone, func() {
+			fmt.Fprintf(os.Stderr, "Executor watchdog: the product did not answer %d health checks in a row (every %s); workerd is unresponsive, restarting it\n", failures, interval)
+			command.Process.Kill()
+		})
+	}
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(signals)
@@ -844,6 +858,76 @@ func productProxy(socket string, upstreamIdleTimeout time.Duration, trustedProxy
 			}
 			http.Error(w, "Executor did not complete the request", http.StatusBadGateway)
 		},
+	}
+}
+
+// watchdogSettings reads EXECUTOR_WATCHDOG_INTERVAL (seconds, default 10) and
+// EXECUTOR_WATCHDOG_FAILURES (default 9, so about 90 seconds of silence). EXECUTOR_WATCHDOG=off turns the watchdog off.
+func watchdogSettings() (time.Duration, int, bool) {
+	if strings.EqualFold(setting("EXECUTOR_WATCHDOG", "on"), "off") {
+		return 0, 0, false
+	}
+	seconds, err := strconv.ParseFloat(setting("EXECUTOR_WATCHDOG_INTERVAL", "10"), 64)
+	if err != nil || seconds <= 0 {
+		seconds = 10
+	}
+	failures, err := strconv.Atoi(setting("EXECUTOR_WATCHDOG_FAILURES", "9"))
+	if err != nil || failures < 1 {
+		failures = 9
+	}
+	return time.Duration(seconds * float64(time.Second)), failures, true
+}
+
+// productProbe asks the product's own socket for /health, bypassing the public proxy, and
+// reports whether it answered 200 within timeout.
+func productProbe(socket string, timeout time.Duration) func() bool {
+	client := http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", socket)
+			},
+			DisableKeepAlives: true,
+		},
+	}
+	return func() bool {
+		response, err := client.Get("http://product/health")
+		if err != nil {
+			return false
+		}
+		io.Copy(io.Discard, response.Body)
+		response.Body.Close()
+		return response.StatusCode == http.StatusOK
+	}
+}
+
+// watchdog probes every interval, one probe at a time. It arms after the first successful probe,
+// so startup and migrations are never cut short, then calls stall once after failures failed
+// probes in a row and returns. A success resets the count. Closing done stops it.
+func watchdog(probe func() bool, interval time.Duration, failures int, after func(time.Duration) <-chan time.Time, done <-chan struct{}, stall func()) {
+	armed, failed := false, 0
+	for {
+		select {
+		case <-after(interval):
+		case <-done:
+			return
+		}
+		if probe() {
+			armed, failed = true, 0
+			continue
+		}
+		if !armed {
+			continue
+		}
+		failed++
+		if failed >= failures {
+			select {
+			case <-done:
+			default:
+				stall()
+			}
+			return
+		}
 	}
 }
 
