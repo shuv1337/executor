@@ -96,9 +96,10 @@ const appUse = (
       on m."organizationId" = p.organization_id and m."userId" = ${input.actor}
       where p.id = ${input.id} and p.organization_id = ${input.organization}
       and ((p.audience = 'private' and p.creator_id = m."userId") or p.audience = 'everyone'
-        or (p.audience = 'groups' and exists(select 1 from hosted_app_groups g
-          join hosted_group_members gm on gm.group_id = g.group_id
-          where g.app_id = p.id and gm.member_id = m.id)))`;
+        or (p.audience = 'groups' and (p.creator_id = m."userId" or m.role = 'owner'
+          or exists(select 1 from hosted_app_groups g
+            join hosted_group_members gm on gm.group_id = g.group_id
+            where g.app_id = p.id and gm.member_id = m.id))))`;
 
 /** Whether a subject is a member who may use the app now, as any of its operations requires. */
 export const actorUsesApp = (

@@ -137,6 +137,18 @@ layer(HostedLive, { excludeTestServices: true })("Apps CLI call", (it) => {
         const fromStdin = yield* call(["--tool", "import.records", "--input-file", "-"], large);
         expect(fromStdin.code, fromStdin.stderr).toBe(0);
         expect(yield* Schema.decodeUnknownEffect(Imported)(fromStdin.stdout)).toEqual(whole);
+        // An input over the host's 32 MiB limit is refused with its size and the limit, before the
+        // app runs, instead of failing inside the runtime as an unreadable result.
+        const oversized = yield* write(
+          "oversized.json",
+          JSON.stringify(records(190_000, "x".repeat(180))),
+        );
+        const tooLarge = yield* call(["--tool", "import.records", "--input-file", oversized]);
+        expect(tooLarge.code).toBe(1);
+        const refusedSize = (yield* Schema.decodeUnknownEffect(Failure)(tooLarge.stdout)).error;
+        yield* evidence.json("oversized-input.json", refusedSize);
+        expect(refusedSize).toMatchObject({ code: "InputInvalid", status: 422 });
+        expect(refusedSize.message).toContain("limited to 32 MiB");
         // The same call by the app's ID, with inline input.
         const byId = yield* owner.cli([
           "call",

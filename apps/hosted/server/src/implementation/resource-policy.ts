@@ -88,10 +88,15 @@ const appAccessOf = (found: typeof AppPolicy.Type, actor: ResourceAuthority) => 
     audience,
     revision: found.revision,
     canManage: actor.role !== "member" || found.creator === actor.user,
+    // A group audience always keeps its creator and the organization's owner, who could restore
+    // their own use by changing the audience anyway; narrowing an app must not lock them out.
     canUse:
       found.audience === "private"
         ? found.creator === actor.user
-        : found.audience === "everyone" || found.granted,
+        : found.audience === "everyone" ||
+          found.granted ||
+          found.creator === actor.user ||
+          actor.role === "owner",
   } satisfies typeof AppAccess.Type;
 };
 /** Resolve app policies in one read, retaining tenant and group checks for every row. */
@@ -485,10 +490,10 @@ export const requireAppUse = (app: App, organization: OrganizationId, user: stri
         and p.id = ${app.id}
         and (p.audience = 'everyone'
           or (p.audience = 'private' and p.creator_id = ${user})
-          or (p.audience = 'groups' and exists (
+          or (p.audience = 'groups' and (p.creator_id = ${user} or m.role = 'owner' or exists (
             select 1 from hosted_app_groups g
             join hosted_group_members gm on gm.group_id = g.group_id
-            where g.app_id = p.id and gm.member_id = m.id)))
+            where g.app_id = p.id and gm.member_id = m.id))))
       `;
     const result = yield* Schema.decodeUnknownEffect(
       Schema.Array(Schema.Struct({ role: OrganizationRole })),

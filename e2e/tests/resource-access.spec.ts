@@ -315,10 +315,18 @@ layer(HostedLive, { excludeTestServices: true })("Resource access", (it) => {
           (yield* api.request(actors.admin, "POST", `${prefix}/apps/${app.id}/tools/call`, call))
             .status,
         ).toBe(200);
+        // A group audience always keeps the organization's owner, who could change the audience
+        // anyway: narrowing an app to groups never locks the owner out.
         expect(
           (yield* api.request(actors.owner, "POST", `${prefix}/apps/${app.id}/tools/call`, call))
             .status,
-        ).toBe(403);
+        ).toBe(200);
+        expect(
+          yield* body(
+            Access,
+            yield* api.request(actors.owner, "GET", `${prefix}/apps/${app.id}/access`),
+          ),
+        ).toMatchObject({ canUse: true });
         const shared = yield* body(
           Inventory,
           yield* api.request(actors.member, "GET", `${prefix}/inventory`),
@@ -332,14 +340,28 @@ layer(HostedLive, { excludeTestServices: true })("Resource access", (it) => {
             revision: engineering.revision,
           })).status,
         ).toBe(200);
+        // The app's creator keeps use after leaving its groups, as the owner does.
         expect(
           (yield* api.request(actors.member, "POST", `${prefix}/apps/${app.id}/tools/call`, call))
             .status,
-        ).toBe(403);
+        ).toBe(200);
         expect(
           (yield* api.request(actors.admin, "POST", `${prefix}/apps/${app.id}/tools/call`, call))
             .status,
         ).toBe(200);
+        // Anyone else loses use with their group membership: the admin, once out of sales.
+        expect(
+          (yield* api.request(actors.owner, "PATCH", `${prefix}/groups/${sales.id}`, {
+            name: `Sales ${suffix}`,
+            description: "",
+            memberIds: [],
+            revision: sales.revision,
+          })).status,
+        ).toBe(200);
+        expect(
+          (yield* api.request(actors.admin, "POST", `${prefix}/apps/${app.id}/tools/call`, call))
+            .status,
+        ).toBe(403);
         // The app list checks current membership with every app's policy, so an app shared with
         // everyone after a member is removed stays hidden from that member.
         const listed = (actor: Session) => api.request(actor, "GET", `${prefix}/apps`);
@@ -347,7 +369,9 @@ layer(HostedLive, { excludeTestServices: true })("Resource access", (it) => {
           Effect.flatMap(listed(actor), (response) =>
             Effect.map(body(Schema.Array(App), response), (apps) => apps.map((item) => item.id)),
           );
-        expect(yield* listedIds(actors.member)).not.toContain(app.id);
+        // The creator still lists the app outside its groups; the admin, out of sales, does not.
+        expect(yield* listedIds(actors.member)).toContain(app.id);
+        expect(yield* listedIds(actors.admin)).not.toContain(app.id);
         const seat = yield* freeSeat;
         const grouped = yield* body(
           Access,
