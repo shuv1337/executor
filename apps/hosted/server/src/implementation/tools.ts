@@ -250,7 +250,8 @@ export const hostedToolHandlers = HttpApiBuilder.group(HostedApi, "tools", (hand
         // The SDK checks the issuer again before it consumes the request.
         const result = yield* executor.tools.resume(
           { requestId: params.requestId, owner: yield* currentOwner, response },
-          { issuer },
+          // The signed-in person reviewed the saved call in their dashboard.
+          { issuer, approvalMethod: "dashboard" },
         );
         return result.status === "already-consumed" ||
           (result.status === "failed" && result.reason === "expired")

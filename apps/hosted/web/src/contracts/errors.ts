@@ -57,6 +57,8 @@ const errorMessage = Match.type<HostedError>().pipe(
       "This app changed while you were editing. Reload its source and try again.",
     AppDataNotFound: () => "This data operation is no longer available. Reload the app.",
     AppDataFailed: () => "The app could not complete this data operation.",
+    AppDataApprovalRequired: () =>
+      "This operation needs approval. Run it as a tool call to approve it.",
     AppNotDeployed: () => "Deploy this app before running its tools or configuring accounts.",
     SourceError: (error) =>
       error.reason === "conflict"

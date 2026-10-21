@@ -2,12 +2,17 @@
 import { Effect, Result, Schema, Stream } from "effect";
 import type { WorkflowHostControls } from "apps/contracts";
 import { Json } from "../contracts/shared.ts";
-import { HostOperationNotFound } from "apps/contracts";
-import { AppDataFailed, AppDataNotFound, type AppDataInput } from "../contracts/app-data.ts";
+import { HostOperationNotFound, HostToolApprovalRequired } from "apps/contracts";
+import {
+  AppDataApprovalRequired,
+  AppDataFailed,
+  AppDataNotFound,
+  type AppDataInput,
+} from "../contracts/app-data.ts";
 import type { Runtime } from "../contracts/runtime.ts";
 import type { ExecutorDatabase } from "./storage.ts";
 import { database } from "./database.ts";
-import { resolve, snapshot, type InvocationSnapshot } from "./tools.ts";
+import { callerContext, resolve, snapshot, type InvocationSnapshot } from "./tools.ts";
 import type { makeOAuth } from "./oauth.ts";
 import { ownsDatabase } from "../contracts/apps.ts";
 
@@ -36,12 +41,15 @@ export const makeAppData = (
         ...(workflows === undefined ? {} : { workflowControls: workflows(state) }),
         name: input.name,
         input: input.input,
+        ...callerContext(state),
         ...(observeRevision === undefined ? {} : { observeRevision }),
       }).pipe(
         Effect.mapError((error) =>
           Schema.is(HostOperationNotFound)(error)
             ? new AppDataNotFound({ app: input.app, name: input.name })
-            : new AppDataFailed({ app: input.app, name: input.name }),
+            : Schema.is(HostToolApprovalRequired)(error)
+              ? new AppDataApprovalRequired({ app: input.app, name: input.name })
+              : new AppDataFailed({ app: input.app, name: input.name }),
         ),
       );
     });

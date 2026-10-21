@@ -100,10 +100,10 @@ export const makeMcpSession = Effect.fn(function* ({
               Effect.as(mcpSessionNotFound()),
             ),
       );
-    const browser = browserMcpRequest((access, address) =>
+    const browser = browserMcpRequest((access, address, issuer) =>
       bound(
         access,
-        hostedMcpApproval(handler.approvals, access, address).pipe(
+        hostedMcpApproval(handler.approvals, access, address, issuer).pipe(
           Effect.provideService(CurrentUserId, access.userId),
         ),
       ),

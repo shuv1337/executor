@@ -1,6 +1,6 @@
 /** Browser delivery data. URLs locate an interaction; hosts must authorize every read and answer. */
 import { Schema, type Effect } from "effect";
-import { ElicitationResponse } from "apps/contracts";
+import { ElicitationResponse, type ApprovedBy } from "apps/contracts";
 import {
   ApprovalRequestId,
   Json,
@@ -17,6 +17,8 @@ export const BrowserSessionId = Schema.NonEmptyString.check(Schema.isMaxLength(5
 export const BrowserApprovalAddress = Schema.Struct({
   requestId: InteractionId,
   sessionId: BrowserSessionId,
+  /** A model-mode request that requires a person; its program is the caller's, not a session's. */
+  mode: Schema.optionalKey(Schema.Literal("model")),
 });
 export type BrowserApprovalAddress = typeof BrowserApprovalAddress.Type;
 /** Only a live pending view contains private invocation data and form fields. */
@@ -116,5 +118,7 @@ export interface BrowserApprovals {
     product: string,
     address: BrowserApprovalAddress,
     response: typeof ElicitationResponse.Type,
+    /** The signed-in person answering, recorded as the call's `approvedBy`. */
+    approver?: ApprovedBy,
   ) => Effect.Effect<BrowserApprovalAcknowledgement, ElicitationResponseInvalid>;
 }

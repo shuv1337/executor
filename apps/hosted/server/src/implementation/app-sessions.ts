@@ -205,7 +205,14 @@ export const hostedAppSessions = (
         const code = yield* nonce;
         yield* put(
           key("grant", yield* digest(code)),
-          { kind: "grant", request, target, parent: principal.sessionId, user: principal.userId },
+          {
+            kind: "grant",
+            request,
+            target,
+            parent: principal.sessionId,
+            user: principal.userId,
+            email: principal.email ?? null,
+          },
           new Date((yield* Clock.currentTimeMillis) + 60_000),
         );
         return code;
@@ -244,7 +251,13 @@ export const hostedAppSessions = (
         );
         yield* put(
           key("session", yield* digest(token)),
-          { kind: "session", target, parent: grant.parent, user: grant.user },
+          {
+            kind: "session",
+            target,
+            parent: grant.parent,
+            user: grant.user,
+            ...(grant.email === undefined ? {} : { email: grant.email }),
+          },
           expiresAt,
         );
         return { token, returnTo: attempt.returnTo, expiresAt };
@@ -257,7 +270,7 @@ export const hostedAppSessions = (
         yield* parent(session.parent, session.user);
         // The serving host checks current membership together with app/account
         // permissions. A second lookup here adds no authority to that decision.
-        return { userId: session.user };
+        return { userId: session.user, email: session.email ?? null };
       }),
   });
 };

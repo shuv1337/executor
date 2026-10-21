@@ -22,8 +22,13 @@ import {
   type McpOptions,
 } from "../contracts/tools.ts";
 import type { BrowserExecutionResult } from "../contracts/browser-tools.ts";
-import type { BrowserApprovals, BrowserDelivery } from "../contracts/browser.ts";
+import type {
+  BrowserApprovalAddress,
+  BrowserApprovals,
+  BrowserDelivery,
+} from "../contracts/browser.ts";
 import type { McpExecutionResult } from "../contracts/execute.ts";
+import { ElicitationResponseInvalid, InteractionId } from "../contracts/interactions.ts";
 import { makeExecutions } from "./executions.ts";
 import { executeNative } from "./native-elicitation.ts";
 import { callTools, describeCatalog, executeProgram, searchCatalog } from "./execute.ts";
@@ -147,6 +152,12 @@ const withLink = (
         .pipe(Effect.map((approvalUrl) => ({ ...result, approvalUrl })))
     : Effect.succeed(result);
 
+/** Resume tools advertise a plain pattern (`AdvertisedInteractionId`); decode the typed ID here. */
+const interactionId = (requestId: string) =>
+  Schema.decodeUnknownEffect(InteractionId)(requestId).pipe(
+    Effect.mapError(() => new ElicitationResponseInvalid()),
+  );
+
 /** Build protocol state and its browser accessors together. Hosts authorize browser calls separately from MCP. */
 export const makeMcp = (options: McpOptions) =>
   Effect.gen(function* () {
@@ -191,6 +202,16 @@ export const makeMcp = (options: McpOptions) =>
           searchCatalog(options.backend, options.limits, input).pipe(Effect.withSpan("mcp.search"));
         const describe = (input: Parameters<typeof describeCatalog>[1]) =>
           describeCatalog(options.backend, input).pipe(Effect.withSpan("mcp.describe"));
+        /**
+         * In model mode, a request only a person may approve carries the browser page they approve
+         * it on. The agent shows it and resumes; the person's answer is used, never the agent's.
+         */
+        const personLink = (result: McpExecutionResult): Effect.Effect<McpExecutionResult> =>
+          result.status === "approval-required" && result.human === true && delivery !== undefined
+            ? delivery
+                .url({ sessionId: "model", requestId: result.requestId, mode: "model" })
+                .pipe(Effect.map((approvalUrl) => ({ ...result, approvalUrl })))
+            : Effect.succeed(result);
         const toolkit =
           mode === "native"
             ? McpServer.toolkit(NativeMcpToolkit).pipe(
@@ -250,23 +271,34 @@ export const makeMcp = (options: McpOptions) =>
                         ),
                       search,
                       describe,
-                      resume: ({ requestId }) =>
+                      resume: (input) =>
                         caller.pipe(
                           Effect.flatMap(({ id, sessionId }) =>
                             Effect.gen(function* () {
+                              const requestId = yield* interactionId(input.requestId);
                               const response = yield* executions.browserAnswer(
                                 id,
                                 requestId,
                                 delivery.pollMs ?? 25_000,
                               );
-                              if (response !== undefined)
+                              if (response !== undefined) {
+                                const approver = yield* executions.browserApprover(requestId);
                                 return yield* executions
-                                  .resume(id, options.backend, { requestId, response })
+                                  .resume(
+                                    id,
+                                    options.backend,
+                                    { requestId, response },
+                                    {
+                                      method: "browser",
+                                      ...(approver === undefined ? {} : { approver }),
+                                    },
+                                  )
                                   .pipe(
                                     Effect.flatMap((result) =>
                                       withLink(result, sessionId, delivery),
                                     ),
                                   );
+                              }
                               const pending = yield* executions.pendingInteraction(id, requestId);
                               return yield* pending === undefined
                                 ? executions.unavailable(id, requestId)
@@ -285,14 +317,18 @@ export const makeMcp = (options: McpOptions) =>
                       execute: ({ code }) =>
                         caller.pipe(
                           Effect.flatMap(({ id }) =>
-                            executions.execute(id, options.backend, executeProgram(code), "result"),
+                            executions
+                              .execute(id, options.backend, executeProgram(code), "result")
+                              .pipe(Effect.flatMap(personLink)),
                           ),
                           observeExecution("mcp.execute"),
                         ),
                       call: (input) =>
                         caller.pipe(
                           Effect.flatMap(({ id }) =>
-                            executions.execute(id, options.backend, callTools(input), "result"),
+                            executions
+                              .execute(id, options.backend, callTools(input), "result")
+                              .pipe(Effect.flatMap(personLink)),
                           ),
                           observeExecution("mcp.call"),
                         ),
@@ -300,7 +336,30 @@ export const makeMcp = (options: McpOptions) =>
                       describe,
                       resume: (input) =>
                         caller.pipe(
-                          Effect.flatMap(({ id }) => executions.resume(id, options.backend, input)),
+                          Effect.flatMap(({ id }) =>
+                            Effect.gen(function* () {
+                              const requestId = yield* interactionId(input.requestId);
+                              // A person may have answered on the approval page; their answer wins.
+                              const answered = yield* executions.browserAnswer(id, requestId, 0);
+                              if (answered !== undefined) {
+                                const approver = yield* executions.browserApprover(requestId);
+                                return yield* executions.resume(
+                                  id,
+                                  options.backend,
+                                  { requestId, response: answered },
+                                  {
+                                    method: "browser",
+                                    ...(approver === undefined ? {} : { approver }),
+                                  },
+                                );
+                              }
+                              return yield* executions.resume(id, options.backend, {
+                                requestId,
+                                response: input.response,
+                              });
+                            }),
+                          ),
+                          Effect.flatMap(personLink),
                           observeExecution("mcp.resume"),
                         ),
                       skills: skill,
@@ -375,14 +434,21 @@ export const makeMcp = (options: McpOptions) =>
         }),
       );
     }).pipe(Effect.map(withSseHeartbeat));
+    // A model-mode address names the caller's model programs, which only a person-required
+    // request links to; any other address names one browser-mode session.
+    const addressed = (product: string, address: BrowserApprovalAddress) =>
+      address.mode === "model"
+        ? callerIdentity(product, "model")
+        : browserIdentity(product, address.sessionId);
     const approvals: BrowserApprovals = {
       get: (product, address) =>
-        executions.browserView(browserIdentity(product, address.sessionId), address.requestId),
-      answer: (product, address, response) =>
+        executions.browserView(addressed(product, address), address.requestId),
+      answer: (product, address, response, approver) =>
         executions.answerInBrowser(
-          browserIdentity(product, address.sessionId),
+          addressed(product, address),
           address.requestId,
           response,
+          approver,
         ),
     };
     return { http, approvals };

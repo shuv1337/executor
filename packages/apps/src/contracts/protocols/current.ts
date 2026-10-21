@@ -191,6 +191,11 @@ export const DeclaredRequirements = Schema.Struct({
        * as an excess field.
        */
       sharedDefinitions: Schema.optionalKey(Schema.Literal(true)),
+      /**
+       * Accepts the invocation's verified `caller` and, on a resumed approval, `approvedBy`.
+       * Earlier builds are never sent either.
+       */
+      callerIdentity: Schema.optionalKey(Schema.Literal(true)),
     }),
   ),
   /**
@@ -255,6 +260,70 @@ export type ResolvedAccounts = typeof ResolvedAccounts.Type;
 /** Trusted approval for one decoded call. Never accepted in public command JSON. */
 export const TrustedToolApproval = Schema.Struct({ tool: Schema.NonEmptyString, input: JsonValue });
 export type TrustedToolApproval = typeof TrustedToolApproval.Type;
+
+/**
+ * What started an invocation: a person, an agent acting for one, or the host's own background work.
+ * Agents are MCP clients and API keys; they act for the person who owns the grant or key.
+ */
+export const CallerKind = Schema.Literals(["human", "agent", "system"]);
+export type CallerKind = typeof CallerKind.Type;
+
+/** The surface an invocation arrived through. Every invocation names one. */
+export const CallerChannel = Schema.Literals([
+  "ui",
+  "mcp",
+  "api",
+  "dashboard",
+  "schedule",
+  "workflow",
+  "webhook",
+]);
+export type CallerChannel = typeof CallerChannel.Type;
+
+/**
+ * Unverified client details, for logs only. The host relays what the client presented; never
+ * authorize anything with them.
+ */
+export const CallerProvenance = Schema.Struct({
+  trusted: Schema.Literal(false),
+  /** The MCP OAuth client, or `pat:<id>` for a personal access token. */
+  clientId: Schema.optionalKey(Schema.String),
+  /** The scoped MCP connection the grant was issued for. */
+  connectionId: Schema.optionalKey(Schema.String),
+});
+export type CallerProvenance = typeof CallerProvenance.Type;
+
+/**
+ * The verified caller of one invocation. `subject` is the user the invocation acts for, or null
+ * for background work that has none. `issuer` is the authority that verified it.
+ */
+export const Caller = Schema.Struct({
+  kind: CallerKind,
+  subject: Schema.NullOr(Schema.String),
+  issuer: Schema.NullOr(Schema.String),
+  email: Schema.NullOr(Schema.String),
+  organizationId: Schema.NullOr(Schema.String),
+  channel: CallerChannel,
+  provenance: Schema.optionalKey(CallerProvenance),
+});
+export type Caller = typeof Caller.Type;
+
+/** How a person or agent answered an approval request. */
+export const ApprovalMethod = Schema.Literals([
+  "model",
+  "client",
+  "native",
+  "browser",
+  "dashboard",
+]);
+export type ApprovalMethod = typeof ApprovalMethod.Type;
+
+/**
+ * Who answered the approval a resumed call runs under. `caller` stays the original requester;
+ * `approvedBy` has its own channel, such as a browser approval of an MCP call.
+ */
+export const ApprovedBy = Schema.Struct({ ...Caller.fields, method: ApprovalMethod });
+export type ApprovedBy = typeof ApprovedBy.Type;
 
 /** Absolute Unix time in milliseconds; remote hosts enforce it inside the operation transaction. */
 export const InvocationDeadline = Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0));
@@ -507,7 +576,12 @@ export class HostToolBlocked extends Schema.TaggedError<HostToolBlocked>()("Host
 /** Policy elicitation plus decoded input. No tool body ran; the host owns delivery and resumption. */
 export class HostToolApprovalRequired extends Schema.TaggedError<HostToolApprovalRequired>()(
   "HostToolApprovalRequired",
-  { input: JsonValue, elicitation: ApprovalElicitation },
+  {
+    input: JsonValue,
+    elicitation: ApprovalElicitation,
+    /** The tool requires a person to approve: an agent's own answer never counts. */
+    human: Schema.optionalKey(Schema.Literal(true)),
+  },
 ) {}
 /** The tool's approval policy failed or returned an invalid decision. Author failures remain private. */
 export class HostToolPolicyFailed extends Schema.TaggedError<HostToolPolicyFailed>()(
@@ -575,6 +649,10 @@ export const HostInvocation = Schema.Struct({
   replay: Schema.optionalKey(WorkflowReplay),
   deadline: Schema.optionalKey(InvocationDeadline),
   workflowRun: Schema.optionalKey(WorkflowRunId),
+  /** Sent only to builds that declare the callerIdentity capability. */
+  caller: Schema.optionalKey(Caller),
+  /** On a resumed approval, to builds that declare callerIdentity. */
+  approvedBy: Schema.optionalKey(ApprovedBy),
 });
 export type HostInvocation = typeof HostInvocation.Type;
 

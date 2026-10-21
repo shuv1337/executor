@@ -682,7 +682,7 @@ export const dashboard = (
           // The SDK checks the issuer again before it consumes the request.
           const result = yield* executor.tools.resume(
             { requestId: params.requestId, owner, response },
-            { issuer: dashboardRun },
+            { issuer: dashboardRun, approvalMethod: "dashboard" },
           );
           return result.status === "already-consumed" ||
             (result.status === "failed" && result.reason === "expired")

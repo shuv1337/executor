@@ -1,4 +1,5 @@
-import { CurrentActor } from "../contracts/executor.ts";
+import { systemCaller } from "./caller.ts";
+import { CurrentActor, CurrentCaller } from "../contracts/executor.ts";
 /** Retained run identities pin code/accounts; the backend owns timers and checkpoint execution. */
 import { Cause, Clock, Effect, Redacted, Result, Schema, type Crypto } from "effect";
 import { Hex } from "effect/encoding";
@@ -30,7 +31,7 @@ import type { makeOAuth } from "./oauth.ts";
 import { database, query, transaction } from "./database.ts";
 import { storedAccount } from "./accounts.ts";
 import { storedApp, storedVersion } from "./apps.ts";
-import { resolve, snapshot, type InvocationSnapshot } from "./tools.ts";
+import { callerContext, resolve, snapshot, type InvocationSnapshot } from "./tools.ts";
 import { invocationScope, scopedSelection } from "./selection.ts";
 import type { Declarations } from "./declarations.ts";
 import { ownsDatabase } from "../contracts/apps.ts";
@@ -200,7 +201,10 @@ export const makeWorkflowRuns = (
       app: row.app,
       version: row.version,
       captured: { accounts: row.accounts, scope: row.scope },
-    }).pipe(Effect.provideService(CurrentActor, row.actor ?? undefined));
+    }).pipe(
+      Effect.provideService(CurrentActor, row.actor ?? undefined),
+      Effect.provideService(CurrentCaller, systemCaller("workflow", row.actor ?? undefined)),
+    );
   const context: WorkflowHost["context"] = (run) =>
     safe(
       Effect.gen(function* () {
@@ -211,7 +215,10 @@ export const makeWorkflowRuns = (
         return {
           ...(yield* resolve(state, resolveAccount).pipe(
             Effect.provideService(CurrentActor, state.actor),
+            Effect.provideService(CurrentCaller, systemCaller("workflow", state.actor)),
           )),
+          // A run's steps run as the host's workflow, for the person it started for, if any.
+          ...callerContext(state),
           database: ownsDatabase(state.version.requirements),
           workflowControls: controls(state),
         };
@@ -444,6 +451,7 @@ export const makeWorkflowRuns = (
         const state = inherited ?? (yield* snapshot(db, input));
         const bound = yield* resolve(state, resolveAccount).pipe(
           Effect.provideService(CurrentActor, actor),
+          Effect.provideService(CurrentCaller, systemCaller("workflow", actor)),
         );
         const parsed = yield* safe(
           runtime

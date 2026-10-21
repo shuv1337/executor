@@ -89,7 +89,16 @@ export class UiVersionChanged extends Schema.TaggedError<UiVersionChanged>()(
 export class UiFailed extends Schema.TaggedError<UiFailed>()(
   "UiFailed",
   {
-    reason: Schema.Literals(["unavailable", "operation_failed", "account_required"]),
+    /**
+     * `approval_required`: the operation's approval policy asked for a decision, which a call from
+     * the page cannot pause for; it did not run past its policy.
+     */
+    reason: Schema.Literals([
+      "unavailable",
+      "operation_failed",
+      "account_required",
+      "approval_required",
+    ]),
   },
   { httpApiStatus: 422 },
 ) {}

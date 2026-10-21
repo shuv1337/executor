@@ -47,6 +47,19 @@ export const AppDataFailed = ApiError.define({
     "The operation failed: its input was invalid, app storage was unavailable, or the app's code failed",
 });
 export type AppDataFailed = typeof AppDataFailed.Type;
+/**
+ * The operation's approval policy asked for a decision, and data calls cannot pause for one. The
+ * call did not run past its policy. Run it as a tool call, which can be approved, instead.
+ */
+export const AppDataApprovalRequired = ApiError.define({
+  tag: "AppDataApprovalRequired",
+  status: 409,
+  fields: { app: AppId, name: Schema.String },
+  message: ({ name }) =>
+    `The operation “${name}” needs approval, which a call from the app's page cannot ask for. Run it as a tool call to approve it.`,
+  recorded: () => "The operation needs approval, which data calls cannot ask for",
+});
+export type AppDataApprovalRequired = typeof AppDataApprovalRequired.Type;
 
 const errors = [
   StorageError,
@@ -62,6 +75,7 @@ const errors = [
   OAuthRenewalFailed,
   AppDataNotFound,
   AppDataFailed,
+  AppDataApprovalRequired,
 ] as const;
 /** Data failures shared by transports without losing their precise typed union. */
 export const AppDataErrors = Schema.Union(errors);

@@ -16,6 +16,15 @@ export const always =
   () =>
     "user-approval";
 
+/**
+ * Require a person to approve every call: an agent cannot approve its own request, even in model
+ * mode. The approval reaches the person through the browser approval page or their MCP client's form.
+ */
+export const human =
+  <Input = unknown>(): Approval<Input> =>
+  () =>
+    "human-approval";
+
 /** Never require human approval for this tool. Product access checks still apply. */
 export const never =
   <Input = unknown>(): Approval<Input> =>

@@ -17,6 +17,11 @@ export const ElicitationRequestId = Schema.String.pipe(
 export const InteractionId = Schema.Union([ApprovalRequestId, ElicitationRequestId]);
 export type InteractionId = typeof InteractionId.Type;
 /**
+ * A request ID as MCP tool parameters advertise it: one plain pattern that strict JSON Schema
+ * validators in MCP connectors accept. Handlers still decode it as an `InteractionId`.
+ */
+export const AdvertisedInteractionId = Schema.String.check(Schema.isPattern(/^(?:apr|elc)_.+$/u));
+/**
  * The running call that asked. A call without accounts, such as one to an account-free app, omits
  * the accounts key: pending interactions are MCP results, and JSON has no undefined.
  */

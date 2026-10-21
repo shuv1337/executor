@@ -24,6 +24,8 @@ import {
   type HostAccount,
   type HostAccounts,
   type HostAccountSlots,
+  type ApprovedBy,
+  type Caller,
   scopedSlots,
 } from "apps/contracts";
 import {
@@ -42,6 +44,7 @@ import { VersionNotFound } from "../contracts/version.ts";
 import {
   type AppAccountUse,
   CurrentActor,
+  CurrentCaller,
   type Executor,
   type ResourceLifecycle,
 } from "../contracts/executor.ts";
@@ -102,6 +105,8 @@ import {
   StoredVersion,
 } from "../contracts/storage.ts";
 import { makeToolApprovals } from "./tool-approvals.ts";
+import { fallbackCaller } from "./caller.ts";
+export { fallbackCaller, systemCaller } from "./caller.ts";
 import { gotApp, storedVersion } from "./apps.ts";
 import { database, query, type Query } from "./database.ts";
 import type { OwnerId } from "../contracts/shared.ts";
@@ -199,9 +204,58 @@ export function snapshot(
           ),
       ahead?.accounts,
     );
-    return { app, version, scope, selections, accounts, actor: yield* CurrentActor };
+    return {
+      app,
+      version,
+      scope,
+      selections,
+      accounts,
+      actor: yield* CurrentActor,
+      caller: yield* CurrentCaller,
+    };
   });
 }
+
+/** Run resumed work as the stored requester, when the request saved one. */
+const asRequester = <A, E, R>(requester: Caller | undefined, work: Effect.Effect<A, E, R>) =>
+  requester === undefined
+    ? work
+    : work.pipe(
+        Effect.provideService(CurrentActor, requester.subject ?? undefined),
+        Effect.provideService(CurrentCaller, requester),
+      );
+
+/**
+ * The verified identity an invocation of this build receives. Builds that do not declare
+ * callerIdentity get neither field, so their bundles never see JSON they would reject.
+ */
+export const callerContext = (
+  state: {
+    readonly app: { readonly owner: string };
+    readonly version: {
+      readonly requirements: {
+        readonly capabilities?: { readonly callerIdentity?: true | undefined } | undefined;
+      };
+    };
+    readonly actor: string | undefined;
+    readonly caller: Caller | undefined;
+  },
+  approvedBy?: ApprovedBy,
+): { readonly caller?: Caller; readonly approvedBy?: ApprovedBy } =>
+  state.version.requirements.capabilities?.callerIdentity === true
+    ? {
+        caller: withOrganization(state.caller ?? fallbackCaller(state.actor), state.app.owner),
+        ...(approvedBy === undefined
+          ? {}
+          : { approvedBy: withOrganization(approvedBy, state.app.owner) }),
+      }
+    : {};
+
+/** Background work names no organization itself; the app's organization owner is the one it runs in. */
+const withOrganization = <C extends Caller>(caller: C, owner: string): C =>
+  caller.organizationId !== null || !owner.startsWith("organization:")
+    ? caller
+    : { ...caller, organizationId: owner.slice("organization:".length) };
 
 /**
  * The actor's app recheck run beside the snapshot's reads, before the call's own app and accounts
@@ -1426,6 +1480,7 @@ export const makeTools = (
                 tool: parsed.tool,
                 ...(kind === undefined ? {} : { kind }),
                 input: args,
+                ...callerContext(state),
                 ...(options?.elicitation === undefined ? {} : { elicitation: options.elicitation }),
               });
             }).pipe(
@@ -1464,6 +1519,10 @@ export const makeTools = (
               yield* invocation(state, parsed.tool, named, result.failure.input),
               args,
               options?.issuer,
+              {
+                caller: state.caller ?? fallbackCaller(state.actor),
+                ...(result.failure.human === true ? { human: true as const } : {}),
+              },
             );
           }
           return yield* Effect.fail(runtimeFailure(identity, state, renewal)(result.failure));
@@ -1513,145 +1572,169 @@ export const makeTools = (
         .pipe(
           Effect.mapError(() => new RequestInvalid()),
           Effect.flatMap((input) =>
-            approvals.resume(input, options?.issuer, (saved, originalInput) =>
-              Effect.gen(function* () {
-                // The saved identities name the accounts; their credentials are resolved again.
-                const checked = yield* snapshot(db, {
-                  app: saved.app,
-                  version: saved.version,
-                  accounts: invocationAccounts(saved),
-                }).pipe(
-                  Effect.withSpan("sdk.invocation.snapshot"),
-                  Effect.flatMap((state) =>
-                    invocation(state, saved.tool, saved.kind, saved.input).pipe(
-                      Effect.map((current) => ({ state, current })),
-                    ),
-                  ),
-                  Effect.result,
-                );
-                // A failed read shows nothing about the context: only an answer that differs does.
-                if (Result.isFailure(checked) && !isContextChange(checked.failure)) {
-                  yield* Effect.annotateCurrentSpan({
-                    "executor.outcome": "failed",
-                    "error.type": checked.failure._tag,
-                  });
-                  return {
-                    status: "failed",
-                    requestId: input.requestId,
-                    reason: "execution-failed",
-                    error: checked.failure,
-                    context: "unconfirmed",
-                  } satisfies ToolResumeResult;
-                }
-                if (
-                  Result.isFailure(checked) ||
-                  !Schema.toEquivalence(ToolInvocation)(saved, checked.success.current)
-                ) {
-                  return {
-                    status: "failed",
-                    requestId: input.requestId,
-                    reason: "context-changed",
-                  } satisfies ToolResumeResult;
-                }
-                const { state } = checked.success;
-                return yield* Effect.gen(function* () {
-                  yield* Effect.annotateCurrentSpan({
-                    "executor.app.id": saved.app,
-                    "executor.deployment.id": saved.version,
-                    "executor.build.id": state.version.build,
-                    "executor.tool.name": saved.tool,
-                    "executor.approval.id": input.requestId,
-                  });
-                  const context = yield* resolve(state, resolveAccount).pipe(
-                    Effect.withSpan("sdk.accounts.resolve"),
-                  );
-                  // Set by the host when it hands this call's work to the app's code, as for a call.
-                  let enteredApp = false;
-                  // As for a call, every failure from here passes through `callFailure` once, so a
-                  // resumed call that may write reports what it failed with as possibly written.
-                  return yield* Effect.gen(function* () {
-                    const kind = yield* kindOf(state, context, saved.tool, saved.kind);
-                    let toolError = false;
-                    const execute = (context: InvocationContext) =>
-                      Effect.suspend(() => {
-                        toolError = false;
-                        return runtime.call({
-                          app: saved.app,
-                          ...(workflows === undefined
-                            ? {}
-                            : { workflowControls: workflows(state) }),
-                          build: state.version.build,
-                          database: ownsDatabase(state.version.requirements),
-                          ...context,
-                          tool: saved.tool,
-                          ...(kind === undefined ? {} : { kind }),
-                          input: originalInput,
-                          approval: { tool: saved.tool, input: saved.input },
-                          ...(options?.elicitation === undefined
-                            ? {}
-                            : { elicitation: options.elicitation }),
-                        });
-                      }).pipe(
-                        Effect.provideService(ToolResultObservation, {
-                          failed: () => {
-                            toolError = true;
-                          },
-                        }),
-                        Effect.result,
-                      );
-                    // As for a call, the saved (caller's) kind decides whether a refused call is
-                    // repeated; the catalog's only sets the dispatched kind.
-                    const { result, renewal } = yield* executeRenewing(
-                      state,
-                      context,
-                      saved.kind,
-                      execute,
-                    );
-                    if (Result.isFailure(result))
-                      return yield* Effect.fail(
-                        runtimeFailure(
-                          { app: saved.app, version: saved.version, tool: saved.tool },
-                          state,
-                          renewal,
-                        )(result.failure),
-                      );
-                    const value = result.success;
-                    if (toolError)
-                      yield* Effect.annotateCurrentSpan({
-                        "executor.outcome": "failed",
-                        "error.type": "McpToolError",
-                      });
-                    return {
-                      status: "completed" as const,
-                      value,
-                      ...(toolError ? { toolError: true as const } : {}),
-                    };
+            Effect.gen(function* () {
+              // Without an approver from the product, the resumer approved it by answering.
+              const resumer = (yield* CurrentCaller) ?? fallbackCaller(yield* CurrentActor);
+              const method = options?.approvalMethod ?? "model";
+              const approver: ApprovedBy = options?.approver ?? {
+                ...resumer,
+                // A person answers a client's own form, the browser page and the dashboard.
+                kind:
+                  method === "native" || method === "browser" || method === "dashboard"
+                    ? "human"
+                    : resumer.kind,
+                method,
+              };
+              return { input, approver };
+            }),
+          ),
+          Effect.flatMap(({ input, approver }) =>
+            approvals.resume(input, options?.issuer, approver, (saved, originalInput, requester) =>
+              // An approved call runs as its requester: their access is rechecked and their identity
+              // reaches the app as `ctx.caller`, with the approver beside it. Requests saved before
+              // the requester was stored run as the resumer.
+              asRequester(
+                requester,
+                Effect.gen(function* () {
+                  // The saved identities name the accounts; their credentials are resolved again.
+                  const checked = yield* snapshot(db, {
+                    app: saved.app,
+                    version: saved.version,
+                    accounts: invocationAccounts(saved),
                   }).pipe(
-                    Effect.mapError((failure) =>
-                      failure._tag === "OAuthReconnectRequired" ||
-                      failure._tag === "OAuthRenewalFailed" ||
-                      failure._tag === "AccountRequired"
-                        ? failure
-                        : callFailure(saved.kind, enteredApp)(failure),
+                    Effect.withSpan("sdk.invocation.snapshot"),
+                    Effect.flatMap((state) =>
+                      invocation(state, saved.tool, saved.kind, saved.input).pipe(
+                        Effect.map((current) => ({ state, current })),
+                      ),
                     ),
-                    Effect.provideService(AppCodeEntered, {
-                      entered: () => {
-                        enteredApp = true;
-                      },
-                    }),
+                    Effect.result,
                   );
-                }).pipe(
-                  // The request is consumed, so its caller receives the call's own failure.
-                  Effect.catch((error) =>
-                    Effect.succeed({
-                      status: "failed" as const,
+                  // A failed read shows nothing about the context: only an answer that differs does.
+                  if (Result.isFailure(checked) && !isContextChange(checked.failure)) {
+                    yield* Effect.annotateCurrentSpan({
+                      "executor.outcome": "failed",
+                      "error.type": checked.failure._tag,
+                    });
+                    return {
+                      status: "failed",
                       requestId: input.requestId,
-                      reason: "execution-failed" as const,
-                      error,
-                    } satisfies ToolResumeResult),
-                  ),
-                );
-              }),
+                      reason: "execution-failed",
+                      error: checked.failure,
+                      context: "unconfirmed",
+                    } satisfies ToolResumeResult;
+                  }
+                  if (
+                    Result.isFailure(checked) ||
+                    !Schema.toEquivalence(ToolInvocation)(saved, checked.success.current)
+                  ) {
+                    return {
+                      status: "failed",
+                      requestId: input.requestId,
+                      reason: "context-changed",
+                    } satisfies ToolResumeResult;
+                  }
+                  const { state } = checked.success;
+                  return yield* Effect.gen(function* () {
+                    yield* Effect.annotateCurrentSpan({
+                      "executor.app.id": saved.app,
+                      "executor.deployment.id": saved.version,
+                      "executor.build.id": state.version.build,
+                      "executor.tool.name": saved.tool,
+                      "executor.approval.id": input.requestId,
+                    });
+                    const context = yield* resolve(state, resolveAccount).pipe(
+                      Effect.withSpan("sdk.accounts.resolve"),
+                    );
+                    // Set by the host when it hands this call's work to the app's code, as for a call.
+                    let enteredApp = false;
+                    // As for a call, every failure from here passes through `callFailure` once, so a
+                    // resumed call that may write reports what it failed with as possibly written.
+                    return yield* Effect.gen(function* () {
+                      const kind = yield* kindOf(state, context, saved.tool, saved.kind);
+                      let toolError = false;
+                      const execute = (context: InvocationContext) =>
+                        Effect.suspend(() => {
+                          toolError = false;
+                          return runtime.call({
+                            app: saved.app,
+                            ...(workflows === undefined
+                              ? {}
+                              : { workflowControls: workflows(state) }),
+                            build: state.version.build,
+                            database: ownsDatabase(state.version.requirements),
+                            ...context,
+                            tool: saved.tool,
+                            ...(kind === undefined ? {} : { kind }),
+                            input: originalInput,
+                            approval: { tool: saved.tool, input: saved.input },
+                            ...callerContext(state, approver),
+                            ...(options?.elicitation === undefined
+                              ? {}
+                              : { elicitation: options.elicitation }),
+                          });
+                        }).pipe(
+                          Effect.provideService(ToolResultObservation, {
+                            failed: () => {
+                              toolError = true;
+                            },
+                          }),
+                          Effect.result,
+                        );
+                      // As for a call, the saved (caller's) kind decides whether a refused call is
+                      // repeated; the catalog's only sets the dispatched kind.
+                      const { result, renewal } = yield* executeRenewing(
+                        state,
+                        context,
+                        saved.kind,
+                        execute,
+                      );
+                      if (Result.isFailure(result))
+                        return yield* Effect.fail(
+                          runtimeFailure(
+                            { app: saved.app, version: saved.version, tool: saved.tool },
+                            state,
+                            renewal,
+                          )(result.failure),
+                        );
+                      const value = result.success;
+                      if (toolError)
+                        yield* Effect.annotateCurrentSpan({
+                          "executor.outcome": "failed",
+                          "error.type": "McpToolError",
+                        });
+                      return {
+                        status: "completed" as const,
+                        value,
+                        ...(toolError ? { toolError: true as const } : {}),
+                      };
+                    }).pipe(
+                      Effect.mapError((failure) =>
+                        failure._tag === "OAuthReconnectRequired" ||
+                        failure._tag === "OAuthRenewalFailed" ||
+                        failure._tag === "AccountRequired"
+                          ? failure
+                          : callFailure(saved.kind, enteredApp)(failure),
+                      ),
+                      Effect.provideService(AppCodeEntered, {
+                        entered: () => {
+                          enteredApp = true;
+                        },
+                      }),
+                    );
+                  }).pipe(
+                    // The request is consumed, so its caller receives the call's own failure.
+                    Effect.catch((error) =>
+                      Effect.succeed({
+                        status: "failed" as const,
+                        requestId: input.requestId,
+                        reason: "execution-failed" as const,
+                        error,
+                      } satisfies ToolResumeResult),
+                    ),
+                  );
+                }),
+              ),
             ),
           ),
         )

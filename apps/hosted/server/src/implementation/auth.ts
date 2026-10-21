@@ -125,7 +125,11 @@ export const authOptions = (
 /** Project only identity fields; never expose Better Auth tokens as product identity. */
 export const sessionPrincipal = (
   session: {
-    readonly user: { readonly id: string; readonly name: string };
+    readonly user: {
+      readonly id: string;
+      readonly name: string;
+      readonly email?: string | null | undefined;
+    };
     readonly session: { readonly id: string };
   } | null,
 ) =>
@@ -135,6 +139,7 @@ export const sessionPrincipal = (
         userId: session.user.id,
         sessionId: session.session.id,
         name: session.user.name,
+        email: session.user.email ?? null,
       }).pipe(Effect.mapError(() => new AuthenticationUnavailable()));
 
 /** Authenticate each request and reject foreign-origin cookie writes. */

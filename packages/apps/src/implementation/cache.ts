@@ -1,6 +1,7 @@
 /** Bind the portable Effect cache to an app invocation's author API. */
 import { Effect, Schema, type Context } from "effect";
 import { makeCache, CacheError } from "@executor-js/app-cache";
+import type { Caller } from "../contracts/protocols/current.ts";
 import { captureTelemetry, owned, ownedBy } from "@executor-js/telemetry";
 import type { AppCache, CacheGetOptions, HostCache } from "../contracts/cache.ts";
 import { scopedSlots, type ResolvedAccounts } from "../contracts/host.ts";
@@ -50,6 +51,8 @@ export const authorCache = (
   telemetry: Context.Context<never>,
   /** The invocation's trusted deadline. Waiting on another caller's load never runs past it. */
   deadline?: number,
+  /** The verified caller, which `forCaller` scopes entries to. */
+  caller?: Caller,
 ): AppCache => {
   const scoped = (
     scope: JsonValue,
@@ -152,6 +155,12 @@ export const authorCache = (
           callerSignal,
           services,
         );
+      },
+      forCaller: () => {
+        // The subject the invocation acts for: an agent shares its user's entries, and work
+        // without a caller has its own. Discovery has no caller to scope to.
+        if (caller === undefined) throw new CacheError({ reason: "invalid" });
+        return scoped({ caller: caller.subject }, callerSignal, services);
       },
     };
     // Only Executor's own cache object carries the combined read, as a non-enumerable own

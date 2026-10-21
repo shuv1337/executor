@@ -62,6 +62,7 @@ export interface BearerRequest {
 
 export interface ApiBearerAccess {
   readonly userId: string;
+  readonly email: string | null;
   readonly access: OrganizationAccess;
   readonly organizationSlug: string;
   readonly policy: AuthorizationPolicy;
@@ -170,6 +171,7 @@ const OAuthRow = Schema.Struct({
   sessionExpiresAt: Schema.NullOr(Schema.Number),
   bound: Schema.Boolean,
   subject: Schema.NullOr(Schema.String),
+  userEmail: Schema.optionalKey(Schema.NullOr(Schema.String)),
   tokenClient: Schema.NullOr(Schema.String),
   grantReference: Schema.NullOr(Schema.String),
   scopes: Schema.NullOr(Schema.String),
@@ -216,6 +218,7 @@ const loadOAuth = (
     floor(extract(epoch from s."expiresAt") * 1000)::float8 as "sessionExpiresAt",
     t.confirmation is not null as bound,
     u.id as subject,
+    u.email as "userEmail",
     t."clientId" as "tokenClient",
     t."referenceId" as "grantReference",
     t.scopes::text as scopes,
@@ -381,6 +384,7 @@ const oauthAccess = (
       return yield* forbidden("organization_mismatch");
     return {
       userId: row.subject,
+      email: row.userEmail ?? null,
       clientId: row.tokenClient,
       grant: { id: grantId, policy, target },
       access: { organization, owner: organizationOwner(organization), role },
@@ -396,6 +400,7 @@ const PatRow = Schema.Struct({
   usable: Schema.Boolean,
   contended: Schema.Boolean,
   userExists: Schema.Boolean,
+  userEmail: Schema.optionalKey(Schema.NullOr(Schema.String)),
   memberships: Schema.String,
   urlOrganizations: Schema.String,
   headerOrganizations: Schema.String,
@@ -467,6 +472,7 @@ const loadPat = (
     k.usable and not coalesce(k.expired, false) and not coalesce(k.recorded, false)
       and not exists (select 1 from used) as contended,
     exists (select 1 from "user" u where u.id = k."referenceId") as "userExists",
+    (select u.email from "user" u where u.id = k."referenceId") as "userEmail",
     (select coalesce(json_agg(json_build_object(
         'organization', m."organizationId", 'role', m.role, 'slug', o.slug)), '[]'::json)::text
       from member m left join organization o on o.id = m."organizationId"
@@ -533,6 +539,7 @@ const patAccess = (sql: SqlClient.SqlClient, token: string, request: BearerReque
     );
     return {
       userId: row.userId,
+      email: row.userEmail ?? null,
       id,
       access: { organization, owner: organizationOwner(organization), role },
       organizationSlug: membership?.slug ?? null,
@@ -552,6 +559,7 @@ export const mcpBearerAccess = (
       const grant = yield* oauthAccess(sql, origins, "mcp", token, request);
       return McpAccess.make({
         userId: grant.userId,
+        email: grant.email,
         clientId: grant.clientId,
         grant: grant.grant,
         access: grant.access,
@@ -561,6 +569,7 @@ export const mcpBearerAccess = (
     const mode = request.mode ?? "model";
     return McpAccess.make({
       userId: key.userId,
+      email: key.email,
       clientId: `pat:${key.id}`,
       grant: {
         id: patGrantId({ token: key.id, organization: key.access.organization, mode }),
@@ -591,6 +600,7 @@ export const apiBearerAccess = (origins: HostedOAuthOrigins, request: BearerRequ
       ? yield* patAccess(sql, token, request).pipe(
           Effect.map((key) => ({
             userId: key.userId,
+            email: key.email,
             key: { id: key.id },
             policy: fullAuthority,
             access: key.access,
@@ -600,6 +610,7 @@ export const apiBearerAccess = (origins: HostedOAuthOrigins, request: BearerRequ
       : yield* oauthAccess(sql, origins, "api", token, request).pipe(
           Effect.map((grant) => ({
             userId: grant.userId,
+            email: grant.email,
             access: grant.access,
             policy: grantAuthorization(grant.grant.policy),
             organizationSlug: grant.organizationSlug,

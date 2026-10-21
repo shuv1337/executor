@@ -24,6 +24,7 @@ import {
   ElicitationFailed,
   EventNotFound,
   InvocationSelection,
+  CurrentCaller,
   linkedRequirements,
   type AppId,
   type ToolInvocationOptions,
@@ -53,12 +54,14 @@ export const hostedMcpBackend = Effect.gen(function* () {
   const sdk = yield* HostedExecutor;
   const database = yield* GroupDatabase;
   const user = yield* CurrentUserId;
+  const caller = yield* CurrentCaller;
   const grant = yield* CurrentMcpGrant;
   const context = Context.make(CurrentOrganization, organization).pipe(
     Context.add(HostedExecutor, sdk),
     Context.add(CurrentAuthorization, policy),
     Context.add(GroupDatabase, database),
     Context.add(CurrentUserId, user),
+    Context.add(CurrentCaller, caller),
   );
   // Discovery reads are traced only; clients repeat them on every session and poll.
   const observe = <A, E, R>(

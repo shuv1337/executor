@@ -6,7 +6,12 @@ import { McpSchema, Tool as McpTool } from "effect/ai";
 import { ApiErrorResponse, ElicitationResponse } from "apps/contracts";
 import { UserFacingError } from "@executor-js/utils/user-facing-error";
 import { ToolName } from "@executor-js/sdk/core";
-import { InteractionId, PendingInteraction, ElicitationResponseInvalid } from "./interactions.ts";
+import {
+  AdvertisedInteractionId,
+  InteractionId,
+  PendingInteraction,
+  ElicitationResponseInvalid,
+} from "./interactions.ts";
 export * from "./interactions.ts";
 import { NativeElicitationFailed } from "./elicitation.ts";
 
@@ -125,6 +130,7 @@ export const ApprovalUnavailable = UserFacingError.define({
       "context-unconfirmed",
       "answered",
       "ended",
+      "human-approval-required",
     ]),
   },
   recorded: ({ reason }) => `Approval unavailable: ${reason}`,
@@ -172,6 +178,17 @@ export const ApprovalUnavailable = UserFacingError.define({
             action:
               "Check the response to the earlier answer, if you have it, and the current state before running anything again.",
             instructions: `Each approval request is answered once. The earlier answer may not have received a result yet, or its response may have been lost. ${check}`,
+          },
+        };
+      case "human-approval-required":
+        return {
+          title: "A person must approve this call",
+          description:
+            "This tool requires a person to approve each call, and the answer came from the client rather than a person, so Executor did not run it.",
+          recovery: {
+            action:
+              "Ask the user to approve the request on its approval page or in their MCP client.",
+            instructions: `Agents cannot approve their own requests for this tool. Show the user the approvalUrl, or connect with elicitation_mode=native or browser so the client asks them. ${check}`,
           },
         };
       case "ended":
@@ -289,6 +306,11 @@ export const ResumeInput = Schema.Struct({
   requestId: InteractionId,
   response: ElicitationResponse,
 });
+/** The resume tool's advertised parameters; see `AdvertisedInteractionId`. */
+export const ResumeToolInput = Schema.Struct({
+  requestId: AdvertisedInteractionId,
+  response: ElicitationResponse,
+});
 /**
  * Claude Code saves a text result over 50,000 characters to a file unless the tool raises that
  * threshold. Execution results are already bounded by the output budget, so ask it to show them
@@ -301,7 +323,7 @@ export const ResumeTool = McpTool.make("resume", {
   description:
     "Continue a paused execute program using its pending requestId and the user's MCP elicitation response: {action: 'accept', content: {...}}, {action: 'decline'}, or {action: 'cancel'}. Ask the user before approving. Return the user's form fields in content on accept. Returns the next pending interaction or the completed program result. An approved call that fails reports its own error. Unavailable carries a reason (answered, expired, ended or not-found) and what to do; do not rerun the whole program because earlier calls may have completed. Busy means another resume is advancing this program; wait for that response. Results are not replayed.",
   dependencies: [HttpServerRequest.HttpServerRequest],
-  parameters: ResumeInput,
+  parameters: ResumeToolInput,
   success: McpExecutionResult,
   failure: ElicitationResponseInvalid,
 }).annotate(McpTool.Meta, ExecutionResultMeta);

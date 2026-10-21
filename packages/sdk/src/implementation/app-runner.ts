@@ -19,6 +19,8 @@ import {
   type InvocationDeadline,
   type ResolvedAccounts,
   type TrustedToolApproval,
+  type ApprovedBy,
+  type Caller,
   type WorkflowExecution,
   WorkflowFailure,
   type WorkflowReplay,
@@ -130,6 +132,9 @@ export interface AppInvocation {
   readonly command: HostRequest;
   readonly accounts: HostAccounts;
   readonly approval?: typeof TrustedToolApproval.Type;
+  /** Sent only to builds that declare callerIdentity; see `callerContext`. */
+  readonly caller?: Caller;
+  readonly approvedBy?: ApprovedBy;
   readonly replay?: typeof WorkflowReplay.Type;
   readonly deadline?: typeof InvocationDeadline.Type;
   /** The scheduled run the invocation serves, for telemetry; see `InvocationRun`. */
@@ -838,6 +843,8 @@ export const makeAppRunner = (host: AppRunnerHost) => {
           command: invocation.command,
           accounts,
           ...(invocation.approval === undefined ? {} : { approval: invocation.approval }),
+          ...(invocation.caller === undefined ? {} : { caller: invocation.caller }),
+          ...(invocation.approvedBy === undefined ? {} : { approvedBy: invocation.approvedBy }),
           ...(invocation.replay === undefined ? {} : { replay: invocation.replay }),
           ...(invocation.deadline === undefined ? {} : { deadline: invocation.deadline }),
           ...(capabilities.workflow === undefined

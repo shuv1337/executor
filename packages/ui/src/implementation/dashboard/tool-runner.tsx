@@ -132,6 +132,11 @@ const answered = (result: ToolResumeResultReceived) =>
             { reason: "expired" },
             () => "This request expired, so Executor will not resume this saved call.",
           ),
+          Match.when(
+            { reason: "human-approval-required" },
+            () =>
+              "This tool needs a person to approve it, so this answer did not count. The request is still waiting.",
+          ),
           Match.exhaustive,
         ),
       "already-consumed": () => "This request was already answered.",

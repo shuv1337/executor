@@ -35,14 +35,14 @@ export default {
   clock: host.isolatedClock,
   async fetch(request, env) {
     // This entry point has no public route or host bindings. Only the trusted loader calls it.
-    const { command, accounts, approval, replay, deadline, workflowRun } = await request.json();
+    const { command, accounts, approval, replay, deadline, workflowRun, caller, approvedBy } = await request.json();
     const lifetime = new AbortController();
     const delivery = env?.ELICITATION;
     const elicitation = delivery == null ? undefined : host.isolatedElicitation((prompt) => delivery(prompt), lifetime);
     try {
       return await handler(new Request("https://app.internal/dispatch", {
         method: "POST", headers: { "content-type": "application/json", traceparent: request.headers.get("traceparent") ?? "" }, body: JSON.stringify(command), signal: AbortSignal.any([request.signal, lifetime.signal])
-      }), { ...host.hostContext(accounts, approval), files, ...(env?.CACHE === undefined ? {} : { cache: env.CACHE }), ...(replay === undefined ? {} : { replay }), ...(deadline === undefined ? {} : { deadline }), ...(env?.WORKFLOW && workflowRun ? { workflow: host.isolatedWorkflowExecution(workflowRun, env.WORKFLOW, lifetime.signal) } : {}), ...(env?.WORKFLOW_CONTROLS ? { workflowControls: host.isolatedWorkflowControls(env.WORKFLOW_CONTROLS) } : {}), ...(elicitation === undefined ? {} : { elicitation }), ...(env?.STORAGE === undefined ? {} : { storage: env.STORAGE }) });
+      }), { ...host.hostContext(accounts, approval), files, ...(env?.CACHE === undefined ? {} : { cache: env.CACHE }), ...(replay === undefined ? {} : { replay }), ...(deadline === undefined ? {} : { deadline }), ...(caller === undefined ? {} : { caller }), ...(approvedBy === undefined ? {} : { approvedBy }), ...(env?.WORKFLOW && workflowRun ? { workflow: host.isolatedWorkflowExecution(workflowRun, env.WORKFLOW, lifetime.signal) } : {}), ...(env?.WORKFLOW_CONTROLS ? { workflowControls: host.isolatedWorkflowControls(env.WORKFLOW_CONTROLS) } : {}), ...(elicitation === undefined ? {} : { elicitation }), ...(env?.STORAGE === undefined ? {} : { storage: env.STORAGE }) });
     } finally { lifetime.abort(); }
   }
 };`;

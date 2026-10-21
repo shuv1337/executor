@@ -172,6 +172,8 @@ export const appRuntime = (host: AppRuntimeHost) =>
             // Workers RPC structured-clones its arguments; Effect headers carry a prototype it rejects.
             headers: Object.fromEntries(Object.entries(yield* traceHeaders)),
             ...(input.approval === undefined ? {} : { approval: input.approval }),
+            ...(input.caller === undefined ? {} : { caller: input.caller }),
+            ...(input.approvedBy === undefined ? {} : { approvedBy: input.approvedBy }),
             ...(input.replay === undefined ? {} : { replay: input.replay }),
             ...(input.deadline === undefined ? {} : { deadline: input.deadline }),
             ...(run === undefined ? {} : { run }),

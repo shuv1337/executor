@@ -5,6 +5,8 @@ import {
   InvocationDeadline,
   HostAccounts,
   TrustedToolApproval,
+  ApprovedBy,
+  Caller,
   WorkflowReplay,
   WorkflowRunId,
   WorkflowRunFailure,
@@ -31,6 +33,9 @@ export const WorkerInvocation = Schema.Struct({
   command: HostRequest,
   accounts: HostAccounts,
   approval: Schema.optionalKey(TrustedToolApproval),
+  /** Present only for builds that declare callerIdentity; see `callerContext`. */
+  caller: Schema.optionalKey(Caller),
+  approvedBy: Schema.optionalKey(ApprovedBy),
   replay: Schema.optionalKey(WorkflowReplay),
   deadline: Schema.optionalKey(InvocationDeadline),
   /** The scheduled run the invocation serves, for telemetry; see `InvocationRun`. */
