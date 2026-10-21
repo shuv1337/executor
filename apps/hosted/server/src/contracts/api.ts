@@ -16,6 +16,7 @@ import {
   Principal,
   RequireUser,
   Unauthorized,
+  ConnectionKeyRefused,
 } from "./auth.ts";
 import {
   HostedOrganization,
@@ -194,7 +195,12 @@ export const HostedApi = HttpApi.make("executor-hosted")
            */
           gitOrigins: Schema.NonEmptyArray(Schema.String),
         }),
-        error: [Unauthorized, OrganizationForbidden, AuthenticationUnavailable],
+        error: [
+          Unauthorized,
+          OrganizationForbidden,
+          ConnectionKeyRefused,
+          AuthenticationUnavailable,
+        ],
       }).annotate(OpenApi.Override, { security: [{ oauth: ["executor"] }] }),
     ),
   )

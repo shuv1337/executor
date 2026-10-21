@@ -45,6 +45,30 @@ const saveErrors = [
   AccountNotFound,
   AccountSelectionInvalid,
 ] as const;
+/** The longest a connection key may live: 90 days. */
+export const connectionKeyMaxSeconds = 90 * 24 * 60 * 60;
+/** A connection key always expires, between 5 seconds and 90 days after it is minted. */
+export const ConnectionKeyInput = Schema.Struct({
+  name: Schema.optional(
+    Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(80), Schema.isPattern(/\S/u)),
+  ),
+  expiresInSeconds: Schema.Number.check(
+    Schema.isInt(),
+    Schema.isGreaterThanOrEqualTo(5),
+    Schema.isLessThanOrEqualTo(connectionKeyMaxSeconds),
+  ),
+});
+/**
+ * A key bound to one scoped connection. The secret is returned only here. It works only at the
+ * connection's `url`, never with the API, and dies with the connection or at `expiresAt`.
+ */
+export const ConnectionKey = Schema.Struct({
+  id: Schema.String,
+  key: Schema.String,
+  connection: ConnectionId,
+  url: Schema.String,
+  expiresAt: Schema.String,
+});
 /**
  * MCP grants, including a connection's own, cannot manage connections: the API refuses MCP tokens.
  * Connections only narrow their owner's own access, so an admin key cannot widen anything.
@@ -80,6 +104,14 @@ export const HostedMcpConnections = HttpApiGroup.make("mcpConnections")
     HttpApiEndpoint.post("revoke", `${path}/:connection/revoke`, {
       params: connection,
       success: Schema.Void,
+      error: [...errors, ConnectionNotFound],
+    }).annotate(RequiredAction, "manage"),
+  )
+  .add(
+    HttpApiEndpoint.post("mintKey", `${path}/:connection/keys`, {
+      params: connection,
+      payload: ConnectionKeyInput,
+      success: ConnectionKey,
       error: [...errors, ConnectionNotFound],
     }).annotate(RequiredAction, "manage"),
   )

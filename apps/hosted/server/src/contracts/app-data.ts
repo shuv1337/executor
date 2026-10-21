@@ -9,7 +9,7 @@ import {
   OrganizationForbidden,
   RequireOrganization,
 } from "./organization.ts";
-import { AuthenticationUnavailable, Unauthorized } from "./auth.ts";
+import { AuthenticationUnavailable, ConnectionKeyRefused, Unauthorized } from "./auth.ts";
 
 const params = { organization: OrganizationReference, app: AppId };
 const payload = Schema.Struct({
@@ -22,6 +22,7 @@ const errors = [
   OrganizationForbidden,
   AuthenticationUnavailable,
   Unauthorized,
+  ConnectionKeyRefused,
 ] as const;
 const prefix = "/api/organizations/:organization/apps/:app/data";
 /** Members may query; mutations follow hosted execution's administrator policy. */

@@ -39,6 +39,7 @@ export const McpForbiddenReason = Schema.Literals([
   "organization_required",
   "organization_mismatch",
   "membership",
+  "connection_key",
 ]);
 export type McpForbiddenReason = typeof McpForbiddenReason.Type;
 const forbidden: { readonly [Reason in McpForbiddenReason]: ErrorPresentation } = {
@@ -61,6 +62,16 @@ const forbidden: { readonly [Reason in McpForbiddenReason]: ErrorPresentation } 
       action: "Use the organization this credential belongs to in the URL and header, then retry.",
       instructions:
         "OAuth connections and organization-pinned tokens work only in their own organization. Make the organization in the MCP URL and in X-Executor-Organization agree with the credential, reconnect, and verify that tools are listed. To work in another organization, connect again from that organization. Do not bypass authorization.",
+    },
+  },
+  connection_key: {
+    title: "Connection key",
+    description:
+      "This key belongs to one scoped MCP connection and works only at that connection's MCP URL.",
+    recovery: {
+      action: "Connect at the MCP URL of the connection this key was minted for, then retry.",
+      instructions:
+        "A connection key is bound to one scoped MCP connection. Use it only at that connection's URL (/mcp?connection=<id>). For other URLs or the Executor API, use a credential made for them. Do not bypass authorization.",
     },
   },
   membership: {
@@ -117,6 +128,17 @@ export interface McpConnectionStore {
   readonly agents: (
     owner: ConnectionOwner,
   ) => Effect.Effect<readonly ConnectedAgent[], AuthenticationUnavailable>;
+  /**
+   * Mint a key bound to one of the owner's standing connections. It expires, works only at the
+   * connection's MCP URL, and is deleted when the connection is revoked.
+   */
+  readonly mintKey: (
+    owner: ConnectionOwner,
+    input: { readonly id: ConnectionId; readonly name: string; readonly expiresIn: number },
+  ) => Effect.Effect<
+    { readonly id: string; readonly key: string; readonly expiresAt: string },
+    ConnectionNotFound | AuthenticationUnavailable
+  >;
   /** Revoke one of the owner's grants and delete its access and refresh tokens. */
   readonly revokeAgent: (
     owner: ConnectionOwner,

@@ -7282,6 +7282,17 @@ export const scenarios = plan({
       local: na("Local has one subject and no organization roles or API keys."),
     },
   },
+  connectionKeys: {
+    fixtures: "actors",
+    file: "connection-keys.spec.ts",
+    title:
+      "a connection key minted by its connection's owner expires, works only at that connection's MCP URL, is refused by the API and elsewhere, dies with the connection and is audited",
+    targets: {
+      "self-host": scheduled,
+      cloud: scheduled,
+      local: na("Local has one subject and no organization roles or API keys."),
+    },
+  },
   callerIdentity: {
     fixtures: "actors",
     file: "caller-identity.spec.ts",

@@ -640,5 +640,12 @@ An agent then connects to the connection's `url` (`/mcp?connection=<id>`) with a
 with its owner's API key: at that URL the key runs with only the connection's apps, tools and
 `runsAs` accounts. Revoking the connection stops both at once.
 
+For a headless agent, CI job or staff bot, give it a connection key instead of a full API key. The
+connection's owner mints one with `POST /api/organizations/:organization/mcp-connections/<id>/keys`
+and `{ "expiresInSeconds": <5 to 7776000>, "name"?: "..." }`, from the dashboard session or their
+own API key. The response holds the only copy of the secret. A connection key works only at its
+connection's `url`; plain `/mcp`, other connections and the Executor API refuse it with a 403. It
+expires, revoking the connection deletes it, and every mint is in the audit log.
+
 For one key that runs an app for everyone, a member can connect it as a shared account, and
 someone who can edit the app links it to the app's own requirement with `appAccounts.appLink`.

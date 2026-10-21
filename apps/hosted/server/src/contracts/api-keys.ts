@@ -1,12 +1,18 @@
 import { Schema } from "effect";
+import { ConnectionId } from "@executor-js/mcp-auth/connections";
 import { OrganizationId } from "./organization.ts";
 /** Public identifier, never the bearer credential. */
 export const ApiKeyId = Schema.NonEmptyString.pipe(Schema.brand("ApiKeyId"));
 /**
  * Stored key scope. A recorded organization pins the key to that organization;
- * a key without one authorizes every organization the user belongs to.
+ * a key without one authorizes every organization the user belongs to. A recorded connection
+ * binds the key to that scoped MCP connection: it works only at the connection's MCP URL, while
+ * the connection stands, and never with the API. Only the connection's owner mints one.
  */
-export const ApiKeyMetadata = Schema.Struct({ organization: Schema.optional(OrganizationId) });
+export const ApiKeyMetadata = Schema.Struct({
+  organization: Schema.optional(OrganizationId),
+  connection: Schema.optional(ConnectionId),
+});
 export type ApiKeyMetadata = typeof ApiKeyMetadata.Type;
 /** Native Better Auth key metadata; secret hashes are excluded. */
 export const ApiKeySummary = Schema.Struct({

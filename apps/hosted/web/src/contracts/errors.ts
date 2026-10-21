@@ -170,6 +170,8 @@ const errorMessage = Match.type<HostedError>().pipe(
     OrganizationForbidden: () =>
       "You do not have permission to do this. Ask an organization admin.",
     Unauthorized: () => "Your session has ended. Sign in again.",
+    ConnectionKeyRefused: () =>
+      "This key works only at its MCP connection's URL. Use an API key for the Executor API.",
     Forbidden: () => "You do not have permission to make this request.",
     AuthenticationUnavailable: () => "Sign-in is unavailable. Try again shortly.",
     AppWorkflowsActive: () =>
