@@ -606,15 +606,20 @@ export const mcpBearerAccess = (
     }
     const key = yield* patAccess(sql, token, request);
     const mode = request.mode ?? "model";
-    const connection = request.connection;
-    // At a connection's URL a PAT runs with the connection's narrower policy, as its OAuth grants do.
-    const policy: GrantPolicy =
-      connection === undefined
-        ? { kind: "all" }
-        : yield* patConnectionPolicy(sql, connection, key.userId, key.access.organization).pipe(
-            Effect.mapError(() => unavailable),
-            Effect.flatMap(Option.match({ onNone: () => unauthorized, onSome: Effect.succeed })),
-          );
+    // At a connection's URL a PAT runs with that connection's narrower policy, as its OAuth grants
+    // do, when the connection is its user's own and stands. Otherwise the PAT keeps its unscoped
+    // grant, which the URL's delivery check refuses and names the URL it serves.
+    const scoped =
+      request.connection === undefined
+        ? Option.none<GrantPolicy>()
+        : yield* patConnectionPolicy(
+            sql,
+            request.connection,
+            key.userId,
+            key.access.organization,
+          ).pipe(Effect.mapError(() => unavailable));
+    const connection = Option.isSome(scoped) ? request.connection : undefined;
+    const policy: GrantPolicy = Option.getOrElse(scoped, () => ({ kind: "all" }) as const);
     return McpAccess.make({
       userId: key.userId,
       email: key.email,
