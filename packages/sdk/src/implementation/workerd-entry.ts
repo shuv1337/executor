@@ -448,9 +448,22 @@ export class AppWorkflows extends WorkflowEntrypoint<Environment, { run: string 
             run: Schema.decodeUnknownSync(WorkflowRunId)(event.payload.run),
           }).pipe(Effect.flatMap(Schema.decodeUnknownEffect(PreparedWorkflow)));
           if (prepared.state === "complete") return prepared.output;
+          if (prepared.state === "stalled") {
+            const message = `The workflow body started ${prepared.starts} times without reaching a step or a sleep; its process stopped during each run. Move long or blocking work into a step.`;
+            yield* hostRequest(this.env, {
+              operation: "finish",
+              run: Schema.decodeUnknownSync(WorkflowRunId)(event.payload.run),
+              result: { ok: false, error: "execution", detail: { message } },
+            });
+            return yield* Effect.die(new NonRetryableError(message));
+          }
           const { seed, accounts } = prepared;
           const native = <A>(work: () => Promise<A>) =>
             Effect.tryPromise({ try: work, catch: decodeWorkflowFailure });
+          // Tell the product the body reached a durable point, so its next start is a replay.
+          const progress = hostRequest(this.env, { operation: "progress", run: seed.runId }).pipe(
+            Effect.ignore,
+          );
           const execution: WorkflowExecution = {
             runId: seed.runId,
             driver: {
@@ -472,7 +485,7 @@ export class AppWorkflows extends WorkflowEntrypoint<Environment, { run: string 
                         ),
                       );
                     return Effect.runPromise(
-                      work().pipe(
+                      Effect.andThen(progress, work()).pipe(
                         Effect.catch((error) =>
                           Effect.die(
                             error.retryable
@@ -487,8 +500,16 @@ export class AppWorkflows extends WorkflowEntrypoint<Environment, { run: string 
                   Effect.flatMap(Schema.decodeUnknownEffect(WorkflowValue)),
                   Effect.mapError(decodeWorkflowFailure),
                 ),
-              sleep: (name, duration) => native(() => nativeStep.sleep(name, duration)),
-              sleepUntil: (name, timestamp) => native(() => nativeStep.sleepUntil(name, timestamp)),
+              sleep: (name, duration) =>
+                Effect.andThen(
+                  progress,
+                  native(() => nativeStep.sleep(name, duration)),
+                ),
+              sleepUntil: (name, timestamp) =>
+                Effect.andThen(
+                  progress,
+                  native(() => nativeStep.sleepUntil(name, timestamp)),
+                ),
             },
             resolve: () =>
               hostRequest(this.env, { operation: "context", run: seed.runId }).pipe(

@@ -295,6 +295,9 @@ workflow step as possibly run once already, and use idempotency keys for externa
 
 A workflow step that stops the process on every attempt ends its run once it has used its retry
 limit (`retries.limit + 1` attempts, 6 by default), instead of running again after every restart.
+A workflow body that stops the process between steps ends its run after it starts three times in a
+row without reaching a step or a sleep. Sleeping and waking never count toward that limit, because
+the body reaches a sleep before each wake.
 
 The product process has its own watchdog. Once the product has answered its first health check, the
 host probes `/health` every `EXECUTOR_WATCHDOG_INTERVAL` seconds (default 10). After

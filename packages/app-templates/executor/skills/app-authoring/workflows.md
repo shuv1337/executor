@@ -27,6 +27,10 @@ waiting. Put time reads, randomness and I/O inside steps; use their results for
 branches and loops. `Promise.all` works for independent steps. Runs pin deployed
 code and account IDs, but each executing step resolves current credentials.
 
+Keep long or CPU-heavy work inside `step.do`. On a self-hosted Executor, a body that runs without
+awaiting between steps stops the app process; after three such starts in a row without reaching a
+step or a sleep, the run fails with that reason.
+
 App mutations/webhooks can call `ctx.workflows.start({ workflow, input, key? })`
 and `terminate({ run })`. Queries also have `get({ run })` and `list(options?)`.
 Controls cannot target another app. Use stable start keys when retrying a caller;

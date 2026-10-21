@@ -97,6 +97,11 @@ export interface WorkerdAppApi {
 /** Background runs use finite host requests; no step callback or Promise lives in Node. */
 export const WorkflowHostCommand = Schema.Union([
   Schema.Struct({ operation: Schema.Literal("prepare"), run: WorkflowRunId }),
+  /**
+   * The run's body reached a durable point: a step's work began, or the body is about to sleep.
+   * Its next start is then a replay, not a restart after its process stopped mid-body.
+   */
+  Schema.Struct({ operation: Schema.Literal("progress"), run: WorkflowRunId }),
   /** The run's build, read only when the runner cold-starts the run's Worker. */
   Schema.Struct({ operation: Schema.Literal("load"), run: WorkflowRunId }),
   Schema.Struct({ operation: Schema.Literal("context"), run: WorkflowRunId }),
@@ -127,6 +132,11 @@ export type WorkflowHostCommand = typeof WorkflowHostCommand.Type;
 /** A completed run can return immediately even if the engine lost its final checkpoint. */
 export const PreparedWorkflow = Schema.Union([
   Schema.Struct({ state: Schema.Literal("complete"), output: WorkflowValue }),
+  /**
+   * The body started this many times in a row without reaching a step or a sleep: its process
+   * stopped each time while the body ran, so running it again would only stop it again.
+   */
+  Schema.Struct({ state: Schema.Literal("stalled"), starts: Schema.Int }),
   Schema.Struct({
     state: Schema.Literal("execute"),
     seed: WorkflowSeed,

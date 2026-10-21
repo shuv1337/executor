@@ -71,6 +71,12 @@ class HostCallbacks extends RpcTarget implements AppHostCallbacks {
   }
 }
 
+/**
+ * How many times a run's body may start in a row without reaching a step or a sleep. Each such
+ * start after the first was a restart after its process stopped mid-body, so the run fails
+ * instead of stopping the process again.
+ */
+export const workflowBodyStartLimit = 3;
 /** Authorized workflow callbacks shared by native loopback and Worker service bindings. */
 export const workerdHostHandler = (options: {
   readonly executor: Effect.Effect<Executor>;
@@ -79,6 +85,9 @@ export const workerdHostHandler = (options: {
   Effect.gen(function* () {
     const services = yield* Effect.context<never>();
     const provideBlobs = Effect.provideService(BlobStore, options.blobs);
+    // Starts of each run's body since it last reached a step or a sleep. The product outlives the
+    // app process, so these survive the restarts they count; a product restart only resets them.
+    const unprogressed = new Map<string, number>();
     const hostOperation = (command: WorkflowHostCommand) =>
       Effect.gen(function* () {
         const executor = yield* options.executor,
@@ -87,6 +96,14 @@ export const workerdHostHandler = (options: {
           case "prepare": {
             const current = yield* host.get(command.run);
             if (current.status === "complete") return { state: "complete", output: current.output };
+            // A body that spins between steps stops its process; the engine then starts it again
+            // from the top, forever. Stop after a few starts that never reached a durable point.
+            const starts = (unprogressed.get(command.run) ?? 0) + 1;
+            unprogressed.set(command.run, starts);
+            if (starts > workflowBodyStartLimit) {
+              unprogressed.delete(command.run);
+              return { state: "stalled", starts: starts - 1 };
+            }
             const seed = yield* host.seed(command.run),
               context = yield* host.context(command.run);
             return yield* Schema.encodeEffect(PreparedWorkflow)({
@@ -126,9 +143,14 @@ export const workerdHostHandler = (options: {
             const context = yield* host.context(command.run);
             return Redacted.value(context.accounts);
           }
+          case "progress": {
+            unprogressed.delete(command.run);
+            return null;
+          }
           case "invoke":
             return yield* host.invoke(command.run, command).pipe(Effect.timeout(command.timeout));
           case "finish": {
+            unprogressed.delete(command.run);
             if (command.result.ok) yield* host.finish(command.run, command.result);
             else
               yield* host.finish(command.run, {

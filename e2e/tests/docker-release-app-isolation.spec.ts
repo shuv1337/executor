@@ -83,6 +83,66 @@ it.live("released image restarts only the app process when an app isolate spins"
   ).pipe(Effect.provide(NodeServices.layer)),
 );
 
+// A body that spins between steps stops the app process; the engine would start it again from the
+// top after each restart. It ends after three starts that never reached a step or a sleep, while a
+// body that sleeps in a loop, and so starts again after every wake, still completes.
+it.live(
+  "a workflow body that keeps stopping the app process between steps ends the run, and a sleeping loop still completes",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* releasedServerWith({
+          environment: { EXECUTOR_APP_WATCHDOG_INTERVAL: "1", EXECUTOR_APP_WATCHDOG_FAILURES: "3" },
+          restart: "unless-stopped",
+        });
+        const app = yield* server.deploy("Stuck body", [
+          { path: "index.ts", content: spinningBody },
+          appsManifest,
+        ]);
+        const runs = `${server.prefix}/apps/${app.id}/workflow-runs`;
+        const settled = (workflow: string) =>
+          Effect.gen(function* () {
+            const started = yield* server.json(Run, runs, {
+              workflow,
+              input: {},
+              key: `${workflow}-${Date.now()}`,
+            });
+            return yield* server.json(Run, `${runs}/${started.id}`).pipe(
+              Effect.flatMap((run) =>
+                ["complete", "errored", "terminated"].includes(run.status)
+                  ? Effect.succeed(run)
+                  : Effect.fail(run),
+              ),
+              Effect.retry({ schedule: Schedule.spaced("2 seconds"), times: 90 }),
+            );
+          });
+        // Many wakes, each a fresh start of the body, never count as a stall.
+        expect((yield* settled("sleepy")).status).toBe("complete");
+        const stuck = yield* settled("stuck");
+        expect(stuck.status).toBe("errored");
+        // The first start and three restarts, each stopped by the app watchdog, then the run ends.
+        const restarts = (yield* server.logs).split("the app process did not answer").length - 1;
+        expect(restarts).toBeGreaterThanOrEqual(2);
+        expect(restarts).toBeLessThanOrEqual(4);
+        // The product stayed up throughout.
+        expect(yield* server.restartCount).toBe(0);
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+const spinningBody = `import { defineApp, workflow, object } from "apps";
+export default defineApp({}, {
+  workflows: {
+    sleepy: workflow({ input: object({}) }, async (ctx) => {
+      for (let wake = 0; wake < 6; wake++) await ctx.step.sleep(\`nap-\${wake}\`, "1 second");
+      return "rested";
+    }),
+    stuck: workflow({ input: object({}) }, async (ctx) => {
+      await ctx.step.do("before", async () => "ok");
+      for (;;) {}
+    }),
+  },
+});`;
 const spinningStep = `import { defineApp, workflow, object } from "apps";
 export default defineApp({}, {
   workflows: {
