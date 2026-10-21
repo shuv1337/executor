@@ -1,6 +1,13 @@
 import { ApiKeyId } from "../contracts/api-keys.ts";
 import { browserPersonalTokenAccess, apiKeyAccess, requirePinnedOrganization } from "./api-keys.ts";
-import { ApprovalMode, type ConnectionId, GrantId, mcpOAuthResources } from "@executor-js/mcp-auth";
+import {
+  ApprovalMode,
+  ConnectionId as ConnectionIdSchema,
+  type ConnectionId,
+  GrantId,
+  type GrantPolicy,
+  mcpOAuthResources,
+} from "@executor-js/mcp-auth";
 
 /** Hosted membership composes with the shared OAuth grant lifecycle. */
 import type { BetterAuthPlugin, GenericEndpointContext } from "@better-auth/core";
@@ -26,7 +33,8 @@ import {
   Connection,
   ConnectionIdTaken,
   ConnectionNotFound,
-  type ConnectionPolicy,
+  ConnectionPolicy,
+  connectionGrantPolicy,
 } from "@executor-js/mcp-auth/connections";
 import { ConnectedAgent, ConnectedAgentNotFound } from "@executor-js/mcp-auth/agents";
 import { OrganizationId, OrganizationRole, organizationOwner } from "../contracts/organization.ts";
@@ -140,6 +148,8 @@ export const PatGrant = Schema.Struct({
   token: ApiKeyId,
   organization: OrganizationId,
   mode: ApprovalMode,
+  /** The scoped connection whose URL the PAT was used at; its policy narrows the PAT's. */
+  connection: Schema.optionalKey(ConnectionIdSchema),
 });
 const patGrantPrefix = "pat:";
 /** The PAT a synthetic grant ID names, or none for an OAuth grant ID. */
@@ -165,24 +175,72 @@ const parsePatGrant = (id: GrantId) =>
     Effect.flatMap(Schema.decodeUnknownEffect(Schema.fromJsonString(PatGrant))),
     Effect.mapError(() => new APIError("UNAUTHORIZED")),
   );
+/** A stored connection as the browser page reads it; its policy may arrive as JSON text or as JSON. */
+const StoredConnection = Schema.Struct({
+  userId: Schema.String,
+  resource: Schema.String,
+  revoked: Schema.Boolean,
+  policy: Schema.Unknown,
+});
+const ConnectionPolicyJson = Schema.Union([
+  ConnectionPolicy,
+  Schema.fromJsonString(ConnectionPolicy),
+]);
 /** Stable metadata identifies the PAT/organization/mode partition; it is never a credential. */
 const projectPatAccess = (
   ctx: GenericEndpointContext,
   identity: Effect.Success<ReturnType<typeof apiKeyAccess>>,
   organization: OrganizationId,
   mode: ApprovalMode,
+  connection?: ConnectionId,
 ) =>
   Effect.gen(function* () {
     yield* requirePinnedOrganization(identity, organization);
     const member = yield* membership(ctx.context, identity.userId, organization);
+    // A PAT used at a connection's URL has that connection's policy, while the connection stands.
+    const policy: GrantPolicy =
+      connection === undefined
+        ? { kind: "all" }
+        : yield* authCall(() =>
+            ctx.context.adapter.findOne({
+              model: "mcpConnection",
+              where: [{ field: "id", value: connection }],
+            }),
+          ).pipe(
+            Effect.map((row) =>
+              Schema.decodeUnknownOption(StoredConnection)(row).pipe(
+                Option.filter(
+                  (stored) =>
+                    stored.revoked === false &&
+                    stored.userId === identity.userId &&
+                    stored.resource === organization,
+                ),
+                Option.flatMap((stored) =>
+                  Schema.decodeUnknownOption(ConnectionPolicyJson)(stored.policy),
+                ),
+                Option.map(connectionGrantPolicy),
+              ),
+            ),
+            Effect.flatMap(
+              Option.match({
+                onNone: () => Effect.fail(new APIError("UNAUTHORIZED")),
+                onSome: Effect.succeed,
+              }),
+            ),
+          );
     return McpAccess.make({
       userId: identity.userId,
       email: yield* userEmail(ctx.context, identity.userId),
       clientId: `pat:${identity.key.id}`,
       grant: {
-        id: patGrantId({ token: identity.key.id, organization, mode }),
-        policy: { kind: "all" },
-        target: { kind: "mcp", mode },
+        id: patGrantId({
+          token: identity.key.id,
+          organization,
+          mode,
+          ...(connection === undefined ? {} : { connection }),
+        }),
+        policy,
+        target: { kind: "mcp", mode, ...(connection === undefined ? {} : { connection }) },
       },
       access: { organization, owner: organizationOwner(organization), role: member.role },
     });
@@ -241,7 +299,13 @@ export const mcpOAuthPlugins = (options: HostedOAuthOptions) => {
                   .pipe(Effect.flatMap((grant) => projectAccess(ctx, grant)));
               const target = yield* parsePatGrant(ctx.body.id);
               const identity = yield* browserPersonalTokenAccess(ctx, options.origin, target.token);
-              return yield* projectPatAccess(ctx, identity, target.organization, target.mode);
+              return yield* projectPatAccess(
+                ctx,
+                identity,
+                target.organization,
+                target.mode,
+                target.connection,
+              );
             }),
           ),
       ),

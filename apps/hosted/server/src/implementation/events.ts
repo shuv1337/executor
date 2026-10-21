@@ -17,6 +17,7 @@ import type { SqlClient } from "effect/sql";
 import { GroupDatabase } from "../contracts/groups.ts";
 import { OrganizationId, organizationOwner } from "../contracts/organization.ts";
 import { patGrantOf } from "./mcp-oauth.ts";
+import { patConnectionPolicy } from "./bearer-access.ts";
 import {
   requireAccountAccessAs,
   requireAppAccessAs,
@@ -53,11 +54,17 @@ const grantStanding = (sql: SqlClient.SqlClient, id: string) =>
       if (Option.isNone(key) || !key.value.usable) return Option.none();
       const expiresAt = key.value.expiresAt;
       if (expiresAt !== null && (yield* Clock.currentTimeMillis) > expiresAt) return Option.none();
-      return Option.some({
+      // A PAT grant at a connection's URL stands only while that connection does, with its policy.
+      const connection = pat.value.connection;
+      const policy =
+        connection === undefined
+          ? Option.some(GrantPolicy.make({ kind: "all" }))
+          : yield* patConnectionPolicy(sql, connection, key.value.userId, pat.value.organization);
+      return Option.map(policy, (policy) => ({
         userId: key.value.userId,
         organization: pat.value.organization,
-        policy: GrantPolicy.make({ kind: "all" }),
-      });
+        policy,
+      }));
     }
     const rows = yield* sql`select g."userId" as "userId", g.resource, g.policy, g.revoked,
         g.connection, mc.policy as "connectionPolicy", mc.revoked as "connectionRevoked",

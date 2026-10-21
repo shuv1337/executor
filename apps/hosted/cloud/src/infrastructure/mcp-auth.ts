@@ -77,8 +77,8 @@ export const mcpAuthentication = (
     Effect.gen(function* () {
       return McpAuthentication.of({
         ...origins,
-        authenticate: (headers, mode, organization) =>
-          withSql(mcpBearerAccess(origins, { headers, mode, organization })).pipe(
+        authenticate: (headers, mode, organization, connection) =>
+          withSql(mcpBearerAccess(origins, { headers, mode, organization, connection })).pipe(
             Effect.tap(({ access }) =>
               Effect.annotateCurrentSpan("executor.organization.id", access.organization),
             ),

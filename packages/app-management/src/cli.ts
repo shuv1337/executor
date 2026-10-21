@@ -1023,7 +1023,7 @@ export const appsCommand = (platform: string) =>
       Command.make("credential", {
         action: Argument.Literals("action", ["get", "store", "erase"]).pipe(
           Argument.withDescription(
-            "Operation Git passes to the helper. get supplies the signed-in session for the remote's Git paths, including remotes on another origin than the host you signed in to; store and erase are ignored",
+            "Operation Git passes to the helper. get supplies EXECUTOR_ACCESS_TOKEN when it is set, otherwise the signed-in session for the remote's Git paths, including remotes on another origin than the host you signed in to; store and erase are ignored",
           ),
         ),
       }).pipe(
@@ -1043,6 +1043,16 @@ export const appsCommand = (platform: string) =>
             );
             const origin = `${fields.get("protocol")}://${fields.get("host")}`;
             if (!Schema.is(RegistryOrigin)(origin)) return;
+            // An API key, as every other command uses it: the host decides which organizations'
+            // Git paths it may read. It does not expire, so no expiry is given.
+            const key = yield* Config.Redacted("EXECUTOR_ACCESS_TOKEN").pipe(Config.option);
+            if (Option.isSome(key)) {
+              if (!fields.get("path")?.startsWith("git/")) return;
+              yield* Stream.succeed(
+                `username=executor\npassword=${Redacted.value(key.value)}\n\n`,
+              ).pipe(Stream.run(stdio.stdout()));
+              return;
+            }
             const session = Redacted.value(yield* gitSession(origin));
             if (!fields.get("path")?.startsWith(`git/${session.organization}/`)) return;
             // Git stores what a helper returns with every other helper it has, such as macOS's

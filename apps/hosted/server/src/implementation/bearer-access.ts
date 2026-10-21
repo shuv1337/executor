@@ -22,6 +22,7 @@ import {
   grantAuthorization,
   grantTarget,
   type ApprovalMode,
+  type ConnectionId,
   type GrantTarget,
 } from "@executor-js/mcp-auth";
 import { ConnectionPolicy, connectionGrantPolicy } from "@executor-js/mcp-auth/connections";
@@ -546,10 +547,48 @@ const patAccess = (sql: SqlClient.SqlClient, token: string, request: BearerReque
     };
   });
 
+const ConnectionRow = Schema.Struct({
+  userId: Schema.String,
+  resource: Schema.String,
+  revoked: Schema.NullOr(Schema.Boolean),
+  policy: Schema.String,
+});
+
+/**
+ * The policy a PAT gets at a scoped connection's URL: the connection's own, read on every use. Only
+ * the connection's owner may use it, in the organization it was made for, while it stands. The PAT
+ * has its user's full authority, so the connection can only narrow it. None when it does not stand.
+ */
+export const patConnectionPolicy = (
+  sql: SqlClient.SqlClient,
+  connection: ConnectionId,
+  userId: string,
+  organization: string,
+) =>
+  Effect.gen(function* () {
+    const rows = yield* sql`select "userId", resource, revoked, policy::text as policy
+      from "mcpConnection" where id = ${connection}`;
+    const row = Schema.decodeUnknownOption(ConnectionRow)(rows[0]);
+    if (
+      Option.isNone(row) ||
+      row.value.revoked !== false ||
+      row.value.userId !== userId ||
+      row.value.resource !== organization
+    )
+      return Option.none<GrantPolicy>();
+    return Schema.decodeUnknownOption(Schema.fromJsonString(ConnectionPolicy))(
+      row.value.policy,
+    ).pipe(Option.map(connectionGrantPolicy));
+  });
+
 /** MCP authority for an OAuth grant or a PAT, with live grant, connection and membership. */
 export const mcpBearerAccess = (
   origins: HostedOAuthOrigins,
-  request: BearerRequest & { readonly mode?: ApprovalMode | undefined },
+  request: BearerRequest & {
+    readonly mode?: ApprovalMode | undefined;
+    /** The scoped connection the MCP URL names, if any. */
+    readonly connection?: ConnectionId | undefined;
+  },
 ) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
@@ -567,14 +606,33 @@ export const mcpBearerAccess = (
     }
     const key = yield* patAccess(sql, token, request);
     const mode = request.mode ?? "model";
+    // At a connection's URL a PAT runs with that connection's narrower policy, as its OAuth grants
+    // do, when the connection is its user's own and stands. Otherwise the PAT keeps its unscoped
+    // grant, which the URL's delivery check refuses and names the URL it serves.
+    const scoped =
+      request.connection === undefined
+        ? Option.none<GrantPolicy>()
+        : yield* patConnectionPolicy(
+            sql,
+            request.connection,
+            key.userId,
+            key.access.organization,
+          ).pipe(Effect.mapError(() => unavailable));
+    const connection = Option.isSome(scoped) ? request.connection : undefined;
+    const policy: GrantPolicy = Option.getOrElse(scoped, () => ({ kind: "all" }) as const);
     return McpAccess.make({
       userId: key.userId,
       email: key.email,
       clientId: `pat:${key.id}`,
       grant: {
-        id: patGrantId({ token: key.id, organization: key.access.organization, mode }),
-        policy: { kind: "all" },
-        target: { kind: "mcp", mode },
+        id: patGrantId({
+          token: key.id,
+          organization: key.access.organization,
+          mode,
+          ...(connection === undefined ? {} : { connection }),
+        }),
+        policy,
+        target: { kind: "mcp", mode, ...(connection === undefined ? {} : { connection }) },
       },
       access: key.access,
     });
