@@ -7234,6 +7234,28 @@ export const scenarios = plan({
       cloud: na("Hosted app account links have their own scenarios."),
     },
   },
+  callerIdentity: {
+    fixtures: "actors",
+    file: "caller-identity.spec.ts",
+    title:
+      "apps see each MCP user, the dashboard person and workflow work as distinct verified callers",
+    targets: {
+      "self-host": scheduled,
+      cloud: scheduled,
+      local: na("This scenario uses hosted memberships, API keys and MCP."),
+    },
+  },
+  personApproval: {
+    fixtures: "actors",
+    file: "caller-identity.spec.ts",
+    title:
+      "a tool that requires a person refuses the agent's own approval until the person approves",
+    targets: {
+      "self-host": scheduled,
+      cloud: scheduled,
+      local: na("This scenario uses hosted memberships, API keys and the browser approval page."),
+    },
+  },
   workflowActors: {
     fixtures: "actors",
     file: "workflow-actors.spec.ts",

@@ -234,16 +234,19 @@ returned `app.slug` when calling tools across copies and renamed installations.
 Declare `approval` in a query or mutation options object:
 
 ```ts
-import { always, never } from "apps/operations/approval"
+import { always, human, never } from "apps/operations/approval"
 
 // On a tool that needs confirmation:
 approval: always(),
+// On a tool only a person may approve, never the agent itself:
+approval: human(),
 // On a tool that can run without confirmation:
 approval: never(),
 ```
 
 A custom synchronous or async callback receives `toolName`, decoded `toolInput`,
-and `signal`. Return `approved`, `denied`, or `user-approval`. The constructors infer the callback input from its schema. Annotate a shared
+`signal` and the verified `caller`. Return `approved`, `denied`, `user-approval`
+or `human-approval`. The constructors infer the callback input from its schema. Annotate a shared
 function with `Approval<Input>` from `apps/operations/approval`.
 Assign the same function to several tools to share a policy. Attach approval to
 one shared operation with `withApproval(operation, policy)`, and to the tools of
@@ -292,11 +295,42 @@ again. If it returns a new link, show that link too. The original program and
 running tool continue without replay. An unavailable request may have expired,
 been consumed, or been lost on restart; do not rerun the source automatically.
 
+`human-approval` (`human()`) accepts only a person's answer: the browser approval
+page, the dashboard, or the client's own form in native mode. In model mode the
+agent's own `accept` is refused and the same request comes back with an
+`approvalUrl`; show it to the user, wait for them to approve there, then call
+`resume` again to collect the result. Declining needs no person.
+
+## Who called the tool
+
+`ctx.caller` is the invocation's verified caller, set by the host, never by the
+caller's input:
+
+```ts
+const record = mutation({ input: object({ note: string() }) }, async (ctx, { note }) => {
+  const by = ctx.caller; // { kind, subject, issuer, email, organizationId, channel }
+  // kind: "human" (dashboard or the app's page), "agent" (MCP client or API key acting
+  // for subject), "system" (schedule, workflow step or webhook delivery).
+  // channel: "ui", "mcp", "api", "dashboard", "schedule", "workflow" or "webhook".
+});
+```
+
+`subject` is the user the call acts for; it is null for background work that belongs
+to nobody. Agents carry `provenance: { trusted: false, clientId, connectionId }`: the
+client details they presented, for logs only. Never authorize anything with them.
+A call resumed after approval runs as its requester, so `ctx.caller` is unchanged,
+and `ctx.approvedBy` names who approved it with its own `channel` and `method`
+(`model`, `client`, `native`, `browser` or `dashboard`). `ctx.caller` is undefined
+during discovery and on hosts that do not provide identity, so check it before use.
+Approval callbacks receive the same `caller`.
+
 ## Cache and lazy operation sources
 
 Use `ctx.cache.get({ key, schema, freshFor, staleFor, load })` for shared JSON.
 Put every result dependency in the key. Use `ctx.cache.forAccount(account)` for
-private results; the host also scopes entries to current credentials. Use the
+private results; the host also scopes entries to current credentials. Use
+`ctx.cache.forCaller()` for anything computed from who is calling: the shared
+scope serves every caller of the app. Use the
 loader's `fetch`, `signal`, and `cache` so stale refreshes can finish after the
 request. Pass `stale: "revalidate"` to await the load past `freshFor` instead of
 serving the old value; the loader can `read(key, schema)` the old value to confirm

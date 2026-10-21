@@ -86,6 +86,10 @@ its own files; activating an older version serves its files again.
 `useAppQuery(atom)` returns `{ data, pending, error }`, never the query data directly.
 `data` is `undefined` until a successful result. `pending` means no result has arrived.
 `error` is an optional safe message. Keep an existing result visible during a failed refresh.
+The page cannot pause for approval: an operation whose approval policy asks for one
+fails with reason `approval_required` and does not run. Run such operations as tool
+calls, or give the page an operation without that policy. The operation's `ctx.caller`
+is the signed-in person, with channel `ui`.
 
 ```tsx
 const { data, pending, error } = useAppQuery(todosAtom);
