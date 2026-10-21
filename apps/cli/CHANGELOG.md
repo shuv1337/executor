@@ -1,5 +1,17 @@
 # executor
 
+## 2.0.0-beta.25
+
+Nightly beta of the Executor local runtime, CLI, desktop, and self-host Docker image.
+
+## 2.0.0-beta.24
+
+Nightly beta of the Executor local runtime, CLI, desktop, and self-host Docker image.
+
+## 2.0.0-beta.23
+
+Nightly beta of the Executor local runtime, CLI, desktop, and self-host Docker image.
+
 ## 2.0.0-beta.22
 
 Nightly beta of the Executor local runtime, CLI, desktop, and self-host Docker image.

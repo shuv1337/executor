@@ -2,6 +2,7 @@
 import { holdTeamInstallation, InstallationDirectory } from "../support/team-installation.ts";
 import { expect, layer } from "@effect/vitest";
 import { Effect, Schema, Schedule } from "effect";
+import type { Page } from "playwright";
 import { scenarios } from "../test-plan.ts";
 import { Actors } from "../support/actors.ts";
 import { Api, body, type Session } from "../support/api.ts";
@@ -22,7 +23,7 @@ const App = Schema.Struct({
   id: Schema.String,
   name: Schema.String,
   slug: Schema.String,
-  activeDeployment: Schema.String,
+  activeVersion: Schema.String,
   accounts: Schema.optional(Schema.Never),
 });
 const Inventory = Schema.Struct({
@@ -92,6 +93,35 @@ layer(HostedLive, { excludeTestServices: true })("Executor API-key account", (it
           );
           expect(card).toContain(account.label);
           expect(card).not.toContain("Needs account");
+          // Add app knows the default app is installed, so its Executor row offers Open, not Add.
+          yield* browser.use("Open Add app", (page) =>
+            page.goto(`/org/${actors.organization.slug}/apps/add`),
+          );
+          const executorRow = (page: Page) =>
+            page.locator(".catalog-row", {
+              has: page.getByText("Executor", { exact: true }),
+            });
+          yield* browser.use("The Executor row offers Open", (page) =>
+            executorRow(page).getByRole("link", { name: "Open", exact: true }).waitFor(),
+          );
+          expect(
+            yield* browser.use("The Executor row offers no Add", (page) =>
+              executorRow(page).getByRole("button", { name: "Add Executor", exact: true }).count(),
+            ),
+          ).toBe(0);
+          yield* browser.checkpoint(`Add app shows Executor installed for ${account.label}`);
+          yield* browser.use("Open Executor from Add app", (page) =>
+            executorRow(page).getByRole("link", { name: "Open", exact: true }).click(),
+          );
+          yield* browser.use("Open leads to the default app", (page) =>
+            page.waitForURL(`**/apps/${app.id}?view=accounts`),
+          );
+          yield* browser.use("Return to the app list again", (page) =>
+            page.getByRole("link", { name: "Back to apps", exact: true }).click(),
+          );
+          yield* browser.use("The Executor card is loaded again", (page) =>
+            page.getByRole("link", { name: "Open Executor", exact: true }).waitFor(),
+          );
           for (const view of ["available", "managed"]) {
             const directory = yield* body(
               Schema.Struct({
@@ -525,7 +555,7 @@ layer(HostedLive, { excludeTestServices: true })("Executor API-key account", (it
           expect(call.body).toMatchObject({ _tag: "AccountRequired", slot: "service" });
         });
         yield* unlinked;
-        // A new deployment of the common app sends member setup past its fast path.
+        // A new version of the common app sends member setup past its fast path.
         const original = yield* body(
           Schema.Struct({
             files: Schema.Array(Schema.Struct({ path: Schema.String, content: Schema.String })),
