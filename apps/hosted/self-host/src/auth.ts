@@ -17,6 +17,7 @@ import {
   mcpBearerAccess,
   Authentication,
   AuthenticationUnavailable,
+  McpUnauthorized,
   sessionPrincipal,
   lookupMembership,
   lookupOrganizationSlug,
@@ -107,6 +108,19 @@ export const selfHostAuth = Effect.gen(function* () {
           Effect.annotateCurrentSpan("executor.organization.id", access.organization),
         ),
         Effect.withSpan("auth.authenticate"),
+      ),
+    sealGrant: (id) =>
+      Effect.tryPromise({
+        try: () => auth.api.sealMcpGrantRef({ body: { id } }),
+        catch: () => new AuthenticationUnavailable(),
+      }).pipe(Effect.map(({ ref }) => ref)),
+    openGrant: (ref) =>
+      Effect.tryPromise({
+        try: () => auth.api.openMcpGrantRef({ body: { ref } }),
+        catch: mcpBrowserGrantError,
+      }).pipe(
+        Effect.map(({ id }) => id),
+        Effect.catchTag("McpApprovalForbidden", () => Effect.fail(new McpUnauthorized())),
       ),
     browserGrant: (headers, id) =>
       Effect.tryPromise({

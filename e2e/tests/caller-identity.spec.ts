@@ -127,7 +127,7 @@ const mcpUser = (actor: Session, label: string, slug: string) =>
           Schema.decodeUnknownEffect(schema)(done.structuredContent.execution.value),
         ),
       );
-    return { actor, execute, resume, completed, revoke };
+    return { actor, execute, resume, completed, revoke, keyId: key.id };
   });
 
 layer(HostedLive, { excludeTestServices: true })("Caller identity", (it) => {
@@ -269,6 +269,12 @@ layer(HostedLive, { excludeTestServices: true })("Caller identity", (it) => {
         // The signed-in person approves on the browser page; the agent then collects the result.
         // The page posts the answer to the approval API with the link's own query.
         const page = new URL(asked.approvalUrl!);
+        // A link names its grant only by an opaque reference: no grant ID, API key ID or JSON.
+        expect([...page.searchParams.keys()].sort()).toEqual(["grant", "mode", "sessionId"]);
+        expect(asked.approvalUrl).not.toContain("grantId");
+        expect(asked.approvalUrl).not.toContain("pat:");
+        expect(asked.approvalUrl).not.toContain(alice.keyId);
+        expect(decodeURIComponent(asked.approvalUrl!)).not.toContain("{");
         const answer = yield* api.request(
           actors.member,
           "POST",

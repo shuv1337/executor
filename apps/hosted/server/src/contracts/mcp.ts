@@ -141,6 +141,12 @@ export class McpAuthentication extends Context.Service<
       /** The scoped connection the MCP URL names. A PAT there runs with its narrower policy. */
       connection?: ConnectionId,
     ) => Effect.Effect<McpAccess, McpUnauthorized | McpForbidden | AuthenticationUnavailable>;
+    /** An opaque reference to a grant for approval links; it reveals nothing without the instance secret. */
+    readonly sealGrant: (id: GrantId) => Effect.Effect<string, AuthenticationUnavailable>;
+    /** The grant an approval link's reference names. */
+    readonly openGrant: (
+      ref: string,
+    ) => Effect.Effect<GrantId, McpUnauthorized | AuthenticationUnavailable>;
     readonly browserGrant: (
       headers: Headers,
       id: GrantId,
