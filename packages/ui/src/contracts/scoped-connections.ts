@@ -99,3 +99,16 @@ export interface ScopedConnectionBindings<EL, ES, ER> {
   readonly save: Atom.AtomResultFn<ConnectionSave, ConnectionView, ES>;
   readonly revoke: Atom.AtomResultFn<ConnectionId, void, ER>;
 }
+/** A request for a key bound to one connection: it expires after `expiresInSeconds`. */
+export interface ConnectionKeyRequest {
+  readonly connection: ConnectionId;
+  readonly expiresInSeconds: number;
+}
+/** A minted connection key. The secret appears only in this response. */
+export interface MintedConnectionKey {
+  readonly key: string;
+  readonly url: string;
+  readonly expiresAt: string;
+}
+/** Hosts that issue connection keys bind this; the page then offers to create one. */
+export type ConnectionKeyMint<E> = Atom.AtomResultFn<ConnectionKeyRequest, MintedConnectionKey, E>;

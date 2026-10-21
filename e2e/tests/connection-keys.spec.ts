@@ -13,6 +13,7 @@ import { Actors } from "../support/actors.ts";
 import { HostedLive, withHostedCase } from "../support/case.ts";
 import { App } from "../support/contracts.ts";
 import { Telemetry } from "../support/evidence.ts";
+import { Browser } from "../support/browser.ts";
 import { McpClient } from "../support/mcp-client.ts";
 import { ConnectionView, Execution, readWriteAppFiles } from "../support/mcp-connections.ts";
 
@@ -194,6 +195,31 @@ layer(HostedLive, { excludeTestServices: true })("Connection keys", (it) => {
         expect(Exit.isSuccess(yield* atConnection(brief.key, "brief key"))).toBe(true);
         yield* Effect.sleep("6 seconds");
         expect(Exit.isFailure(yield* atConnection(brief.key, "expired key"))).toBe(true);
+
+        // The owner can also create one in the dashboard; it is shown once and works the same way.
+        const browser = yield* Browser;
+        yield* browser.login(actors.member);
+        yield* browser.use("Open the member's connections", (page) =>
+          page.goto(`/org/${actors.organization.slug}/connect`),
+        );
+        yield* browser.use("Open the bound connection", (page) =>
+          page.getByRole("button", { name: new RegExp(bound.name) }).click(),
+        );
+        yield* browser.use("Start a connection key", (page) =>
+          page.getByRole("button", { name: "Create connection key", exact: true }).click(),
+        );
+        yield* browser.use("Create the key", (page) =>
+          page.getByRole("button", { name: "Create key", exact: true }).click(),
+        );
+        const shown = yield* browser.use("Read the key shown once", (page) =>
+          page
+            .getByText(/^exp_[A-Za-z0-9_-]+$/)
+            .first()
+            .innerText(),
+        );
+        expect(
+          Exit.isSuccess(yield* atConnection(Redacted.make(shown.trim()), "dashboard key")),
+        ).toBe(true);
 
         // Revoking the connection stops the key at its URL and deletes it.
         expect(

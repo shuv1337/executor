@@ -21,6 +21,8 @@ import {
   connectionTargetLabel,
   connectionToolsLabel,
   connectionEventsLabel,
+  type ConnectionKeyMint,
+  type MintedConnectionKey,
   type ScopedConnectionBindings,
 } from "../../contracts/scoped-connections.ts";
 import { HugeiconsIcon } from "@hugeicons/react";
@@ -58,6 +60,7 @@ import {
 } from "./connection-app-picker.tsx";
 import { useIncrementalList } from "./incremental-list.tsx";
 import { McpInstallInstructions } from "./connect.tsx";
+import { Code } from "./code.tsx";
 import { publicDocsBaseUrl } from "../../contracts/documentation.ts";
 
 /** Each host supplies its existing authorized catalog read of the app's tools. */
@@ -116,17 +119,26 @@ const newDraft = (): ConnectionDraft => ({
  * Connections the current user owns. The default connection keeps every app; scoped
  * connections each issue their own MCP URL, and edits apply to connected agents immediately.
  */
-export function ScopedConnectionsPage<E, EL extends E, ES extends E, ER extends E>({
+export function ScopedConnectionsPage<
+  E,
+  EL extends E,
+  ES extends E,
+  ER extends E,
+  EK extends E = never,
+>({
   query,
   connections,
   save,
   revoke,
+  mintKey,
   Failure,
   installation,
   agents,
   docs = publicDocsBaseUrl,
   renderTools,
 }: ScopedConnectionBindings<EL, ES, ER> & {
+  /** Mints keys bound to one connection, when the host issues them. */
+  readonly mintKey?: ConnectionKeyMint<EK>;
   readonly query: Query<Inventory, E>;
   /** Renders every failure: inventory, connection reads, saves and revocation. */
   readonly Failure: ComponentType<FailureProps<E>>;
@@ -139,6 +151,7 @@ export function ScopedConnectionsPage<E, EL extends E, ES extends E, ER extends 
 }) {
   const [view, setView] = useState<View>({ kind: "list" });
   const [revoking, setRevoking] = useState<ConnectionView>();
+  const [minting, setMinting] = useState<ConnectionView>();
   const submitRevoke = useAtomSet(revoke, { mode: "promiseExit" });
   const revokeState = useAtomValue(revoke);
   const back = () => setView({ kind: "list" });
@@ -270,6 +283,11 @@ export function ScopedConnectionsPage<E, EL extends E, ES extends E, ER extends 
                           >
                             Edit access
                           </Button>
+                          {mintKey !== undefined && (
+                            <Button variant="outline" onClick={() => setMinting(connection)}>
+                              Create connection key
+                            </Button>
+                          )}
                           <Button
                             variant="ghost"
                             className="text-destructive"
@@ -336,7 +354,138 @@ export function ScopedConnectionsPage<E, EL extends E, ES extends E, ER extends 
           </DialogFooter>
         </DialogContent>
       </Dialog>
+      {mintKey !== undefined && minting !== undefined && (
+        <ConnectionKeyDialog
+          key={minting.id}
+          connection={minting}
+          mintKey={mintKey}
+          Failure={Failure}
+          onClose={() => setMinting(undefined)}
+        />
+      )}
     </PageFrame>
+  );
+}
+
+const keyLifetimes = [
+  { label: "7 days", seconds: 7 * 86400 },
+  { label: "30 days", seconds: 30 * 86400 },
+  { label: "90 days", seconds: 90 * 86400 },
+] as const;
+
+/**
+ * Create a key that works only at this connection's URL, for an agent that cannot sign in. The
+ * secret is shown once, with the MCP configuration that uses it.
+ */
+function ConnectionKeyDialog<E, EK extends E>({
+  connection,
+  mintKey,
+  Failure,
+  onClose,
+}: {
+  readonly connection: ConnectionView;
+  readonly mintKey: ConnectionKeyMint<EK>;
+  readonly Failure: ComponentType<FailureProps<E>>;
+  readonly onClose: () => void;
+}) {
+  const [seconds, setSeconds] = useState<number>(keyLifetimes[1].seconds);
+  const [minted, setMinted] = useState<MintedConnectionKey>();
+  const submit = useAtomSet(mintKey, { mode: "promiseExit" });
+  const state = useAtomValue(mintKey);
+  const lifetime = useId();
+  const config =
+    minted === undefined
+      ? ""
+      : JSON.stringify(
+          {
+            mcpServers: {
+              [connection.name]: {
+                type: "http",
+                url: minted.url,
+                headers: { Authorization: `Bearer ${minted.key}` },
+              },
+            },
+          },
+          null,
+          2,
+        );
+  return (
+    <Dialog
+      open
+      onOpenChange={(open) => {
+        if (!open && !state.waiting) onClose();
+      }}
+    >
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>
+            {minted === undefined ? `Create a key for ${connection.name}` : "Copy this key now"}
+          </DialogTitle>
+          <DialogDescription>
+            {minted === undefined
+              ? "For an agent, CI job or bot that cannot sign in. The key works only at this connection's URL, never with the Executor API, and stops when the connection is revoked."
+              : `It will not be shown again. It expires ${new Date(minted.expiresAt).toLocaleString()}.`}
+          </DialogDescription>
+        </DialogHeader>
+        {minted === undefined ? (
+          <div className="grid gap-2">
+            <Label htmlFor={lifetime}>Expires after</Label>
+            <select
+              id={lifetime}
+              className="h-9 rounded-md border bg-background px-2 text-sm"
+              value={seconds}
+              onChange={(event) => setSeconds(Number(event.target.value))}
+            >
+              {keyLifetimes.map((option) => (
+                <option key={option.seconds} value={option.seconds}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </div>
+        ) : (
+          <div className="grid gap-3">
+            <div className="overflow-hidden rounded-lg border">
+              <Code
+                code={minted.key}
+                path="key.txt"
+                lineNumbers={false}
+                copyable
+                copyLabel="Copy key"
+              />
+            </div>
+            <div className="overflow-hidden rounded-lg border">
+              <Code code={config} path="mcp.json" lineNumbers={false} copyable />
+            </div>
+          </div>
+        )}
+        {AsyncResult.isFailure(state) && <Failure cause={state.cause} />}
+        <DialogFooter>
+          {minted === undefined ? (
+            <>
+              <Button variant="outline" disabled={state.waiting} onClick={onClose}>
+                Cancel
+              </Button>
+              <Button
+                loading={state.waiting}
+                disabled={state.waiting}
+                onClick={async () => {
+                  const result = await submit({
+                    connection: connection.id,
+                    expiresInSeconds: seconds,
+                  });
+                  if (Exit.isSuccess(result)) setMinted(result.value);
+                }}
+              >
+                Create key
+              </Button>
+            </>
+          ) : (
+            <Button onClick={onClose}>Done</Button>
+          )}
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
 
