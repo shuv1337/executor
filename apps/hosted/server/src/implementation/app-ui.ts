@@ -437,6 +437,11 @@ export const hostedAppUi = <R = never>(
         return yield* executor.appData
           .query(input)
           .pipe(asUiCaller(current), Effect.mapError(dataFailure));
+      // Only a page that can follow a saved approval gets one; older pages keep the refusal.
+      if (payload.acceptsApproval !== true)
+        return yield* executor.appData
+          .mutate(input)
+          .pipe(asUiCaller(current), Effect.mapError(dataFailure));
       return yield* executor.appData.mutate(input).pipe(
         Effect.catchTag("AppDataApprovalRequired", () => savedForReview(current, input)),
         asUiCaller(current),

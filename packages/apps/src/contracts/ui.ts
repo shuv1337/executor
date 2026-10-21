@@ -63,6 +63,12 @@ export const UiOperation = Schema.Struct({
   ...UiContextFields.fields,
   name: Schema.NonEmptyString,
   input: JsonValue,
+  /**
+   * The page can follow a saved approval: a gated mutation is then saved for the person's review
+   * and fails with its `approval`. Pages built before this field get the plain refusal, and the
+   * host saves nothing they could not show.
+   */
+  acceptsApproval: Schema.optionalKey(Schema.Boolean),
 }).pipe(withLegacyKeys({ version: "deployment" }));
 /** The app session is absent or its parent login was revoked. */
 export class UiUnauthorized extends Schema.TaggedError<UiUnauthorized>()(

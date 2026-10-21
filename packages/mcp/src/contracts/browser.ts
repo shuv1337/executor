@@ -78,11 +78,11 @@ export const ToolRunApprovalRefused = UserFacingError.define({
       ? {
           title: "Another person’s run",
           description:
-            "Another person started this run from the Tools tab, so only they can review or answer it.",
+            "Another person started this run, from the Tools tab or an app's page, so only they can review or answer it.",
           recovery: {
             action: "Leave this request to them. To make this call yourself, run the tool again.",
             instructions:
-              "A dashboard approval is reviewed only by the person whose run from the Tools tab requested it. Do not retry this request here. To make the call yourself, run the tool from your own Tools tab and review the request it shows you.",
+              "A dashboard approval is reviewed only by the person whose run requested it, from the Tools tab or an app's page. Do not retry this request here. To make the call yourself, run the tool from your own Tools tab or use the app's page, and review the request it shows you.",
           },
         }
       : {

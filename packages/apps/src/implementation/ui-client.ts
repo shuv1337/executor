@@ -131,7 +131,11 @@ export const createAppClient = () => {
   ) =>
     Effect.gen(function* () {
       const api = yield* client;
-      const value = yield* api.ui[kind]({ payload: yield* payload(name, input) });
+      const base = yield* payload(name, input);
+      // This client follows saved approvals, so the host may save a gated mutation for review.
+      const value = yield* api.ui[kind]({
+        payload: kind === "mutate" ? { ...base, acceptsApproval: true } : base,
+      });
       return yield* EffectSchema.decodeUnknownEffect(decoderOf(output))(value);
     }).pipe(
       Effect.tapErrorTag("UiDeploymentChanged", () => versionChanged),
