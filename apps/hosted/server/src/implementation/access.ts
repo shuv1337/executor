@@ -29,6 +29,7 @@ import type { ToolIdentity } from "@executor-js/authorization";
 import type { ToolAuthorization } from "./authorization.ts";
 import { Context, Effect, type Exit, Result } from "effect";
 import { HttpServerRequest } from "effect/http";
+import type { AppAccess } from "../contracts/resource-access.ts";
 import { CurrentUserId, Forbidden } from "../contracts/auth.ts";
 import {
   appAccountReads,
@@ -141,6 +142,15 @@ export const FoldReadAhead = Context.Reference<
   | undefined
 >("hosted/FoldReadAhead", { defaultValue: () => undefined });
 /**
+ * An app and the caller's access to it, both read earlier in the same request, such as by the app
+ * list MCP discovery reads ({@link visibleAppAccesses}). A check given one still decides with this
+ * access, and reads the caller's links itself; it is never kept beyond the request.
+ */
+export interface CheckedApp {
+  readonly app: App;
+  readonly access: typeof AppAccess.Type;
+}
+/**
  * The app read an MCP tool call made beside its authentication recheck, for the call it is about
  * to make. Unset everywhere else.
  */
@@ -173,36 +183,51 @@ const usableAppWithLinks = (
   owner: OwnerId,
   app: AppId,
   read?: SelectionReads,
+  checked?: CheckedApp,
 ) =>
   Effect.gen(function* () {
-    const ahead =
-      read !== undefined && read.owner === owner && read.app === app && answered(read.current)
-        ? read.current
+    const known =
+      checked !== undefined && checked.app.id === app && checked.app.owner === owner
+        ? checked
         : undefined;
+    const ahead =
+      known !== undefined
+        ? Result.succeed(known.app)
+        : read !== undefined && read.owner === owner && read.app === app && answered(read.current)
+          ? read.current
+          : undefined;
     const current = ahead ?? (yield* Effect.result(executor.apps.get({ owner, app })));
     const organization = (yield* CurrentOrganization).organization;
     const user = yield* CurrentUserId;
     const fold = read === undefined ? undefined : yield* FoldReadAhead;
+    const accountless =
+      Result.isSuccess(current) && Object.keys(current.success.requirements.accounts).length === 0;
     const { access, accounts } =
       fold !== undefined &&
       fold.organization === organization &&
       fold.user === user &&
       fold.app === app
         ? yield* fold.result
-        : Result.isSuccess(current) &&
-            Object.keys(current.success.requirements.accounts).length === 0
-          ? // The active version needs no account, so the statement reads no links or
-            // app links. A retained version that declares accounts reads them when it resolves
-            // its requirements.
-            yield* resourceAuthorityForApp(organization, user, app).pipe(
-              Effect.flatMap(({ actor, access }) =>
-                Effect.map(policyDatabase, (sql) => ({
-                  access,
-                  accounts: appAccountReads(sql, { subject: actor.user, app }),
-                })),
-              ),
-            )
-          : yield* resourceAuthorityForLinks(organization, user, app);
+        : accountless && known !== undefined && user !== undefined
+          ? // This request read the caller's membership and the app's policy with the app; the
+            // check below still decides with them.
+            yield* Effect.map(policyDatabase, (sql) => ({
+              access: known.access,
+              accounts: appAccountReads(sql, { subject: user, app }),
+            }))
+          : accountless
+            ? // The active version needs no account, so the statement reads no links or
+              // app links. A retained version that declares accounts reads them when it resolves
+              // its requirements.
+              yield* resourceAuthorityForApp(organization, user, app).pipe(
+                Effect.flatMap(({ actor, access }) =>
+                  Effect.map(policyDatabase, (sql) => ({
+                    access,
+                    accounts: appAccountReads(sql, { subject: actor.user, app }),
+                  })),
+                ),
+              )
+            : yield* resourceAuthorityForLinks(organization, user, app);
     if (!access.canUse) return yield* new OrganizationForbidden();
     return { app: yield* Effect.fromResult(current), linked: accounts };
   });
@@ -215,9 +240,10 @@ export const selectedApp = (
   owner: OwnerId,
   app: AppId,
   read?: SelectionReads,
+  checked?: CheckedApp,
 ) =>
   Effect.gen(function* () {
-    const { app: current, linked } = yield* usableAppWithLinks(executor, owner, app, read);
+    const { app: current, linked } = yield* usableAppWithLinks(executor, owner, app, read, checked);
     return { app: current, accounts: yield* callerAccounts(current, linked) };
   });
 /**
@@ -249,9 +275,10 @@ export const selectedActiveVersion = (
   executor: Executor,
   owner: OwnerId,
   input: { readonly app: AppId; readonly version?: VersionId | undefined },
+  checked?: CheckedApp,
 ) =>
   Effect.gen(function* () {
-    const { app, accounts } = yield* selectedApp(executor, owner, input.app);
+    const { app, accounts } = yield* selectedApp(executor, owner, input.app, undefined, checked);
     if (input.version !== undefined && input.version !== app.activeVersion)
       return yield* new VersionNotFound({ app: app.id, version: input.version });
     if (app.activeVersion === null) return yield* new AppNotDeployed({ app: app.id });

@@ -37,18 +37,23 @@ import {
   currentOwner,
   selectedActiveVersion,
   usableApp,
+  type CheckedApp,
 } from "./access.ts";
 
-/** Discover the current account-dependent catalog with the caller's resolved accounts. */
+/**
+ * Discover the current account-dependent catalog with the caller's resolved accounts. `checked` is
+ * the app and the caller's access to it, when this request has read them already.
+ */
 export const listTools = (
   input: Parameters<Executor["tools"]["list"]>[0],
   options?: ToolListOptions,
+  checked?: CheckedApp,
 ) =>
   Effect.gen(function* () {
     const policy = yield* authorizeApp(input.app);
     const owner = yield* currentOwner;
     const executor = yield* Effect.flatten(HostedExecutor);
-    const { version, accounts } = yield* selectedActiveVersion(executor, owner, input);
+    const { version, accounts } = yield* selectedActiveVersion(executor, owner, input, checked);
     const page = yield* executor.tools.list({ ...input, version, accounts, limit: 2000 }, options);
     return {
       ...page,
@@ -62,12 +67,13 @@ export const listTools = (
 export const searchableTools = (
   input: Parameters<Executor["tools"]["searchable"]>[0],
   options?: ToolListOptions,
+  checked?: CheckedApp,
 ) =>
   Effect.gen(function* () {
     const policy = yield* authorizeApp(input.app);
     const owner = yield* currentOwner;
     const executor = yield* Effect.flatten(HostedExecutor);
-    const { version, accounts } = yield* selectedActiveVersion(executor, owner, input);
+    const { version, accounts } = yield* selectedActiveVersion(executor, owner, input, checked);
     const searchable = yield* executor.tools.searchable({ ...input, version, accounts }, options);
     // Failed routers list no tools, so the policy decides them without the catalog.
     return {

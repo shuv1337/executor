@@ -547,9 +547,34 @@ export const visibleAccountsAs = (actor: ResourceAuthority, accounts: readonly A
     );
     return accounts.filter((account) => usable.has(account.id));
   });
+/**
+ * The usable apps of a list, each with the caller's access to it. Membership and every policy are
+ * read in one statement ({@link resourceAuthorityForApps}); an empty list still checks membership.
+ */
+export const visibleAppAccesses = (apps: readonly App[]) =>
+  Effect.gen(function* () {
+    const organization = (yield* CurrentOrganization).organization;
+    const user = yield* CurrentUserId;
+    if (apps.length === 0) {
+      yield* resourceAuthority(organization, user);
+      return [];
+    }
+    const { access } = yield* resourceAuthorityForApps(
+      organization,
+      user,
+      apps.map((app) => app.id),
+    );
+    const usable = new Map(
+      access.filter((policy) => policy.canUse).map((policy) => [policy.app, policy]),
+    );
+    return apps.flatMap((app) => {
+      const policy = usable.get(app.id);
+      return policy === undefined ? [] : [{ app, access: policy }];
+    });
+  });
 /** Normal app lists contain usable apps, not every app that an admin can manage. */
 export const visibleApps = (apps: readonly App[]) =>
-  Effect.flatMap(currentResourceAuthority, (actor) => visibleAppsAs(actor, apps));
+  Effect.map(visibleAppAccesses(apps), (visible) => visible.map(({ app }) => app));
 /** {@link visibleApps} for an actor already resolved in this operation. */
 export const visibleAppsAs = (actor: ResourceAuthority, apps: readonly App[]) =>
   Effect.gen(function* () {
