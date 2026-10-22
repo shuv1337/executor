@@ -70,6 +70,8 @@ export const AppRequirements = Schema.Struct({
   events: DeclaredRequirements.fields.events,
   /** The icons the app declares on `defineApp`, recorded at build without evaluating it. */
   icons: DeclaredRequirements.fields.icons,
+  /** The author lets every caller share one runtime; see `sharesRuntime`. */
+  sharedRuntime: DeclaredRequirements.fields.sharedRuntime,
 });
 
 export type AppRequirements = typeof AppRequirements.Type;
@@ -77,6 +79,13 @@ export type AppRequirements = typeof AppRequirements.Type;
 /** Whether the app owns a database, so its calls run in its data facet. */
 export const ownsDatabase = (requirements: Pick<AppRequirements, "database" | "sql">) =>
   requirements.sql === true || requirements.database !== undefined;
+
+/**
+ * Whether every caller's calls of this version run in one runtime, named by build alone. Versions
+ * recorded before `sharedRuntime`, and builds that do not declare it, keep one per selection.
+ */
+export const sharesRuntime = (requirements: Pick<AppRequirements, "sharedRuntime">) =>
+  requirements.sharedRuntime === true;
 
 /** A retained version's build metadata and the requirements its code declares. */
 export const RetainedVersion = Schema.Struct({

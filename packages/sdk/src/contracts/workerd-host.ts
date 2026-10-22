@@ -30,6 +30,8 @@ export const WorkerInvocation = Schema.Struct({
   app: Schema.NonEmptyString,
   build: Schema.NonEmptyString,
   database: Schema.Boolean,
+  /** Sent only for builds that declare `sharedRuntime`; see `appWorker`. */
+  sharedRuntime: Schema.optionalKey(Schema.Literal(true)),
   command: HostRequest,
   accounts: HostAccounts,
   approval: Schema.optionalKey(TrustedToolApproval),

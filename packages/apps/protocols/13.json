@@ -2407,6 +2407,14 @@
             ]
           },
           "isOptional": true
+        },
+        {
+          "name": "sharedRuntime",
+          "type": {
+            "_tag": "Literal",
+            "literal": true
+          },
+          "isOptional": true
         }
       ]
     },

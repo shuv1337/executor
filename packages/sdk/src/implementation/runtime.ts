@@ -40,11 +40,14 @@ export interface ResolvedAppRuntime {
   readonly skills: (input: {
     readonly app: string;
     readonly build: BuildId;
+    /** The build's requirements declare `sharedRuntime`; see `sharesRuntime`. */
+    readonly sharedRuntime?: boolean;
     readonly accounts: ResolvedAccountsInput;
   }) => Promise<readonly AppSkillSource[]>;
   readonly inspect: (input: {
     readonly app: string;
     readonly build: BuildId;
+    readonly sharedRuntime?: boolean;
     readonly accounts: ResolvedAccountsInput;
     readonly tools?: readonly string[];
     readonly scheduled?: true;
@@ -52,11 +55,13 @@ export interface ResolvedAppRuntime {
   readonly index: (input: {
     readonly app: string;
     readonly build: BuildId;
+    readonly sharedRuntime?: boolean;
     readonly accounts: ResolvedAccountsInput;
   }) => Promise<HostedCatalogSummary>;
   readonly query: (input: {
     readonly app: string;
     readonly build: BuildId;
+    readonly sharedRuntime?: boolean;
     readonly database: boolean;
     readonly accounts: ResolvedAccountsInput;
     readonly name: string;
@@ -65,6 +70,7 @@ export interface ResolvedAppRuntime {
   readonly mutate: (input: {
     readonly app: string;
     readonly build: BuildId;
+    readonly sharedRuntime?: boolean;
     readonly database: boolean;
     readonly accounts: ResolvedAccountsInput;
     readonly name: string;
@@ -73,6 +79,7 @@ export interface ResolvedAppRuntime {
   readonly webhook: (input: {
     readonly app: string;
     readonly build: BuildId;
+    readonly sharedRuntime?: boolean;
     readonly database: boolean;
     readonly accounts: ResolvedAccountsInput;
     readonly command: import("apps/contracts").WebhookCommand;
@@ -82,6 +89,7 @@ export interface ResolvedAppRuntime {
     readonly approval?: NonNullable<HostContext["approval"]>;
     readonly elicitation?: NonNullable<HostContext["elicitation"]>;
     readonly build: BuildId;
+    readonly sharedRuntime?: boolean;
     readonly database: boolean;
     readonly accounts: ResolvedAccountsInput;
     readonly tool: string;
@@ -112,46 +120,48 @@ export const createAppRuntime = (options: {
     ...(asset === undefined
       ? {}
       : { asset: (input: { build: BuildId; path: string }) => Effect.runPromise(asset(input)) }),
-    skills: ({ accounts, ...input }) =>
+    skills: ({ accounts, sharedRuntime = false, ...input }) =>
       Effect.runPromise(
         context(accounts).pipe(
-          Effect.flatMap((context) => runtime.skills({ ...input, ...context })),
+          Effect.flatMap((context) => runtime.skills({ ...input, sharedRuntime, ...context })),
           Effect.map((catalog) => catalog.skills),
         ),
       ),
-    inspect: ({ accounts, ...input }) =>
+    inspect: ({ accounts, sharedRuntime = false, ...input }) =>
       Effect.runPromise(
         context(accounts).pipe(
-          Effect.flatMap((context) => runtime.inspect({ ...input, ...context })),
+          Effect.flatMap((context) => runtime.inspect({ ...input, sharedRuntime, ...context })),
         ),
       ),
-    index: ({ accounts, ...input }) =>
+    index: ({ accounts, sharedRuntime = false, ...input }) =>
       Effect.runPromise(
         context(accounts).pipe(
-          Effect.flatMap((context) => runtime.index({ ...input, ...context })),
+          Effect.flatMap((context) => runtime.index({ ...input, sharedRuntime, ...context })),
         ),
       ),
-    query: ({ accounts, ...input }) =>
+    query: ({ accounts, sharedRuntime = false, ...input }) =>
       Effect.runPromise(
         context(accounts).pipe(
-          Effect.flatMap((context) => runtime.query({ ...input, ...context })),
+          Effect.flatMap((context) => runtime.query({ ...input, sharedRuntime, ...context })),
         ),
       ),
-    mutate: ({ accounts, ...input }) =>
+    mutate: ({ accounts, sharedRuntime = false, ...input }) =>
       Effect.runPromise(
         context(accounts).pipe(
-          Effect.flatMap((context) => runtime.mutate({ ...input, ...context })),
+          Effect.flatMap((context) => runtime.mutate({ ...input, sharedRuntime, ...context })),
         ),
       ),
-    webhook: ({ accounts, ...input }) =>
+    webhook: ({ accounts, sharedRuntime = false, ...input }) =>
       Effect.runPromise(
         context(accounts).pipe(
-          Effect.flatMap((context) => runtime.webhook({ ...input, ...context })),
+          Effect.flatMap((context) => runtime.webhook({ ...input, sharedRuntime, ...context })),
         ),
       ),
-    call: ({ accounts, ...input }) =>
+    call: ({ accounts, sharedRuntime = false, ...input }) =>
       Effect.runPromise(
-        context(accounts).pipe(Effect.flatMap((context) => runtime.call({ ...input, ...context }))),
+        context(accounts).pipe(
+          Effect.flatMap((context) => runtime.call({ ...input, sharedRuntime, ...context })),
+        ),
       ),
   };
 };

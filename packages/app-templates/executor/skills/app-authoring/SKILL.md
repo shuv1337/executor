@@ -25,6 +25,7 @@ build through `execute`; source then travels as data inside tool calls.
 | ------------------------------------------------------------ | ------------------------------------------------------ |
 | Start a new UI with storage from a checked example           | [starter.md](starter.md)                               |
 | Declare queries, mutations, schemas, approvals, skills, icon | [tools.md](tools.md)                                   |
+| Share one warm runtime across callers (`sharedRuntime`)      | [tools.md](tools.md#shared-runtime-sharedruntime)      |
 | Create, save, deploy, update or select dependencies          | [deploy.md](deploy.md)                                 |
 | Build a React UI and subscribe to data                       | [ui.md](ui.md)                                         |
 | Store, query or modify app data                              | [storage.md](storage.md)                               |

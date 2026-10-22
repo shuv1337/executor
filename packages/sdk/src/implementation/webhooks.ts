@@ -51,7 +51,7 @@ import { storedApp, storedVersion } from "./apps.ts";
 import { backgroundAccounts } from "./background-accounts.ts";
 import { accountAuthority } from "./selection.ts";
 import type { Declarations } from "./declarations.ts";
-import { ownsDatabase } from "../contracts/apps.ts";
+import { ownsDatabase, sharesRuntime } from "../contracts/apps.ts";
 
 const StoredWebhook = Schema.Struct({
   ...WebhookSubscriptionFields.fields,
@@ -269,6 +269,7 @@ export const makeWebhooks = (
         app: row.app,
         build: state.version.build,
         database: ownsDatabase(state.version.requirements),
+        sharedRuntime: sharesRuntime(state.version.requirements),
         ...context,
         // Deliveries run as the host's webhook, for the person whose account it watches, if any.
         ...callerContext({ ...state, caller: systemCaller("webhook", state.actor) }),
@@ -301,6 +302,7 @@ export const makeWebhooks = (
               app: state.app.id,
               build: state.version.build,
               database: ownsDatabase(state.version.requirements),
+              sharedRuntime: sharesRuntime(state.version.requirements),
               ...context,
               command: { operation: "webhooks" },
             })
@@ -505,6 +507,7 @@ export const makeWebhooks = (
           app: parsed.app,
           build: state.version.build,
           database: ownsDatabase(state.version.requirements),
+          sharedRuntime: sharesRuntime(state.version.requirements),
           ...context,
           command: { operation: "webhooks" },
         })
@@ -542,6 +545,7 @@ export const makeWebhooks = (
           app: parsed.app,
           build: state.version.build,
           database: ownsDatabase(state.version.requirements),
+          sharedRuntime: sharesRuntime(state.version.requirements),
           ...context,
           command: {
             operation: "webhook-validate",

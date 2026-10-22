@@ -14,7 +14,7 @@ import type { ExecutorDatabase } from "./storage.ts";
 import { database } from "./database.ts";
 import { callerContext, resolve, snapshot, type InvocationSnapshot } from "./tools.ts";
 import type { makeOAuth } from "./oauth.ts";
-import { ownsDatabase } from "../contracts/apps.ts";
+import { ownsDatabase, sharesRuntime } from "../contracts/apps.ts";
 import { refreshAtMostEvery } from "./live-refresh.ts";
 
 /** Bind data calls to the current app version and the named accounts. */
@@ -37,6 +37,7 @@ export const makeAppData = (
       return yield* runtime[kind]({
         build: state.version.build,
         database: ownsDatabase(state.version.requirements),
+        sharedRuntime: sharesRuntime(state.version.requirements),
         ...accounts,
         app: state.app.id,
         ...(workflows === undefined ? {} : { workflowControls: workflows(state) }),

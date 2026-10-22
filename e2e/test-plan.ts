@@ -7343,6 +7343,35 @@ export const scenarios = plan({
       local: na("This scenario uses hosted memberships, API keys and the browser approval page."),
     },
   },
+  sharedRuntime: {
+    fixtures: "actors",
+    file: "shared-runtime.spec.ts",
+    title:
+      "callers of an app that declares sharedRuntime share one warm runtime and keep their own accounts, caller, approver and cache",
+    targets: {
+      "self-host": scheduled,
+      cloud: {
+        status: "not-run",
+        reason:
+          "Cloud serves a named Worker from many isolates and restarts an idle data facet for each call, so whether two callers shared a runtime is not observable there; the runner that names it is shared with self-host.",
+      },
+      local: na("This scenario needs several hosted members, each with an API key and MCP."),
+    },
+  },
+  sharedRuntimeOptOut: {
+    fixtures: "actors",
+    file: "shared-runtime.spec.ts",
+    title: "an app that does not declare sharedRuntime keeps a runtime for each account selection",
+    targets: {
+      "self-host": scheduled,
+      cloud: {
+        status: "not-run",
+        reason:
+          "Cloud serves a named Worker from many isolates and restarts an idle data facet for each call, so which runtime a call reached is not observable there.",
+      },
+      local: na("This scenario needs several hosted members, each with an API key and MCP."),
+    },
+  },
   workflowActors: {
     fixtures: "actors",
     file: "workflow-actors.spec.ts",

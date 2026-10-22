@@ -55,7 +55,10 @@ export interface WorkflowHost {
   readonly seed: (run: WorkflowRunId) => Effect.Effect<WorkflowSeed, WorkflowFailure>;
   readonly context: (
     run: WorkflowRunId,
-  ) => Effect.Effect<HostContext & { readonly database: boolean }, WorkflowFailure>;
+  ) => Effect.Effect<
+    HostContext & { readonly database: boolean; readonly sharedRuntime: boolean },
+    WorkflowFailure
+  >;
   readonly invoke: (
     run: WorkflowRunId,
     input: {

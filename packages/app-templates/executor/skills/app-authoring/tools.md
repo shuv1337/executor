@@ -324,6 +324,66 @@ and `ctx.approvedBy` names who approved it with its own `channel` and `method`
 during discovery and on hosts that do not provide identity, so check it before use.
 Approval callbacks receive the same `caller`.
 
+## Shared runtime (`sharedRuntime`)
+
+By default the host runs an app in a runtime named by its build **and the
+caller's selected accounts**: each account selection gets its own app Worker
+and, for an app with a database, its own data facet. An app's database facet
+holds one selection at a time, so when people with different accounts call a
+database app, each switch restarts the facet (a cold start of a few hundred
+milliseconds) and their calls take turns instead of running together.
+
+Declare `sharedRuntime: true` beside the requirements to run every caller's
+calls in one warm runtime, named by build alone:
+
+```ts
+export default defineApp(
+  { sharedRuntime: true, user: { accounts: { github } } },
+  { tools: router({ issues, comment }) },
+);
+```
+
+For a multi-user database app this removes the restart between callers and
+lets their calls run side by side: much lower latency and far higher write
+throughput. Each call still receives its own `ctx.user.accounts`, `ctx.caller`,
+`ctx.approvedBy`, approval and `ctx.cache.forCaller()`. A build without the
+flag, and every build deployed before it existed, keeps one runtime per
+selection. Remove the flag and redeploy to go back.
+
+**What is shared is module scope.** Anything kept outside a call is visible to
+every caller of the app: one person's credentials or data can be used for
+another. Unsafe patterns include:
+
+- a client built from one caller's account and stored in a module variable or a
+  closure created outside the handler (`let client; client ??= new Octokit({ auth: ctx.user.accounts.github.fields.token })`);
+- a module-level cache or `Map` keyed without the caller or account, such as
+  results by URL or by input;
+- memoized `ctx.user.accounts` values, tokens, or anything derived from them;
+- a lazily initialized singleton or in-flight promise that captures the first
+  caller's context, such as a shared "load once" promise for the user's data;
+- a factory (`defineApp(requirements, async (ctx) => ...)`) or helper whose
+  closure keeps per-user values across calls;
+- a third-party SDK that caches auth, a session or a default client globally.
+
+Audit the whole app, including every imported module, before you opt in:
+
+1. No module-level mutable state holds per-user data or credentials. Constants,
+   schemas and data that is the same for every caller are fine.
+2. Build clients inside each call from that call's `ctx.user.accounts` (or
+   `ctx.app.accounts`), and let them go when the call ends.
+3. Cache per caller with `ctx.cache.forCaller()` and per account with
+   `ctx.cache.forAccount(account)`; use the shared `ctx.cache` only for data
+   every caller may see.
+4. No singleton, memo or pending promise captures the first caller's context.
+5. Check factory closures and helpers for values kept between calls.
+6. Check each third-party SDK for global auth, session or client caches; pass
+   credentials per request or construct a fresh client per call.
+7. Test with two users, each with their own account, calling concurrently, and
+   confirm every result carries only that caller's account and identity.
+
+If any item fails, leave `sharedRuntime` off: the default isolates selections at
+the cost of cold starts.
+
 ## Cache and lazy operation sources
 
 Use `ctx.cache.get({ key, schema, freshFor, staleFor, load })` for shared JSON.

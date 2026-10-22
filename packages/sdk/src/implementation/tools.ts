@@ -122,7 +122,7 @@ import {
 } from "./selection.ts";
 import type { Listings, ToolListing } from "./listings.ts";
 import { pageStart, pageTools } from "./tool-pages.ts";
-import { ownsDatabase } from "../contracts/apps.ts";
+import { ownsDatabase, sharesRuntime } from "../contracts/apps.ts";
 
 /** The configured app with its active version, in one statement. */
 const readApp = (db: Query, app: AppId) =>
@@ -877,6 +877,7 @@ export const makeTools = (
   const inspection = (state: InvocationSnapshot, context: InvocationContext) => ({
     app: state.app.id,
     build: state.version.build,
+    sharedRuntime: sharesRuntime(state.version.requirements),
     ...context,
     ...(workflows === undefined ? {} : { workflowControls: workflows(state) }),
     ...(state.version.requirements.capabilities?.sharedDefinitions === true
@@ -1489,6 +1490,7 @@ export const makeTools = (
                 ...(workflows === undefined ? {} : { workflowControls: workflows(state) }),
                 build: state.version.build,
                 database: ownsDatabase(state.version.requirements),
+                sharedRuntime: sharesRuntime(state.version.requirements),
                 ...context,
                 tool: parsed.tool,
                 ...(kind === undefined ? {} : { kind }),
@@ -1676,6 +1678,7 @@ export const makeTools = (
                               : { workflowControls: workflows(state) }),
                             build: state.version.build,
                             database: ownsDatabase(state.version.requirements),
+                            sharedRuntime: sharesRuntime(state.version.requirements),
                             ...context,
                             tool: saved.tool,
                             ...(kind === undefined ? {} : { kind }),
