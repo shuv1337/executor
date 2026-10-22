@@ -92,6 +92,12 @@ in JSON, form or text bodies up to 1 MiB reach the app as handles; other
 responses reach it as the service sent them, so the declared hosts are trusted
 not to echo a credential back.
 
+Because of that redaction, a service that echoes the request, such as
+`httpbin.org/anything` or `/headers`, shows app code the handle (`exsec_…` or
+`exsec2_…`) even though the service received the real value. Do not read an
+echo from app code to check what was sent. Check the service's own answer
+instead, such as a call that succeeds only with the real credential.
+
 **Adding a host to a provider that already declares hosts means users must
 connect existing accounts again.** Each account keeps the hosts it was connected
 with, so Executor refuses requests that send its credentials to the new host
