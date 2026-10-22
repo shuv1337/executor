@@ -52,7 +52,10 @@ Import `createAppClient`, `queryReference`, and `mutationReference` from
 schemas in a separate file. Use `client.queryAtom(reference, input, outputSchema)`
 with `useAppQuery` from `apps/react`, and `client.mutate(reference, input,
 outputSchema)` for explicit writes. `client.query(reference, input, outputSchema)`
-reads once. Both operation types may fetch external APIs. External changes do
+reads once. A subscribed query reruns after the app's writes commit, at most once
+a second: the first result and a lone write arrive at once, and a burst of writes
+shows up as about one update a second, the last of which includes the final write.
+Both operation types may fetch external APIs. External changes do
 not invalidate subscriptions, and rolling back a SQL transaction cannot undo
 external effects. All callbacks use Promises; the framework runs Effect internally.
 

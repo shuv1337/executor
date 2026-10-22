@@ -166,7 +166,8 @@ explicit empty arrays. SDK operations check account existence, provider matching
 cardinality and duplicate selections inside those maps. Versions are inserted
 as immutable rows; selection and activation changes are transactional.
 
-Live queries track storage reads and update after committed writes. The dashboard
+Live queries track storage reads and update after committed writes. An app's live
+query reruns at most once a second, and the last rerun reads the last write. The dashboard
 uses typed subscriptions; apps can declare async queries and mutations. See
 [reactive storage](notes/reactive-storage.md) for the author model and runtime boundaries.
 
