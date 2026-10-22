@@ -469,11 +469,25 @@ export const makeFacetSupervisor = (
           : Schema.decodeUnknownEffect(Schema.Boolean)(value).pipe(Effect.mapError(failed)),
       ),
     );
+    /**
+     * Whether this instance armed the alarm that is still due. A due alarm is the durable mark
+     * that a write may be running: if the instance stops before the write finishes, the alarm
+     * wakes a new one, which announces a new revision. Writes leave it armed instead of setting
+     * and deleting it each time. On a self-hosted runtime every alarm change and every write to
+     * this object's storage is a disk sync that blocks the whole app process.
+     */
+    let armed = false;
     const arm = Effect.flatMap(Clock.currentTimeMillis, (now) =>
       Effect.tryPromise({
         try: () => state.storage.setAlarm(now + 1_000),
         catch: failed,
       }),
+    ).pipe(
+      Effect.tap(() =>
+        Effect.sync(() => {
+          armed = true;
+        }),
+      ),
     );
     const send = (socket: WebSocket, value: number) => {
       socket.send(JSON.stringify({ revision: value }));
@@ -493,11 +507,7 @@ export const makeFacetSupervisor = (
       });
     const begin = metadata.withPermits(1)(
       Effect.gen(function* () {
-        yield* arm;
-        yield* Effect.tryPromise({
-          try: () => state.storage.put("pending", true),
-          catch: failed,
-        });
+        if (!armed) yield* arm;
         writes++;
       }),
     );
@@ -506,21 +516,23 @@ export const makeFacetSupervisor = (
         writes--;
         const next = (yield* revision) + 1;
         yield* Effect.tryPromise({
-          try: () => state.storage.put({ revision: next, pending: writes > 0 }),
+          try: () => state.storage.put("revision", next),
           catch: failed,
         });
         yield* notify(next);
-        if (writes === 0)
-          yield* Effect.tryPromise({
-            try: () => state.storage.deleteAlarm(),
-            catch: failed,
-          });
       }),
     );
+    /**
+     * The alarm fired. It is rearmed while writes run. An alarm this instance did not arm was left
+     * by one that stopped, possibly during a write, so it announces a new revision, as does the
+     * `pending` mark that earlier releases wrote.
+     */
     const recover = metadata.withPermits(1)(
       Effect.gen(function* () {
+        const ours = armed;
+        armed = false;
         if (writes > 0) return yield* arm;
-        if (yield* pending) {
+        if (!ours || (yield* pending)) {
           const next = (yield* revision) + 1;
           yield* Effect.tryPromise({
             try: () => state.storage.put({ revision: next, pending: false }),
