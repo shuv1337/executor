@@ -7,6 +7,7 @@ import {
   AppDataApprovalRequired,
   AppDataFailed,
   AppDataNotFound,
+  AppDataVersionSuperseded,
   type AppDataInput,
 } from "../contracts/app-data.ts";
 import type { Runtime } from "../contracts/runtime.ts";
@@ -16,6 +17,19 @@ import { callerContext, resolve, snapshot, type InvocationSnapshot } from "./too
 import type { makeOAuth } from "./oauth.ts";
 import { ownsDatabase, sharesRuntime } from "../contracts/apps.ts";
 import { refreshAtMostEvery } from "./live-refresh.ts";
+
+/**
+ * Refuse a call pinned to a superseded version of an app with a database. The database follows the
+ * active version's migrations, and its data facet holds one build at a time: a page or client left
+ * on an old version would run old code against the new schema and, on every refresh, replace the
+ * active build's warm facet, so the app's next call would cold-start.
+ */
+const activeData = <S extends InvocationSnapshot>(input: AppDataInput, state: S) =>
+  input.version !== undefined &&
+  ownsDatabase(state.version.requirements) &&
+  state.version.id !== state.app.activeVersion
+    ? Effect.fail(new AppDataVersionSuperseded({ app: state.app.id, version: state.version.id }))
+    : Effect.succeed(state);
 
 /** Bind data calls to the current app version and the named accounts. */
 export const makeAppData = (
@@ -32,7 +46,7 @@ export const makeAppData = (
     read: ReturnType<typeof snapshot> = snapshot(db, input),
   ) =>
     Effect.gen(function* () {
-      const state = yield* read;
+      const state = yield* read.pipe(Effect.flatMap((state) => activeData(input, state)));
       const accounts = yield* resolve(state, resolveAccount);
       return yield* runtime[kind]({
         build: state.version.build,
@@ -65,7 +79,10 @@ export const makeAppData = (
               Effect.sync(() => {
                 let observedRevision: number | undefined;
                 return Stream.tick("15 seconds").pipe(
-                  Stream.mapEffect(() => snapshot(db, input)),
+                  // A pinned version that is superseded ends the stream at the next tick.
+                  Stream.mapEffect(() =>
+                    snapshot(db, input).pipe(Effect.flatMap((state) => activeData(input, state))),
+                  ),
                   Stream.changesWith((a, b) => a.version.id === b.version.id),
                   Stream.switchMap((state) => {
                     // The version's first query uses the selections just read for it.

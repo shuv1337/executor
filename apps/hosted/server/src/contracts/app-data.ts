@@ -1,7 +1,7 @@
 import { withLegacyKeys } from "@executor-js/utils/legacy-keys";
 import { RequiredAction } from "./authorization.ts";
 /** Authored app operations, scoped to an explicit hosted organization and configured app. */
-import { AppDataErrors, AppDataSnapshot, AppId, VersionId, Json } from "@executor-js/sdk/core";
+import { appDataErrors, AppDataSnapshot, AppId, VersionId, Json } from "@executor-js/sdk/core";
 import { Schema } from "effect";
 import { HttpApiEndpoint, HttpApiGroup, HttpApiSchema } from "effect/http-api";
 import {
@@ -18,7 +18,7 @@ const payload = Schema.Struct({
   input: Json,
 }).pipe(withLegacyKeys({ version: "deployment" }));
 const errors = [
-  AppDataErrors,
+  ...appDataErrors,
   OrganizationForbidden,
   AuthenticationUnavailable,
   Unauthorized,

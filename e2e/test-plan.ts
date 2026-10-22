@@ -5329,6 +5329,17 @@ export const scenarios = plan({
       local: na("This scenario uses hosted deploys and app authentication."),
     },
   },
+  appSupersededDataVersion: {
+    fixtures: "actors",
+    file: "app-superseded-data-version.spec.ts",
+    title:
+      "a data call or live query pinned to a superseded version of an app with a database is refused, and the active version keeps serving",
+    targets: {
+      "self-host": scheduled,
+      cloud: scheduled,
+      local: na("This scenario uses hosted deploys and API keys."),
+    },
+  },
   appUiOlderRelease: {
     fixtures: "actors",
     file: "app-ui-older-release.spec.ts",

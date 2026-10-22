@@ -59,6 +59,8 @@ const errorMessage = Match.type<HostedError>().pipe(
     AppDataFailed: () => "The app could not complete this data operation.",
     AppDataApprovalRequired: () =>
       "This operation needs approval. Run it as a tool call to approve it.",
+    AppDataVersionSuperseded: () =>
+      "This version of the app is no longer active. Reload the app to use its current version.",
     AppNotDeployed: () => "Deploy this app before running its tools or configuring accounts.",
     SourceError: (error) =>
       error.reason === "conflict"

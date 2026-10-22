@@ -18,6 +18,7 @@ import {
   invocationEntries,
   CurrentCaller,
   AppDataApprovalRequired,
+  AppDataVersionSuperseded,
   ApprovalRequestId,
   ToolName,
   type AppDataInput,
@@ -342,17 +343,20 @@ export const hostedAppUi = <R = never>(
   const dataFailure = (error: unknown) =>
     Schema.is(OrganizationForbidden)(error)
       ? new UiForbidden()
-      : new UiFailed({
-          reason:
-            Schema.is(AccountRequired)(error) ||
-            Schema.is(AccountNotFound)(error) ||
-            Schema.is(AccountSelectionInvalid)(error) ||
-            Schema.is(OAuthReconnectRequired)(error)
-              ? "account_required"
-              : Schema.is(AppDataApprovalRequired)(error)
-                ? "approval_required"
-                : "operation_failed",
-        });
+      : // A deploy between the page's check and the call: the page reloads on the new version.
+        Schema.is(AppDataVersionSuperseded)(error)
+        ? new UiVersionChanged()
+        : new UiFailed({
+            reason:
+              Schema.is(AccountRequired)(error) ||
+              Schema.is(AccountNotFound)(error) ||
+              Schema.is(AccountSelectionInvalid)(error) ||
+              Schema.is(OAuthReconnectRequired)(error)
+                ? "account_required"
+                : Schema.is(AppDataApprovalRequired)(error)
+                  ? "approval_required"
+                  : "operation_failed",
+          });
   /**
    * Each call runs with the caller's linked accounts, resolved again from their links; the page
    * names no accounts.

@@ -61,7 +61,27 @@ export const AppDataApprovalRequired = ApiError.define({
 });
 export type AppDataApprovalRequired = typeof AppDataApprovalRequired.Type;
 
-const errors = [
+/**
+ * The call named a version of an app with a database that is no longer the app's active version.
+ * The database follows the active version's migrations, and the app runs one build against it at a
+ * time, so a superseded build's code never runs against it. Reload the page or call without a
+ * version.
+ */
+export const AppDataVersionSuperseded = ApiError.define({
+  tag: "AppDataVersionSuperseded",
+  status: 409,
+  fields: { app: AppId, version: VersionId },
+  message: () =>
+    "This version of the app is no longer active, and its database now belongs to the active version. Reload the page, or call without a version.",
+  recorded: () => "The call named a superseded version of an app with a database",
+});
+export type AppDataVersionSuperseded = typeof AppDataVersionSuperseded.Type;
+
+/**
+ * Each data failure on its own, for endpoint error lists: a union keeps their bodies but loses each
+ * one's HTTP status, so every failure would answer 500.
+ */
+export const appDataErrors = [
   StorageError,
   CredentialsError,
   AppNotFound,
@@ -76,9 +96,10 @@ const errors = [
   AppDataNotFound,
   AppDataFailed,
   AppDataApprovalRequired,
+  AppDataVersionSuperseded,
 ] as const;
 /** Data failures shared by transports without losing their precise typed union. */
-export const AppDataErrors = Schema.Union(errors);
+export const AppDataErrors = Schema.Union(appDataErrors);
 
 /** Full current query result; revisions belong to the current server process. */
 export const AppDataSnapshot = Schema.Struct({ revision: Schema.Int, value: Json });
@@ -87,20 +108,20 @@ export const AppDataGroup = HttpApiGroup.make("appData")
   .add(
     HttpApiEndpoint.post("subscribe", "/v1/app-data/subscribe", {
       payload: AppDataInput,
-      success: HttpApiSchema.StreamSse({ data: AppDataSnapshot, error: Schema.Union(errors) }),
+      success: HttpApiSchema.StreamSse({ data: AppDataSnapshot, error: AppDataErrors }),
     }),
   )
   .add(
     HttpApiEndpoint.post("query", "/v1/app-data/query", {
       payload: AppDataInput,
       success: Json,
-      error: errors,
+      error: appDataErrors,
     }),
   )
   .add(
     HttpApiEndpoint.post("mutate", "/v1/app-data/mutate", {
       payload: AppDataInput,
       success: Json,
-      error: errors,
+      error: appDataErrors,
     }),
   );

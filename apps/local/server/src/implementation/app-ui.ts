@@ -4,6 +4,7 @@ import {
   VersionId,
   AccountNotFound,
   AccountRequired,
+  AppDataVersionSuperseded,
   AccountSelectionInvalid,
   accountProblems,
   invocationEntries,
@@ -80,12 +81,15 @@ export const appUi = (
     return yield* current(target.app);
   });
   const operationFailure = (error: unknown) =>
-    Schema.is(AccountRequired)(error) ||
-    Schema.is(AccountNotFound)(error) ||
-    Schema.is(AccountSelectionInvalid)(error) ||
-    Schema.is(OAuthReconnectRequired)(error)
-      ? failed("account_required")
-      : failed("operation_failed");
+    // A deploy between the page's check and the call: the page reloads on the new version.
+    Schema.is(AppDataVersionSuperseded)(error)
+      ? new UiVersionChanged()
+      : Schema.is(AccountRequired)(error) ||
+          Schema.is(AccountNotFound)(error) ||
+          Schema.is(AccountSelectionInvalid)(error) ||
+          Schema.is(OAuthReconnectRequired)(error)
+        ? failed("account_required")
+        : failed("operation_failed");
   /** Each call runs with the accounts linked to the app now. */
   const operation = (payload: typeof UiOperation.Type) =>
     Effect.gen(function* () {
