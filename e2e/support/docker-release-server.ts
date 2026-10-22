@@ -10,11 +10,13 @@ import { containerNpmRegistry } from "./npm-registry.ts";
 /** Start the image under test, set up its owner and organization; removed when the scope closes. */
 /**
  * A fresh released image with an owner. `environment` adds server settings; `restart` sets the
- * container's restart policy, as an operator's compose file does.
+ * container's restart policy, as an operator's compose file does; `docker` adds `docker run`
+ * arguments, such as a mounted file or a host name.
  */
 export const releasedServerWith = (options: {
   readonly environment?: Readonly<Record<string, string>>;
   readonly restart?: "unless-stopped";
+  readonly docker?: readonly string[];
 }) =>
   Effect.gen(function* () {
     const processes = yield* ChildProcessSpawner.ChildProcessSpawner;
@@ -63,6 +65,7 @@ export const releasedServerWith = (options: {
           `127.0.0.1:${port}:8080`,
           ...Object.keys(environment).flatMap((name) => ["--env", name]),
           ...registry.docker,
+          ...(options.docker ?? []),
           image,
         ],
         environment,
