@@ -6,6 +6,7 @@ import { randomBytes } from "node:crypto";
 import { createServer } from "node:net";
 import { driver } from "./platform.ts";
 import { containerNpmRegistry } from "./npm-registry.ts";
+import { fullTracing } from "./trace-sampling.ts";
 
 /** Start the image under test, set up its owner and organization; removed when the scope closes. */
 /**
@@ -50,6 +51,7 @@ export const releasedServerWith = (options: {
       BETTER_AUTH_URL: origin,
       BETTER_AUTH_SECRET: randomBytes(32).toString("hex"),
       EXECUTOR_ENCRYPTION_KEY: encryptionKey,
+      ...fullTracing,
       ...options.environment,
     };
     yield* Effect.acquireRelease(

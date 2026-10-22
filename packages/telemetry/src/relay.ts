@@ -6,6 +6,7 @@ import { telemetryLayer } from "./layer.ts";
 import { retryTelemetryExport, telemetryHttpClient } from "./transport.ts";
 import { recordExportFailure } from "./measurements.ts";
 import { appLog, appSpan } from "./app-records.ts";
+import { CurrentTraceSampler } from "./sampling.ts";
 
 /**
  * Forward app telemetry in the host scope without delaying an app result.
@@ -57,13 +58,38 @@ export const makeTelemetryForwarder = Effect.gen(function* () {
       ),
     ),
   );
-  return (batch: TelemetryBatch, traceId: string, source: TelemetrySource) =>
+  const enqueue = (batch: TelemetryBatch, traceId: string, source: TelemetrySource) =>
     Effect.suspend(() => {
       const size = [...batch.traces, ...batch.logs].reduce((total, body) => total + body.length, 0);
       if (queued + size > queueBudget) return failed("capacity");
       pending.push({ batch, traceId, source, size });
       queued += size;
       return FiberSet.run(fibers, drain).pipe(Effect.asVoid);
+    });
+  return (batch: TelemetryBatch, traceId: string, source: TelemetrySource) =>
+    Effect.gen(function* () {
+      const sampler = yield* CurrentTraceSampler;
+      const span = yield* Effect.currentSpan.pipe(Effect.option);
+      if (
+        sampler === undefined ||
+        Option.isNone(span) ||
+        span.value.sampled ||
+        span.value.traceId !== traceId
+      )
+        return yield* enqueue(batch, traceId, source);
+      // The app's spans belong to the caller's trace and follow its tail decision. Logs are never
+      // sampled, so they and the count of dropped records leave now.
+      if (batch.traces.length > 0) {
+        // A tail decision is made where a span ends, outside any fiber; queue with this call's services.
+        const context = yield* Effect.context<never>();
+        sampler.whenRecorded(span.value, () => {
+          Effect.runForkWith(context)(
+            enqueue({ traces: batch.traces, logs: [], dropped: 0 }, traceId, source),
+          );
+        });
+      }
+      if (batch.logs.length > 0 || batch.dropped > 0)
+        yield* enqueue({ traces: [], logs: batch.logs, dropped: batch.dropped }, traceId, source);
     });
 });
 

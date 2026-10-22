@@ -6,6 +6,7 @@ import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import { HttpClient, HttpClientRequest } from "effect/http";
 import { freePort } from "./ports.ts";
 import { driver } from "./platform.ts";
+import { fullTracing } from "./trace-sampling.ts";
 
 /** Two synthetic visitors behind one actual TCP proxy. It replaces inbound IP assertions. */
 export const nativeClientProxy = (upstream: string) =>
@@ -138,6 +139,7 @@ export const nativeSelfHost = (environment: Readonly<Record<string, string>>) =>
           EXECUTOR_RUNTIME_DIR: runtime,
           // Leave OTEL_EXPORTER_OTLP_* unset so the product uses its MOTEL binding. Setting an
           // endpoint would export to that URL instead of the private Unix socket.
+          ...fullTracing,
           ...environment,
         },
         stdout: "pipe",

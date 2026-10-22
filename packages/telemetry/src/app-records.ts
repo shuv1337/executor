@@ -324,6 +324,8 @@ export const droppedAppAttributeKeys: ReadonlySet<string> = new Set([
   // A request's path and route in an app's isolate are the app's.
   "url.path",
   "http.route",
+  // Only a host's trace sampler sets it; an isolate records every span, so the claim is not its own.
+  "executor.trace.sampled_by",
 ]);
 
 /** The framework's own log messages. Any other log body is the app's text. */

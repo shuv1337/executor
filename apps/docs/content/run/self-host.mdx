@@ -40,6 +40,17 @@ These settings override the defaults:
 | `SSO_DISCOVERY_URL`                  | no       | OIDC discovery document. Leave it empty to keep SSO off.                 |
 | `SSO_CLIENT_ID`, `SSO_CLIENT_SECRET` | no       | Credentials for that identity provider.                                  |
 | `SSO_ALLOWED_DOMAINS`                | no       | Comma-separated email domains allowed to join through SSO.               |
+| `EXECUTOR_TRACE_SAMPLE_RATE`         | no       | Fraction of ordinary request traces to record, from `0` to `1`. The default is `0.1`; `1` records every trace. See below. |
+| `EXECUTOR_TRACE_SLOW_MS`             | no       | Record every trace that runs at least this many milliseconds. The default is `1000`. |
+
+Executor records traces in its bundled collector. To keep that collector's work
+small, it records a tenth of ordinary traces by default, chosen by trace ID, and
+always records a trace that fails, answers with a server error, or runs for
+`EXECUTOR_TRACE_SLOW_MS` or longer. A request that sends a W3C `traceparent`
+header with its sampled flag set is always recorded, so you can read the trace
+of any request you make. Logs and metrics are never sampled. Set
+`EXECUTOR_TRACE_SAMPLE_RATE=1` to record every trace, or `0` to record only the
+traces you ask for and those that fail or run slowly.
 
 App code runs in an isolate whose `fetch` reaches only public addresses, the same
 as Executor Cloud. Requests to your own `BETTER_AUTH_URL` origin go straight to

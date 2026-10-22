@@ -27,6 +27,8 @@ const testServerConfiguration = Effect.gen(function* () {
   const defaults = ConfigProvider.fromUnknown({
     NODE_ENV: "development",
     EXECUTOR_DATA_DIR: ".local/test-accounts/self-host/data",
+    // Reproductions read the traces of any request they make.
+    EXECUTOR_TRACE_SAMPLE_RATE: "1",
     ...(Option.isNone(origin)
       ? {
           BETTER_AUTH_URL: `http://${devAppName("self-host-test")}.localhost:${yield* Effect.promise(freePort)}`,

@@ -2,6 +2,7 @@
 import { type Duration, Effect, Layer, Logger, Metric, Redacted } from "effect";
 import { telemetryHttpClient } from "./transport.ts";
 import { spanAttributes } from "./span-attributes.ts";
+import { CurrentTraceSampler, makeTraceSampler } from "./sampling.ts";
 import { OtlpLogger, OtlpMetrics, OtlpSerialization, OtlpTracer } from "effect/observability";
 import {
   CurrentTelemetryConfig,
@@ -37,15 +38,22 @@ export const telemetryLayer = (
     shutdownTimeout: shutdownTimeouts[name] ?? ("3 seconds" as const),
   });
   const console = Logger.layer([logger]);
+  // A rate of 1 records every trace exactly as without a policy, without holding any span.
+  const sampler =
+    config.traces === undefined || config.sampling === undefined || config.sampling.rate >= 1
+      ? undefined
+      : makeTraceSampler(config.sampling);
   return Layer.mergeAll(
     Layer.succeed(CurrentTelemetryConfig, config),
+    Layer.succeed(CurrentTraceSampler, sampler),
     config.traces === undefined
       ? Layer.empty
       : // Credentials travel in provider headers and query strings this product does
         // not choose, so every exported span records only allowlisted HTTP attributes.
-        // Record every operation. Caller-supplied sampling is correlation metadata,
-        // not authority to suppress server diagnostics.
-        spanAttributes(config.clock, true).pipe(
+        // Without a sampling policy, record every operation. A caller's unsampled flag
+        // never suppresses server diagnostics: with a policy, failed and slow traces are
+        // kept whatever the head decision, and a caller's sampled flag is honoured.
+        spanAttributes(config.clock, true, sampler).pipe(
           Layer.provideMerge(
             OtlpTracer.layer(signal(config.traces, "traces")).pipe(
               Layer.provide(OtlpSerialization.layerJson),
