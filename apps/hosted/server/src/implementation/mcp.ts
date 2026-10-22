@@ -15,7 +15,7 @@ import {
 } from "@executor-js/authorization";
 import { GroupDatabase } from "../contracts/groups.ts";
 import { CurrentUserId } from "../contracts/auth.ts";
-import { policyDatabase, visibleApps, requireAppAccess } from "./resource-policy.ts";
+import { policyDatabase, visibleAppAccesses, requireAppAccess } from "./resource-policy.ts";
 /** Hosted catalog and execution policy for the shared MCP engine; no HTTP transport or credentials. */
 import type { McpBackend } from "@executor-js/mcp";
 import {
@@ -88,22 +88,28 @@ export const hostedMcpBackend = Effect.gen(function* () {
         Effect.provideContext(context),
       );
     });
-  // A single metadata snapshot feeds this request's catalog. Each call still checks the app and
-  // resolves the caller's accounts again.
-  const discoveryApps = yield* Effect.cached(
+  // A single metadata snapshot feeds this request's catalog: the apps, with the caller's membership
+  // and access to each read in the same statement. Discovery's listings check each app with that
+  // access instead of reading it again; each call still checks the app and resolves the caller's
+  // accounts again. Never retained beyond this request.
+  const discoveryChecked = yield* Effect.cached(
     Effect.flatMap(sdk, (executor) =>
       executor.apps
         .list({ ids: permittedAppIds(policy), owner: organization.owner })
-        .pipe(Effect.flatMap(visibleApps)),
+        .pipe(Effect.flatMap(visibleAppAccesses)),
     ).pipe(Effect.provideContext(context)),
   );
-  const discoveryToolApps = yield* Effect.cached(
-    Effect.flatMap(sdk, (executor) =>
-      executor.apps
-        .list({ ids: permittedToolAppIds(policy), owner: organization.owner })
-        .pipe(Effect.flatMap(visibleApps)),
-    ).pipe(Effect.provideContext(context)),
+  const discoveryApps = Effect.map(discoveryChecked, (checked) => checked.map(({ app }) => app));
+  // A tool permission is an app permission, so the tool apps are among the apps.
+  const toolAppIds = permittedToolAppIds(policy);
+  const discoveryToolApps = Effect.map(discoveryApps, (apps) =>
+    toolAppIds === undefined ? apps : apps.filter((app) => toolAppIds.includes(app.id)),
   );
+  /** The app and the caller's access, as this request's discovery read them. */
+  const checkedApp = (app: AppId) =>
+    Effect.map(discoveryChecked, (checked) => checked.find((entry) => entry.app.id === app));
+  /** {@link checkedApp} for a listing, which reads the app itself when discovery could not. */
+  const listedApp = (app: AppId) => Effect.orElseSucceed(checkedApp(app), () => undefined);
   // Resolve linked account labels once per request, even when discovery fans out over apps.
   const discoveryAccounts = yield* Effect.cached(
     Effect.flatMap(discoveryApps, (apps) => callerLinkedAccounts(apps.map((app) => app.id))).pipe(
@@ -222,9 +228,13 @@ export const hostedMcpBackend = Effect.gen(function* () {
     listAccounts: (input) =>
       Effect.gen(function* () {
         yield* authorizeApp(input.app);
-        yield* requireAppAccess(input.app, "use");
-        const app = (yield* discoveryApps).find((app) => app.id === input.app);
-        if (app === undefined) return yield* new AppNotFound({ app: input.app });
+        // Discovery lists only apps the caller may use, read with their membership in this
+        // request; an app it does not list is checked again, so a refusal precedes not found.
+        const app = (yield* checkedApp(input.app))?.app;
+        if (app === undefined) {
+          yield* requireAppAccess(input.app, "use");
+          return yield* new AppNotFound({ app: input.app });
+        }
         // A read pinned to a retained version resolves that version's requirements.
         const requirements =
           input.version === undefined || input.version === app.activeVersion
@@ -234,18 +244,38 @@ export const hostedMcpBackend = Effect.gen(function* () {
                 app: app.id,
                 version: input.version,
               })).requirements;
+        // Only user requirements take the caller's links; without one, none are read.
+        const linked = Object.values(requirements.accounts).some(
+          (required) => required.scope === "user",
+        )
+          ? yield* discoveryAccounts
+          : [];
         return linkedRequirements(
           requirements.accounts,
           "user",
-          (yield* discoveryAccounts)
+          linked
             .filter((account) => account.app === app.id)
             .map((link) => ({ requirement: link.requirement, account: link })),
         );
       }).pipe((work) => observe("listAccounts", work, "read")),
     listTools: (input, options) =>
-      observe("listTools", grantRefusal(listTools(input, options)), "read"),
+      observe(
+        "listTools",
+        grantRefusal(
+          Effect.flatMap(listedApp(input.app), (checked) => listTools(input, options, checked)),
+        ),
+        "read",
+      ),
     searchableTools: (input, options) =>
-      observe("searchableTools", grantRefusal(searchableTools(input, options)), "read"),
+      observe(
+        "searchableTools",
+        grantRefusal(
+          Effect.flatMap(listedApp(input.app), (checked) =>
+            searchableTools(input, options, checked),
+          ),
+        ),
+        "read",
+      ),
     searchTools: (input) => observe("searchTools", searchTools(input), "read"),
     callTool: (input, options?: ToolInvocationOptions) =>
       Effect.gen(function* () {
