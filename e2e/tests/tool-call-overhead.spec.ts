@@ -16,6 +16,7 @@ import { HostedLive, withHostedCase } from "../support/case.ts";
 import { App, type SpanQuery } from "../support/contracts.ts";
 import { Evidence, Telemetry } from "../support/evidence.ts";
 import { McpClient } from "../support/mcp-client.ts";
+import { Target } from "../support/platform.ts";
 import { mcpOutcomeFixture, slowUpstreamMs } from "../support/mcp-outcome-fixture.ts";
 import { mcpInCallFixture } from "../support/mcp-in-call-fixture.ts";
 import { withApps, mcpSdkVersion } from "../support/apps-release.ts";
@@ -1210,9 +1211,14 @@ export default defineApp({}, { tools: router({
         const app = yield* deploy(
           `import { defineApp, mutation, query, object, number, string, router } from "apps";
 const slow = ${JSON.stringify(`${upstream}/slow`)};
+const ping = ${JSON.stringify(`${upstream}/ping`)};
 export default defineApp({}, { tools: router({
   count: query({ input: object({}), output: number() }, async ({ sql }) =>
     Number(sql.exec("SELECT count(*) AS notes FROM notes").one()["notes"])),
+  burst: query({ input: object({}), output: number() }, async ({ sql }) => {
+    for (let request = 0; request < 400; request++) await (await fetch(ping)).text();
+    return Number(sql.exec("SELECT count(*) AS notes FROM notes").one()["notes"]);
+  }),
   hold: query({ input: object({}), output: number() }, async ({ sql }) => {
     for (let attempt = 0; attempt < 40; attempt++) {
       await (await fetch(slow)).text();
@@ -1245,7 +1251,31 @@ export default defineApp({}, { tools: router({
           });
         }
         const sequential = yield* toolCalls(app, "count", 3);
-        expect(sequential.map(startedFacet)).toEqual([true, true, true]);
+        // Cloudflare counts a facet's subrequests over its whole life, so there each call that
+        // finds the facet idle gets a fresh one. Open-source workerd has no such limit, so a
+        // self-hosted runtime keeps the facet warm instead of cold-starting every call.
+        const cloud = (yield* Target).metadata.target === "cloud";
+        if (cloud) expect(sequential.map(startedFacet)).toEqual([true, true, true]);
+        else expect(sequential.slice(1).map(startedFacet)).toEqual([false, false]);
+        if (!cloud) {
+          // One warm facet sends 1,200 requests over three calls, past Cloudflare's per-facet
+          // allowance, and every call still succeeds.
+          for (let call = 1; call <= 3; call++) {
+            const result = yield* execute(
+              `Burst of 400 requests, call ${call} of 3`,
+              `return await tools[${JSON.stringify(app.slug)}].burst({})`,
+            );
+            expect(
+              result.structuredContent,
+              JSON.stringify(result.structuredContent),
+            ).toMatchObject({
+              status: "completed",
+              execution: { ok: true, value: 0 },
+            });
+          }
+          const bursts = yield* toolCalls(app, "burst", 3);
+          expect(bursts.filter(startedFacet).length).toBe(0);
+        }
         // A call that arrives while another runs joins the running facet: a running call may be
         // waiting on it, so it is never held back for a fresh one.
         const overlapping = yield* execute(
@@ -1261,7 +1291,9 @@ return [await held, await noted];`,
         ).toMatchObject({ status: "completed", execution: { ok: true, value: [1, "noted"] } });
         const [hold] = yield* toolCalls(app, "hold", 1);
         const [note] = yield* toolCalls(app, "note", 1);
-        expect([hold!, note!].filter(startedFacet).length).toBe(1);
+        // On Cloudflare the first of the two starts a fresh facet; on a workerd host both join the
+        // warm one.
+        expect([hold!, note!].filter(startedFacet).length).toBe(cloud ? 1 : 0);
       }).pipe(Effect.provide(McpClient.layer)),
     ),
   );
