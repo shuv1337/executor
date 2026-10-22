@@ -25,7 +25,7 @@ import {
   type ToolSearchScope,
   type ToolSearchTarget,
 } from "@executor-js/sdk/core";
-import { Clock, Deferred, Duration, Effect, Option, Schema, Semaphore } from "effect";
+import { Clock, Deferred, Duration, Effect, Option, Result, Schema, Semaphore } from "effect";
 import {
   diagnostic,
   diagnosticSummary,
@@ -980,16 +980,45 @@ function catalog(
         ),
       );
 
+    /**
+     * Each app's linked accounts as one operation for many apps listed them, and the apps it was
+     * asked for. An app whose own listing started first keeps that one.
+     */
+    const listedAtOnce = new Map<AppId, Result.Result<McpAppAccounts, Error>>();
+    const askedAtOnce = new Set<AppId>();
     /** Each app's linked accounts, listed at most once per execution. A failure is recorded once. */
     const accountsOf = new Map(
       yield* Effect.forEach(apps, (app) =>
         Effect.cached(
-          discover("mcp.discovery.accounts", app.id, backend.listAccounts({ app: app.id })).pipe(
-            Effect.tapError(unloaded),
-          ),
+          Effect.suspend(() => {
+            const listed = listedAtOnce.get(app.id);
+            return listed !== undefined
+              ? Effect.fromResult(listed)
+              : discover("mcp.discovery.accounts", app.id, backend.listAccounts({ app: app.id }));
+          }).pipe(Effect.tapError(unloaded)),
         ).pipe(Effect.map((linked) => [app.id, linked] as const)),
       ),
     );
+    /**
+     * List the accounts of the apps a search or describe is about to discover in one operation,
+     * instead of one each. Listing accounts reads only the product, never an app, so it cannot
+     * stall on one. An app it fails for, or that the operation leaves out, is listed on its own.
+     */
+    const listAccountsAtOnce = (selected: ReadonlyArray<ListedApp>) =>
+      Effect.gen(function* () {
+        const pending = selected.filter((app) => unique(app) && !askedAtOnce.has(app.id));
+        if (pending.length < 2) return;
+        for (const app of pending) askedAtOnce.add(app.id);
+        const listed = yield* backend
+          .listAccountsEach({ apps: pending.map((app) => app.id) })
+          .pipe(Effect.option);
+        if (Option.isNone(listed)) return;
+        for (const [index, app] of pending.entries()) {
+          const outcome = listed.value[index];
+          if (outcome !== undefined) listedAtOnce.set(app.id, outcome);
+        }
+        yield* settled;
+      }).pipe(Effect.withSpan("mcp.discovery.accounts.batch"));
     /**
      * Read something of an app with the accounts discovery lists it with, recording why it has
      * nothing.
@@ -1159,15 +1188,60 @@ function catalog(
         ),
       ).pipe(Effect.map((load) => ({ app, load }))),
     );
+    /** Each app's search target as one operation for many apps read it from kept rows. */
+    const keptAtOnce = new Map<AppId, Discovered<SearchableTools>>();
+    const searchedAtOnce = new Set<AppId>();
+    /**
+     * Read the search rows the backend already keeps for the apps a search is about to discover in
+     * one operation, with their accounts listed in one more, instead of two operations per app.
+     * The backend serves only rows it can serve without listing an app's tools; every other app,
+     * and every app that operation fails for, is read on its own as before, so a slow or stalled
+     * app still holds only itself.
+     */
+    const searchAtOnce = (selected: ReadonlyArray<ListedApp>) =>
+      Effect.gen(function* () {
+        const pending = selected.filter((app) => unique(app) && !searchedAtOnce.has(app.id));
+        if (pending.length < 2) return;
+        for (const app of pending) searchedAtOnce.add(app.id);
+        yield* listAccountsAtOnce(pending);
+        const targets = pending.flatMap((app) => {
+          const listed = listedAtOnce.get(app.id);
+          if (listed === undefined || Result.isFailure(listed)) return [];
+          const accounts = discoveryAccounts(listed.success);
+          return accounts === undefined ? [] : [{ app, linked: listed.success, accounts }];
+        });
+        if (targets.length === 0) return;
+        const kept = yield* backend
+          .searchableKept(targets.map(({ app, accounts }) => ({ app: app.id, accounts })))
+          .pipe(Effect.option);
+        if (Option.isNone(kept)) return;
+        let served = 0;
+        for (const [index, { app, linked }] of targets.entries()) {
+          const value = kept.value[index];
+          if (value === undefined) continue;
+          keptAtOnce.set(app.id, { kind: "loaded", linked, value });
+          served += 1;
+        }
+        yield* Effect.annotateCurrentSpan({
+          "executor.discovery.apps": pending.length,
+          "executor.discovery.kept": served,
+        });
+        yield* settled;
+      }).pipe(Effect.withSpan("mcp.search.discovery.batch"));
     const searchedApps = yield* Effect.forEach(apps, (app) =>
       Effect.cached(
-        discoverApp(app, "mcp.discovery.search", (accounts) =>
-          backend.searchableTools(
-            { app: app.id, accounts },
-            // Search reads every app's rows; refreshing aged ones would load each app's Worker.
-            { reportRunningAfterMillis: discoveryWaitMs, refreshStale: false },
-          ),
-        ).pipe(
+        Effect.suspend(() => {
+          const kept = keptAtOnce.get(app.id);
+          return kept !== undefined
+            ? Effect.succeed(kept)
+            : discoverApp(app, "mcp.discovery.search", (accounts) =>
+                backend.searchableTools(
+                  { app: app.id, accounts },
+                  // Search reads every app's rows; refreshing aged ones would load each app's Worker.
+                  { reportRunningAfterMillis: discoveryWaitMs, refreshStale: false },
+                ),
+              );
+        }).pipe(
           Effect.flatMap((result) => projectSearch(app, result)),
           Effect.andThen(reported),
         ),
@@ -1242,6 +1316,7 @@ function catalog(
     const described = (names: ReadonlyArray<string> | "all") =>
       Effect.gen(function* () {
         const selected = named(discovered, names);
+        yield* listAccountsAtOnce(selected.map(({ app }) => app));
         yield* load(selected);
         if (names !== "all") yield* revealNamed(selected);
         const entries = selected
@@ -1286,6 +1361,7 @@ function catalog(
     const searchable = (names: ReadonlyArray<string> | "all") =>
       Effect.gen(function* () {
         const selected = named(searchedApps, names);
+        yield* searchAtOnce(selected.map(({ app }) => app));
         yield* load(selected);
         if (names !== "all") yield* revealNamed(selected);
         const targets = selected

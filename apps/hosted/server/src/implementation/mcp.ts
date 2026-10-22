@@ -17,7 +17,7 @@ import { GroupDatabase } from "../contracts/groups.ts";
 import { CurrentUserId } from "../contracts/auth.ts";
 import { policyDatabase, visibleAppAccesses, requireAppAccess } from "./resource-policy.ts";
 /** Hosted catalog and execution policy for the shared MCP engine; no HTTP transport or credentials. */
-import type { McpBackend } from "@executor-js/mcp";
+import type { McpBackend, McpTargetInput } from "@executor-js/mcp";
 import {
   AccountRequired,
   AppNotFound,
@@ -40,7 +40,7 @@ import {
 import { ConcurrentStatements, HostedExecutor } from "../contracts/executor.ts";
 import { CurrentOrganization, OrganizationForbidden } from "../contracts/organization.ts";
 import { CurrentMcpGrant } from "../contracts/mcp.ts";
-import { listTools, searchableTools, searchTools } from "./tools.ts";
+import { listTools, searchableKept, searchableTools, searchTools } from "./tools.ts";
 import { listAppSkills, readAppSkill } from "./skills.ts";
 
 /**
@@ -163,6 +163,40 @@ export const hostedMcpBackend = Effect.gen(function* () {
         return yield* new AppNotFound({ app });
       yield* requireAppAccess(app, "use");
     });
+  /** The caller's linked accounts for one app, as `listAccounts` lists them. */
+  const accountsOf = (input: McpTargetInput) =>
+    Effect.gen(function* () {
+      yield* authorizeApp(input.app);
+      // Discovery lists only apps the caller may use, read with their membership in this
+      // request; an app it does not list is checked again, so a refusal precedes not found.
+      const app = (yield* checkedApp(input.app))?.app;
+      if (app === undefined) {
+        yield* requireAppAccess(input.app, "use");
+        return yield* new AppNotFound({ app: input.app });
+      }
+      // A read pinned to a retained version resolves that version's requirements.
+      const requirements =
+        input.version === undefined || input.version === app.activeVersion
+          ? app.requirements
+          : (yield* (yield* sdk).apps.version({
+              owner: organization.owner,
+              app: app.id,
+              version: input.version,
+            })).requirements;
+      // Only user requirements take the caller's links; without one, none are read.
+      const linked = Object.values(requirements.accounts).some(
+        (required) => required.scope === "user",
+      )
+        ? yield* discoveryAccounts
+        : [];
+      return linkedRequirements(
+        requirements.accounts,
+        "user",
+        linked
+          .filter((account) => account.app === app.id)
+          .map((link) => ({ requirement: link.requirement, account: link })),
+      );
+    });
   const backend = {
     eventDefinitions: (input) =>
       Effect.gen(function* () {
@@ -225,39 +259,15 @@ export const hostedMcpBackend = Effect.gen(function* () {
         }),
         (work) => observe("listApps", work, "read"),
       ),
-    listAccounts: (input) =>
-      Effect.gen(function* () {
-        yield* authorizeApp(input.app);
-        // Discovery lists only apps the caller may use, read with their membership in this
-        // request; an app it does not list is checked again, so a refusal precedes not found.
-        const app = (yield* checkedApp(input.app))?.app;
-        if (app === undefined) {
-          yield* requireAppAccess(input.app, "use");
-          return yield* new AppNotFound({ app: input.app });
-        }
-        // A read pinned to a retained version resolves that version's requirements.
-        const requirements =
-          input.version === undefined || input.version === app.activeVersion
-            ? app.requirements
-            : (yield* (yield* sdk).apps.version({
-                owner: organization.owner,
-                app: app.id,
-                version: input.version,
-              })).requirements;
-        // Only user requirements take the caller's links; without one, none are read.
-        const linked = Object.values(requirements.accounts).some(
-          (required) => required.scope === "user",
-        )
-          ? yield* discoveryAccounts
-          : [];
-        return linkedRequirements(
-          requirements.accounts,
-          "user",
-          linked
-            .filter((account) => account.app === app.id)
-            .map((link) => ({ requirement: link.requirement, account: link })),
-        );
-      }).pipe((work) => observe("listAccounts", work, "read")),
+    listAccounts: (input) => observe("listAccounts", accountsOf(input), "read"),
+    listAccountsEach: (input) =>
+      observe(
+        "listAccountsEach",
+        Effect.forEach(input.apps, (app) => Effect.result(accountsOf({ app })), {
+          concurrency: "unbounded",
+        }),
+        "read",
+      ),
     listTools: (input, options) =>
       observe(
         "listTools",
@@ -273,6 +283,15 @@ export const hostedMcpBackend = Effect.gen(function* () {
           Effect.flatMap(listedApp(input.app), (checked) =>
             searchableTools(input, options, checked),
           ),
+        ),
+        "read",
+      ),
+    // A search reads every app's rows: those kept for apps this request checked are read at once.
+    searchableKept: (inputs) =>
+      observe(
+        "searchableKept",
+        Effect.orElseSucceed(discoveryChecked, () => []).pipe(
+          Effect.flatMap((checked) => searchableKept(inputs, checked)),
         ),
         "read",
       ),

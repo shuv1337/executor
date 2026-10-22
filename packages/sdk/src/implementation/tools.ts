@@ -95,6 +95,7 @@ import {
   InvocationSelection,
   type PrefetchedInvocation,
   type PrefetchHost,
+  type SearchableTools,
 } from "../contracts/tools.ts";
 import type { ExecutorDatabase } from "./storage.ts";
 import type { ProviderDefinition } from "../contracts/provider.ts";
@@ -1351,6 +1352,61 @@ export const makeTools = (
           routers: found.routers.filter((router) => router.error !== undefined),
         };
       }).pipe(Effect.withSpan("sdk.tools.searchable")),
+    /**
+     * `searchable` for many targets, from rows already kept: each target's app and accounts are
+     * read for every target at once, and the rows and checks as `Listings.searchableKept` reads
+     * them. A target it does not serve is `undefined`, such as one whose rows must be written or
+     * whose app or accounts fail a check: `searchable` reads it and reports why.
+     */
+    searchableKept: (
+      inputs: ReadonlyArray<Omit<Parameters<Executor["tools"]["list"]>[0], "cursor" | "limit">>,
+    ) =>
+      Effect.gen(function* () {
+        if (inputs.length === 0) return [];
+        const apps = [...new Set(inputs.map((input) => input.app))];
+        const rows = yield* query(() =>
+          db.findMany("apps", {
+            join: (b) => b.deployment(),
+            where: (b) => b("id", "in", apps),
+          }),
+        );
+        const byId = new Map(rows.map((row) => [row.id, row]));
+        const named = (input: (typeof inputs)[number]) =>
+          input.accounts === undefined
+            ? []
+            : [...new Set(invocationEntries(input.accounts).flatMap(([, ids]) => ids))];
+        const ids = [...new Set(inputs.flatMap(named))];
+        const accounts = yield* Effect.result(readSelectionAccounts(db, ids));
+        const states = yield* Effect.forEach(inputs, (input) => {
+          const app = byId.get(input.app);
+          const own = new Set(named(input));
+          return snapshot(db, input, {
+            app: Result.succeed(app ?? null),
+            accounts: {
+              ids: [...own],
+              rows: Result.map(accounts, (found) => found.filter((row) => own.has(row.id))),
+            },
+          }).pipe(Effect.option);
+        });
+        const current = states.flatMap((state) => (Option.isSome(state) ? [state.value] : []));
+        const found = yield* listings.searchableKept(current);
+        let position = 0;
+        return states.map((state): SearchableTools | undefined => {
+          if (Option.isNone(state)) return undefined;
+          const served = found[position++];
+          if (served === undefined) return undefined;
+          return {
+            listing: served.listing,
+            version: state.value.version.id,
+            accounts: scopedSelection(
+              state.value.version.requirements.accounts,
+              state.value.accounts,
+              state.value.scope,
+            ),
+            routers: served.routers.filter((router) => router.error !== undefined),
+          };
+        });
+      }).pipe(Effect.withSpan("sdk.tools.searchableKept")),
     /**
      * Describe the declared operations that have schedules. Current builds skip dynamic
      * tool discovery, which can compile a large catalog in the shared app runtime.

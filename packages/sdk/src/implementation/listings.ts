@@ -1,5 +1,5 @@
 /** Evaluated tool listings, reused across requests through the declaration store. */
-import { Cause, Clock, Effect, Exit, Fiber, Option, Semaphore } from "effect";
+import { Cause, Clock, Effect, Exit, Fiber, Option, Result, Semaphore } from "effect";
 import {
   defaultToolListingPolicy,
   durableHeadStartMillis,
@@ -574,6 +574,59 @@ export const makeListings = (options: {
           attributes: { "executor.app.id": state.app.id },
         }),
       ),
+    /**
+     * `searchable` for many states, serving only current rows that need no write: those
+     * `searchable` serves as kept and not superseded, after the same checks, read for every state
+     * at once. A state whose rows are missing, stale, superseded or newer in memory, or whose
+     * checks fail, is `undefined`: its `searchable` read writes them or reports why. Never evaluates.
+     */
+    searchableKept: (states: ReadonlyArray<InvocationSnapshot>) =>
+      Effect.gen(function* () {
+        if (policy.maxStaleMillis <= 0 || states.length === 0) return states.map(() => undefined);
+        const ids = yield* Effect.forEach(states, (state) =>
+          options.declarations.key("tools.list", state),
+        );
+        const wanted = states.map((state, index) => ({
+          state,
+          listing: ToolSearchListing.make(ids[index] ?? ""),
+        }));
+        const kept = yield* search.listings(wanted);
+        const now = yield* Clock.currentTimeMillis;
+        const current: Array<{
+          readonly index: number;
+          readonly state: InvocationSnapshot;
+          readonly routers: ReadonlyArray<ToolRouter>;
+        }> = [];
+        for (const [index, { state, listing }] of wanted.entries()) {
+          const found = kept.get(listing);
+          if (found === undefined || found.superseded !== null) continue;
+          if (now - found.at >= policy.maxStaleMillis || cache.outdated(state.app.id, found.at))
+            continue;
+          const memory = yield* cache.get(listing);
+          if (memory?.kind === "value" && memory.value instanceof Listed && memory.at > found.at)
+            continue;
+          current.push({ index, state, routers: found.routers });
+        }
+        const checked = yield* options.declarations.authorizeEach(
+          current.map(({ state }) => state),
+        );
+        const served: Array<
+          | { readonly listing: ToolSearchListing; readonly routers: ReadonlyArray<ToolRouter> }
+          | undefined
+        > = states.map(() => undefined);
+        for (const [position, { index, routers }] of current.entries()) {
+          const outcome = checked[position];
+          const listing = wanted[index]?.listing;
+          if (outcome === undefined || listing === undefined || !Result.isSuccess(outcome))
+            continue;
+          served[index] = { listing, routers };
+        }
+        yield* Effect.annotateCurrentSpan({
+          "executor.search.targets": states.length,
+          "executor.search.kept": served.filter((entry) => entry !== undefined).length,
+        });
+        return served;
+      }).pipe(Effect.withSpan("sdk.tools.searchable.kept")),
   };
 };
 export type Listings = ReturnType<typeof makeListings>;

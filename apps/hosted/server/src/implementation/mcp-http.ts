@@ -92,8 +92,10 @@ const RequestBackend = Context.Reference<McpBackend<RequestError>>("hosted/McpRe
     readSkill: unavailable,
     listApps: unavailable,
     listAccounts: unavailable,
+    listAccountsEach: unavailable,
     listTools: unavailable,
     searchableTools: unavailable,
+    searchableKept: unavailable,
     searchTools: unavailable,
     callTool: unavailable,
     resumeInvocation: unavailable,
@@ -118,10 +120,14 @@ const requestBackend: McpBackend<RequestError> = {
     Effect.flatMap(RequestBackend, (backend) => backend.authorizeElicitation(input)),
   listApps: (input) => Effect.flatMap(RequestBackend, (backend) => backend.listApps(input)),
   listAccounts: (input) => Effect.flatMap(RequestBackend, (backend) => backend.listAccounts(input)),
+  listAccountsEach: (input) =>
+    Effect.flatMap(RequestBackend, (backend) => backend.listAccountsEach(input)),
   listTools: (input, options) =>
     Effect.flatMap(RequestBackend, (backend) => backend.listTools(input, options)),
   searchableTools: (input, options) =>
     Effect.flatMap(RequestBackend, (backend) => backend.searchableTools(input, options)),
+  searchableKept: (inputs) =>
+    Effect.flatMap(RequestBackend, (backend) => backend.searchableKept(inputs)),
   searchTools: (input) => Effect.flatMap(RequestBackend, (backend) => backend.searchTools(input)),
   callTool: (input, options) =>
     Effect.flatMap(RequestBackend, (backend) => backend.callTool(input, options)),

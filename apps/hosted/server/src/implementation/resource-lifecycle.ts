@@ -206,6 +206,61 @@ export const hostedResourceLifecycle = Effect.gen(function* () {
         if (rows.length !== 1) return yield* new StorageError();
         return user;
       });
+    /**
+     * One `appResolving` check as the columns of a row, and how its row decides: the accounts that
+     * passed every check asked of them, or undefined when the actor may not use the app.
+     */
+    const appRecheck = (check: {
+      readonly app: { readonly id: AppId; readonly owner: OwnerId };
+      readonly accounts: readonly AccountOwner[];
+      readonly appUses: readonly AppUse[];
+    }) =>
+      Effect.gen(function* () {
+        const { app, accounts, appUses } = check;
+        const user = yield* CurrentUserId;
+        const organization = yield* organizationOf(app.owner);
+        // The SDK resolved each account with its owner; only the product's policy is checked here.
+        const owned = user === undefined ? [] : organizationAccounts(accounts);
+        // An app account is the app owner's; one resolved under another owner is refused.
+        const uses = appUses.filter((use) => use.account.owner === app.owner);
+        const access =
+          user === undefined
+            ? sql`select p.id from hosted_app_access p
+                where p.id = ${app.id} and p.organization_id = ${organization}`
+            : appUse(sql, { id: app.id, organization, actor: user });
+        const users =
+          user === undefined || owned.length === 0
+            ? sql.literal(noRows)
+            : sql`(select coalesce(json_agg(allowed), '[]'::json)::text
+                from (${accountAccess(sql, owned, user)}) allowed)`;
+        const linkRows =
+          uses.length === 0
+            ? sql.literal(noRows)
+            : sql`(select coalesce(json_agg(json_build_object('requirement', l.requirement,
+                  'id', a.id)), '[]'::json)::text
+                from ${usableAppLinks(sql, [app.id])}
+                  and ${sql.in(
+                    "l.account",
+                    uses.map((use) => use.account.id),
+                  )})`;
+        return {
+          columns: sql`(select count(*)::int from (${access}) access) as access,
+            ${users} as accounts, ${linkRows} as "appLinks"`,
+          passed: (row: typeof AppRecheck.Type) =>
+            row.access !== 1
+              ? undefined
+              : passedEvery(
+                  accounts,
+                  appUses,
+                  allowedOf(owned, row.accounts),
+                  new Set(
+                    row.appLinks
+                      .filter((link) => uses.some((use) => use.account.id === link.id))
+                      .map((link) => useKey(link.requirement, link.id)),
+                  ),
+                ),
+        };
+      });
     const lifecycle: ResourceLifecycle = {
       userLinks: (input) =>
         linkedAccounts(sql, { subject: input.subject, apps: [input.app] }).pipe(
@@ -239,47 +294,37 @@ export const hostedResourceLifecycle = Effect.gen(function* () {
       // it has no user accounts.
       appResolving: (app, accounts, appUses) =>
         Effect.gen(function* () {
-          const user = yield* CurrentUserId;
-          const organization = yield* organizationOf(app.owner);
-          // The SDK resolved each account with its owner; only the product's policy is checked here.
-          const owned = user === undefined ? [] : organizationAccounts(accounts);
-          // An app account is the app owner's; one resolved under another owner is refused.
-          const uses = appUses.filter((use) => use.account.owner === app.owner);
-          const access =
-            user === undefined
-              ? sql`select p.id from hosted_app_access p
-                  where p.id = ${app.id} and p.organization_id = ${organization}`
-              : appUse(sql, { id: app.id, organization, actor: user });
-          const users =
-            user === undefined || owned.length === 0
-              ? sql.literal(noRows)
-              : sql`(select coalesce(json_agg(allowed), '[]'::json)::text
-                  from (${accountAccess(sql, owned, user)}) allowed)`;
-          const linkRows =
-            uses.length === 0
-              ? sql.literal(noRows)
-              : sql`(select coalesce(json_agg(json_build_object('requirement', l.requirement,
-                    'id', a.id)), '[]'::json)::text
-                  from ${usableAppLinks(sql, [app.id])}
-                    and ${sql.in(
-                      "l.account",
-                      uses.map((use) => use.account.id),
-                    )})`;
-          const rows = yield* sql`select
-            (select count(*)::int from (${access}) access) as access,
-            ${users} as accounts, ${linkRows} as "appLinks"`;
+          const check = yield* appRecheck({ app, accounts, appUses });
+          const rows = yield* sql`select ${check.columns}`;
           const checked = (yield* Schema.decodeUnknownEffect(Schema.Array(AppRecheck))(rows))[0];
-          if (checked === undefined || checked.access !== 1) return yield* new StorageError();
-          return passedEvery(
-            accounts,
-            appUses,
-            allowedOf(owned, checked.accounts),
-            new Set(
-              checked.appLinks
-                .filter((row) => uses.some((use) => use.account.id === row.id))
-                .map((row) => useKey(row.requirement, row.id)),
-            ),
-          );
+          if (checked === undefined) return yield* new StorageError();
+          const passed = check.passed(checked);
+          return passed === undefined ? yield* new StorageError() : passed;
+        }).pipe(
+          Effect.catchTags({
+            SqlError: () => new StorageError(),
+            SchemaError: () => new StorageError(),
+          }),
+        ),
+      // Every app's recheck in one statement, one row per check; each decides as `appResolving`.
+      appsResolving: (checks) =>
+        Effect.gen(function* () {
+          if (checks.length === 0) return [];
+          const rechecks = yield* Effect.forEach(checks, appRecheck);
+          const rows = yield* sql`${sql.join(
+            " union all ",
+            false,
+          )(
+            rechecks.map((check, index) => sql`select ${index}::int as recheck, ${check.columns}`),
+          )}`;
+          const checked = yield* Schema.decodeUnknownEffect(
+            Schema.Array(Schema.Struct({ ...AppRecheck.fields, recheck: Schema.Int })),
+          )(rows);
+          const byCheck = new Map(checked.map((row) => [row.recheck, row]));
+          return rechecks.map((check, index) => {
+            const row = byCheck.get(index);
+            return row === undefined ? undefined : check.passed(row);
+          });
         }).pipe(
           Effect.catchTags({
             SqlError: () => new StorageError(),

@@ -13,7 +13,7 @@ import {
   type ToolListOptions,
   type ToolPage,
 } from "@executor-js/sdk/core";
-import { Effect } from "effect";
+import { Effect, Result } from "effect";
 import {
   appEntryPolicies,
   permitsApp,
@@ -298,6 +298,22 @@ export const restrictMcpBackend = <E extends Error, G extends Error>(
         yield* refuse(appRefusal(policy, input.app));
         return targetedLinks(policy, input.app, yield* backend.listAccounts(input));
       }),
+    // Each app as `listAccounts` decides it; the host lists only the apps the grant permits.
+    listAccountsEach: (input) =>
+      Effect.gen(function* () {
+        const policy = yield* authority;
+        const permitted = input.apps.filter((app) => appRefusal(policy, app) === undefined);
+        const listed = yield* backend.listAccountsEach({ apps: permitted });
+        const outcomes = new Map(permitted.map((app, index) => [app, listed[index]]));
+        return input.apps.map((app) => {
+          const refusal = appRefusal(policy, app);
+          if (refusal !== undefined) return Result.fail(new GrantForbidden({ refusal }));
+          const outcome = outcomes.get(app);
+          return outcome === undefined
+            ? Result.fail(new GrantForbidden({ refusal: { reason: "app", app } }))
+            : Result.map(outcome, (linked) => targetedLinks(policy, app, linked));
+        });
+      }),
     listTools: (input, options) =>
       Effect.gen(function* () {
         const policy = yield* authority;
@@ -335,6 +351,37 @@ export const restrictMcpBackend = <E extends Error, G extends Error>(
             permitsRouter(policy, { app: input.app, path: router.path }, []),
           ),
         };
+      }),
+    // A target `searchableTools` would refuse is left to it, which reports why.
+    searchableKept: (inputs) =>
+      Effect.gen(function* () {
+        const policy = yield* authority;
+        const refused = (app: AppId, accounts: AppAccounts | undefined) => {
+          const ids = named(accounts);
+          return (
+            (ids.length === 0 ? appRefusal(policy, app) : accountsRefusal(policy, app, ids)) !==
+            undefined
+          );
+        };
+        const permitted = inputs.filter((input) => !refused(input.app, input.accounts));
+        const kept = yield* backend.searchableKept(permitted);
+        const served = new Map(permitted.map((input, index) => [input, kept[index]]));
+        return inputs.map((input) => {
+          const searchable = served.get(input);
+          // The listing names the accounts the host resolved; one entry must permit all of them.
+          if (
+            searchable === undefined ||
+            accountsRefusal(policy, input.app, named(searchable.accounts)) !== undefined
+          )
+            return undefined;
+          // Failed routers list no tools, so the grant decides them without the catalog.
+          return {
+            ...searchable,
+            routers: searchable.routers.filter((router) =>
+              permitsRouter(policy, { app: input.app, path: router.path }, []),
+            ),
+          };
+        });
       }),
     // A target the grant no longer permits keeps its place with no tools, so result indexes hold.
     searchTools: (input) =>

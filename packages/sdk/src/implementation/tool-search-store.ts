@@ -214,6 +214,38 @@ export const makeToolSearchStore = (sql: SqlClient.SqlClient) => {
         failed,
       ),
     /**
+     * `listing` for many targets in one statement: the kept rows of each listing whose row is for
+     * its target, by listing.
+     */
+    listings: (
+      wanted: ReadonlyArray<{ readonly listing: ToolSearchListing; readonly target: string }>,
+    ): Effect.Effect<ReadonlyMap<string, typeof Kept.Type>, StorageError> =>
+      wanted.length === 0
+        ? Effect.succeed(new Map())
+        : sql`select listing, target, at::float8 as at, digest, routers,
+            superseded::float8 as superseded
+          from executor_tool_search_listings
+          where listing in ${sql.in([...new Set(wanted.map((entry) => entry.listing))])}`.pipe(
+            Effect.flatMap(
+              Schema.decodeUnknownEffect(
+                Schema.Array(
+                  Schema.Struct({ ...Kept.fields, listing: Schema.String, target: Schema.String }),
+                ),
+              ),
+            ),
+            Effect.map((rows) => {
+              const targets = new Map(wanted.map((entry) => [entry.listing, entry.target]));
+              return new Map(
+                rows.flatMap(({ listing, target, ...kept }) =>
+                  targets.get(ToolSearchListing.make(listing)) === target
+                    ? [[listing, kept] as const]
+                    : [],
+                ),
+              );
+            }),
+            failed,
+          ),
+    /**
      * Keep a superseded listing that a target resolves to again for as long as a current one,
      * so the executions that search it keep finding it.
      */

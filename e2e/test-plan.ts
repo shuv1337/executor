@@ -6005,6 +6005,17 @@ export const scenarios = plan({
       local: na("Local has no hosted organization policies."),
     },
   },
+  mcpSearchStatements: {
+    fixtures: "actors",
+    file: "mcp-search-statements.spec.ts",
+    title:
+      "An organization-wide MCP search reads every app's kept search rows in the same statements however many apps there are",
+    targets: {
+      "self-host": scheduled,
+      cloud: na("This scenario reads SQL spans from the self-host Motel collector."),
+      local: na("Local reads each app's search rows on its own; it has no hosted policies."),
+    },
+  },
   toolCallHeldCheck: {
     fixtures: "actors",
     file: "tool-call-held-check.spec.ts",
