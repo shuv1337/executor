@@ -28,7 +28,13 @@ const activeData = <S extends InvocationSnapshot>(input: AppDataInput, state: S)
   input.version !== undefined &&
   ownsDatabase(state.version.requirements) &&
   state.version.id !== state.app.activeVersion
-    ? Effect.fail(new AppDataVersionSuperseded({ app: state.app.id, version: state.version.id }))
+    ? Effect.fail(
+        new AppDataVersionSuperseded({
+          app: state.app.id,
+          version: state.version.id,
+          active: state.app.activeVersion,
+        }),
+      )
     : Effect.succeed(state);
 
 /** Bind data calls to the current app version and the named accounts. */
