@@ -380,6 +380,9 @@ export class AppDataSupervisor extends DurableObject<Environment> {
         appOutbound(ctx),
         (app) => ctx.id.equals(env.DATA.idFromName(app)),
         true,
+        // Open-source workerd does not count a facet's subrequests across calls, so a warm facet
+        // serves every call that finds it idle instead of cold-starting one each time.
+        false,
       ),
     );
   }

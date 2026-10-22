@@ -222,6 +222,13 @@ export const makeFacetSupervisor = (
    * process never unloads named Workers itself sets this; Cloudflare unloads them.
    */
   unloadReplacedFacets = false,
+  /**
+   * Restart a facet for each call that finds it idle. Cloudflare counts a facet's subrequests over
+   * its whole life (cloudflare/workerd#7572), so a long-lived facet runs out of them; there each
+   * idle call gets a fresh one. Open-source workerd enforces no such limit, so a self-hosted
+   * runtime keeps the facet warm instead of paying a cold start for every call.
+   */
+  recycleIdleFacets = true,
 ) =>
   Effect.gen(function* () {
     const metadata = yield* Semaphore.make(1);
@@ -396,7 +403,7 @@ export const makeFacetSupervisor = (
         if (active !== loaded) {
           state.facets.abort("data", "Execution context changed");
           active = loaded;
-        } else if (admission.running === 1 && finishing === 0) {
+        } else if (recycleIdleFacets && admission.running === 1 && finishing === 0) {
           // Cloudflare counts a facet's subrequests over the facet's whole life, not per call
           // (cloudflare/workerd#7572), so a facet kept running across calls runs out of them and
           // every later request fails until it restarts. A call that finds the facet idle, with no

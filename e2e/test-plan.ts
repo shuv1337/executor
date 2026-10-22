@@ -5628,7 +5628,7 @@ export const scenarios = plan({
     fixtures: "actors",
     file: "tool-call-overhead.spec.ts",
     title:
-      "Executor time counts a fresh facet for each database call that finds it idle, and overlapping calls share one",
+      "Executor time counts a fresh facet for each database call that finds it idle on Cloudflare, keeps it warm on a workerd host, and overlapping calls share one",
     targets: {
       "self-host": scheduled,
       cloud: managedCloud,
