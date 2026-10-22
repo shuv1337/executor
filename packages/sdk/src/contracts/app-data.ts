@@ -1,5 +1,6 @@
 import { withLegacyKeys } from "@executor-js/utils/legacy-keys";
 import { ApiError } from "@executor-js/utils/api-error";
+import { UserFacingError } from "@executor-js/utils/user-facing-error";
 /** Framework data operations. Product hosts authenticate and authorize the configured app. */
 import { Schema } from "effect";
 import { HttpApiEndpoint, HttpApiGroup, HttpApiSchema } from "effect/http-api";
@@ -64,16 +65,22 @@ export type AppDataApprovalRequired = typeof AppDataApprovalRequired.Type;
 /**
  * The call named a version of an app with a database that is no longer the app's active version.
  * The database follows the active version's migrations, and the app runs one build against it at a
- * time, so a superseded build's code never runs against it. Reload the page or call without a
- * version.
+ * time, so a superseded build's code never runs against it. `active` is the version that serves
+ * the app now, or null when none does.
  */
-export const AppDataVersionSuperseded = ApiError.define({
+export const AppDataVersionSuperseded = UserFacingError.define({
   tag: "AppDataVersionSuperseded",
   status: 409,
-  fields: { app: AppId, version: VersionId },
-  message: () =>
-    "This version of the app is no longer active, and its database now belongs to the active version. Reload the page, or call without a version.",
-  recorded: () => "The call named a superseded version of an app with a database",
+  fields: { app: AppId, version: VersionId, active: Schema.NullOr(VersionId) },
+  title: "This app version is no longer active",
+  description:
+    "The call named a version that a newer deploy replaced. The app's database now follows the active version, so the old version's code no longer runs against it, and a live query left on it has ended.",
+  recovery: {
+    action:
+      "Retry the call without a version to use the active version, or reload the app page to load it.",
+    instructions:
+      "Send the same query or mutation again without the `version` field, or with the version in `active`, and resubscribe a live query the same way. A page reloads itself. Do not keep retrying the superseded version: it will never run again.",
+  },
 });
 export type AppDataVersionSuperseded = typeof AppDataVersionSuperseded.Type;
 

@@ -34,7 +34,11 @@ export default defineApp({}, { tools: router({ latest, write }) });`,
 
 const Active = Schema.Struct({ activeVersion: Schema.String });
 const Latest = Schema.Struct({ count: Schema.Number, label: Schema.String });
-const Refusal = Schema.Struct({ _tag: Schema.Literal("AppDataVersionSuperseded") });
+const Refusal = Schema.Struct({
+  _tag: Schema.Literal("AppDataVersionSuperseded"),
+  version: Schema.String,
+  active: Schema.NullOr(Schema.String),
+});
 
 layer(HostedLive, { excludeTestServices: true })("Superseded data version", (it) => {
   it.effect(scenarios.appSupersededDataVersion.title, (context) =>
@@ -140,7 +144,9 @@ layer(HostedLive, { excludeTestServices: true })("Superseded data version", (it)
         ] as const) {
           const refused = yield* data(kind, name, input, first);
           expect(refused.status, `${kind} pinned to the superseded version`).toBe(409);
-          yield* body(Refusal, refused);
+          // The refusal names both versions and says how to recover.
+          expect(yield* body(Refusal, refused)).toMatchObject({ version: first, active: second });
+          expect(JSON.stringify(refused.body)).toContain("Retry the call without a version");
         }
         expect(yield* body(Latest, yield* data("query", "latest", {}))).toEqual({
           count: 1,
