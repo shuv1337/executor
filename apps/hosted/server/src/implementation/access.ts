@@ -13,6 +13,7 @@ import {
   policyDatabase,
   resourceAuthorityForApp,
   resourceAuthorityForLinks,
+  resourceAuthorityForLinksOfApps,
   type ResourceAuthority,
 } from "./resource-policy.ts";
 import type {
@@ -36,6 +37,7 @@ import {
   appLinkedAccounts,
   callerAccounts,
   versionAccounts,
+  type CallerLinks,
 } from "./app-accounts.ts";
 import {
   CurrentOrganization,
@@ -284,6 +286,65 @@ export const selectedActiveVersion = (
     if (app.activeVersion === null) return yield* new AppNotDeployed({ app: app.id });
     // Pin the authorized version so a concurrent promotion cannot silently change the call.
     return { version: app.activeVersion, accounts };
+  });
+
+/**
+ * {@link selectedActiveVersion} for apps this request checked, such as the apps one catalog search
+ * reads: the links of every app with accounts are read with the caller's access in one statement,
+ * and each app decides as {@link selectedActiveVersion} would with them. An app it cannot decide
+ * that way, or that one of the checks refuses, is `None`: its own read reports why.
+ */
+export const selectedActiveVersions = (
+  owner: OwnerId,
+  inputs: ReadonlyArray<{ readonly app: AppId; readonly version?: VersionId | undefined }>,
+  checked: ReadonlyArray<CheckedApp>,
+) =>
+  Effect.gen(function* () {
+    const organization = (yield* CurrentOrganization).organization;
+    const user = yield* CurrentUserId;
+    const known = new Map(
+      checked.filter((entry) => entry.app.owner === owner).map((entry) => [entry.app.id, entry]),
+    );
+    const accountless = (app: App) => Object.keys(app.requirements.accounts).length === 0;
+    const withAccounts = [
+      ...new Set(
+        inputs.flatMap((input) => {
+          const app = known.get(input.app)?.app;
+          return app === undefined || accountless(app) ? [] : [app.id];
+        }),
+      ),
+    ];
+    const none: ReadonlyMap<
+      AppId,
+      { readonly access: typeof AppAccess.Type; readonly accounts: CallerLinks }
+    > = new Map();
+    const links =
+      withAccounts.length === 0
+        ? none
+        : yield* resourceAuthorityForLinksOfApps(organization, user, withAccounts).pipe(
+            Effect.orElseSucceed(() => none),
+          );
+    const sql = yield* policyDatabase;
+    return yield* Effect.forEach(inputs, (input) =>
+      Effect.gen(function* () {
+        const found = known.get(input.app);
+        if (found === undefined || user === undefined) return yield* Effect.fail(undefined);
+        const { access, accounts } = accountless(found.app)
+          ? // As for one app: the caller's access was read with the app, and a version that
+            // declares no account reads no links.
+            {
+              access: found.access,
+              accounts: appAccountReads(sql, { subject: user, app: found.app.id }),
+            }
+          : (links.get(found.app.id) ?? (yield* Effect.fail(undefined)));
+        if (!access.canUse) return yield* Effect.fail(undefined);
+        const resolved = yield* callerAccounts(found.app, accounts);
+        if (input.version !== undefined && input.version !== found.app.activeVersion)
+          return yield* Effect.fail(undefined);
+        if (found.app.activeVersion === null) return yield* Effect.fail(undefined);
+        return { version: found.app.activeVersion, accounts: resolved };
+      }).pipe(Effect.option),
+    );
   });
 
 /**

@@ -138,6 +138,18 @@ export interface ResourceLifecycle {
     appUses: readonly AppAccountUse[],
   ) => Effect.Effect<ReadonlySet<AccountId>, StorageError>;
   /**
+   * Optional: `appResolving` for several apps at once, such as the apps one catalog search reads,
+   * in one call. Returns each check's passing accounts, in order, as `appResolving` would, or
+   * `undefined` for a check `appResolving` would fail.
+   */
+  readonly appsResolving?: (
+    checks: ReadonlyArray<{
+      readonly app: { readonly id: AppId; readonly owner: OwnerId };
+      readonly accounts: readonly Pick<Account, "id" | "owner">[];
+      readonly appUses: readonly AppAccountUse[];
+    }>,
+  ) => Effect.Effect<ReadonlyArray<ReadonlySet<AccountId> | undefined>, StorageError>;
+  /**
    * Recheck authority to remove what an app registered upstream, such as a webhook registration,
    * with the accounts it registered with, before acquiring their credentials and again after any
    * renewal. App access is not needed. The user accounts (`accounts`) are checked as
@@ -388,6 +400,15 @@ export type Executor = Omit<FlatExecutor, "apps" | "appWorkflows" | "appWorkflow
       Effect.Error<ReturnType<FlatExecutor["tools"]["list"]>> | ToolSearchUnavailable
     >;
     /**
+     * Host-only: `searchable` for many targets at once, serving only rows already kept and
+     * current, with the same checks. A target it does not serve is `undefined`; read it with
+     * `searchable`, which writes its rows or reports why. Never evaluates an app, so one slow
+     * app cannot hold the others. Hosts authorize each target as for `searchable`.
+     */
+    readonly searchableKept: (
+      inputs: ReadonlyArray<Omit<Parameters<FlatExecutor["tools"]["list"]>[0], "cursor" | "limit">>,
+    ) => Effect.Effect<ReadonlyArray<SearchableTools | undefined>, StorageError>;
+    /**
      * Host-only: rank the tools of listings `searchable` returned with BM25. Hosts narrow each
      * target's scopes to the tools the caller may discover; the SDK never widens them.
      */
@@ -450,7 +471,10 @@ export type PromiseExecutor = Promisify<
     | "tools"
     | "apps"
   > & {
-    readonly tools: Omit<Executor["tools"], "approval" | "searchable" | "search">;
+    readonly tools: Omit<
+      Executor["tools"],
+      "approval" | "searchable" | "searchableKept" | "search"
+    >;
     readonly apps: Omit<Executor["apps"], "copyAs">;
   }
 >;

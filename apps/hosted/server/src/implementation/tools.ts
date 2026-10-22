@@ -24,7 +24,7 @@ import {
   type BrowserApprovalView,
   type BrowserToolRun,
 } from "@executor-js/mcp/browser";
-import { Effect, Schema } from "effect";
+import { Effect, Option, Schema } from "effect";
 import { HttpApiBuilder } from "effect/http-api";
 import { HostedApi } from "../contracts/api.ts";
 import { HostedExecutor } from "../contracts/executor.ts";
@@ -36,6 +36,7 @@ import {
   checkInvocationAccounts,
   currentOwner,
   selectedActiveVersion,
+  selectedActiveVersions,
   usableApp,
   type CheckedApp,
 } from "./access.ts";
@@ -82,6 +83,49 @@ export const searchableTools = (
         permitsRouter(policy, { app: input.app, path: router.path }, []),
       ),
     };
+  });
+/**
+ * {@link searchableTools} for many targets, from search rows already kept: the apps this request
+ * checked, their links read at once, and the rows and their checks read at once. A target it does
+ * not serve is `undefined`: {@link searchableTools} reads it and reports why.
+ */
+export const searchableKept = (
+  inputs: ReadonlyArray<Parameters<Executor["tools"]["searchable"]>[0]>,
+  checked: ReadonlyArray<CheckedApp>,
+) =>
+  Effect.gen(function* () {
+    const policy = yield* CurrentAuthorization;
+    const owner = yield* currentOwner;
+    const executor = yield* Effect.flatten(HostedExecutor);
+    const permitted = inputs.filter((input) => permitsApp(policy, input.app));
+    const selected = yield* selectedActiveVersions(owner, permitted, checked);
+    const targets = permitted.flatMap((input, index) => {
+      const found = selected[index];
+      return found === undefined || Option.isNone(found)
+        ? []
+        : [{ input, read: { ...input, ...found.value } }];
+    });
+    const kept = yield* executor.tools.searchableKept(targets.map(({ read }) => read));
+    const served = new Map(
+      targets.flatMap(({ input }, index) => {
+        const searchable = kept[index];
+        return searchable === undefined
+          ? []
+          : [
+              [
+                input,
+                {
+                  ...searchable,
+                  // Failed routers list no tools, so the policy decides them without the catalog.
+                  routers: searchable.routers.filter((router) =>
+                    permitsRouter(policy, { app: input.app, path: router.path }, []),
+                  ),
+                },
+              ] as const,
+            ];
+      }),
+    );
+    return inputs.map((input) => served.get(input));
   });
 /**
  * Rank the tools of listings `searchableTools` kept for this request's caller, with each target

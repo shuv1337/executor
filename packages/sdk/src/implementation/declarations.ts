@@ -1,5 +1,5 @@
 /** Stale-while-revalidate reads of evaluated app declarations (skills, workflows, webhooks). */
-import { Clock, Deferred, Effect, Exit, Fiber, Option, Schema, type Crypto } from "effect";
+import { Clock, Deferred, Effect, Exit, Fiber, Option, Result, Schema, type Crypto } from "effect";
 import { Hex } from "effect/encoding";
 import {
   declarationFreshness,
@@ -125,36 +125,84 @@ export const makeDeclarations = (options: {
    * would stop it: a kept result is never served for an account a live read would refuse, such
    * as an OAuth grant that needs reconnecting.
    */
+  const checksOf = (state: InvocationSnapshot) => {
+    const selected = state.selections.flatMap(({ required, accounts }) =>
+      accounts.map((account) => ({ account, provider: required.definition })),
+    );
+    const accounts = selected.map(({ account }) => account);
+    // Each use is authorized on its own: by the actor's use where a user requirement uses the
+    // account, and by the app link for each app requirement it fills.
+    const { user: linked, app: appUses } = accountAuthority(state.selections);
+    return {
+      linked,
+      appUses,
+      permitted: (allowed: ReadonlySet<AccountId>) =>
+        accounts.every((account) => allowed.has(account.id))
+          ? Effect.void
+          : Effect.fail(new StorageError()),
+      usable: Effect.forEach(
+        selected,
+        ({ account, provider }) => options.accountUsable(account, provider),
+        { concurrency: "unbounded", discard: true },
+      ),
+    };
+  };
   const authorize = (state: InvocationSnapshot) =>
     Effect.gen(function* () {
       const lifecycle = options.lifecycle;
-      const selected = state.selections.flatMap(({ required, accounts }) =>
-        accounts.map((account) => ({ account, provider: required.definition })),
-      );
-      const accounts = selected.map(({ account }) => account);
-      // Each use is authorized on its own: by the actor's use where a user requirement uses the
-      // account, and by the app link for each app requirement it fills.
-      const { user: linked, app: appUses } = accountAuthority(state.selections);
-      const permitted = (allowed: ReadonlySet<AccountId>) =>
-        accounts.every((account) => allowed.has(account.id))
-          ? Effect.void
-          : Effect.fail(new StorageError());
+      const { linked, appUses, permitted, usable } = checksOf(state);
       // The actor's use of the app and of every account is one read, alongside the grant checks.
       yield* Effect.all(
         [
           lifecycle === undefined
             ? Effect.void
             : lifecycle.appResolving(state.app, linked, appUses).pipe(Effect.flatMap(permitted)),
-          Effect.forEach(
-            selected,
-            ({ account, provider }) => options.accountUsable(account, provider),
-            {
-              concurrency: "unbounded",
-              discard: true,
-            },
-          ),
+          usable,
         ],
         { concurrency: "unbounded", discard: true },
+      );
+    });
+  /**
+   * `authorize` for many states, with each state's outcome. A product that offers
+   * `appsResolving` rechecks the actor's use of every app and account in one call; the same checks
+   * decide each state.
+   */
+  const authorizeEach = (states: ReadonlyArray<InvocationSnapshot>) =>
+    Effect.gen(function* () {
+      const many = options.lifecycle?.appsResolving;
+      if (many === undefined || states.length < 2)
+        return yield* Effect.forEach(states, (state) => Effect.result(authorize(state)), {
+          concurrency: "unbounded",
+        });
+      const checks = states.map(checksOf);
+      const allowed = yield* Effect.result(
+        many(
+          states.map((state, index) => ({
+            app: state.app,
+            accounts: checks[index]?.linked ?? [],
+            appUses: checks[index]?.appUses ?? [],
+          })),
+        ),
+      );
+      return yield* Effect.forEach(
+        checks,
+        (check, index) =>
+          Effect.result(
+            Effect.all(
+              [
+                Effect.suspend(() => {
+                  if (Result.isFailure(allowed)) return Effect.fail(allowed.failure);
+                  const passed = allowed.success[index];
+                  return passed === undefined
+                    ? Effect.fail(new StorageError())
+                    : check.permitted(passed);
+                }),
+                check.usable,
+              ],
+              { concurrency: "unbounded", discard: true },
+            ),
+          ),
+        { concurrency: "unbounded" },
       );
     });
   /** A result another process or isolate kept, if the host keeps results beyond this one. */
@@ -195,6 +243,7 @@ export const makeDeclarations = (options: {
   return {
     key,
     authorize,
+    authorizeEach,
     recall,
     persist,
     /**

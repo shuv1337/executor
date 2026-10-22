@@ -325,6 +325,75 @@ export const resourceAuthorityForLinks = (
     Effect.catchTags({ SqlError: () => new StorageError(), SchemaError: () => new StorageError() }),
   );
 
+/**
+ * {@link resourceAuthorityForLinks} for several apps, in one statement: the caller's access to
+ * each app with a policy, with the caller's links to it and its app links. An app without a policy
+ * in the organization is omitted; callers deny it, as `resourceAuthorityForLinks` would.
+ */
+export const resourceAuthorityForLinksOfApps = (
+  organization: OrganizationId,
+  user: string | undefined,
+  apps: readonly AppId[],
+) =>
+  Effect.gen(function* () {
+    if (user === undefined) return yield* new OrganizationForbidden();
+    const sql = yield* policyDatabase;
+    // The policy is `ap`: the link reads name their account policy `p`.
+    const rows = yield* sql`select m.id, m.role, ap.id as app, ap.creator_id as creator,
+    ap.audience, ap.revision,
+    case when ap.id is null then null else
+      array(select g.group_id from hosted_app_groups g where g.app_id = ap.id order by g.group_id)
+    end as groups,
+    exists(select 1 from hosted_app_groups g join hosted_group_members gm on gm.group_id = g.group_id
+      where g.app_id = ap.id and gm.member_id = m.id) as granted,
+    (select coalesce(json_agg(${sql.literal(linkedAccountJson)} order by l.created_at, a.id),
+      '[]'::json)::text from ${usableLinks(sql, { subject: user, apps })}
+      and l.app = ap.id) as "userLinks",
+    (select coalesce(json_agg(${sql.literal(linkedAccountJson)} order by l.created_at, a.id),
+      '[]'::json)::text from ${usableAppLinks(sql, apps)} and l.app = ap.id) as "appLinks"
+    from member m
+    left join hosted_app_access ap on ${sql.in("ap.id", apps)}
+      and ap.organization_id = m."organizationId"
+    where m."organizationId" = ${organization} and m."userId" = ${user}`;
+    const found = yield* Schema.decodeUnknownEffect(Schema.Array(MemberLinksPolicy))(rows);
+    const first = found[0];
+    // Every row repeats the one membership; a second membership is ambiguous, as for one app.
+    if (first === undefined || found.some((other) => other.id !== first.id))
+      return yield* new OrganizationForbidden();
+    const actor = { organization, user, member: first.id, role: first.role };
+    const links = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Array(LinkedAccount)));
+    return new Map(
+      found.flatMap((row) =>
+        row.app === null || row.audience === null || row.revision === null || row.groups === null
+          ? []
+          : [
+              [
+                row.app,
+                {
+                  access: appAccessOf(
+                    {
+                      app: row.app,
+                      creator: row.creator,
+                      audience: row.audience,
+                      revision: row.revision,
+                      groups: row.groups,
+                      granted: row.granted,
+                    },
+                    actor,
+                  ),
+                  accounts: Effect.all({
+                    user: links(row.userLinks),
+                    app: links(row.appLinks),
+                  }).pipe(Effect.mapError(() => new StorageError())),
+                },
+              ] as const,
+            ],
+      ),
+    );
+  }).pipe(
+    Effect.catchTags({ SqlError: () => new StorageError(), SchemaError: () => new StorageError() }),
+  );
+
 const AccountPolicy = Schema.Struct({
   account: AccountId,
   creator: Schema.NullOr(Principal.fields.userId),

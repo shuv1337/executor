@@ -27,6 +27,18 @@ import { appVersion, versionRequirementAccounts } from "./app-accounts.ts";
 import type { SqlClient } from "effect/sql";
 import { Context, Effect, Redacted } from "effect";
 
+/** The user requirements' linked accounts; the app's are its app links, never shown to agents. */
+const linkedAccountsOf = (
+  sql: SqlClient.SqlClient,
+  executor: Executor,
+  input: { readonly app: AppId; readonly version?: VersionId | undefined },
+) =>
+  executor.apps.get({ app: input.app }).pipe(
+    Effect.flatMap((app) => appVersion(executor, app, input.version)),
+    Effect.flatMap((version) => versionRequirementAccounts(sql, executor, version)),
+    Effect.map((accounts) => accounts.userLinks),
+  );
+
 /**
  * Operations as the grant checked them: they run with exactly the accounts their input names.
  * Reached only through {@link localMcpBackend}, which fills those accounts first.
@@ -42,15 +54,13 @@ const grantedBackend = (sql: SqlClient.SqlClient, executor: Executor, principal:
     readSkill: (input) => executor.skills.read(input),
     authorizeElicitation: () => Effect.void,
     listApps: (input = {}) => executor.apps.list(input),
-    listAccounts: (input) =>
-      executor.apps.get({ app: input.app }).pipe(
-        Effect.flatMap((app) => appVersion(executor, app, input.version)),
-        // Agents see the user requirements' accounts only; the app's are its app links.
-        Effect.flatMap((version) => versionRequirementAccounts(sql, executor, version)),
-        Effect.map((accounts) => accounts.userLinks),
-      ),
+    listAccounts: (input) => linkedAccountsOf(sql, executor, input),
+    listAccountsEach: (input) =>
+      Effect.forEach(input.apps, (app) => Effect.result(linkedAccountsOf(sql, executor, { app }))),
     listTools: (input, options) => executor.tools.list(input, options),
     searchableTools: (input, options) => executor.tools.searchable(input, options),
+    // Local reads each app's rows with `searchableTools`, after resolving its accounts.
+    searchableKept: (inputs) => Effect.succeed(inputs.map(() => undefined)),
     searchTools: (input) => executor.tools.search(input),
     callTool: (input, options?: ToolInvocationOptions) => executor.tools.call(input, options),
     resumeInvocation: (request, response, options?: ToolInvocationOptions) =>
@@ -136,8 +146,10 @@ export const localMcp = (
         readSkill: () => Effect.fail(new LocalMcpUnauthorized()),
         listApps: () => Effect.fail(new LocalMcpUnauthorized()),
         listAccounts: () => Effect.fail(new LocalMcpUnauthorized()),
+        listAccountsEach: () => Effect.fail(new LocalMcpUnauthorized()),
         listTools: () => Effect.fail(new LocalMcpUnauthorized()),
         searchableTools: () => Effect.fail(new LocalMcpUnauthorized()),
+        searchableKept: () => Effect.fail(new LocalMcpUnauthorized()),
         searchTools: () => Effect.fail(new LocalMcpUnauthorized()),
         callTool: () => Effect.fail(new LocalMcpUnauthorized()),
         resumeInvocation: () => Effect.fail(new LocalMcpUnauthorized()),
@@ -173,10 +185,13 @@ export const localMcp = (
         readSkill: (input) => Effect.flatMap(RequestBackend, (b) => b.readSkill(input)),
         listApps: (input) => Effect.flatMap(RequestBackend, (b) => b.listApps(input)),
         listAccounts: (input) => Effect.flatMap(RequestBackend, (b) => b.listAccounts(input)),
+        listAccountsEach: (input) =>
+          Effect.flatMap(RequestBackend, (b) => b.listAccountsEach(input)),
         listTools: (input, options) =>
           Effect.flatMap(RequestBackend, (b) => b.listTools(input, options)),
         searchableTools: (input, options) =>
           Effect.flatMap(RequestBackend, (b) => b.searchableTools(input, options)),
+        searchableKept: (inputs) => Effect.flatMap(RequestBackend, (b) => b.searchableKept(inputs)),
         searchTools: (input) => Effect.flatMap(RequestBackend, (b) => b.searchTools(input)),
         callTool: (input, options) =>
           Effect.flatMap(RequestBackend, (b) => b.callTool(input, options)),

@@ -26,7 +26,7 @@ import type {
   EventsUnavailable,
   SubscribeEvent,
 } from "@executor-js/sdk/core";
-import type { Effect } from "effect";
+import type { Effect, Result } from "effect";
 
 /** A subscription key without its principal: the product binds that to the caller. */
 export type McpEventKey = Omit<EventSubscriptionKey, "principal">;
@@ -76,6 +76,14 @@ export interface McpBackend<E extends Error> {
    * app requirements from the app links.
    */
   readonly listAccounts: (input: McpTargetInput) => Effect.Effect<McpAppAccounts, E>;
+  /**
+   * `listAccounts` for the active version of each app, in one operation, with each app's outcome
+   * in order: what `listAccounts` returns or fails with for it. Discovery lists every app it
+   * searches this way instead of one operation per app.
+   */
+  readonly listAccountsEach: (input: {
+    readonly apps: ReadonlyArray<AppId>;
+  }) => Effect.Effect<ReadonlyArray<Result.Result<McpAppAccounts, E>>, E>;
   /** Authorize the app and its selected accounts before evaluating each catalog page. */
   readonly listTools: (
     input: Parameters<Executor["tools"]["list"]>[0],
@@ -89,6 +97,16 @@ export interface McpBackend<E extends Error> {
     input: Parameters<Executor["tools"]["searchable"]>[0],
     options?: ToolListOptions,
   ) => Effect.Effect<SearchableTools, E>;
+  /**
+   * `searchableTools` for many targets in one operation, serving only search rows already kept and
+   * current, after the same checks, read for every target at once. A target it does not serve is
+   * `undefined`, such as one whose rows must be written by listing the app or one a check refuses:
+   * `searchableTools` reads it and reports why. Never lists an app's tools, so a slow app cannot
+   * hold the others; a backend may serve none.
+   */
+  readonly searchableKept: (
+    inputs: ReadonlyArray<Parameters<Executor["tools"]["searchable"]>[0]>,
+  ) => Effect.Effect<ReadonlyArray<SearchableTools | undefined>, E>;
   /**
    * Rank the tools of listings `searchableTools` returned to this backend. Narrow each target's
    * scopes to the tools the caller may discover, as `listTools` filters them, before ranking, so
