@@ -1,5 +1,5 @@
 /** Configured-app data dispatch. Platform storage never holds authored rows. */
-import { Effect, Result, Schema, Stream } from "effect";
+import { Effect, Schema, Stream } from "effect";
 import type { WorkflowHostControls } from "apps/contracts";
 import { Json } from "../contracts/shared.ts";
 import { HostOperationNotFound, HostToolApprovalRequired } from "apps/contracts";
@@ -15,6 +15,7 @@ import { database } from "./database.ts";
 import { callerContext, resolve, snapshot, type InvocationSnapshot } from "./tools.ts";
 import type { makeOAuth } from "./oauth.ts";
 import { ownsDatabase } from "../contracts/apps.ts";
+import { refreshAtMostEvery } from "./live-refresh.ts";
 
 /** Bind data calls to the current app version and the named accounts. */
 export const makeAppData = (
@@ -88,20 +89,29 @@ export const makeAppData = (
                           ),
                     ).pipe(
                       Stream.merge(Stream.tick("15 seconds").pipe(Stream.drop(1))),
-                      Stream.filterMapEffect((revision) =>
-                        typeof revision === "number" &&
-                        observedRevision !== undefined &&
-                        revision <= observedRevision
-                          ? Effect.succeed(Result.fail(undefined))
-                          : execute(
+                      // Under a burst of writes each subscriber reruns its query at most once
+                      // a second, and the run after the burst reads its last write.
+                      (notifications) =>
+                        refreshAtMostEvery(notifications, {
+                          // A notification without a revision always runs.
+                          combine: (pending, next) =>
+                            typeof pending === "number" && typeof next === "number"
+                              ? Math.max(pending, next)
+                              : undefined,
+                          skip: (revision) =>
+                            typeof revision === "number" &&
+                            observedRevision !== undefined &&
+                            revision <= observedRevision,
+                          run: () =>
+                            execute(
                               "query",
                               input,
                               (revision) => {
                                 observedRevision = revision;
                               },
                               current,
-                            ).pipe(Effect.map(Result.succeed)),
-                      ),
+                            ),
+                        }),
                     );
                   }),
                   Stream.changesWith(Schema.toEquivalence(Json)),

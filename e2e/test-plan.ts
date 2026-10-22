@@ -5313,6 +5313,22 @@ export const scenarios = plan({
       local: na("This scenario uses hosted deploys and app authentication."),
     },
   },
+  appLiveQueryBatching: {
+    fixtures: "actors",
+    file: "app-live-query-batching.spec.ts",
+    appOrigin: true,
+    title:
+      "a live app query reruns at most once a second under a burst of writes and shows the last write",
+    targets: {
+      "self-host": scheduled,
+      cloud: {
+        status: "not-run",
+        reason:
+          "Its latency bounds are measured on a local host; a deployed stage adds network time to every notification and page update.",
+      },
+      local: na("This scenario uses hosted deploys and app authentication."),
+    },
+  },
   appUiOlderRelease: {
     fixtures: "actors",
     file: "app-ui-older-release.spec.ts",
