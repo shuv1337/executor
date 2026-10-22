@@ -3,7 +3,7 @@ import { snapshot as invocation } from "./tools.ts";
 import { appProviderFailure } from "./provider-error.ts";
 import { AppSkills, ProviderError } from "apps/contracts";
 import { AppEvaluationFailed, evaluationFailure } from "../contracts/tools.ts";
-import { AppNotDeployed } from "../contracts/apps.ts";
+import { AppNotDeployed, sharesRuntime } from "../contracts/apps.ts";
 /** Skill reads project one authorized runtime catalog, or a retained pre-capability folder. */
 import { Crypto, Effect, Schema } from "effect";
 import { Hex } from "effect/encoding";
@@ -96,7 +96,13 @@ export const makeSkills = (
                 state,
                 (context) =>
                   runtime
-                    .skills({ app: app.id, build: state.version.build, sources, ...context })
+                    .skills({
+                      app: app.id,
+                      build: state.version.build,
+                      sharedRuntime: sharesRuntime(state.version.requirements),
+                      sources,
+                      ...context,
+                    })
                     .pipe(
                       // A service's rejection names the selected account, as in tool listing.
                       Effect.mapError((error) =>

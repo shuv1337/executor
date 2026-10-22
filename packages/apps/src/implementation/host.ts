@@ -224,6 +224,7 @@ function requirements(
   sql: boolean,
   events: Readonly<Record<string, AppEvent>> | undefined,
   icons: AppIcons | undefined,
+  sharedRuntime: boolean,
 ) {
   return Effect.gen(function* () {
     return yield* Schema.decodeUnknownEffect(DeclaredRequirements)({
@@ -246,6 +247,7 @@ function requirements(
             ),
           }),
       ...(icons === undefined ? {} : { icons }),
+      ...(sharedRuntime ? { sharedRuntime: true } : {}),
     }).pipe(
       Effect.mapError((cause) =>
         declarationInvalid("The app's account declarations are invalid", cause),
@@ -432,7 +434,13 @@ function dispatch(
       const secrets = accountSecrets(context.accounts);
       // The build's migrations, not a flag, decide whether the app has a database.
       const ownsSql = hasMigrations(context.files ?? []);
-      const declared = yield* requirements(native.accounts, ownsSql, native.events, native.icons);
+      const declared = yield* requirements(
+        native.accounts,
+        ownsSql,
+        native.events,
+        native.icons,
+        native.sharedRuntime === true,
+      );
       if (request.operation === "requirements")
         return yield* safe(
           () => Schema.decodeUnknownEffect(JsonValue)(declared),

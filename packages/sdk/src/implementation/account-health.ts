@@ -23,7 +23,7 @@ import {
   type AppId,
   type OwnerId,
 } from "../contracts/shared.ts";
-import { AppNotFound } from "../contracts/apps.ts";
+import { AppNotFound, sharesRuntime } from "../contracts/apps.ts";
 import { type AccountCredential, invocationAccount, validateFields } from "./provider.ts";
 import { StoredVersion, type StoredAccount } from "../contracts/storage.ts";
 import { storedAccount } from "./accounts.ts";
@@ -224,6 +224,7 @@ export const makeAccountHealth = (
         runtime.checkAccount({
           app: app.id,
           build: version.build,
+          sharedRuntime: sharesRuntime(version.requirements),
           requirement: target.slot,
           deadline,
           accounts: Redacted.make(
@@ -323,6 +324,7 @@ export const makeAccountHealth = (
         .checkAccount({
           app: app.id,
           build: version.build,
+          sharedRuntime: sharesRuntime(version.requirements),
           requirement: target.slot,
           deadline,
           accounts: Redacted.make(

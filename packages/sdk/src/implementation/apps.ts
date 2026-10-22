@@ -402,6 +402,7 @@ export const makeApps = (
         ...(built.requirements.sql === true ? { sql: true as const } : {}),
         ...(built.requirements.events === undefined ? {} : { events: built.requirements.events }),
         ...(built.requirements.icons === undefined ? {} : { icons: built.requirements.icons }),
+        ...(built.requirements.sharedRuntime === true ? { sharedRuntime: true as const } : {}),
         accounts: Object.fromEntries(
           entries.map(({ slot, scope, provider, cardinality, health }) => [
             slot,

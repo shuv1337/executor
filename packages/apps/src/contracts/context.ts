@@ -22,6 +22,15 @@ export interface AppRequirements {
    * is base64 `data:image/...` or an `https:` URL; at most 8 icons and 32 KiB in total.
    */
   readonly icons?: ReadonlyArray<AppIcon>;
+  /**
+   * Run every caller's calls in one warm runtime. Without it, each account selection gets its own
+   * app Worker and, for a database app, its own data facet, so callers with different accounts
+   * each pay a cold start and a database app runs one selection at a time. Accounts, `ctx.caller`,
+   * `ctx.approvedBy` and `ctx.cache.forCaller()` stay per call either way; what is shared is
+   * module scope. Opt in only when no module-level state holds one caller's accounts, clients or
+   * data: anything kept there is visible to every caller.
+   */
+  readonly sharedRuntime?: boolean;
 }
 
 /** One scope's requirements; none when the app declares none in it. */

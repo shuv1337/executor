@@ -129,6 +129,11 @@ export interface AppInvocation {
   readonly app: string;
   readonly build: string;
   readonly database: boolean;
+  /**
+   * The build declares `sharedRuntime`: its runtime is named by build alone, so every caller's
+   * calls share it. Accounts and the caller still travel with each call.
+   */
+  readonly sharedRuntime?: true;
   readonly command: HostRequest;
   readonly accounts: HostAccounts;
   readonly approval?: typeof TrustedToolApproval.Type;
@@ -371,13 +376,21 @@ class ColdStartFailed extends Schema.TaggedError<ColdStartFailed>()("ColdStartFa
 /**
  * The runtime an invocation uses and its name. A call that uses an app's database runs in its data
  * facet; everything else runs in the app Worker. Both are named by app, build and the selected
- * account IDs, never by credential values or workflow runs.
+ * account IDs, never by credential values or workflow runs. A build that declares `sharedRuntime`
+ * names both by app and build alone, so callers with different selections share one warm runtime;
+ * its calls still carry their own accounts and caller.
  */
 export const appWorker = (
-  invocation: Pick<AppInvocation, "app" | "build" | "database" | "command" | "accounts">,
+  invocation: Pick<
+    AppInvocation,
+    "app" | "build" | "database" | "sharedRuntime" | "command" | "accounts"
+  >,
 ) =>
   // Requirement names are unique across scopes, so one record names the account set.
-  facetIdentity(invocation.build, Object.fromEntries(scopedSlots(invocation.accounts))).pipe(
+  facetIdentity(
+    invocation.build,
+    invocation.sharedRuntime === true ? {} : Object.fromEntries(scopedSlots(invocation.accounts)),
+  ).pipe(
     Effect.map((identity) => ({
       identity,
       mode: runsInFacet(invocation) ? ("facet" as const) : ("worker" as const),

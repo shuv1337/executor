@@ -132,6 +132,8 @@ export interface App<Slots extends ScopedSlots, Def extends AppDefinition<never>
   readonly events?: Readonly<Record<string, import("./events.ts").AppEvent>>;
   /** Declared beside the accounts and checked when the module loads. */
   readonly icons?: import("./icons.ts").AppIcons;
+  /** Declared beside the accounts: every caller's calls share one runtime; see `sharedRuntime`. */
+  readonly sharedRuntime?: true;
   readonly evaluate: (context: EvaluationContext<Slots>) => Effect.Effect<Def, unknown>;
 }
 

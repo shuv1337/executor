@@ -34,7 +34,7 @@ import { storedApp, storedVersion } from "./apps.ts";
 import { callerContext, resolve, snapshot, type InvocationSnapshot } from "./tools.ts";
 import { invocationScope, scopedSelection } from "./selection.ts";
 import type { Declarations } from "./declarations.ts";
-import { ownsDatabase } from "../contracts/apps.ts";
+import { ownsDatabase, sharesRuntime } from "../contracts/apps.ts";
 
 const StoredRun = Schema.Struct({
   id: WorkflowRunId,
@@ -220,6 +220,7 @@ export const makeWorkflowRuns = (
           // A run's steps run as the host's workflow, for the person it started for, if any.
           ...callerContext(state),
           database: ownsDatabase(state.version.requirements),
+          sharedRuntime: sharesRuntime(state.version.requirements),
           workflowControls: controls(state),
         };
       }),
@@ -458,6 +459,7 @@ export const makeWorkflowRuns = (
             .workflow({
               app: input.app,
               build: state.version.build,
+              sharedRuntime: sharesRuntime(state.version.requirements),
               ...bound,
               command: { operation: "workflow-validate", name: input.workflow, input: input.input },
             })
@@ -648,6 +650,7 @@ export const makeWorkflowRuns = (
             runtime.workflow({
               app: input.app,
               build: state.version.build,
+              sharedRuntime: sharesRuntime(state.version.requirements),
               ...context,
               command: { operation: "workflows" },
             }),

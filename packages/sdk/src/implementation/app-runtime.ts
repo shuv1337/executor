@@ -65,7 +65,10 @@ export const buildLoadSpan = "runtime.app.build.load";
  * only its load finds that out: `refused` keeps that as the invocation's failure.
  */
 export const invocationBuildLoader = <R>(
-  invocation: Pick<AppInvocation, "app" | "build" | "database" | "command" | "accounts" | "run">,
+  invocation: Pick<
+    AppInvocation,
+    "app" | "build" | "database" | "sharedRuntime" | "command" | "accounts" | "run"
+  >,
   read: Effect.Effect<LoadedWorkerBuild, RuntimeBuildUnavailable, R>,
 ): Effect.Effect<
   {
@@ -146,6 +149,7 @@ export const appRuntime = (host: AppRuntimeHost) =>
         readonly app: string;
         readonly build: BuildId;
         readonly database: boolean;
+        readonly sharedRuntime: boolean;
         readonly observeRevision?: (revision: number) => void;
       } & HostContext,
       command: HostRequest,
@@ -167,6 +171,7 @@ export const appRuntime = (host: AppRuntimeHost) =>
             app: input.app,
             build,
             database: input.database,
+            ...(input.sharedRuntime ? { sharedRuntime: true as const } : {}),
             command,
             accounts: Redacted.value(input.accounts),
             // Workers RPC structured-clones its arguments; Effect headers carry a prototype it rejects.
@@ -410,7 +415,8 @@ export const appRuntime = (host: AppRuntimeHost) =>
         ).pipe(Effect.withSpan(span("checkAccount"))),
       migrate: (input) =>
         dispatch(
-          { ...input, database: true, accounts: Redacted.make({ app: {} }) },
+          // Named by build alone either way: a migration runs without accounts.
+          { ...input, database: true, sharedRuntime: false, accounts: Redacted.make({ app: {} }) },
           { operation: "migrate" },
           MigrateResult,
           HostCallError,

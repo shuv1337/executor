@@ -216,6 +216,12 @@ export const DeclaredRequirements = Schema.Struct({
   events: Schema.optionalKey(DeclaredEvents),
   /** The icons the app declares, so a host shows them without evaluating the app. */
   icons: Schema.optionalKey(AppIcons),
+  /**
+   * The author declared that every caller may share one runtime: hosts name the app's Worker and
+   * data facet by build alone, not by the caller's account selection. Hosts that predate it, and
+   * builds that do not declare it, keep one runtime per selection.
+   */
+  sharedRuntime: Schema.optionalKey(Schema.Literal(true)),
 });
 /** Parsed declared account requirements. */
 export type DeclaredRequirements = typeof DeclaredRequirements.Type;

@@ -327,6 +327,7 @@ export const defineApp = <
     ...(requirements.icons === undefined || requirements.icons.length === 0
       ? {}
       : { icons: requirements.icons }),
+    ...(requirements.sharedRuntime === true ? { sharedRuntime: true as const } : {}),
     evaluate: (context) =>
       factory(context).pipe(Effect.map((value) => adaptDefinition<Requirements, Def>(value))),
   };

@@ -400,6 +400,8 @@ export interface Runtime<Requirements = never> {
     input: {
       readonly app: string;
       readonly build: BuildId;
+      /** The build declares `sharedRuntime`: its runtime is named by build alone; see `appWorker`. */
+      readonly sharedRuntime: boolean;
       readonly sources?: boolean;
     } & HostContext,
   ) => Effect.Effect<SkillCatalog, RuntimeLoadError | typeof HostInspectError.Type, Requirements>;
@@ -408,6 +410,7 @@ export interface Runtime<Requirements = never> {
     input: {
       readonly app: string;
       readonly build: BuildId;
+      readonly sharedRuntime: boolean;
       readonly tools?: readonly string[];
       /** Describe only declared operations with schedules. Send only to scheduledTools builds. */
       readonly scheduled?: true;
@@ -421,7 +424,11 @@ export interface Runtime<Requirements = never> {
   ) => Effect.Effect<HostedCatalog, RuntimeLoadError | typeof HostInspectError.Type, Requirements>;
   /** List the current tools without their schemas. */
   readonly index: (
-    input: { readonly app: string; readonly build: BuildId } & HostContext,
+    input: {
+      readonly app: string;
+      readonly build: BuildId;
+      readonly sharedRuntime: boolean;
+    } & HostContext,
   ) => Effect.Effect<
     HostedCatalogSummary,
     RuntimeLoadError | typeof HostInspectError.Type,
@@ -431,6 +438,7 @@ export interface Runtime<Requirements = never> {
     input: {
       readonly app: string;
       readonly build: BuildId;
+      readonly sharedRuntime: boolean;
       readonly database: boolean;
       /** Report the storage revision read by this successful query, never an authored result. */
       readonly observeRevision?: (revision: number) => void;
@@ -442,6 +450,7 @@ export interface Runtime<Requirements = never> {
     input: {
       readonly app: string;
       readonly build: BuildId;
+      readonly sharedRuntime: boolean;
       readonly database: boolean;
       readonly name: string;
       readonly input: Json;
@@ -452,6 +461,7 @@ export interface Runtime<Requirements = never> {
     input: {
       readonly app: string;
       readonly build: BuildId;
+      readonly sharedRuntime: boolean;
       readonly database: boolean;
       readonly command: WebhookCommand;
     } & HostContext,
@@ -461,6 +471,7 @@ export interface Runtime<Requirements = never> {
     input: {
       readonly app: string;
       readonly build: BuildId;
+      readonly sharedRuntime: boolean;
       readonly command: WorkflowCommand;
     } & HostContext,
   ) => Effect.Effect<Json, RuntimeLoadError | typeof HostCallError.Type, Requirements>;
@@ -468,6 +479,7 @@ export interface Runtime<Requirements = never> {
     input: {
       readonly app: string;
       readonly build: BuildId;
+      readonly sharedRuntime: boolean;
       readonly database: boolean;
       readonly tool: string;
       /** Decides the storage mode before the app runs; the host verifies it. */
@@ -483,6 +495,7 @@ export interface Runtime<Requirements = never> {
     input: {
       readonly app: string;
       readonly build: BuildId;
+      readonly sharedRuntime: boolean;
       readonly requirement: string;
     } & HostContext,
   ) => Effect.Effect<
