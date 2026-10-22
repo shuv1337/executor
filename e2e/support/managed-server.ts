@@ -39,6 +39,7 @@ import {
 import { scenarios } from "../test-plan.ts";
 import { recordWorkerdCoverage, workerdCoverageFlags } from "./workerd-coverage.ts";
 import { localEntryCommand } from "./local-entry.ts";
+import { fullTracing } from "./trace-sampling.ts";
 
 class ServerFailed extends Schema.TaggedError<ServerFailed>()("ServerFailed", {
   message: Schema.String,
@@ -173,6 +174,7 @@ export const startManagedServer = (
       EXECUTOR_TEST_CLOCK_OFFSET_MS: "0",
       EXECUTOR_TEST_CLOCK_CONTROL: "stdin",
       EXECUTOR_ANALYTICS_TEST_PORT: String(analyticsPort),
+      ...fullTracing,
       ...environment,
     };
     // Ask the product alone to stop, as the self-host image's supervisor does, so its own shutdown

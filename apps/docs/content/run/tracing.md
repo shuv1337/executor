@@ -65,6 +65,25 @@ bundled collector, or point it at your own collector.
 The collector serves `/api/health`, `/api/traces`,
 `/api/traces/<trace-id>/spans`, `/api/logs/search` and `/openapi.json`.
 
+## Which traces are recorded
+
+Local, desktop and self-host servers record a sample of traces, whichever
+collector receives them:
+
+- every trace whose request sends a `traceparent` header with the sampled flag
+  (`00-<trace-id>-<span-id>-01`), so you can always read a request you make;
+- a fraction of all other traces, `EXECUTOR_TRACE_SAMPLE_RATE`, by default
+  `0.1`. The choice comes from the trace ID, so every request of one trace gets
+  the same answer;
+- every trace in which an operation fails or a request answers with a server
+  error, and every trace that runs for `EXECUTOR_TRACE_SLOW_MS` milliseconds or
+  longer, by default `1000`. Their root spans carry `executor.trace.sampled_by`,
+  `error` or `slow`.
+
+Set `EXECUTOR_TRACE_SAMPLE_RATE=1` to record every trace. Logs and metrics are
+never sampled: a log record keeps the trace ID of its request even when that
+trace was not recorded.
+
 ## Exporting to your own collector
 
 Set an OTLP endpoint and Executor exports there instead. Any collector works:

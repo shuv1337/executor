@@ -5466,6 +5466,29 @@ export const scenarios = plan({
       local: na("This scenario uses hosted APIs; the runtime and collector are shared with Local."),
     },
   },
+  traceSampling: {
+    fixtures: "actors",
+    file: "trace-sampling.spec.ts",
+    title:
+      "a sampled server records requested, failed and slow traces and drops an ordinary fast one",
+    serverEnvironment: { EXECUTOR_TRACE_SAMPLE_RATE: "0", EXECUTOR_TRACE_SLOW_MS: "1500" },
+    targets: {
+      "self-host": scheduled,
+      cloud: na("Cloud's isolate exporters apply no sampling policy; they record every trace."),
+      local: na("This scenario uses hosted APIs; the sampler and collector are shared with Local."),
+    },
+  },
+  traceSamplingAll: {
+    fixtures: "actors",
+    file: "trace-sampling.spec.ts",
+    title: "a sample rate of 1 records an ordinary fast trace that did not ask for sampling",
+    serverEnvironment: { EXECUTOR_TRACE_SAMPLE_RATE: "1" },
+    targets: {
+      "self-host": scheduled,
+      cloud: na("Cloud's isolate exporters apply no sampling policy; they record every trace."),
+      local: na("This scenario uses hosted APIs; the sampler and collector are shared with Local."),
+    },
+  },
   toolCallOverhead: {
     fixtures: "actors",
     file: "tool-call-overhead.spec.ts",

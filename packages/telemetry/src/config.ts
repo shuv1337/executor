@@ -27,6 +27,24 @@ export const TelemetryTarget = Schema.Struct({
 /** Parsed target with redaction-safe headers. */
 export type TelemetryTarget = typeof TelemetryTarget.Type;
 
+/**
+ * Which traces a process exporter records. A trace is kept when its head decision samples it (the
+ * caller's sampled `traceparent`, or the trace ID's ratio under `rate`), when any of its spans fails
+ * or answers with a server error, or when it runs for `slowMs` or longer. A rate of 1 records every
+ * trace. Logs and metrics are never sampled.
+ */
+export const TraceSampling = Schema.Struct({
+  rate: Schema.Number.check(Schema.isBetween({ minimum: 0, maximum: 1 })),
+  slowMs: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+});
+/** Parsed trace sampling policy. */
+export type TraceSampling = typeof TraceSampling.Type;
+
+/** The fraction of ordinary traces self-hosted and local servers keep when the operator sets none. */
+export const defaultTraceSampleRate = 0.1;
+/** Root duration from which a trace is kept whatever its head decision. */
+export const defaultTraceSlowMs = 1000;
+
 /** Shared identity and independently selectable OTLP signals. */
 export const TelemetryConfig = Schema.Struct({
   service: Schema.NonEmptyString,
@@ -37,6 +55,8 @@ export const TelemetryConfig = Schema.Struct({
   logs: Schema.optional(TelemetryTarget),
   metrics: Schema.optional(TelemetryTarget),
   metricsProtocol: Schema.optional(Schema.Literals(["http/json", "http/protobuf"])),
+  /** Absent: record every trace. Only process exporters (`telemetryLayer`) apply it. */
+  sampling: Schema.optional(TraceSampling),
 });
 /** Resolved telemetry configuration. */
 export type TelemetryConfig = typeof TelemetryConfig.Type;
@@ -59,6 +79,13 @@ export const telemetryConfig = (service: string) =>
     );
     const metricsProtocol = yield* Config.String("OTEL_EXPORTER_OTLP_METRICS_PROTOCOL").pipe(
       Config.withDefault("http/protobuf"),
+    );
+    // Cloud reads these too but exports through `isolateTelemetry`, which records every trace.
+    const rate = yield* Config.Number("EXECUTOR_TRACE_SAMPLE_RATE").pipe(
+      Config.withDefault(defaultTraceSampleRate),
+    );
+    const slowMs = yield* Config.Number("EXECUTOR_TRACE_SLOW_MS").pipe(
+      Config.withDefault(defaultTraceSlowMs),
     );
     const target = (signal: "TRACES" | "LOGS" | "METRICS") =>
       Effect.gen(function* () {
@@ -97,5 +124,6 @@ export const telemetryConfig = (service: string) =>
       traces: yield* target("TRACES"),
       logs: yield* target("LOGS"),
       metrics: yield* target("METRICS"),
+      sampling: { rate, slowMs },
     });
   });

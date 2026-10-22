@@ -3,8 +3,10 @@ export {
   CurrentTelemetryConfig,
   TelemetryConfig,
   TelemetryTarget,
+  TraceSampling,
   telemetryConfig,
 } from "./config.ts";
+export { CurrentTraceSampler, type TraceSampler } from "./sampling.ts";
 export { telemetryLayer, telemetryFromConfig } from "./layer.ts";
 export {
   captureTelemetry,

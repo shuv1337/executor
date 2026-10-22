@@ -21,6 +21,7 @@
 import { Effect, Exit, Layer, Option, Schema, Tracer } from "effect";
 import { declaredOwner, ownerAttribute } from "./ownership.ts";
 import { recordedCause } from "./recorded-failure.ts";
+import type { TraceSampler } from "./sampling.ts";
 
 class LogicalOperationFailed extends Schema.TaggedError<LogicalOperationFailed>()(
   "LogicalOperationFailed",
@@ -186,10 +187,15 @@ const allowlistedSpan = (span: Tracer.Span): Tracer.Span => {
   };
 };
 
-/** Wrap whichever tracer is already in scope; provide this above the exporter. */
+/**
+ * Wrap whichever tracer is already in scope; provide this above the exporter. `recordAll` records
+ * every span whatever its parent's sampled flag; a `sampler` decides instead which traces reach the
+ * exporter (see `sampling.ts`).
+ */
 export const spanAttributes = (
   clock?: "system" | "cloudflare-io",
   recordAll = false,
+  sampler?: TraceSampler,
 ): Layer.Layer<never> =>
   Layer.effect(Tracer.Tracer)(
     Tracer.Tracer.pipe(
@@ -197,7 +203,9 @@ export const spanAttributes = (
         ...tracer,
         span: (options) => {
           const span = allowlistedSpan(
-            tracer.span(recordAll ? { ...options, sampled: true } : options),
+            sampler !== undefined
+              ? sampler.span(tracer, options)
+              : tracer.span(recordAll ? { ...options, sampled: true } : options),
           );
           if (
             recordAll &&

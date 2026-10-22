@@ -153,7 +153,27 @@ those traces are needed, export them or stop the container and copy its complete
 Motel directory into the new volume before replacement. Keep the product and
 Motel volumes separate; the entrypoint prepares their ownership for the non-root
 server user. Do not remove either volume during updates.
-Product upgrades do not import old Motel data. The product database is PGlite
+Product upgrades do not import old Motel data.
+
+### Trace sampling
+
+Recording every span made Motel the busiest process under load, so the product
+samples traces before they reach it. `EXECUTOR_TRACE_SAMPLE_RATE` (0 to 1,
+default `0.1`) is the fraction of ordinary traces kept; the decision comes from
+the trace ID, so every request of a trace, including the product's requests to
+itself through the app process, agrees. A request whose `traceparent` has the
+sampled flag is always kept. Whatever the head decision, a trace is kept when
+any span fails or a server span answers 5xx, and when it runs for
+`EXECUTOR_TRACE_SLOW_MS` (default `1000`) or longer: the product holds an
+unsampled trace's ended spans, and the app isolate spans it forwards, in memory
+until the trace is decided, and drops them when its last local root ends fast
+and successful. Kept-by-tail roots carry `executor.trace.sampled_by` (`error` or
+`slow`). Logs and metrics are never sampled. `EXECUTOR_TRACE_SAMPLE_RATE=1`
+records everything, as before. The native host passes both variables to the
+product with the other `EXECUTOR_*` settings; the app and Motel processes export
+no spans of their own.
+
+The product database is PGlite
 (PostgreSQL). Bun development stores it at `/app/data/hosted.pglite`; the native
 image stores the active database in `/app/data/product` and retains an imported
 `hosted.pglite` directory when present. Copying only that legacy directory does
