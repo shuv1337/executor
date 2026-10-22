@@ -47,6 +47,7 @@ import {
   AppDiscoveryTimedOut,
   defaultMcpRuntimeLimits,
   defaultSearchLimits,
+  discoveryConcurrency,
   DescribeInput,
   DescribeResult,
   SearchInput,
@@ -802,16 +803,14 @@ type Discovered<A> =
  */
 function catalog(
   backend: McpBackend<Error>,
+  limits: McpLimits,
   progress: ExecutionProgress,
   /** Completes at the execution deadline; dynamic loads must stop in the program phase. */
   programDeadline: Effect.Effect<void>,
 ) {
   return Effect.gen(function* () {
-    const {
-      discoveryConcurrency: concurrency,
-      discoveryWaitMs,
-      discoveryIdleMs,
-    } = defaultMcpRuntimeLimits;
+    const { discoveryWaitMs, discoveryIdleMs } = defaultMcpRuntimeLimits;
+    const concurrency = discoveryConcurrency(limits);
     const slots = yield* Semaphore.make(concurrency);
     // Listings share one app runtime, so how long one takes depends on the others. Discovery
     // gives up on an app only when no listing has completed for a while, not on a per-app clock.
@@ -1556,7 +1555,7 @@ function runProgram(
       // reaches it, and search ranks in the backend without loading apps' tools.
       const reach = yield* programReach(code);
       const loaded = yield* Effect.gen(function* () {
-        const discovered = yield* catalog(tools, progress, deadline);
+        const discovered = yield* catalog(tools, limits, progress, deadline);
         const reachable = discovered.reachable(reach.apps);
         yield* Effect.annotateCurrentSpan({
           "executor.discovery.reachable": reachable.length,
@@ -1749,7 +1748,7 @@ export function callTools(input: typeof CallInput.Type): Program {
       return Effect.gen(function* () {
         // Discovery loads only the apps the calls name.
         const loaded = yield* Effect.gen(function* () {
-          const discovered = yield* catalog(backend, progress, deadline);
+          const discovered = yield* catalog(backend, limits, progress, deadline);
           const entries = yield* discovered.described(named.filter((path) => path !== ""));
           return { discovered, entries };
         }).pipe(
@@ -1864,12 +1863,13 @@ export function callTools(input: typeof CallInput.Type): Program {
  */
 const readCatalog = <A>(
   backend: McpBackend<Error>,
+  limits: McpLimits,
   read: (discovered: Effect.Success<ReturnType<typeof catalog>>) => Effect.Effect<A, Error>,
 ) =>
   Effect.gen(function* () {
     const progress = executionProgress();
     // No program runs, so no program deadline stops a load.
-    return yield* catalog(backend, progress, Effect.never).pipe(
+    return yield* catalog(backend, limits, progress, Effect.never).pipe(
       Effect.flatMap((discovered) =>
         read(discovered).pipe(Effect.map((value) => ({ value, discovered }))),
       ),
@@ -1894,7 +1894,7 @@ export const searchCatalog = (
   limits: McpLimits,
   input: typeof SearchInput.Type,
 ) =>
-  readCatalog(backend, (discovered) =>
+  readCatalog(backend, limits, (discovered) =>
     searchPage(discovered.searchable, discovered.lost, backend.searchTools, limits, input),
   ).pipe(
     Effect.map(({ value, discovered }) => ({
@@ -1904,7 +1904,11 @@ export const searchCatalog = (
   );
 
 /** The describe tool: full signatures for exact paths, as tools.search.describe returns them. */
-export const describeCatalog = (backend: McpBackend<Error>, input: typeof DescribeInput.Type) =>
-  readCatalog(backend, (discovered) => describeTools(discovered.described, input.paths)).pipe(
-    Effect.map(({ value }) => value),
-  );
+export const describeCatalog = (
+  backend: McpBackend<Error>,
+  limits: McpLimits,
+  input: typeof DescribeInput.Type,
+) =>
+  readCatalog(backend, limits, (discovered) =>
+    describeTools(discovered.described, input.paths),
+  ).pipe(Effect.map(({ value }) => value));

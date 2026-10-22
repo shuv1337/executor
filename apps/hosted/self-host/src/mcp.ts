@@ -11,7 +11,7 @@ import {
   makeHostedMcp,
   mcpSessionKey,
 } from "@executor-js/hosted-server";
-import { McpLimits, defaultMcpLimits } from "@executor-js/mcp";
+import { McpLimits, defaultMcpLimits, defaultMcpRuntimeLimits } from "@executor-js/mcp";
 import { PgliteClient } from "@effect/sql-pglite";
 import { Config, Effect, RcMap, Schema } from "effect";
 import { HttpServerResponse } from "effect/http";
@@ -23,6 +23,12 @@ export const selfHostMcp = Effect.gen(function* () {
     ...defaultMcpLimits,
     timeoutMs: yield* Config.Number("EXECUTOR_MCP_TIMEOUT_MS").pipe(
       Config.withDefault(defaultMcpLimits.timeoutMs),
+    ),
+    // Discovery's product operations share one thread, and PGlite, with every other request.
+    // Fewer listings at once delay other sessions less, but a listing waiting on a stalled
+    // upstream holds its place, so the default stays the shared one; see the README.
+    discoveryConcurrency: yield* Config.Number("EXECUTOR_MCP_DISCOVERY_CONCURRENCY").pipe(
+      Config.withDefault(defaultMcpRuntimeLimits.discoveryConcurrency),
     ),
   });
   const sessions = yield* RcMap.make({

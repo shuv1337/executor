@@ -8,7 +8,7 @@ import {
   type AppSkillCatalog,
 } from "@executor-js/sdk/core";
 import type { McpBackend } from "../contracts/backend.ts";
-import { defaultMcpRuntimeLimits } from "../contracts/execute.ts";
+import { discoveryConcurrency, type McpLimits } from "../contracts/execute.ts";
 import {
   SkillAccessFailed,
   SkillAccountRequired,
@@ -67,6 +67,7 @@ const skillAccounts = <E extends Error>(
 export const skills = <E extends Error>(
   input: typeof SkillsInput.Type,
   backend: McpBackend<E>,
+  limits: McpLimits,
 ): Effect.Effect<typeof SkillsResult.Type, SkillsFailure> =>
   Effect.gen(function* () {
     const apps = yield* backend.listApps().pipe(Effect.catch(failure));
@@ -91,7 +92,7 @@ export const skills = <E extends Error>(
               ),
             ),
           ),
-        { concurrency: defaultMcpRuntimeLimits.discoveryConcurrency },
+        { concurrency: discoveryConcurrency(limits) },
       );
       return {
         skills: listed.flatMap((result) => result.skills),

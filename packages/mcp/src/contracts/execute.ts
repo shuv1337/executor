@@ -467,6 +467,13 @@ export const McpLimits = Schema.Struct({
   timeoutMs: Schema.Int.check(Schema.isGreaterThan(0)),
   maxToolCalls: Schema.Int.check(Schema.isGreaterThan(0)),
   maxOutputBytes: Schema.Int.check(Schema.isGreaterThan(0)),
+  /**
+   * How many apps one execution, search, describe or skill index lists at once. Unset uses
+   * `defaultMcpRuntimeLimits.discoveryConcurrency`. A host whose product operations share one
+   * JavaScript thread with every other request sets it lower: more listings at once add no
+   * throughput there, and each one queued ahead of another caller's request delays it.
+   */
+  discoveryConcurrency: Schema.optionalKey(Schema.Int.check(Schema.isGreaterThan(0))),
 });
 export type McpLimits = typeof McpLimits.Type;
 /**
@@ -478,6 +485,9 @@ export const defaultMcpLimits: McpLimits = {
   maxToolCalls: 100,
   maxOutputBytes: 100_000,
 };
+/** How many apps discovery lists at once under these limits. */
+export const discoveryConcurrency = (limits: McpLimits) =>
+  limits.discoveryConcurrency ?? defaultMcpRuntimeLimits.discoveryConcurrency;
 /**
  * UTF-8 bytes of JSON one search page may hold: a quarter of the execute output budget, so a
  * program can return a page beside other data without the result being truncated.

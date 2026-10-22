@@ -296,6 +296,17 @@ published container image. For the published installation, use
 `docker logs --tail 100 executor-v2` and `docker inspect executor-v2` to inspect
 startup and health.
 
+## MCP discovery
+
+The MCP server, code-mode programs, the product's operations and PGlite share the product
+process's one JavaScript thread. The first `tools.search` of an execution, and the `search` and
+`describe` tools, list every app the caller can use: two product operations per app.
+`EXECUTOR_MCP_DISCOVERY_CONCURRENCY` (default `8`) is how many apps one of them lists at once.
+On a slow CPU, `2` roughly halved how long other sessions' MCP calls waited behind a
+catalog-wide search, and made that search up to a quarter slower. A listing waiting on an
+upstream server that never answers holds its place, so with several such apps a lower value
+makes a catalog-wide search wait longer before it reports them as timed out.
+
 ## Unresponsive app code
 
 workerd runs a process's JavaScript on one thread, and the open-source workerd does not enforce CPU

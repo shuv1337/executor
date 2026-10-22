@@ -187,7 +187,7 @@ export const makeMcp = (options: McpOptions) =>
         });
         // Which skills agents read, and in what order, shows whether they follow the entry skill.
         const skill = (input: Parameters<typeof skills>[0]) =>
-          skills(input, options.backend).pipe(
+          skills(input, options.backend, options.limits).pipe(
             Effect.tap((result) =>
               "content" in result ? options.annotateSkillRead(result) : Effect.void,
             ),
@@ -200,8 +200,10 @@ export const makeMcp = (options: McpOptions) =>
         // Search and describe read the catalog directly; call runs as an execution so it can pause.
         const search = (input: Parameters<typeof searchCatalog>[2]) =>
           searchCatalog(options.backend, options.limits, input).pipe(Effect.withSpan("mcp.search"));
-        const describe = (input: Parameters<typeof describeCatalog>[1]) =>
-          describeCatalog(options.backend, input).pipe(Effect.withSpan("mcp.describe"));
+        const describe = (input: Parameters<typeof describeCatalog>[2]) =>
+          describeCatalog(options.backend, options.limits, input).pipe(
+            Effect.withSpan("mcp.describe"),
+          );
         /**
          * In model mode, a request only a person may approve carries the browser page they approve
          * it on. The agent shows it and resumes; the person's answer is used, never the agent's.
