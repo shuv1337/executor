@@ -24,7 +24,8 @@ import type {
   ToolSearchPage,
   ToolSearchUnavailable,
 } from "./tools.ts";
-import type { AccountScope, App } from "./apps.ts";
+import type { AccountScope, App, AppRequirements } from "./apps.ts";
+import type { BuildMemoryExceeded, BuildUnanswered, VersionBuildFailed } from "./version.ts";
 import type { Account } from "./account.ts";
 import type {
   AccountConnectionRefused,
@@ -40,7 +41,7 @@ import type {
 } from "./shared.ts";
 import type { BlobStorage } from "./blobs.ts";
 import type { Caller } from "apps/contracts";
-import { RepositoryHost, type RepositoryBackend } from "./source.ts";
+import { RepositoryHost, type RepositoryBackend, type SourceFiles } from "./source.ts";
 import type { RegistryOptions } from "./registry.ts";
 import type { CatalogReadOptions } from "./declarations.ts";
 
@@ -429,6 +430,20 @@ export type Executor = Omit<FlatExecutor, "apps" | "appWorkflows" | "appWorkflow
         readonly save?: boolean;
       },
     ) => ReturnType<FlatExecutor["apps"]["copy"]>;
+    /**
+     * Host-only: compile source files as `deploy` would and return the requirements they declare,
+     * writing nothing: no app, version or source is saved, and the build is neither retained nor
+     * cached. For checks that must not create anything, such as the v1 import's dry run. Fails
+     * like `deploy`'s build, except that a compiler that did not answer is `BuildUnanswered`.
+     */
+    readonly build: (input: {
+      readonly owner: OwnerId;
+      readonly name: string;
+      readonly files: SourceFiles;
+    }) => Effect.Effect<
+      { readonly requirements: typeof AppRequirements.Type },
+      VersionBuildFailed | BuildMemoryExceeded | BuildUnanswered | StorageError
+    >;
   };
   readonly [WebhookSourceHost]: WebhookSourceDispatcher;
   readonly [WorkflowHost]: import("./workflow-runtime.ts").WorkflowHost;
@@ -475,6 +490,6 @@ export type PromiseExecutor = Promisify<
       Executor["tools"],
       "approval" | "searchable" | "searchableKept" | "search"
     >;
-    readonly apps: Omit<Executor["apps"], "copyAs">;
+    readonly apps: Omit<Executor["apps"], "copyAs" | "build">;
   }
 >;
