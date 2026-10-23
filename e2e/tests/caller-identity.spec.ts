@@ -15,10 +15,12 @@ import { HostedLive, withHostedCase } from "../support/case.ts";
 import { App } from "../support/contracts.ts";
 import { appsManifest } from "../support/apps-release.ts";
 
-const source = `import { defineApp, mutation, query, workflow, object, string, router } from "apps";
+const source = `import { defineApp, mutation, query, workflow, object, string, json, router } from "apps";
 import { always, human } from "apps/operations/approval";
 const identity = (ctx) => ({ caller: ctx.caller ?? null, approvedBy: ctx.approvedBy ?? null });
 const whoami = query({ input: object({}) }, async (ctx) => identity(ctx));
+// Identity named in the input is just data: the host sets ctx.caller and ctx.approvedBy.
+const claim = query({ input: object({ caller: json(), approvedBy: json() }) }, async (ctx) => identity(ctx));
 const mine = query({ input: object({}) }, async (ctx) =>
   ctx.cache.forCaller().get({ key: "me", schema: string(), freshFor: "1 minute",
     load: async () => ctx.caller?.subject ?? "none" }));
@@ -27,7 +29,7 @@ const personal = query({ input: object({ note: string() }), approval: human() },
 const probe = workflow({ input: object({}) }, async (ctx) => ctx.step.runQuery("who", whoami, {}));
 const launch = mutation({ input: object({ key: string() }) }, async (ctx, input) =>
   (await ctx.workflows.start({ workflow: "probe", input: {}, key: input.key })).id);
-export default defineApp({}, { tools: router({ whoami, mine, reviewed, personal, launch }), workflows: { probe } });`;
+export default defineApp({}, { tools: router({ whoami, claim, mine, reviewed, personal, launch }), workflows: { probe } });`;
 
 const Caller = Schema.Struct({
   kind: Schema.Literals(["human", "agent", "system"]),
@@ -170,6 +172,17 @@ layer(HostedLive, { excludeTestServices: true })("Caller identity", (it) => {
         });
         expect(bobCaller).toMatchObject({ kind: "agent", email: "admin@example.test" });
         expect(aliceCaller.subject).not.toBe(bobCaller.subject);
+
+        // Naming another principal, organization or approver in the input changes nothing: the app
+        // still sees the caller's own verified identity and no approver.
+        const forged = yield* alice
+          .execute("alice names bob, another organization and an approver", "claim", {
+            caller: { ...bobCaller, organizationId: "org_forged", email: "owner@example.test" },
+            approvedBy: { ...bobCaller, kind: "human", method: "browser" },
+          })
+          .pipe(Effect.flatMap((r) => alice.completed(Identity, r)));
+        expect(forged.caller).toEqual(aliceCaller);
+        expect(forged.approvedBy).toBe(null);
         // Provenance names the key by its record ID, never by the secret the client presents.
         expect(aliceCaller.provenance?.clientId).toBe(`pat:${alice.keyId}`);
         for (const secret of [alice.secret, bob.secret])
