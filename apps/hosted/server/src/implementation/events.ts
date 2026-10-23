@@ -56,10 +56,25 @@ const grantStanding = (sql: SqlClient.SqlClient, id: string) =>
       if (expiresAt !== null && (yield* Clock.currentTimeMillis) > expiresAt) return Option.none();
       // A PAT grant at a connection's URL stands only while that connection does, with its policy.
       const connection = pat.value.connection;
+      // A grant ID from before the connection was made again names the revoked one.
+      const generation = pat.value.generation;
       const policy =
         connection === undefined
           ? Option.some(GrantPolicy.make({ kind: "all" }))
-          : yield* patConnectionPolicy(sql, connection, key.value.userId, pat.value.organization);
+          : yield* patConnectionPolicy(
+              sql,
+              connection,
+              key.value.userId,
+              pat.value.organization,
+            ).pipe(
+              Effect.map(
+                Option.flatMap((current) =>
+                  generation === undefined || generation === current.generation
+                    ? Option.some(current.policy)
+                    : Option.none(),
+                ),
+              ),
+            );
       return Option.map(policy, (policy) => ({
         userId: key.value.userId,
         organization: pat.value.organization,

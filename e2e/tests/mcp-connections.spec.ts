@@ -256,6 +256,38 @@ layer(HostedLive, { excludeTestServices: true })("Scoped MCP connections", (it) 
             expect(reused.refused).toBe("invalid_target");
           }),
         );
+        yield* evidence.step(
+          "A connection made again with the revoked ID is new; the old grant stays revoked",
+          Effect.gen(function* () {
+            const again = yield* api.request(actors.owner, "POST", `${prefix}/mcp-connections`, {
+              id: connection.id,
+              name: connection.name,
+              apps: [{ app: app.id, runsAs: [{ kind: "app" }], tools: { kind: "readOnly" } }],
+            });
+            expect(again.status, JSON.stringify(again.body)).toBe(200);
+            expect((yield* body(ConnectionView, again)).url).toBe(connection.url);
+            const old = yield* Effect.exit(
+              scoped(
+                "The revoked grant's token at the URL again",
+                `return await ${appPath}.read({})`,
+              ),
+            );
+            expect(Exit.isFailure(old)).toBe(true);
+            expect(yield* oauth.refreshStatus(grant)).not.toBe(200);
+            const renewed = yield* oauth.authorizeConnection(connection.id);
+            const current = executor(
+              yield* mcp.connect(
+                Redacted.make(Redacted.value(renewed.tokens).access_token),
+                "again",
+                {
+                  connection: connection.id,
+                },
+              ),
+            );
+            const read = yield* current("A new grant reads", `return await ${appPath}.read({})`);
+            expect(read.execution).toEqual({ ok: true, value: { read: receipt } });
+          }),
+        );
       }).pipe(Effect.provide(Layer.mergeAll(McpOAuth.layer, McpClient.layer))),
     ),
   );

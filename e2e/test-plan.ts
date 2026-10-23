@@ -5878,7 +5878,7 @@ export const scenarios = plan({
     fixtures: "actors",
     file: "mcp-connections.spec.ts",
     title:
-      "Scoped connections issue their own MCP URL and follow live edits, read-only rules and revocation",
+      "Scoped connections issue their own MCP URL and follow live edits, read-only rules and revocation, and a revoked ID can name a new connection without reviving its grants",
     targets: {
       "self-host": scheduled,
       cloud: scheduled,
@@ -7359,7 +7359,7 @@ export const scenarios = plan({
     fixtures: "actors",
     file: "connection-keys.spec.ts",
     title:
-      "a connection key minted by its connection's owner, through the API or the dashboard, expires, works only at that connection's MCP URL, is refused by the API and elsewhere, dies with the connection and is audited",
+      "a connection key minted by its connection's owner, through the API or the dashboard, expires, works only at that connection's MCP URL, is refused by the API and elsewhere, dies with the connection and is audited, and stays refused when its owner makes a new connection with the revoked ID",
     targets: {
       "self-host": scheduled,
       cloud: scheduled,

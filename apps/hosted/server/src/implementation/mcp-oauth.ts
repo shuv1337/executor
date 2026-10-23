@@ -157,6 +157,11 @@ export const PatGrant = Schema.Struct({
   mode: ApprovalMode,
   /** The scoped connection whose URL the PAT was used at; its policy narrows the PAT's. */
   connection: Schema.optionalKey(ConnectionIdSchema),
+  /**
+   * When that connection was made, in epoch milliseconds. A revoked connection's ID can name a
+   * new connection; a grant ID from the revoked one must not resolve to it.
+   */
+  generation: Schema.optionalKey(Schema.Number),
 });
 const patGrantPrefix = "pat:";
 /** The PAT a synthetic grant ID names, or none for an OAuth grant ID. */
@@ -188,6 +193,7 @@ const StoredConnection = Schema.Struct({
   resource: Schema.String,
   revoked: Schema.Boolean,
   policy: Schema.Unknown,
+  createdAt: Schema.Date,
 });
 const ConnectionPolicyJson = Schema.Union([
   ConnectionPolicy,
@@ -261,6 +267,7 @@ const projectPatAccess = (
   organization: OrganizationId,
   mode: ApprovalMode,
   connection?: ConnectionId,
+  generation?: number,
 ) =>
   Effect.gen(function* () {
     yield* requirePinnedOrganization(identity, organization);
@@ -281,7 +288,8 @@ const projectPatAccess = (
                   (stored) =>
                     stored.revoked === false &&
                     stored.userId === identity.userId &&
-                    stored.resource === organization,
+                    stored.resource === organization &&
+                    (generation === undefined || generation === stored.createdAt.getTime()),
                 ),
                 Option.flatMap((stored) =>
                   Schema.decodeUnknownOption(ConnectionPolicyJson)(stored.policy),
@@ -306,6 +314,7 @@ const projectPatAccess = (
           organization,
           mode,
           ...(connection === undefined ? {} : { connection }),
+          ...(generation === undefined ? {} : { generation }),
         }),
         policy,
         target: { kind: "mcp", mode, ...(connection === undefined ? {} : { connection }) },
@@ -411,7 +420,8 @@ export const mcpOAuthPlugins = (options: HostedOAuthOptions) => {
           return { id: created.id, key: created.key, expiresAt: created.expiresAt.toISOString() };
         },
       ),
-      // Revoking a connection deletes the keys bound to it; bearer checks already refuse them.
+      // Revoking a connection deletes the keys bound to it; bearer checks already refuse them. A
+      // connection made again with a revoked one's ID keeps only keys minted for the new one.
       revokeMcpConnectionKeys: createAuthEndpoint(
         "/mcp/connection-keys/revoke",
         {
@@ -426,7 +436,40 @@ export const mcpOAuthPlugins = (options: HostedOAuthOptions) => {
           metadata: { SERVER_ONLY: true },
         },
         async (ctx) => {
-          const bound = await boundKeys(ctx.context, ctx.body.userId, ctx.body.id);
+          const connection = Schema.decodeUnknownOption(StoredConnection)(
+            await ctx.context.adapter.findOne({
+              model: "mcpConnection",
+              where: [{ field: "id", value: ctx.body.id }],
+            }),
+          ).pipe(
+            Option.filter(
+              (stored) =>
+                stored.revoked === false &&
+                stored.userId === ctx.body.userId &&
+                stored.resource === ctx.body.resource,
+            ),
+          );
+          const keys = await ctx.context.adapter.findMany<{
+            id: string;
+            metadata: unknown;
+            createdAt: unknown;
+          }>({
+            model: "apikey",
+            where: [{ field: "referenceId", value: ctx.body.userId }],
+          });
+          const bound = keys.filter(
+            (key) =>
+              Option.match(Schema.decodeUnknownOption(BoundKeyMetadata)(key.metadata), {
+                onNone: () => false,
+                onSome: (metadata) => metadata.connection === ctx.body.id,
+              }) &&
+              Option.match(connection, {
+                onNone: () => true,
+                onSome: (current) =>
+                  !(key.createdAt instanceof Date) ||
+                  key.createdAt.getTime() < current.createdAt.getTime(),
+              }),
+          );
           for (const key of bound)
             await ctx.context.adapter.delete({
               model: "apikey",
@@ -514,6 +557,7 @@ export const mcpOAuthPlugins = (options: HostedOAuthOptions) => {
                 target.organization,
                 target.mode,
                 target.connection,
+                target.generation,
               );
             }),
           ),
@@ -602,6 +646,14 @@ export const mcpConnectionStore = (
       ),
     create: (owner, input) =>
       request((api) => api.createMcpConnection({ body: { ...owner, ...input } }), Connection).pipe(
+        // A revoked connection's ID may name the new one. Delete keys left from the revoked one,
+        // which bearer checks already refuse, as revoking it would have.
+        Effect.tap(() =>
+          request(
+            (api) => api.revokeMcpConnectionKeys({ body: { ...owner, id: input.id } }),
+            Schema.Struct({ deleted: Schema.Number }),
+          ),
+        ),
         Effect.mapError((status) =>
           status === 409
             ? new ConnectionIdTaken({ connection: input.id })

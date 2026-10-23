@@ -64,6 +64,13 @@ const ConnectionRecord = Schema.Struct({
   createdAt: Schema.Date,
   updatedAt: Schema.Date,
 });
+/** JSON with object keys sorted, so equal values compare equal whatever order they were built in. */
+const canonicalJson = (value: unknown): string =>
+  JSON.stringify(value, (_key, item: unknown) =>
+    item !== null && typeof item === "object" && !Array.isArray(item)
+      ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
+      : item,
+  );
 /** Server-only connection calls name the verified user and host resource explicitly. */
 const ConnectionOwner = { userId: Schema.NonEmptyString, resource: Schema.NonEmptyString };
 /** Verified credential identity plus the current persisted grant, independent of host ownership. */
@@ -498,6 +505,68 @@ export const grantOAuthPlugins = (settings: GrantOAuthOptions) => {
         }),
       ).pipe(Effect.flatMap((rows) => parse(Schema.Array(Record), rows)));
       yield* Effect.forEach(grants, (grant) => revoke(ctx, grant.id), { discard: true });
+    });
+  /**
+   * Its owner may make a new connection with a revoked connection's ID: the URL agents were given
+   * keeps its address. The record is replaced, never restored. Every grant that names the ID is
+   * revoked first, including one an authorization in flight during the revocation stored late, and
+   * the new record's `createdAt` is its generation: credentials from before it never match it.
+   */
+  const reviveConnection = (
+    ctx: GenericEndpointContext,
+    row: typeof ConnectionRecord.Type,
+    input: {
+      readonly id: ConnectionId;
+      readonly name: typeof ConnectionName.Type;
+      readonly policy: ConnectionPolicy;
+    },
+  ) =>
+    Effect.gen(function* () {
+      const grants = yield* authCall(() =>
+        ctx.context.adapter.findMany({
+          model: "mcpGrant",
+          where: [
+            { field: "connection", value: row.id },
+            { field: "revoked", value: false },
+          ],
+        }),
+      ).pipe(Effect.flatMap((rows) => parse(Schema.Array(Record), rows)));
+      yield* Effect.forEach(grants, (grant) => revoke(ctx, grant.id), { discard: true });
+      yield* authCall(() =>
+        ctx.context.adapter.updateMany({
+          model: "oauthResource",
+          where: [
+            {
+              field: "identifier",
+              operator: "in",
+              value: mcpOAuthResources(resourceOrigins.mcp, row.id).map((item) => item.identifier),
+            },
+          ],
+          update: { disabled: false },
+        }),
+      );
+      yield* authCall(() => seedConnectionResources(ctx.context, row.id));
+      // Never at or before the revocation, whatever this server's clock says.
+      const now = new Date(Math.max(yield* Clock.currentTimeMillis, row.updatedAt.getTime() + 1));
+      const replaced = yield* authCall(() =>
+        ctx.context.adapter.update({
+          model: "mcpConnection",
+          where: [
+            { field: "id", value: row.id },
+            { field: "revoked", value: true },
+          ],
+          update: {
+            name: input.name,
+            policy: JSON.stringify(input.policy),
+            revoked: false,
+            createdAt: now,
+            updatedAt: now,
+          },
+        }),
+      );
+      // Another request revived or changed it first; its result stands.
+      if (replaced === null) return yield* Effect.fail(new APIError("CONFLICT"));
+      return yield* connectionView(yield* parse(ConnectionRecord, replaced));
     });
   const serverOnly = { method: "POST", metadata: { SERVER_ONLY: true } } as const;
   /**
@@ -1009,6 +1078,21 @@ export const grantOAuthPlugins = (settings: GrantOAuthOptions) => {
         }),
       );
       const grant = yield* parse(Record, row);
+      // The connection may have been revoked, or revoked and made again, while this grant was
+      // stored; revocation could not see it then. Its generation must still be the one checked.
+      if (connection !== undefined) {
+        const current = yield* findConnection(ctx, connection.id);
+        if (
+          current === undefined ||
+          current.revoked ||
+          current.createdAt.getTime() !== connection.createdAt.getTime()
+        ) {
+          yield* revoke(ctx, grant.id);
+          return yield* Effect.fail(
+            new APIError("FORBIDDEN", { message: "This connection is no longer available." }),
+          );
+        }
+      }
       const observe = settings.onGrantCreated;
       if (observe !== undefined)
         yield* Effect.tryPromise(() =>
@@ -1170,13 +1254,18 @@ export const grantOAuthPlugins = (settings: GrantOAuthOptions) => {
             Effect.gen(function* () {
               const input = ctx.body;
               const existing = yield* findConnection(ctx, input.id);
+              if (
+                existing !== undefined &&
+                (existing.userId !== input.userId || existing.resource !== input.resource)
+              )
+                return yield* Effect.fail(new APIError("CONFLICT"));
               // The client chose this ID for one editor, so a retry returns the first result.
-              if (existing !== undefined)
-                return existing.userId === input.userId &&
-                  existing.resource === input.resource &&
-                  !existing.revoked
+              if (existing !== undefined && !existing.revoked)
+                return existing.name === input.name &&
+                  canonicalJson(yield* connectionPolicy(existing)) === canonicalJson(input.policy)
                   ? yield* connectionView(existing)
                   : yield* Effect.fail(new APIError("CONFLICT"));
+              if (existing !== undefined) return yield* reviveConnection(ctx, existing, input);
               // Resources exist before the URL is shown, so the first authorization can use it.
               yield* authCall(() => seedConnectionResources(ctx.context, input.id));
               const now = new Date();
