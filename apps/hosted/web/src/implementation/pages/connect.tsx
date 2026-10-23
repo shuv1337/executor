@@ -11,10 +11,12 @@ import { resourceInventoryAtom } from "../../contracts/resource-access.ts";
 import { connectionToolListAtom } from "../../contracts/apps.ts";
 import {
   mcpAgentsAtom,
+  mcpConnectionKeysAtom,
   mcpConnectionsAtom,
   mintMcpConnectionKeyAtom,
   revokeMcpAgentAtom,
   revokeMcpConnectionAtom,
+  revokeMcpConnectionKeyAtom,
   saveMcpConnectionAtom,
 } from "../../contracts/mcp-connections.ts";
 import { useDocumentationUrl } from "../documentation.ts";
@@ -80,6 +82,10 @@ export function ConnectPage() {
       save={saveMcpConnectionAtom(organization)}
       revoke={revokeMcpConnectionAtom(organization)}
       mintKey={mintMcpConnectionKeyAtom(organization)}
+      keys={{
+        list: mcpConnectionKeysAtom(organization),
+        revoke: revokeMcpConnectionKeyAtom(organization),
+      }}
       Failure={HostedFailure}
       docs={docs}
       agents={
