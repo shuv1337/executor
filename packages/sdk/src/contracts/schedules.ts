@@ -12,6 +12,7 @@ import {
   ToolName,
 } from "./shared.ts";
 import {
+  AccountScope,
   AppAccounts,
   AppAccountsQuery,
   AppNotDeployed,
@@ -148,6 +149,17 @@ export const ScheduleInvalid = ApiError.define({
   message: "The schedule's timing does not produce a valid future occurrence.",
 });
 export type ScheduleInvalid = typeof ScheduleInvalid.Type;
+/**
+ * A schedule addressed by name without a scope matched both the app schedule and the caller's own
+ * copy of a user schedule. The caller names `scope` rather than the server guessing.
+ */
+export const ScheduleScopeRequired = ApiError.define({
+  tag: "ScheduleScopeRequired",
+  status: 409,
+  message:
+    'Both the app schedule and your own copy of a schedule have this name. Retry with scope "app" for the app schedule or "user" for your copy.',
+});
+export type ScheduleScopeRequired = typeof ScheduleScopeRequired.Type;
 
 const app = {
   app: AppId,
@@ -182,6 +194,13 @@ export const ScheduleInputs = {
   }),
   /** The actor's copy; `ScheduleNotFound` when they have none. */
   copy: Schema.Struct(own),
+  /**
+   * The scope a by-name request from the actor acts on when it names none. A saved schedule
+   * decides: the app schedule, or the actor's copy; both saved fails with `ScheduleScopeRequired`.
+   * With neither, `app` when the app, evaluated as its app schedule runs, declares the name as an
+   * app schedule, and otherwise `user`.
+   */
+  scope: Schema.Struct({ ...app, name: Schema.NonEmptyString, actor: Schema.NonEmptyString }),
   /** Pause or resume one copy, or change its approvals. Its actor never changes. */
   update: Schema.Struct({
     ...copy,
@@ -209,6 +228,7 @@ export const ScheduleErrors = [
   ScheduleNotFound,
   ScheduleConflict,
   ScheduleInvalid,
+  ScheduleScopeRequired,
   AppNotFound,
   AppNotDeployed,
   AccountRequired,
@@ -265,6 +285,17 @@ export const SchedulesGroup = HttpApiGroup.make("schedules")
         actor: Schema.optional(Schema.NonEmptyString),
       },
       success: ScheduleSettings,
+      error: ScheduleErrors,
+    }),
+  )
+  .add(
+    HttpApiEndpoint.get("scope", "/v1/apps/:app/schedules/:name/scope", {
+      params: { app: AppId, name: Schema.NonEmptyString },
+      query: {
+        owner: Schema.optional(OwnerId),
+        actor: Schema.NonEmptyString,
+      },
+      success: AccountScope,
       error: ScheduleErrors,
     }),
   )

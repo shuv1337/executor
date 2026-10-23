@@ -32,18 +32,29 @@ export const localScheduleHandlers = (
           ),
         ),
       )
-      // The app schedule has no actor; the SDK refuses a declaration of the other scope.
+      // The app schedule has no actor; the SDK refuses a declaration of the other scope. Without a
+      // scope, the saved schedule or else the declaration decides.
       .handle("configure", ({ params, payload: { scope, ...settings } }) =>
-        executor.schedules.configure({
-          ...params,
-          ...settings,
-          ...(scope === "app" ? {} : { actor: localActor }),
+        Effect.gen(function* () {
+          const resolved =
+            scope ?? (yield* executor.schedules.scope({ ...params, actor: localActor }));
+          return yield* executor.schedules.configure({
+            ...params,
+            ...settings,
+            ...(resolved === "app" ? {} : { actor: localActor }),
+          });
         }),
       )
-      .handle("runNow", ({ params }) =>
-        executor.schedules
-          .copy({ ...params, actor: localActor })
-          .pipe(Effect.flatMap((copy) => executor.schedules.runNow({ ...params, copy: copy.id }))),
+      .handle("runNow", ({ params, query }) =>
+        Effect.gen(function* () {
+          const scope =
+            query.scope ?? (yield* executor.schedules.scope({ ...params, actor: localActor }));
+          const copy = yield* executor.schedules.copy({
+            ...params,
+            ...(scope === "app" ? {} : { actor: localActor }),
+          });
+          return yield* executor.schedules.runNow({ ...params, copy: copy.id });
+        }),
       )
       .handle("update", ({ params, payload }) =>
         executor.schedules.update({ ...params, ...payload }),

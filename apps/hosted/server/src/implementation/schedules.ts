@@ -126,6 +126,23 @@ const runCopy = (executor: Executor, owner: OwnerId, copy: ScheduleSettings) =>
     yield* wake;
     return result;
   });
+/**
+ * The scope a by-name route acts on when the request names none. Only someone who may read the app,
+ * and so list its schedules, has it resolved; anyone else keeps the user scope, as before, and the
+ * route's own checks answer them.
+ */
+const resolvedScope = (
+  executor: Executor,
+  params: { readonly app: AppId; readonly name: string },
+  actor: string,
+) =>
+  Effect.gen(function* () {
+    const owner = yield* appReaderOwner(params.app).pipe(
+      Effect.catchTag("OrganizationForbidden", () => Effect.succeed(undefined)),
+    );
+    if (owner === undefined) return "user" as const;
+    return yield* executor.schedules.scope({ ...params, owner, actor });
+  });
 /** Shared handlers retain product ownership and reuse the existing browser approval contract. */
 export const hostedScheduleHandlers = HttpApiBuilder.group(HostedApi, "schedules", (handlers) =>
   handlers
@@ -152,7 +169,8 @@ export const hostedScheduleHandlers = HttpApiBuilder.group(HostedApi, "schedules
         const executor = yield* Effect.flatten(HostedExecutor);
         const actor = yield* CurrentUserId;
         if (actor === undefined) return yield* new Forbidden();
-        const { scope, ...settings } = payload;
+        const { scope: requested, ...settings } = payload;
+        const scope = requested ?? (yield* resolvedScope(executor, params, actor));
         if (scope === "app") {
           // The app schedule runs without a caller, with the app's linked accounts; only the app's
           // managers enable or pause it. The SDK refuses a declaration of the other scope.
@@ -181,11 +199,22 @@ export const hostedScheduleHandlers = HttpApiBuilder.group(HostedApi, "schedules
         return result;
       }),
     )
-    .handle("runNow", ({ params }) =>
+    .handle("runNow", ({ params, query }) =>
       Effect.gen(function* () {
         const executor = yield* Effect.flatten(HostedExecutor);
         const actor = yield* CurrentUserId;
         if (actor === undefined) return yield* new Forbidden();
+        const scope = query.scope ?? (yield* resolvedScope(executor, params, actor));
+        if (scope === "app") {
+          // As configure: only the app's managers run the app schedule, which has no actor.
+          const owner = yield* appManagerOwner(params.app);
+          const copy = yield* executor.schedules.copy({
+            app: params.app,
+            name: params.name,
+            owner,
+          });
+          return yield* runCopy(executor, owner, copy);
+        }
         const owner = yield* currentOwner;
         yield* usableApp(executor, owner, params.app);
         // The caller's own copy.

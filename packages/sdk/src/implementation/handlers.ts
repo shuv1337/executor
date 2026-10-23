@@ -23,6 +23,7 @@ export const executorHandlers = (executor: Executor) =>
           executor.schedules.configure({ ...params, ...payload }),
         )
         .handle("copy", ({ params, query }) => executor.schedules.copy({ ...params, ...query }))
+        .handle("scope", ({ params, query }) => executor.schedules.scope({ ...params, ...query }))
         .handle("update", ({ params, payload }) =>
           executor.schedules.update({ ...params, ...payload }),
         )

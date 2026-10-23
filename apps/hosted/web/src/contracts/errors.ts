@@ -39,6 +39,8 @@ const errorMessage = Match.type<HostedError>().pipe(
     ScheduleConflict: () =>
       "The schedule is busy or changed. Check its current status and try again.",
     ScheduleInvalid: () => "Update the interval or calendar timing in the app source.",
+    ScheduleScopeRequired: () =>
+      "Both the app schedule and your own copy have this name. Choose which one to change.",
     GroupNotFound: () =>
       "This group is unavailable or you do not have access. Ask an organization admin.",
     GroupsUnavailable: () => "Groups could not be loaded or saved. Try again.",
