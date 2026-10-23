@@ -402,6 +402,7 @@ const PatRow = Schema.Struct({
   userId: Schema.String,
   metadata: Schema.NullOr(Schema.String),
   expiresAt: Schema.NullOr(Schema.Number),
+  createdAt: Schema.Number,
   usable: Schema.Boolean,
   contended: Schema.Boolean,
   userExists: Schema.Boolean,
@@ -449,7 +450,7 @@ const loadPat = (
 ) =>
   sql`
   with k as (
-    select id, "referenceId", metadata, "expiresAt",
+    select id, "referenceId", metadata, "expiresAt", "createdAt",
       enabled is not false and remaining is null as usable,
       enabled is not false and "expiresAt" < to_timestamp(${at}::float8 / 1000) as expired,
       "lastRequest" > to_timestamp(${at - lastRequestPrecision}::float8 / 1000) as recorded
@@ -472,6 +473,7 @@ const loadPat = (
     k."referenceId" as "userId",
     k.metadata,
     floor(extract(epoch from k."expiresAt") * 1000)::float8 as "expiresAt",
+    floor(extract(epoch from k."createdAt") * 1000)::float8 as "createdAt",
     k.usable and not coalesce(k.expired, false)
       and (coalesce(k.recorded, false) or exists (select 1 from used)) as usable,
     k.usable and not coalesce(k.expired, false) and not coalesce(k.recorded, false)
@@ -550,6 +552,8 @@ const patAccess = (sql: SqlClient.SqlClient, token: string, request: BearerReque
       organizationSlug: membership?.slug ?? null,
       /** The scoped connection this key is bound to, if it was minted for one. */
       connection: metadata?.connection,
+      /** When the key was minted, in epoch milliseconds. */
+      createdAt: row.createdAt,
     };
   });
 
@@ -558,12 +562,15 @@ const ConnectionRow = Schema.Struct({
   resource: Schema.String,
   revoked: Schema.NullOr(Schema.Boolean),
   policy: Schema.String,
+  createdAt: Schema.Number,
 });
 
 /**
  * The policy a PAT gets at a scoped connection's URL: the connection's own, read on every use. Only
  * the connection's owner may use it, in the organization it was made for, while it stands. The PAT
  * has its user's full authority, so the connection can only narrow it. None when it does not stand.
+ * Its generation is when the record was made: a revoked connection's ID can be used again, and
+ * credentials and grant IDs from before then must not match the new record.
  */
 export const patConnectionPolicy = (
   sql: SqlClient.SqlClient,
@@ -572,7 +579,8 @@ export const patConnectionPolicy = (
   organization: string,
 ) =>
   Effect.gen(function* () {
-    const rows = yield* sql`select "userId", resource, revoked, policy::text as policy
+    const rows = yield* sql`select "userId", resource, revoked, policy::text as policy,
+        floor(extract(epoch from "createdAt") * 1000)::float8 as "createdAt"
       from "mcpConnection" where id = ${connection}`;
     const row = Schema.decodeUnknownOption(ConnectionRow)(rows[0]);
     if (
@@ -581,10 +589,11 @@ export const patConnectionPolicy = (
       row.value.userId !== userId ||
       row.value.resource !== organization
     )
-      return Option.none<GrantPolicy>();
+      return Option.none<{ readonly policy: GrantPolicy; readonly generation: number }>();
+    const generation = row.value.createdAt;
     return Schema.decodeUnknownOption(Schema.fromJsonString(ConnectionPolicy))(
       row.value.policy,
-    ).pipe(Option.map(connectionGrantPolicy));
+    ).pipe(Option.map((policy) => ({ policy: connectionGrantPolicy(policy), generation })));
   });
 
 /** MCP authority for an OAuth grant or a PAT, with live grant, connection and membership. */
@@ -620,17 +629,26 @@ export const mcpBearerAccess = (
     // grant, which the URL's delivery check refuses and names the URL it serves.
     const scoped =
       request.connection === undefined
-        ? Option.none<GrantPolicy>()
+        ? Option.none<{ readonly policy: GrantPolicy; readonly generation: number }>()
         : yield* patConnectionPolicy(
             sql,
             request.connection,
             key.userId,
             key.access.organization,
           ).pipe(Effect.mapError(() => unavailable));
-    // A connection key dies with its connection: it has no unscoped grant to fall back on.
-    if (key.connection !== undefined && Option.isNone(scoped)) return yield* unauthorized;
+    // A connection key dies with its connection: it has no unscoped grant to fall back on. A
+    // connection made again with a revoked one's ID is another connection, not the key's.
+    if (
+      key.connection !== undefined &&
+      (Option.isNone(scoped) || key.createdAt < scoped.value.generation)
+    )
+      return yield* unauthorized;
     const connection = Option.isSome(scoped) ? request.connection : undefined;
-    const policy: GrantPolicy = Option.getOrElse(scoped, () => ({ kind: "all" }) as const);
+    const generation = Option.isSome(scoped) ? scoped.value.generation : undefined;
+    const policy: GrantPolicy = Option.match(scoped, {
+      onNone: () => ({ kind: "all" }) as const,
+      onSome: (value) => value.policy,
+    });
     return McpAccess.make({
       userId: key.userId,
       email: key.email,
@@ -641,6 +659,7 @@ export const mcpBearerAccess = (
           organization: key.access.organization,
           mode,
           ...(connection === undefined ? {} : { connection }),
+          ...(generation === undefined ? {} : { generation }),
         }),
         policy,
         target: { kind: "mcp", mode, ...(connection === undefined ? {} : { connection }) },

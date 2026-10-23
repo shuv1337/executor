@@ -71,7 +71,10 @@ export const ConnectionNotFound = ApiError.define({
   recorded: () => "No MCP connection with the requested ID exists for this user",
 });
 export type ConnectionNotFound = typeof ConnectionNotFound.Type;
-/** Another user, organization, or a revoked connection already uses this client-chosen ID. */
+/**
+ * Another user or organization already uses this client-chosen ID, or the user's own live
+ * connection with it has a different name or access. Their own revoked connection's ID is free.
+ */
 export const ConnectionIdTaken = ApiError.define({
   tag: "ConnectionIdTaken",
   status: 409,

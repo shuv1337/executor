@@ -27,6 +27,10 @@ const ConnectionKey = Schema.Struct({
   url: Schema.String,
   expiresAt: Schema.String,
 });
+const ConnectionWithTimes = Schema.Struct({
+  ...ConnectionView.fields,
+  createdAt: Schema.String,
+});
 const Keys = Schema.Struct({ apiKeys: Schema.Array(Schema.Struct({ id: Schema.String })) });
 /** A listed connection key: never its secret. */
 const KeySummary = Schema.Struct({
@@ -90,7 +94,7 @@ layer(HostedLive, { excludeTestServices: true })("Connection keys", (it) => {
               apps: policy,
             });
             expect(created.status, JSON.stringify(created.body)).toBe(200);
-            return yield* body(ConnectionView, created);
+            return yield* body(ConnectionWithTimes, created);
           });
         const bound = yield* connect(`Bound ${receipt.slice(0, 6)}`);
         const other = yield* connect(`Other ${receipt.slice(0, 6)}`);
@@ -246,6 +250,72 @@ layer(HostedLive, { excludeTestServices: true })("Connection keys", (it) => {
           yield* api.request(actors.member, "GET", "/api/auth/api-key/list"),
         );
         expect(remaining.apiKeys.map((item) => item.id)).not.toContain(key.id);
+
+        // Its owner can make a connection with the revoked one's ID again, so the URL agents were
+        // given keeps its address. It is a new connection: keys minted for the revoked one stay
+        // refused there and everywhere else, and only a key minted for the new one works.
+        const create = (actor: Session, data: unknown) =>
+          api.request(actor, "POST", `${prefix}/mcp-connections`, data);
+        const again = yield* create(actors.member, {
+          id: bound.id,
+          name: `Again ${receipt.slice(0, 6)}`,
+          apps: policy,
+        });
+        expect(again.status, JSON.stringify(again.body)).toBe(200);
+        const reused = yield* body(ConnectionWithTimes, again);
+        expect(reused.url).toBe(bound.url);
+        expect(Date.parse(reused.createdAt)).toBeGreaterThan(Date.parse(bound.createdAt));
+        for (const [label, secret] of [
+          ["API-minted key", key.key],
+          ["dashboard key", Redacted.make(shown.trim())],
+        ] as const) {
+          expect(
+            Exit.isFailure(yield* atConnection(secret, `${label} at the new connection`)),
+            label,
+          ).toBe(true);
+          for (const path of [bound.url.slice(bound.url.indexOf("/mcp")), "/mcp"]) {
+            const refused = yield* asKey(secret, "POST", path, initialize);
+            expect(refused.status, `${label} at ${path}: ${JSON.stringify(refused.body)}`).toBe(
+              401,
+            );
+          }
+        }
+        const fresh = yield* body(
+          ConnectionKey,
+          yield* mint(actors.member, bound.id, { name: "After reuse", expiresInSeconds: 3600 }),
+        );
+        expect(Exit.isSuccess(yield* atConnection(fresh.key, "key for the new connection"))).toBe(
+          true,
+        );
+        // A retry with the same body returns the live connection unchanged; another body is a
+        // different connection, and the ID is taken.
+        const retried = yield* create(actors.member, {
+          id: bound.id,
+          name: reused.name,
+          apps: policy,
+        });
+        expect(retried.status, JSON.stringify(retried.body)).toBe(200);
+        expect((yield* body(ConnectionWithTimes, retried)).createdAt).toBe(reused.createdAt);
+        const taken = yield* create(actors.member, {
+          id: bound.id,
+          name: `Different ${receipt.slice(0, 6)}`,
+          apps: policy,
+        });
+        expect(taken.status, JSON.stringify(taken.body)).toBe(409);
+        expect(JSON.stringify(taken.body)).toContain("ConnectionIdTaken");
+        // IDs belong to the user who made them: another member cannot take a live or revoked one.
+        expect(
+          (yield* api.request(
+            actors.member,
+            "POST",
+            `${prefix}/mcp-connections/${other.id}/revoke`,
+          )).status,
+        ).toBeLessThan(300);
+        for (const id of [bound.id, other.id]) {
+          const refused = yield* create(actors.admin, { id, name: "Not theirs", apps: policy });
+          expect(refused.status, JSON.stringify(refused.body)).toBe(409);
+          expect(JSON.stringify(refused.body)).toContain("ConnectionIdTaken");
+        }
       }).pipe(Effect.provide(McpClient.layer)),
     ),
   );
