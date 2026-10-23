@@ -379,6 +379,26 @@ export default defineApp({ user: { accounts: { service } } }, async () => ({ too
           ok: true,
           value: { code: "AccountChoiceUnsupported", status: 400 },
         });
+        // A member who can use the app cannot save a connection that runs as the owner's own
+        // account: it is refused for the account and nothing is linked for the member.
+        const access = `${path}/access`;
+        const { revision } = yield* body(
+          Schema.Struct({ revision: Schema.String }),
+          yield* api.request(actors.owner, "GET", access),
+        );
+        const shared = yield* api.request(actors.owner, "PATCH", access, {
+          revision,
+          audience: { kind: "everyone" },
+        });
+        expect(shared.status, JSON.stringify(shared.body)).toBe(200);
+        const borrowed = yield* api.request(actors.member, "POST", `${prefix}/mcp-connections`, {
+          id: randomUUID(),
+          name: `Connection ${randomUUID().slice(0, 6)}`,
+          apps: [{ app: app.id, runsAs: [{ kind: "account", id: work }], tools: { kind: "all" } }],
+        });
+        expect(borrowed.status, JSON.stringify(borrowed.body)).toBe(400);
+        expect(borrowed.body).toMatchObject({ _tag: "ConnectionAccessInvalid", reason: "account" });
+        expect(yield* linkedAccountIds(actors.member, path)).toEqual([]);
         // Another account linked in place of the connection's is outside the connection: the
         // call is refused and nothing is substituted.
         yield* linkAccount(actors.owner, path, "service", personal);
