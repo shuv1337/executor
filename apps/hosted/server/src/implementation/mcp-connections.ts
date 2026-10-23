@@ -34,7 +34,7 @@ const owner = Effect.gen(function* () {
  * logged, as connections decide which accounts an agent runs as.
  */
 const manager = (
-  action: "list" | "create" | "update" | "revoke" | "mint-key",
+  action: "list" | "create" | "update" | "revoke" | "mint-key" | "list-keys" | "revoke-key",
   connection?: string,
 ) =>
   Effect.gen(function* () {
@@ -44,8 +44,8 @@ const manager = (
     const organization = yield* CurrentOrganization;
     if (organization.role !== "admin" && organization.role !== "owner")
       return yield* new OrganizationForbidden();
-    // Minting records its own audit line for every caller, with the key it made.
-    if (action !== "list" && action !== "mint-key")
+    // Minting and revoking a key record their own audit line for every caller, with the key.
+    if (action === "create" || action === "update" || action === "revoke")
       yield* Effect.logInfo("MCP connection changed with an API credential").pipe(
         Effect.annotateLogs({
           "executor.audit": "mcp-connection",
@@ -233,6 +233,33 @@ export const hostedMcpConnectionHandlers = HttpApiBuilder.group(
               }),
               expiresAt: minted.expiresAt,
             };
+          }),
+        )
+        .handle("listKeys", ({ params }) =>
+          // Only the connection's owner: the store reports any other connection as not found.
+          Effect.flatMap(manager("list-keys", params.connection), (current) =>
+            auth.connections.keys(current, params.connection),
+          ),
+        )
+        .handle("revokeKey", ({ params }) =>
+          Effect.gen(function* () {
+            const current = yield* manager("revoke-key", params.connection);
+            yield* auth.connections.revokeKey(current, {
+              id: params.connection,
+              key: params.key,
+            });
+            const person = yield* Effect.serviceOption(CurrentPrincipal);
+            yield* Effect.logInfo("MCP connection key revoked").pipe(
+              Effect.annotateLogs({
+                "executor.audit": "mcp-connection-key",
+                "executor.audit.action": "revoke",
+                "executor.audit.via": Option.isSome(person) ? "browser" : "api-credential",
+                "executor.user.id": current.userId,
+                "executor.organization.id": current.resource,
+                "executor.mcp.connection": params.connection,
+                "executor.api_key.id": params.key,
+              }),
+            );
           }),
         )
         .handle("agents", () =>

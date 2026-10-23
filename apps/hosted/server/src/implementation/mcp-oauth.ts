@@ -43,6 +43,7 @@ import {
   connectionGrantPolicy,
 } from "@executor-js/mcp-auth/connections";
 import { ConnectedAgent, ConnectedAgentNotFound } from "@executor-js/mcp-auth/agents";
+import { ConnectionKeyNotFound, ConnectionKeySummary } from "../contracts/mcp-connections.ts";
 import { OrganizationId, OrganizationRole, organizationOwner } from "../contracts/organization.ts";
 const Member = Schema.Struct({ role: OrganizationRole });
 /** The user's email for `ctx.approvedBy` on the browser approval page; null when unreadable. */
@@ -197,6 +198,62 @@ const BoundKeyMetadata = Schema.Union([
   Schema.Struct({ connection: Schema.String }),
   Schema.fromJsonString(Schema.Struct({ connection: Schema.String })),
 ]);
+/** The owner's standing connection, or NOT_FOUND for a revoked one or another user's. */
+const requireStandingConnection = async (
+  context: GenericEndpointContext["context"],
+  owner: { readonly userId: string; readonly resource: string; readonly id: string },
+) => {
+  const row = await context.adapter.findOne({
+    model: "mcpConnection",
+    where: [{ field: "id", value: owner.id }],
+  });
+  const stored = Schema.decodeUnknownOption(StoredConnection)(row).pipe(
+    Option.filter(
+      (connection) =>
+        connection.revoked === false &&
+        connection.userId === owner.userId &&
+        connection.resource === owner.resource,
+    ),
+  );
+  if (Option.isNone(stored)) throw new APIError("NOT_FOUND");
+};
+/** A stored key row's non-secret fields. */
+interface StoredKey {
+  readonly id: string;
+  readonly name?: string | null;
+  readonly start?: string | null;
+  readonly createdAt?: unknown;
+  readonly expiresAt?: unknown;
+  readonly lastRequest?: unknown;
+  readonly metadata: unknown;
+}
+/** The user's keys whose metadata binds them to this connection. */
+const boundKeys = async (
+  context: GenericEndpointContext["context"],
+  userId: string,
+  connection: string,
+) => {
+  const keys = await context.adapter.findMany<StoredKey>({
+    model: "apikey",
+    where: [{ field: "referenceId", value: userId }],
+  });
+  return keys.filter((key) =>
+    Option.match(Schema.decodeUnknownOption(BoundKeyMetadata)(key.metadata), {
+      onNone: () => false,
+      onSome: (metadata) => metadata.connection === connection,
+    }),
+  );
+};
+/** A stored timestamp as ISO text; adapters return Dates or their text. */
+const isoTime = (value: unknown) => {
+  const date =
+    value instanceof Date
+      ? value
+      : typeof value === "string" || typeof value === "number"
+        ? new Date(value)
+        : undefined;
+  return date === undefined || Number.isNaN(date.getTime()) ? null : date.toISOString();
+};
 /** Stable metadata identifies the PAT/organization/mode partition; it is never a credential. */
 const projectPatAccess = (
   ctx: GenericEndpointContext,
@@ -340,19 +397,7 @@ export const mcpOAuthPlugins = (options: HostedOAuthOptions) => {
           metadata: { SERVER_ONLY: true },
         },
         async (ctx) => {
-          const row = await ctx.context.adapter.findOne({
-            model: "mcpConnection",
-            where: [{ field: "id", value: ctx.body.id }],
-          });
-          const stored = Schema.decodeUnknownOption(StoredConnection)(row).pipe(
-            Option.filter(
-              (connection) =>
-                connection.revoked === false &&
-                connection.userId === ctx.body.userId &&
-                connection.resource === ctx.body.resource,
-            ),
-          );
-          if (Option.isNone(stored)) throw new APIError("NOT_FOUND");
+          await requireStandingConnection(ctx.context, ctx.body);
           const created = await apiKeys.endpoints.createApiKey({
             context: ctx.context,
             body: {
@@ -381,22 +426,69 @@ export const mcpOAuthPlugins = (options: HostedOAuthOptions) => {
           metadata: { SERVER_ONLY: true },
         },
         async (ctx) => {
-          const keys = await ctx.context.adapter.findMany<{ id: string; metadata: unknown }>({
-            model: "apikey",
-            where: [{ field: "referenceId", value: ctx.body.userId }],
-          });
-          const bound = keys.filter((key) =>
-            Option.match(Schema.decodeUnknownOption(BoundKeyMetadata)(key.metadata), {
-              onNone: () => false,
-              onSome: (metadata) => metadata.connection === ctx.body.id,
-            }),
-          );
+          const bound = await boundKeys(ctx.context, ctx.body.userId, ctx.body.id);
           for (const key of bound)
             await ctx.context.adapter.delete({
               model: "apikey",
               where: [{ field: "id", value: key.id }],
             });
           return { deleted: bound.length };
+        },
+      ),
+      // The keys bound to one of the owner's standing connections. Never their secrets or hashes.
+      listMcpConnectionKeys: createAuthEndpoint(
+        "/mcp/connection-keys/list",
+        {
+          method: "POST",
+          body: Schema.toStandardSchemaV1(
+            Schema.Struct({
+              userId: Schema.String,
+              resource: Schema.String,
+              id: ConnectionIdSchema,
+            }),
+          ),
+          metadata: { SERVER_ONLY: true },
+        },
+        async (ctx) => {
+          await requireStandingConnection(ctx.context, ctx.body);
+          const bound = await boundKeys(ctx.context, ctx.body.userId, ctx.body.id);
+          return bound
+            .map((key) => ({
+              id: key.id,
+              name: key.name ?? null,
+              start: key.start ?? null,
+              createdAt: isoTime(key.createdAt) ?? new Date(0).toISOString(),
+              expiresAt: isoTime(key.expiresAt),
+              lastRequest: isoTime(key.lastRequest),
+            }))
+            .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+        },
+      ),
+      // Delete one key bound to one of the owner's standing connections. The connection and its
+      // other keys stay; bearer checks read the key row, so the deleted key is refused at once.
+      revokeMcpConnectionKey: createAuthEndpoint(
+        "/mcp/connection-keys/revoke-one",
+        {
+          method: "POST",
+          body: Schema.toStandardSchemaV1(
+            Schema.Struct({
+              userId: Schema.String,
+              resource: Schema.String,
+              id: ConnectionIdSchema,
+              key: Schema.String,
+            }),
+          ),
+          metadata: { SERVER_ONLY: true },
+        },
+        async (ctx) => {
+          await requireStandingConnection(ctx.context, ctx.body);
+          const bound = await boundKeys(ctx.context, ctx.body.userId, ctx.body.id);
+          if (!bound.some((key) => key.id === ctx.body.key)) return { revoked: false };
+          await ctx.context.adapter.delete({
+            model: "apikey",
+            where: [{ field: "id", value: ctx.body.key }],
+          });
+          return { revoked: true };
         },
       ),
       getMcpBrowserAccess: createAuthEndpoint(
@@ -467,6 +559,12 @@ export interface McpConnectionApi {
   }) => Promise<unknown>;
   readonly revokeMcpConnectionKeys: (input: {
     body: { userId: string; resource: string; id: string };
+  }) => Promise<unknown>;
+  readonly listMcpConnectionKeys: (input: {
+    body: { userId: string; resource: string; id: string };
+  }) => Promise<unknown>;
+  readonly revokeMcpConnectionKey: (input: {
+    body: { userId: string; resource: string; id: string; key: string };
   }) => Promise<unknown>;
 }
 /** A minted connection key: the only response that contains its secret. */
@@ -546,6 +644,31 @@ export const mcpConnectionStore = (
           status === 404
             ? new ConnectionNotFound({ connection: input.id })
             : new AuthenticationUnavailable(),
+        ),
+      ),
+    keys: (owner, id) =>
+      request(
+        (api) => api.listMcpConnectionKeys({ body: { ...owner, id } }),
+        Schema.Array(ConnectionKeySummary),
+      ).pipe(
+        Effect.mapError((status) =>
+          status === 404
+            ? new ConnectionNotFound({ connection: id })
+            : new AuthenticationUnavailable(),
+        ),
+      ),
+    revokeKey: (owner, input) =>
+      request(
+        (api) => api.revokeMcpConnectionKey({ body: { ...owner, ...input } }),
+        Schema.Struct({ revoked: Schema.Boolean }),
+      ).pipe(
+        Effect.mapError((status) =>
+          status === 404
+            ? new ConnectionNotFound({ connection: input.id })
+            : new AuthenticationUnavailable(),
+        ),
+        Effect.flatMap(({ revoked }) =>
+          revoked ? Effect.void : Effect.fail(new ConnectionKeyNotFound({ key: input.key })),
         ),
       ),
     agents: (owner) =>

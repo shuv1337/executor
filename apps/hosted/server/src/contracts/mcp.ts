@@ -12,6 +12,7 @@ import { Context, Schema } from "effect";
 import type { Effect } from "effect";
 import { OrganizationAccess, type OrganizationReference } from "./organization.ts";
 import { AuthenticationUnavailable } from "./auth.ts";
+import type { ConnectionKeyNotFound, ConnectionKeySummary } from "./mcp-connections.ts";
 
 /** MCP authority from OAuth or a PAT and current membership. Tokens never become browser sessions. */
 export const McpAccess = Schema.Struct({
@@ -139,6 +140,22 @@ export interface McpConnectionStore {
     { readonly id: string; readonly key: string; readonly expiresAt: string },
     ConnectionNotFound | AuthenticationUnavailable
   >;
+  /** The keys bound to one of the owner's standing connections, without their secrets. */
+  readonly keys: (
+    owner: ConnectionOwner,
+    id: ConnectionId,
+  ) => Effect.Effect<
+    readonly ConnectionKeySummary[],
+    ConnectionNotFound | AuthenticationUnavailable
+  >;
+  /**
+   * Delete one key bound to one of the owner's standing connections. Bearer checks read the key
+   * row on every request, so it is refused at once; the connection and its other keys stay.
+   */
+  readonly revokeKey: (
+    owner: ConnectionOwner,
+    input: { readonly id: ConnectionId; readonly key: string },
+  ) => Effect.Effect<void, ConnectionNotFound | ConnectionKeyNotFound | AuthenticationUnavailable>;
   /** Revoke one of the owner's grants and delete its access and refresh tokens. */
   readonly revokeAgent: (
     owner: ConnectionOwner,

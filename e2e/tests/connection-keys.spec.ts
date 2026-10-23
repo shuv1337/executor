@@ -2,11 +2,13 @@
  * A connection key is an API key bound to one scoped MCP connection, for headless agents, CI and
  * staff bots. Only the connection's owner mints one, it always expires, it works only at its
  * connection's MCP URL, the API never accepts it, revoking the connection deletes it, and every
- * mint is in the audit log.
+ * mint is in the audit log. The owner lists a connection's keys without their secrets and revokes
+ * one at a time, so a seat's key can be rotated without revoking the connection.
  */
 import { expect, layer } from "@effect/vitest";
 import { Effect, Exit, Redacted, Schedule, Schema } from "effect";
 import { randomBytes, randomUUID } from "node:crypto";
+import type { Page } from "playwright";
 import { scenarios } from "../test-plan.ts";
 import { Api, body, type Session } from "../support/api.ts";
 import { Actors } from "../support/actors.ts";
@@ -26,6 +28,15 @@ const ConnectionKey = Schema.Struct({
   expiresAt: Schema.String,
 });
 const Keys = Schema.Struct({ apiKeys: Schema.Array(Schema.Struct({ id: Schema.String })) });
+/** A listed connection key: never its secret. */
+const KeySummary = Schema.Struct({
+  id: Schema.String,
+  name: Schema.NullOr(Schema.String),
+  start: Schema.NullOr(Schema.String),
+  createdAt: Schema.String,
+  expiresAt: Schema.NullOr(Schema.String),
+  lastRequest: Schema.NullOr(Schema.String),
+});
 const initialize = {
   jsonrpc: "2.0",
   id: 1,
@@ -235,6 +246,230 @@ layer(HostedLive, { excludeTestServices: true })("Connection keys", (it) => {
           yield* api.request(actors.member, "GET", "/api/auth/api-key/list"),
         );
         expect(remaining.apiKeys.map((item) => item.id)).not.toContain(key.id);
+      }).pipe(Effect.provide(McpClient.layer)),
+    ),
+  );
+
+  it.effect(scenarios.connectionKeyRevoke.title, (context) =>
+    withHostedCase(
+      context,
+      Effect.gen(function* () {
+        const api = yield* Api,
+          actors = yield* Actors,
+          mcp = yield* McpClient,
+          telemetry = yield* Telemetry;
+        const organization = actors.organization.id;
+        const prefix = `/api/organizations/${organization}`;
+        const receipt = randomUUID();
+        const deployed = yield* api.request(actors.owner, "POST", `${prefix}/apps/deploy`, {
+          name: `Key rotation app ${receipt.slice(0, 8)}`,
+          files: readWriteAppFiles(receipt),
+        });
+        expect(deployed.status, JSON.stringify(deployed.body)).toBe(200);
+        const app = yield* body(App, deployed);
+        const appPath = `${prefix}/apps/${app.id}`;
+        yield* Effect.addFinalizer(() =>
+          api.request(actors.owner, "DELETE", appPath).pipe(Effect.ignore),
+        );
+        const access = yield* body(
+          Access,
+          yield* api.request(actors.owner, "GET", `${appPath}/access`),
+        );
+        expect(
+          (yield* api.request(actors.owner, "PATCH", `${appPath}/access`, {
+            revision: access.revision,
+            audience: { kind: "everyone" },
+          })).status,
+        ).toBe(200);
+        const connect = (name: string) =>
+          Effect.gen(function* () {
+            const created = yield* api.request(actors.member, "POST", `${prefix}/mcp-connections`, {
+              id: randomUUID(),
+              name,
+              apps: [{ app: app.id, runsAs: [{ kind: "app" }], tools: { kind: "readOnly" } }],
+            });
+            expect(created.status, JSON.stringify(created.body)).toBe(200);
+            return yield* body(ConnectionView, created);
+          });
+        const seat = yield* connect(`Seat ${receipt.slice(0, 6)}`);
+        const other = yield* connect(`Other seat ${receipt.slice(0, 6)}`);
+        const keysPath = (connection: string) => `${prefix}/mcp-connections/${connection}/keys`;
+        const revokePath = (connection: string, key: string) =>
+          `${keysPath(connection)}/${key}/revoke`;
+        const mint = (name: string) =>
+          Effect.gen(function* () {
+            const minted = yield* api.request(actors.member, "POST", keysPath(seat.id), {
+              name,
+              expiresInSeconds: 90 * 86400,
+            });
+            expect(minted.status, JSON.stringify(minted.body)).toBe(200);
+            return yield* body(ConnectionKey, minted);
+          });
+
+        // The seat's owner mints its current key and the replacement.
+        const current = yield* mint(`Seat key ${receipt.slice(0, 6)}`);
+        const replacement = yield* mint(`Replacement ${receipt.slice(0, 6)}`);
+
+        // The owner lists both, newest first, with names and expiry but never the secrets.
+        const listed = yield* api.request(actors.member, "GET", keysPath(seat.id));
+        expect(listed.status, JSON.stringify(listed.body)).toBe(200);
+        const keys = yield* body(Schema.Array(KeySummary), listed);
+        expect(keys.map((key) => key.id).sort()).toEqual([current.id, replacement.id].sort());
+        for (const [key, secret] of [
+          [keys.find((item) => item.id === current.id), current.key],
+          [keys.find((item) => item.id === replacement.id), replacement.key],
+        ] as const) {
+          expect(key?.expiresAt).not.toBeNull();
+          expect(key?.start).not.toBeNull();
+          expect(Redacted.value(secret).startsWith(key?.start ?? "-")).toBe(true);
+          expect(Redacted.value(secret).length).toBeGreaterThan((key?.start ?? "").length + 16);
+        }
+        expect(keys.map((key) => key.name).sort()).toEqual(
+          [`Replacement ${receipt.slice(0, 6)}`, `Seat key ${receipt.slice(0, 6)}`].sort(),
+        );
+        const listedText = JSON.stringify(listed.body);
+        expect(listedText).not.toContain(Redacted.value(current.key));
+        expect(listedText).not.toContain(Redacted.value(replacement.key));
+        expect(listedText).not.toContain('"key"');
+        // Another connection lists none of them.
+        const otherKeys = yield* api.request(actors.member, "GET", keysPath(other.id));
+        expect(otherKeys.status).toBe(200);
+        expect(otherKeys.body).toEqual([]);
+
+        // No one else can list or revoke them: an admin and the organization's owner see no such
+        // connection, and the key itself is never accepted by the API.
+        for (const actor of [actors.admin, actors.owner]) {
+          expect((yield* api.request(actor, "GET", keysPath(seat.id))).status).toBe(404);
+          expect((yield* api.request(actor, "POST", revokePath(seat.id, current.id))).status).toBe(
+            404,
+          );
+        }
+        const asKey = (
+          secret: Redacted.Redacted<string>,
+          method: "GET" | "POST",
+          path: string,
+          data?: unknown,
+        ) =>
+          Effect.gen(function* () {
+            return yield* api.request(yield* api.session(), method, path, data, {
+              authorization: `Bearer ${Redacted.value(secret)}`,
+              "x-executor-organization": organization,
+              accept: "application/json, text/event-stream",
+            });
+          });
+        for (const [method, path] of [
+          ["GET", keysPath(seat.id)],
+          ["POST", revokePath(seat.id, current.id)],
+        ] as const) {
+          const refused = yield* asKey(replacement.key, method, path);
+          expect(refused.status, JSON.stringify(refused.body)).toBe(403);
+          expect(JSON.stringify(refused.body)).toContain("ConnectionKeyRefused");
+        }
+        // A key is revoked only through its own connection.
+        const elsewhere = yield* api.request(
+          actors.member,
+          "POST",
+          revokePath(other.id, current.id),
+        );
+        expect(elsewhere.status, JSON.stringify(elsewhere.body)).toBe(404);
+        expect(JSON.stringify(elsewhere.body)).toContain("ConnectionKeyNotFound");
+
+        // Both keys work at the seat's URL before the rotation.
+        const atConnection = (secret: Redacted.Redacted<string>, label: string) =>
+          Effect.exit(
+            Effect.gen(function* () {
+              const client = yield* mcp.connect(secret, label, {
+                organization,
+                connection: seat.id,
+              });
+              return yield* client.use(`${label}: list tools`, (session, signal) =>
+                session.listTools(undefined, { signal }),
+              );
+            }),
+          );
+        expect(Exit.isSuccess(yield* atConnection(current.key, "current key"))).toBe(true);
+        expect(Exit.isSuccess(yield* atConnection(replacement.key, "replacement key"))).toBe(true);
+
+        // The owner revokes the old key; the revocation is in the audit log.
+        const trace = randomBytes(16).toString("hex");
+        const revoked = yield* api.request(
+          actors.member,
+          "POST",
+          revokePath(seat.id, current.id),
+          undefined,
+          { traceparent: `00-${trace}-${randomBytes(8).toString("hex")}-01` },
+        );
+        expect(revoked.status, JSON.stringify(revoked.body)).toBeLessThan(300);
+        const audit = yield* telemetry.logs(trace, "MCP connection key revoked").pipe(
+          Effect.map((found) => found.join("\n")),
+          Effect.filterOrFail((text) => text.includes(current.id)),
+          Effect.retry({ schedule: Schedule.spaced("1 second"), times: 20 }),
+        );
+        expect(audit).toContain(seat.id);
+        expect(audit).toContain("mcp-connection-key");
+
+        // The old key is refused at once at the seat's URL; the replacement keeps working.
+        const refused = yield* asKey(current.key, "POST", `/mcp?connection=${seat.id}`, initialize);
+        expect(refused.status, JSON.stringify(refused.body)).toBe(401);
+        expect(Exit.isFailure(yield* atConnection(current.key, "revoked key"))).toBe(true);
+        expect(Exit.isSuccess(yield* atConnection(replacement.key, "kept key"))).toBe(true);
+        // The connection stands, with only the replacement listed; revoking again finds nothing.
+        const connections = yield* body(
+          Schema.Array(ConnectionView),
+          yield* api.request(actors.member, "GET", `${prefix}/mcp-connections`),
+        );
+        expect(connections.map((connection) => connection.id)).toContain(seat.id);
+        const remaining = yield* body(
+          Schema.Array(KeySummary),
+          yield* api.request(actors.member, "GET", keysPath(seat.id)),
+        );
+        expect(remaining.map((key) => key.id)).toEqual([replacement.id]);
+        expect(
+          (yield* api.request(actors.member, "POST", revokePath(seat.id, current.id))).status,
+        ).toBe(404);
+
+        // In the dashboard the owner sees the seat's key and revokes it after confirming.
+        const browser = yield* Browser;
+        yield* browser.login(actors.member);
+        yield* browser.use("Open the member's connections", (page) =>
+          page.goto(`/org/${actors.organization.slug}/connect`),
+        );
+        yield* browser.use("Open the seat's connection", (page) =>
+          page.getByRole("button", { name: new RegExp(seat.name) }).click(),
+        );
+        const keyName = `Replacement ${receipt.slice(0, 6)}`;
+        const keyList = (page: Page) => page.getByRole("region", { name: "Connection keys" });
+        yield* browser.use("See the replacement key listed", (page) =>
+          keyList(page)
+            .getByRole("listitem")
+            .filter({ hasText: keyName })
+            .waitFor({ state: "visible" }),
+        );
+        const shownText = yield* browser.use("Read the key list", (page) =>
+          keyList(page).innerText(),
+        );
+        expect(shownText).not.toContain(Redacted.value(replacement.key));
+        expect(shownText).not.toContain(`Seat key ${receipt.slice(0, 6)}`);
+        yield* browser.use("Start revoking the key", (page) =>
+          keyList(page)
+            .getByRole("button", { name: `Revoke ${keyName}`, exact: true })
+            .click(),
+        );
+        yield* browser.use("Confirm the revocation", (page) =>
+          page.getByRole("button", { name: "Revoke key", exact: true }).click(),
+        );
+        yield* browser.use("The key leaves the list", (page) =>
+          keyList(page).getByText("No keys.", { exact: false }).waitFor({ state: "visible" }),
+        );
+        expect(Exit.isFailure(yield* atConnection(replacement.key, "dashboard-revoked key"))).toBe(
+          true,
+        );
+        // The connection still stands after both revocations.
+        const after = yield* body(
+          Schema.Array(ConnectionView),
+          yield* api.request(actors.member, "GET", `${prefix}/mcp-connections`),
+        );
+        expect(after.map((connection) => connection.id)).toContain(seat.id);
       }).pipe(Effect.provide(McpClient.layer)),
     ),
   );

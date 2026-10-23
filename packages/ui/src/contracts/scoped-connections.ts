@@ -112,3 +112,23 @@ export interface MintedConnectionKey {
 }
 /** Hosts that issue connection keys bind this; the page then offers to create one. */
 export type ConnectionKeyMint<E> = Atom.AtomResultFn<ConnectionKeyRequest, MintedConnectionKey, E>;
+/** A key bound to one connection, as its owner lists it. It never carries the secret. */
+export interface ConnectionKeyView {
+  readonly id: string;
+  readonly name: string | null;
+  /** The key's first characters, to tell installed keys apart. */
+  readonly start: string | null;
+  readonly createdAt: string;
+  readonly expiresAt: string | null;
+  readonly lastRequest: string | null;
+}
+/** Revoke one key bound to one connection; the connection and its other keys stay. */
+export interface ConnectionKeyRevoke {
+  readonly connection: ConnectionId;
+  readonly key: string;
+}
+/** Hosts that list and revoke connection keys bind these; the connection's page then shows them. */
+export interface ConnectionKeyBindings<E> {
+  readonly list: (connection: ConnectionId) => Query<readonly ConnectionKeyView[], E>;
+  readonly revoke: Atom.AtomResultFn<ConnectionKeyRevoke, void, E>;
+}

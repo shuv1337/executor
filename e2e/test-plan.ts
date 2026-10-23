@@ -7366,6 +7366,17 @@ export const scenarios = plan({
       local: na("Local has one subject and no organization roles or API keys."),
     },
   },
+  connectionKeyRevoke: {
+    fixtures: "actors",
+    file: "connection-keys.spec.ts",
+    title:
+      "a connection's owner lists its keys without secrets and revokes one, through the API or the dashboard, which stops that key at once while the connection and its other keys keep working, and no one else can list or revoke them",
+    targets: {
+      "self-host": scheduled,
+      cloud: scheduled,
+      local: na("Local has one subject and no organization roles or API keys."),
+    },
+  },
   callerIdentity: {
     fixtures: "actors",
     file: "caller-identity.spec.ts",

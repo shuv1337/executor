@@ -21,6 +21,7 @@ import {
 } from "@executor-js/mcp-auth/connections";
 import { ConnectedAgent, ConnectedAgentNotFound } from "@executor-js/mcp-auth/agents";
 import { GrantId } from "@executor-js/mcp-auth";
+import { ApiError } from "@executor-js/utils/api-error";
 import { Schema } from "effect";
 import { HttpApiEndpoint, HttpApiGroup } from "effect/http-api";
 import { AuthenticationUnavailable, RequireUser } from "./auth.ts";
@@ -70,6 +71,28 @@ export const ConnectionKey = Schema.Struct({
   expiresAt: Schema.String,
 });
 /**
+ * A key bound to one scoped connection, as its owner lists it: never the secret. `start` is the
+ * key's first characters, so the owner can tell which installed key it is.
+ */
+export const ConnectionKeySummary = Schema.Struct({
+  id: Schema.String,
+  name: Schema.NullOr(Schema.String),
+  start: Schema.NullOr(Schema.String),
+  createdAt: Schema.String,
+  expiresAt: Schema.NullOr(Schema.String),
+  /** When the key was last used, when its store records it. */
+  lastRequest: Schema.NullOr(Schema.String),
+});
+export type ConnectionKeySummary = typeof ConnectionKeySummary.Type;
+/** The connection has no such key: it was revoked, or belongs to another connection or user. */
+export const ConnectionKeyNotFound = ApiError.define({
+  tag: "ConnectionKeyNotFound",
+  status: 404,
+  fields: { key: Schema.String },
+  message: "This connection key was revoked or does not belong to this connection.",
+});
+export type ConnectionKeyNotFound = typeof ConnectionKeyNotFound.Type;
+/**
  * MCP grants, including a connection's own, cannot manage connections: the API refuses MCP tokens.
  * Connections only narrow their owner's own access, so an admin key cannot widen anything.
  */
@@ -113,6 +136,20 @@ export const HostedMcpConnections = HttpApiGroup.make("mcpConnections")
       payload: ConnectionKeyInput,
       success: ConnectionKey,
       error: [...errors, ConnectionNotFound],
+    }).annotate(RequiredAction, "manage"),
+  )
+  .add(
+    HttpApiEndpoint.get("listKeys", `${path}/:connection/keys`, {
+      params: connection,
+      success: Schema.Array(ConnectionKeySummary),
+      error: [...errors, ConnectionNotFound],
+    }).annotate(RequiredAction, "manage"),
+  )
+  .add(
+    HttpApiEndpoint.post("revokeKey", `${path}/:connection/keys/:key/revoke`, {
+      params: { ...connection, key: Schema.NonEmptyString },
+      success: Schema.Void,
+      error: [...errors, ConnectionNotFound, ConnectionKeyNotFound],
     }).annotate(RequiredAction, "manage"),
   )
   .add(

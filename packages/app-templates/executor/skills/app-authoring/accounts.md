@@ -651,7 +651,11 @@ connection's owner mints one with `POST /api/organizations/:organization/mcp-con
 and `{ "expiresInSeconds": <5 to 7776000>, "name"?: "..." }`, from the dashboard session or their
 own API key. The response holds the only copy of the secret. A connection key works only at its
 connection's `url`; plain `/mcp`, other connections and the Executor API refuse it with a 403. It
-expires, revoking the connection deletes it, and every mint is in the audit log.
+expires, revoking the connection deletes it, and every mint is in the audit log. To rotate one,
+mint the new key, install it, then revoke the old one: `GET .../mcp-connections/<id>/keys` lists
+the connection's keys (id, name, first characters, created, expiry, last use; never the secret)
+and `POST .../mcp-connections/<id>/keys/<keyId>/revoke` stops one key at once while the
+connection and its other keys keep working.
 
 For one key that runs an app for everyone, a member can connect it as a shared account, and
 someone who can edit the app links it to the app's own requirement with `appAccounts.appLink`.

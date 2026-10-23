@@ -21,7 +21,9 @@ import {
   connectionTargetLabel,
   connectionToolsLabel,
   connectionEventsLabel,
+  type ConnectionKeyBindings,
   type ConnectionKeyMint,
+  type ConnectionKeyView,
   type MintedConnectionKey,
   type ScopedConnectionBindings,
 } from "../../contracts/scoped-connections.ts";
@@ -46,6 +48,7 @@ import {
 } from "../components/dialog.tsx";
 import { Popover, PopoverContent, PopoverTrigger } from "../components/popover.tsx";
 import { Skeleton } from "../components/skeleton.tsx";
+import { LocalTime, RelativeTime, shortMoment } from "../components/local-time.tsx";
 import { PageFrame, PageHeader } from "./page.tsx";
 import { QueryView } from "./context.tsx";
 import { AppIcon } from "./common.tsx";
@@ -131,6 +134,7 @@ export function ScopedConnectionsPage<
   save,
   revoke,
   mintKey,
+  keys,
   Failure,
   installation,
   agents,
@@ -139,6 +143,8 @@ export function ScopedConnectionsPage<
 }: ScopedConnectionBindings<EL, ES, ER> & {
   /** Mints keys bound to one connection, when the host issues them. */
   readonly mintKey?: ConnectionKeyMint<EK>;
+  /** Lists and revokes one connection's keys, when the host issues them. */
+  readonly keys?: ConnectionKeyBindings<EK>;
   readonly query: Query<Inventory, E>;
   /** Renders every failure: inventory, connection reads, saves and revocation. */
   readonly Failure: ComponentType<FailureProps<E>>;
@@ -297,6 +303,9 @@ export function ScopedConnectionsPage<
                           </Button>
                         </PageHeader>
                         <ConnectionAccessList apps={draft.apps} inventory={inventory} />
+                        {keys !== undefined && (
+                          <ConnectionKeys connection={connection} keys={keys} Failure={Failure} />
+                        )}
                         <section className="mt-8 max-w-190">
                           <h2 className="mb-3 text-sm font-medium">Connect your agent</h2>
                           <McpInstallInstructions
@@ -486,6 +495,127 @@ function ConnectionKeyDialog<E, EK extends E>({
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  );
+}
+
+const keyName = (key: ConnectionKeyView) => key.name?.trim() || "Unnamed key";
+
+/**
+ * The keys bound to this connection, newest first, without their secrets. Revoking one stops it
+ * at once and leaves the connection and its other keys working, so a key can be rotated: create
+ * a new one, install it, then revoke the old one.
+ */
+function ConnectionKeys<E, EK extends E>({
+  connection,
+  keys,
+  Failure,
+}: {
+  readonly connection: ConnectionView;
+  readonly keys: ConnectionKeyBindings<EK>;
+  readonly Failure: ComponentType<FailureProps<E>>;
+}) {
+  const [revoking, setRevoking] = useState<ConnectionKeyView>();
+  const submit = useAtomSet(keys.revoke, { mode: "promiseExit" });
+  const state = useAtomValue(keys.revoke);
+  return (
+    <section aria-label="Connection keys" className="mt-8 max-w-190">
+      <h2 className="mb-3 text-sm font-medium">Connection keys</h2>
+      <QueryView<readonly ConnectionKeyView[], E>
+        query={keys.list(connection.id)}
+        Failure={Failure}
+        pending={
+          <div role="status" aria-label="Loading connection keys" className="border-y px-1 py-3">
+            <Skeleton aria-hidden className="h-3 w-40" />
+          </div>
+        }
+      >
+        {(items) =>
+          items.length === 0 ? (
+            <p className="text-[13px] text-muted-foreground">
+              No keys. Create one for an agent, CI job or bot that cannot sign in.
+            </p>
+          ) : (
+            <ul className="divide-y border-y">
+              {items.map((key) => {
+                const expired =
+                  key.expiresAt !== null && new Date(key.expiresAt).getTime() <= Date.now();
+                return (
+                  <li key={key.id} className="flex items-center gap-4 px-1 py-3">
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate text-[13px] font-medium">
+                        {keyName(key)}
+                        {key.start !== null && (
+                          <span className="ml-2 font-mono text-xs font-normal text-muted-foreground">
+                            {key.start}…
+                          </span>
+                        )}
+                      </p>
+                      <p className="mt-0.5 truncate text-xs text-muted-foreground">
+                        {"Created "}
+                        <LocalTime value={key.createdAt} options={shortMoment} />
+                        {key.expiresAt !== null && (
+                          <>
+                            {expired ? " · Expired " : " · Expires "}
+                            <LocalTime value={key.expiresAt} options={shortMoment} />
+                          </>
+                        )}
+                        {key.lastRequest !== null && (
+                          <>
+                            {" · Last used "}
+                            <RelativeTime value={key.lastRequest} />
+                          </>
+                        )}
+                      </p>
+                    </div>
+                    <Button variant="outline" size="sm" onClick={() => setRevoking(key)}>
+                      Revoke<span className="sr-only"> {keyName(key)}</span>
+                    </Button>
+                  </li>
+                );
+              })}
+            </ul>
+          )
+        }
+      </QueryView>
+      <Dialog
+        open={revoking !== undefined}
+        onOpenChange={(open) => {
+          if (!open && !state.waiting) setRevoking(undefined);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Revoke {revoking === undefined ? "" : keyName(revoking)}?</DialogTitle>
+            <DialogDescription>
+              Agents using this key lose access immediately. The connection and its other keys keep
+              working.
+            </DialogDescription>
+          </DialogHeader>
+          {AsyncResult.isFailure(state) && <Failure cause={state.cause} />}
+          <DialogFooter>
+            <Button
+              variant="outline"
+              disabled={state.waiting}
+              onClick={() => setRevoking(undefined)}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              loading={state.waiting}
+              disabled={state.waiting}
+              onClick={async () => {
+                if (revoking === undefined) return;
+                const result = await submit({ connection: connection.id, key: revoking.id });
+                if (Exit.isSuccess(result)) setRevoking(undefined);
+              }}
+            >
+              Revoke key
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </section>
   );
 }
 

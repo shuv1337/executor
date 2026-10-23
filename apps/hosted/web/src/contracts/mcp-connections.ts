@@ -13,6 +13,7 @@ import type { ConnectionId } from "@executor-js/mcp-auth/connections";
 import { GrantId } from "@executor-js/mcp-auth/grants";
 import type {
   ConnectionKeyRequest,
+  ConnectionKeyRevoke,
   ConnectionSave,
 } from "@executor-js/ui/contracts/scoped-connections";
 import { acknowledge, acknowledgedQuery, upsert } from "@executor-js/ui/contracts/mutations";
@@ -44,14 +45,49 @@ export const saveMcpConnectionAtom = Atom.family((organization: OrganizationRefe
     }),
   ),
 );
+/** One connection's keys in one organization. */
+class ConnectionKeysKey extends Data.Class<{
+  readonly organization: OrganizationReference;
+  readonly connection: ConnectionId;
+}> {}
+const connectionKeysQuery = Atom.family((key: ConnectionKeysKey) =>
+  HostedClient.query("mcpConnections", "listKeys", hydrated({ params: key })).pipe(
+    revalidated,
+    acknowledgedQuery,
+  ),
+);
+/** The keys bound to one connection, without their secrets. */
+export const mcpConnectionKeysAtom =
+  (organization: OrganizationReference) => (connection: ConnectionId) =>
+    connectionKeysQuery(new ConnectionKeysKey({ organization, connection }));
 /** Mint a key bound to one connection; the secret is returned only by this call. */
 export const mintMcpConnectionKeyAtom = Atom.family((organization: OrganizationReference) =>
-  HostedClient.runtime.fn(({ connection, expiresInSeconds }: ConnectionKeyRequest) =>
+  HostedClient.runtime.fn(({ connection, expiresInSeconds }: ConnectionKeyRequest, get) =>
     Effect.flatMap(HostedClient, (client) =>
       client.mcpConnections.mintKey({
         params: { organization, connection },
         payload: { expiresInSeconds },
       }),
+    ).pipe(
+      Effect.tap(() =>
+        Effect.sync(() => get.refresh(mcpConnectionKeysAtom(organization)(connection))),
+      ),
+    ),
+  ),
+);
+/** Remove the key's row only after the server deleted it; the connection and other keys stay. */
+export const revokeMcpConnectionKeyAtom = Atom.family((organization: OrganizationReference) =>
+  HostedClient.runtime.fn(({ connection, key }: ConnectionKeyRevoke, get) =>
+    Effect.flatMap(HostedClient, (client) =>
+      client.mcpConnections.revokeKey({ params: { organization, connection, key } }),
+    ).pipe(
+      Effect.tap(() =>
+        Effect.sync(() =>
+          acknowledge(get, mcpConnectionKeysAtom(organization)(connection), (current) =>
+            current.filter((item) => item.id !== key),
+          ),
+        ),
+      ),
     ),
   ),
 );

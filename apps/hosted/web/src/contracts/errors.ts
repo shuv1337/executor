@@ -29,6 +29,7 @@ const errorMessage = Match.type<HostedError>().pipe(
     ConnectionNotFound: () => "This connection was revoked or no longer exists.",
     ConnectionIdTaken: () => "This connection could not be created. Close the form and try again.",
     ConnectedAgentNotFound: () => "This agent is no longer connected.",
+    ConnectionKeyNotFound: () => "This key was already revoked.",
     ConnectionAccessInvalid: ({ reason }) =>
       ({
         app: "An included app is no longer available to you. Remove it and try again.",
