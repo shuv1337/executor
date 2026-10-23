@@ -7196,6 +7196,17 @@ export const scenarios = plan({
       cloud: scheduled,
     },
   },
+  hostedAppScheduleScope: {
+    fixtures: "actors",
+    file: "app-schedules.spec.ts",
+    title:
+      "by-name schedule configure and run now without a scope resolve the app schedule or the caller's copy, refuse to guess when both are saved, and keep each scope's authorization",
+    targets: {
+      local: na("Hosted managers and members; Local app schedules have their own scenario."),
+      "self-host": scheduled,
+      cloud: scheduled,
+    },
+  },
   hostedAppScopeWorkflows: {
     fixtures: "actors",
     file: "app-schedules.spec.ts",
@@ -8516,7 +8527,7 @@ export const scenarios = plan({
   localAppScheduleAppLinks: {
     file: "local-app-account-app-links.spec.ts",
     title:
-      "a local app schedule runs with only the app's linked account and waits for one while none is linked",
+      "a local app schedule runs with only the app's linked account and waits for one while none is linked, and by-name run now and configure without a scope act on it",
     targets: {
       local: scheduled,
       "self-host": na("Local app link routes; hosted app links have their own scenarios."),

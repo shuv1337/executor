@@ -105,7 +105,13 @@ needed. A workflow such a mutation starts declares `WorkflowContext<typeof requi
 Schedules start paused. Use the app's Schedules tab or the Executor management
 app's schedule definitions/configure operations to enable them. The management
 API also lists saved schedules and runs, pauses, removes and runs one now. Only
-people who can edit an app enable, pause, run or remove its app schedules. Each
+people who can edit an app enable, pause, run or remove its app schedules.
+Configure and run now take the schedule's name and an optional `scope`: `app`
+for an app schedule, `user` for your own copy of a user schedule. Without
+`scope`, the schedule saved under that name decides, then the app's
+declaration, then `user`. If both the app schedule and your copy are saved
+under the name, the call fails with `ScheduleScopeRequired`; retry with
+`scope`. Each
 run uses the current version and, at that moment, the member's linked
 accounts for a user schedule or the accounts linked for everyone for an app
 schedule. A schedule whose plain requirement has no account skips its

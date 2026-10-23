@@ -83,6 +83,7 @@ export const promiseExecutor = (executor: Executor): PromiseExecutor => {
       list: (input) => run(ScheduleInputs.list, input, executor.schedules.list),
       configure: (input) => run(ScheduleInputs.configure, input, executor.schedules.configure),
       copy: (input) => run(ScheduleInputs.copy, input, executor.schedules.copy),
+      scope: (input) => run(ScheduleInputs.scope, input, executor.schedules.scope),
       update: (input) => run(ScheduleInputs.update, input, executor.schedules.update),
       runNow: (input) => run(ScheduleInputs.runNow, input, executor.schedules.runNow),
       remove: (input) => run(ScheduleInputs.remove, input, executor.schedules.remove),

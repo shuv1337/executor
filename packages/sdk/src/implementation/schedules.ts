@@ -8,7 +8,7 @@ import {
   type Executor,
   type ResourceLifecycle,
 } from "../contracts/executor.ts";
-import { AccountRequired } from "../contracts/apps.ts";
+import { AccountRequired, type AccountScope } from "../contracts/apps.ts";
 import {
   StorageError,
   RequestInvalid,
@@ -28,6 +28,7 @@ import {
   ScheduleNotFound,
   ScheduleConflict,
   ScheduleInvalid,
+  ScheduleScopeRequired,
 } from "../contracts/schedules.ts";
 import { InvocationRun } from "../contracts/runtime.ts";
 import { ScheduleObservation } from "../contracts/scheduler.ts";
@@ -544,6 +545,27 @@ export const makeSchedules = (
         });
         if (found === null) return yield* new ScheduleNotFound();
         return found;
+      }),
+    scope: (input: typeof ScheduleInputs.scope.Type) =>
+      Effect.gen(function* () {
+        const app = yield* apps.get(input);
+        const named = { app: app.id, name: input.name };
+        const shared = yield* findOwn({ ...named, actor: null });
+        const own = yield* findOwn({ ...named, actor: input.actor });
+        if (shared !== null && own !== null) return yield* new ScheduleScopeRequired();
+        if (shared !== null) return "app" as const;
+        if (own !== null) return "user" as const;
+        // Nothing saved: the declaration decides, evaluated with the accounts an app schedule
+        // runs with, so the caller's own links are not needed. Any failure but storage keeps the
+        // user scope, whose request then reports its own failure.
+        return yield* definition({ ...named, actor: null }).pipe(
+          Effect.as<AccountScope>("app"),
+          Effect.catch((error) =>
+            Schema.is(StorageError)(error)
+              ? Effect.fail(error)
+              : Effect.succeed<AccountScope>("user"),
+          ),
+        );
       }),
     update: (input: typeof ScheduleInputs.update.Type) =>
       Effect.gen(function* () {

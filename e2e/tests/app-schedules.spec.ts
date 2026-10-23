@@ -11,6 +11,7 @@ import { Resource } from "../support/contracts.ts";
 import { appsManifest } from "../support/apps-release.ts";
 import { appLinksFixture, keyProvider, ok, okBody, refused } from "../support/app-links.ts";
 import { WorkflowRun } from "../support/workflow-app.ts";
+import { requirementPath } from "../support/app-accounts.ts";
 import { scenarios } from "../test-plan.ts";
 
 /**
@@ -53,6 +54,19 @@ const tick = mutation({ input: object({}) }, async () => "user tick");
 export default defineApp({ app: { accounts: { team } } }, async () => ({
   tools: router({ tick }),
   schedules: { tick: userInterval({ minutes: 1 }, tick, {}) },
+}));`;
+/**
+ * `tick` declared in one scope over the same requirements: an app account linked for everyone and
+ * a user account each member links for themselves.
+ */
+const scopeSource = (
+  scope: "app" | "user",
+) => `import { defineApp, defineProvider, secrets, mutation, ${scope}Interval, object, string, router } from "apps";
+const team = ${keyProvider("App schedule fixture")};
+const tick = mutation({ input: object({}) }, async () => "tick");
+export default defineApp({ app: { accounts: { team } }, user: { accounts: { personal: team } } }, async () => ({
+  tools: router({ tick }),
+  schedules: { tick: ${scope}Interval({ minutes: 1 }, tick, {}) },
 }));`;
 const migration = {
   path: "migrations/0001_ticks.sql",
@@ -190,6 +204,97 @@ layer(HostedLive, { excludeTestServices: true })("App schedules", (it) => {
         ).toMatchObject({ enabled: false, actor: null });
         yield* ok(yield* api.request(actors.owner, "DELETE", appSchedule));
         expect(yield* schedules()).toEqual([]);
+      }),
+    ),
+  );
+  it.effect(scenarios.hostedAppScheduleScope.title, (context) =>
+    withHostedCase(
+      context,
+      Effect.gen(function* () {
+        // `tick` starts as a user declaration that runs with the member's own key.
+        const fixture = yield* appLinksFixture([
+          { path: "index.ts", content: scopeSource("user") },
+        ]);
+        const { api, actors, prefix, app, path, connect } = fixture;
+        const configure = (actor: Session, settings: object) =>
+          api.request(actor, "PATCH", `${path}/schedules/tick`, settings);
+        const runNow = (actor: Session, scope?: "app" | "user") =>
+          api.request(
+            actor,
+            "POST",
+            `${path}/schedules/tick/run${scope === undefined ? "" : `?scope=${scope}`}`,
+          );
+        const succeeded = (count: number) =>
+          api.request(actors.owner, "GET", `${prefix}/scheduled-runs?app=${app.id}`).pipe(
+            Effect.flatMap((response) => body(Runs, response)),
+            Effect.flatMap((rows) =>
+              rows.filter((row) => row.status === "succeeded").length >= count
+                ? Effect.void
+                : Effect.fail(new Error(`Fewer than ${count} succeeded: ${JSON.stringify(rows)}`)),
+            ),
+            Effect.retry({ schedule: Schedule.spaced("200 millis"), times: 100 }),
+          );
+        yield* connect(actors.owner, "app", "team", "team-key");
+        const personal = yield* connect(actors.member, "user", "personal", "personal-key");
+
+        // A user declaration keeps the user scope without one: the member's own copy.
+        const copy = yield* okBody(Settings, yield* configure(actors.member, { enabled: true }));
+        expect(copy).toMatchObject({ actor: fixture.ids.member, enabled: true });
+        expect((yield* okBody(Settings, yield* runNow(actors.member))).id).toBe(copy.id);
+        yield* succeeded(1);
+        // Without their key the member's copy cannot be checked, so a redeploy keeps it.
+        yield* ok(
+          yield* api.request(
+            actors.member,
+            "DELETE",
+            `${requirementPath(path, "user", "personal")}/${encodeURIComponent(personal)}`,
+          ),
+        );
+
+        // `tick` becomes an app declaration. With nothing saved for the admin, configuring it
+        // without a scope follows the declaration to the app schedule.
+        const redeployed = yield* api.request(actors.owner, "POST", `${path}/deploy`, {
+          files: [{ path: "index.ts", content: scopeSource("app") }, appsManifest],
+        });
+        expect(redeployed.status, JSON.stringify(redeployed.body)).toBe(200);
+        const appSchedule = yield* okBody(
+          Settings,
+          yield* configure(actors.admin, { enabled: true }),
+        );
+        expect(appSchedule).toMatchObject({ name: "tick", actor: null, enabled: true });
+
+        // Run now finds the app schedule by name, without and with a scope.
+        expect((yield* okBody(Settings, yield* runNow(actors.owner))).id).toBe(appSchedule.id);
+        yield* succeeded(2);
+        expect((yield* okBody(Settings, yield* runNow(actors.admin, "app"))).id).toBe(
+          appSchedule.id,
+        );
+        yield* succeeded(3);
+        // The admin has no copy of their own.
+        yield* refused(yield* runNow(actors.admin, "user"), 404, "ScheduleNotFound");
+
+        // Only managers run or configure the app schedule, however it is named.
+        expect((yield* runNow(actors.member, "app")).status).toBe(403);
+        expect((yield* configure(actors.member, { enabled: false, scope: "app" })).status).toBe(
+          403,
+        );
+
+        // The member has both the app schedule and their kept copy under the name: without a
+        // scope both routes refuse to guess, and with one each acts on the schedule it names.
+        yield* refused(yield* runNow(actors.member), 409, "ScheduleScopeRequired");
+        yield* refused(
+          yield* configure(actors.member, { enabled: false }),
+          409,
+          "ScheduleScopeRequired",
+        );
+        const paused = yield* okBody(
+          Settings,
+          yield* configure(actors.member, { enabled: false, scope: "user" }),
+        );
+        expect(paused).toMatchObject({ id: copy.id, actor: fixture.ids.member, enabled: false });
+        expect(
+          yield* okBody(Settings, yield* configure(actors.owner, { enabled: false })),
+        ).toMatchObject({ id: appSchedule.id, actor: null, enabled: false });
       }),
     ),
   );

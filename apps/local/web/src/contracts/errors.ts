@@ -73,6 +73,11 @@ const errorMessage = Match.type<DashboardError>().pipe(
       ),
     ScheduleInvalid: () =>
       message("Invalid schedule", "Update the interval or calendar timing in the app source."),
+    ScheduleScopeRequired: () =>
+      message(
+        "Choose a schedule",
+        "Both the app schedule and your own copy have this name. Choose which one to change.",
+      ),
     RegistryError: (error) => message("Public app unavailable", registryErrorMessage(error)),
     AppAccessDenied: () =>
       message("Action unavailable", "You do not have permission to change this app."),

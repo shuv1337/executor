@@ -505,6 +505,30 @@ export default defineApp({ app: { accounts: { x: service } }, user: { accounts: 
           [second, false],
         ]);
         expect((yield* runs).map((row) => row.status)).toEqual(["succeeded", "succeeded"]);
+
+        // By name, without a scope, run now and configure find the app schedule; a user scope
+        // names a local copy, which there is none of.
+        const byName = (scope?: "app" | "user") =>
+          api.request(
+            agent,
+            "POST",
+            `${path}/tick/run${scope === undefined ? "" : `?scope=${scope}`}`,
+          );
+        const unscoped = yield* byName();
+        expect(unscoped.status, JSON.stringify(unscoped.body)).toBe(200);
+        expect((yield* body(Settings, unscoped)).id).toBe(schedule.id);
+        yield* succeeded(3);
+        const scoped = yield* byName("app");
+        expect(scoped.status, JSON.stringify(scoped.body)).toBe(200);
+        yield* succeeded(4);
+        expect((yield* byName("user")).status).toBe(404);
+        const paused = yield* api.request(agent, "PATCH", `${path}/tick`, { enabled: false });
+        expect(paused.status, JSON.stringify(paused.body)).toBe(200);
+        expect(yield* body(Settings, paused)).toMatchObject({
+          id: schedule.id,
+          actor: null,
+          enabled: false,
+        });
       }),
     ),
   );
