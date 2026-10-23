@@ -103,7 +103,7 @@ const host = Flag.String("host").pipe(
 );
 const organization = Flag.String("organization").pipe(
   Flag.withDescription(
-    "Hosted organization. Required with EXECUTOR_ACCESS_TOKEN; after executor apps login it defaults to the signed-in organization",
+    "Hosted organization ID or slug. Required with EXECUTOR_ACCESS_TOKEN; after executor apps login it defaults to the signed-in organization",
   ),
   Flag.optional,
 );
@@ -153,9 +153,17 @@ const access = (host: string, organization: Option.Option<string>) =>
     )
       return { token: local.value, organization: undefined };
     const session = Redacted.value(yield* registrySession(host));
-    if (Option.isSome(organization) && organization.value !== session.organization)
-      return yield* new AppClientError({ reason: "forbidden" });
-    return { token: Redacted.make(session.accessToken), organization: session.organization };
+    // Sign-in prints the organization's slug and saves its ID, so either names the session's own
+    // organization. Any other reference goes to the host, which refuses an organization the
+    // session's grant does not cover; the CLI never reports a refusal the host did not send.
+    const named = Option.getOrUndefined(organization);
+    return {
+      token: Redacted.make(session.accessToken),
+      organization:
+        named === undefined || named === session.organization || named === session.namespace
+          ? session.organization
+          : named,
+    };
   });
 /** Authenticated requests to the host; redirects are refused so credentials never follow them. */
 const transport = (host: string, token: Redacted.Redacted<string>, path = (url: string) => url) =>

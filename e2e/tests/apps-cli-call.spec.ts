@@ -1,6 +1,7 @@
 /**
  * `executor apps call` runs one app tool from a shell with an API key, as an import script does:
  * input from a file or stdin, the tool's value on stdout, and the host's refusals as exit codes.
+ * A CLI signed in with a device code calls tools under its person's own access the same way.
  */
 import { expect, layer } from "@effect/vitest";
 import { Effect, Schema } from "effect";
@@ -228,6 +229,125 @@ layer(HostedLive, { excludeTestServices: true })("Apps CLI call", (it) => {
         expect(refused.stdout).not.toContain("r-2");
         const forbidden = (yield* Schema.decodeUnknownEffect(Failure)(refused.stdout)).error;
         expect(forbidden).toMatchObject({ code: "OrganizationForbidden", status: 403 });
+      }),
+    ),
+  );
+
+  it.effect(scenarios.appsCliCallDeviceLogin.title, (context) =>
+    withHostedCase(
+      context,
+      Effect.gen(function* () {
+        const hosts = targetHosts(yield* Target);
+        const api = yield* Api,
+          actors = yield* Actors,
+          evidence = yield* Evidence;
+        const prefix = `/api/organizations/${actors.organization.id}`;
+        const deployed = yield* api.request(actors.owner, "POST", `${prefix}/apps/deploy`, {
+          name: `CLI device call ${randomUUID().slice(0, 8)}`,
+          files,
+        });
+        expect(deployed.status).toBe(200);
+        const app = yield* body(App, deployed);
+        const path = `${prefix}/apps/${app.id}`;
+        yield* Effect.addFinalizer(() =>
+          api.request(actors.owner, "DELETE", path).pipe(Effect.orDie),
+        );
+        const input = JSON.stringify(records(2, "hello"));
+        /** Sign one actor's CLI in with a device code, approved for the test organization. */
+        const signedIn = (actor: typeof actors.owner) =>
+          Effect.gen(function* () {
+            const cli = yield* appsCli;
+            const login = yield* cli.login(hosts.api, actor);
+            expect(login.finished.code, login.finished.stderr).toBe(0);
+            return cli;
+          });
+        const call = (
+          cli: Effect.Success<typeof appsCli>,
+          target: string,
+          selection: ReadonlyArray<string> = [],
+        ) =>
+          cli.cli([
+            "call",
+            "--host",
+            hosts.api,
+            ...selection,
+            "--app",
+            target,
+            "--tool",
+            "import.records",
+            "--input",
+            input,
+          ]);
+
+        // Both people approve their CLI's code at once; each approval waits for the next poll.
+        const [owner, member] = yield* Effect.all(
+          [signedIn(actors.owner), signedIn(actors.member)],
+          { concurrency: 2 },
+        );
+
+        // The owner, who can use their own app, calls it. Sign-in prints the organization's slug,
+        // so people name it by slug as often as by ID; both select the signed-in organization.
+        const bySlug = ["--organization", actors.organization.slug];
+        const listed = yield* owner.cli(["list", "--host", hosts.api, ...bySlug]);
+        expect(listed.code, listed.stderr).toBe(0);
+        expect(listed.stdout).toContain(app.id);
+        for (const [label, selection] of [
+          ["slug", bySlug],
+          ["id", ["--organization", actors.organization.id]],
+        ] as const) {
+          const called = yield* call(owner, app.slug, selection);
+          yield* evidence.json(`owner-device-call-by-${label}.json`, {
+            code: called.code,
+            stderr: called.stderr,
+          });
+          expect(called.code, called.stderr).toBe(0);
+          expect(yield* Schema.decodeUnknownEffect(Imported)(called.stdout)).toEqual({
+            count: 2,
+            first: "r-1",
+            last: "r-2",
+            noteChars: 10,
+          });
+        }
+        // An organization the session was not signed in to is the host's to refuse.
+        const elsewhere = yield* call(owner, app.id, [
+          "--organization",
+          `elsewhere-${randomUUID().slice(0, 8)}`,
+        ]);
+        expect(elsewhere.code).toBe(1);
+        expect(elsewhere.stdout).not.toContain("r-2");
+        expect((yield* Schema.decodeUnknownEffect(Failure)(elsewhere.stdout)).error).toMatchObject({
+          code: "OrganizationForbidden",
+          status: 403,
+        });
+
+        // A member, calling without --organization, cannot use the owner's private app: the host
+        // refuses the call and the tool never runs.
+        const refused = yield* call(member, app.id);
+        yield* evidence.json("member-device-refused.json", refused);
+        expect(refused.code).toBe(1);
+        expect(refused.stdout).not.toContain("r-2");
+        expect((yield* Schema.decodeUnknownEffect(Failure)(refused.stdout)).error).toMatchObject({
+          code: "OrganizationForbidden",
+          status: 403,
+        });
+
+        // Once the owner shares the app with everyone, the member's same session may call it.
+        const access = yield* body(
+          Schema.Struct({ revision: Schema.String }),
+          yield* api.request(actors.owner, "GET", `${path}/access`),
+        );
+        const shared = yield* api.request(actors.owner, "PATCH", `${path}/access`, {
+          revision: access.revision,
+          audience: { kind: "everyone" },
+        });
+        expect(shared.status).toBe(200);
+        const allowed = yield* call(member, app.slug);
+        yield* evidence.json("member-device-call.json", {
+          code: allowed.code,
+          stderr: allowed.stderr,
+        });
+        expect(allowed.code, allowed.stderr).toBe(0);
+        expect((yield* Schema.decodeUnknownEffect(Imported)(allowed.stdout)).count).toBe(2);
       }),
     ),
   );
