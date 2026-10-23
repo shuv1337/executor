@@ -265,14 +265,14 @@ export const appsCli = Effect.gen(function* () {
       return { ...printed, finished: running };
     });
   /**
-   * `executor apps login --host <host>`, approved for the test organization by the synthetic
-   * owner. The grant is revoked with the caller's scope.
+   * `executor apps login --host <host>`, approved for the test organization by a synthetic actor,
+   * the owner unless another is named. The grant is revoked with the caller's scope.
    */
-  const login = (host: string) =>
+  const login = (host: string, actor: typeof actors.owner = actors.owner) =>
     Effect.gen(function* () {
       const started = yield* deviceLogin(host, "opens");
       const lookup = yield* api.request(
-        actors.owner,
+        actor,
         "GET",
         `/api/auth/device/request?user_code=${encodeURIComponent(started.userCode)}`,
       );
@@ -281,16 +281,16 @@ export const appsCli = Effect.gen(function* () {
         Effect.gen(function* () {
           const grants = yield* body(
             Schema.Array(Schema.Struct({ id: Schema.String, clientId: Schema.String })),
-            yield* api.request(actors.owner, "GET", "/api/auth/oauth2/get-consents"),
+            yield* api.request(actor, "GET", "/api/auth/oauth2/get-consents"),
           );
           for (const grant of grants.filter((item) => item.clientId === clientId))
-            yield* api.request(actors.owner, "POST", "/api/auth/oauth2/delete-consent", {
+            yield* api.request(actor, "POST", "/api/auth/oauth2/delete-consent", {
               id: grant.id,
             });
         }).pipe(Effect.orDie),
       );
       const decided = yield* api.request(
-        actors.owner,
+        actor,
         "POST",
         "/api/auth/device/decide",
         { user_code: started.userCode, accept: true },

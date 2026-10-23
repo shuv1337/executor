@@ -317,6 +317,19 @@ export const scenarios = plan({
       ),
     },
   },
+  appsCliCallDeviceLogin: {
+    fixtures: "actors",
+    file: "apps-cli-call.spec.ts",
+    title:
+      "executor apps call signed in with a device code runs an app tool for a person who can use the app, with the signed-in organization named by slug, by ID or not at all, and the host refuses it for another organization and for a person who cannot use the app until it is shared with them",
+    targets: {
+      "self-host": scheduled,
+      cloud: na(
+        "Cloud serves the same hosted server's tool-call route and device sign-in; self-host runs this scenario against it.",
+      ),
+      local: na("Local signs the CLI in with an API key, not a saved session."),
+    },
+  },
   appGitKeptCredentials: {
     fixtures: "actors",
     file: "app-git-remotes.spec.ts",
