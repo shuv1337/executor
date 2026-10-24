@@ -5516,7 +5516,8 @@ export const scenarios = plan({
     fixtures: "actors",
     file: "trace-sampling.spec.ts",
     appOrigin: true,
-    title: "an app page's live query does not make a server that samples nothing record its traces",
+    title:
+      "a browser page's live queries and reads do not make a server that samples nothing record their traces",
     // Production's settings: no head sampling and no slow rule, so only a failure keeps a trace.
     serverEnvironment: { EXECUTOR_TRACE_SAMPLE_RATE: "0", EXECUTOR_TRACE_SLOW_MS: "86400000" },
     targets: {

@@ -1,8 +1,9 @@
 /**
  * The product samples traces before they reach its collector: a caller's sampled `traceparent`, a
  * failed operation and a slow trace are always recorded; an ordinary fast trace is recorded only
- * when the trace ID falls under `EXECUTOR_TRACE_SAMPLE_RATE`. An app page is not such a caller: its
- * live queries are sampled by the server's policy, whatever flag the page sends.
+ * when the trace ID falls under `EXECUTOR_TRACE_SAMPLE_RATE`. A browser is not such a caller: an
+ * app page's live queries and the dashboard's reads are sampled by the server's policy, whatever
+ * flag the page sends.
  */
 import { expect, layer } from "@effect/vitest";
 import { Effect, Option, Schedule } from "effect";
@@ -267,7 +268,33 @@ layer(HostedLive, { excludeTestServices: true })("Trace sampling", (it) => {
           ),
         );
         const older = yield* open("Reopen the page as an earlier client");
-        const pageTraces = [traceOf(current), traceOf(older)];
+        // (h) The dashboard's own reads get the same treatment when they ask to be sampled.
+        yield* browser.use("Make the dashboard's reads ask to be sampled", (page) =>
+          page.route("**/api/organizations/**", (route) =>
+            route.continue({
+              headers: {
+                ...route.request().headers(),
+                traceparent: (route.request().headers()["traceparent"] ?? "").replace(
+                  /-[a-f0-9]{2}$/,
+                  "-01",
+                ),
+              },
+            }),
+          ),
+        );
+        const dashboard = yield* browser.use("Open the dashboard", (page) =>
+          Promise.all([
+            page
+              .waitForRequest(
+                (request) =>
+                  request.method() === "GET" && request.url().includes("/api/organizations/"),
+                { timeout: 60_000 },
+              )
+              .then((request) => request.headers()["traceparent"] ?? ""),
+            page.goto(targetHosts(target).browser),
+          ]).then(([traceparent]) => traceparent),
+        );
+        const pageTraces = [traceOf(current), traceOf(older), traceOf(dashboard)];
         if (pageTraces.some((trace) => trace === undefined))
           return yield* Effect.die("The app page did not propagate a valid trace");
         yield* browser.use("Close the page so its live queries end", (page) =>
@@ -302,13 +329,17 @@ layer(HostedLive, { excludeTestServices: true })("Trace sampling", (it) => {
             ),
           ),
         );
-        yield* evidence.json("app-page-traces.json", { pageTraces, recorded });
-        // The earlier client's request keeps its own server span, which it asked for; nothing the
-        // live query did inside it is recorded.
+        yield* evidence.json("page-traces.json", { pageTraces, recorded });
+        // A request that asked for sampling keeps its own server span; nothing the server did for
+        // it is recorded: no live query run, check or read.
         expect(
-          recorded.map((spans) => spans.map(({ operationName }) => operationName)),
-          "the server recorded none of either page's live query work",
-        ).toEqual([[], ["http.server POST"]]);
+          recorded.map((spans) =>
+            spans
+              .filter(({ operationName }) => !operationName.startsWith("http.server "))
+              .map(({ operationName }) => operationName),
+          ),
+          "the server recorded none of the pages' work",
+        ).toEqual([[], [], []]);
       }),
     ),
   );
