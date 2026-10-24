@@ -1,5 +1,5 @@
 /** Host-authorized, bounded OTLP ingestion. Authentication/origin policy stays with the product. */
-import { ByteSize, Clock, Effect, Option } from "effect";
+import { ByteSize, Clock, Effect, Option, Tracer } from "effect";
 import {
   HttpEffect,
   HttpIncomingMessage,
@@ -57,6 +57,30 @@ export const requestTiming = <E, R>(
     );
     return yield* handler;
   });
+
+/**
+ * Run a browser page's request under an unsampled copy of its caller's trace context, so the
+ * server's own sampling policy decides which of its spans to keep. Only the request's server span
+ * keeps the caller's flag. App pages built with an earlier `apps` release mark every request
+ * sampled, and a page's live queries run for as long as it stays open.
+ */
+export const ignoreCallerSampling = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+  Effect.currentSpan.pipe(
+    Effect.option,
+    Effect.flatMap((span) =>
+      Option.isSome(span) && span.value.sampled
+        ? effect.pipe(
+            Effect.withParentSpan(
+              Tracer.externalSpan({
+                traceId: span.value.traceId,
+                spanId: span.value.spanId,
+                sampled: false,
+              }),
+            ),
+          )
+        : effect,
+    ),
+  );
 
 /** Forward browser events to the host's private destination. Call only after authorizing the origin. */
 export const receiveBrowserTelemetry = (signal: "traces" | "logs", build?: string) =>

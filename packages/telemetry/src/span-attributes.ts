@@ -117,7 +117,7 @@ export const routeTemplates = (templates: Iterable<`/${string}`>) => {
  * probe all record `/api/auth/*`, `/docs/*` or `/api/*`. A handler that serves a fixed set of
  * endpoints under its wildcard names the request's endpoint with `routeTemplates`.
  */
-const allowlistedSpan = (span: Tracer.Span): Tracer.Span => {
+const allowlistedSpan = (span: Tracer.Span, propagatesSampled: boolean): Tracer.Span => {
   let path = false;
   let route: string | undefined;
   return {
@@ -146,8 +146,9 @@ const allowlistedSpan = (span: Tracer.Span): Tracer.Span => {
     get links() {
       return span.links;
     },
+    // Propagation reads this flag; the exporter reads the recorded span's own.
     get sampled() {
-      return span.sampled;
+      return propagatesSampled && span.sampled;
     },
     get kind() {
       return span.kind;
@@ -190,12 +191,14 @@ const allowlistedSpan = (span: Tracer.Span): Tracer.Span => {
 /**
  * Wrap whichever tracer is already in scope; provide this above the exporter. `recordAll` records
  * every span whatever its parent's sampled flag; a `sampler` decides instead which traces reach the
- * exporter (see `sampling.ts`).
+ * exporter (see `sampling.ts`). With `propagation: "unsampled"`, spans are recorded as before but
+ * tell the services they call that they were not sampled.
  */
 export const spanAttributes = (
   clock?: "system" | "cloudflare-io",
   recordAll = false,
   sampler?: TraceSampler,
+  propagation: "sampled" | "unsampled" = "sampled",
 ): Layer.Layer<never> =>
   Layer.effect(Tracer.Tracer)(
     Tracer.Tracer.pipe(
@@ -206,6 +209,7 @@ export const spanAttributes = (
             sampler !== undefined
               ? sampler.span(tracer, options)
               : tracer.span(recordAll ? { ...options, sampled: true } : options),
+            propagation === "sampled",
           );
           if (
             recordAll &&

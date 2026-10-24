@@ -160,6 +160,9 @@ export const browserSettings = (
       "development",
     traces: { url: new URL(`${basePath}/traces`, window.location.origin).href },
     logs: { url: new URL(`${basePath}/logs`, window.location.origin).href },
+    // The page records its own spans; the server's sampling decides which of its traces to keep,
+    // so open pages cannot make it record every request and live update they make.
+    propagation: "unsampled",
   }));
 
 export {
