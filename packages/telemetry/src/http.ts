@@ -59,28 +59,34 @@ export const requestTiming = <E, R>(
   });
 
 /**
- * Run a browser page's request under an unsampled copy of its caller's trace context, so the
- * server's own sampling policy decides which of its spans to keep. Only the request's server span
- * keeps the caller's flag. App pages built with an earlier `apps` release mark every request
- * sampled, and a page's live queries run for as long as it stays open.
+ * Run a browser's request under an unsampled copy of its caller's trace context, so the server's
+ * own sampling policy decides which of its spans to keep; only the request's server span keeps
+ * the caller's flag. Browsers send `Sec-Fetch-Site` with every request; Node and Bun clients do not
+ * (Node's fetch sends only `Sec-Fetch-Mode`), so an API client, test or operator that asks for a
+ * trace still gets it. Pages marked every
+ * request sampled, including app pages built with an earlier `apps` release, which made the
+ * server record every request and live update of every open page.
  */
-export const ignoreCallerSampling = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-  Effect.currentSpan.pipe(
-    Effect.option,
-    Effect.flatMap((span) =>
-      Option.isSome(span) && span.value.sampled
-        ? effect.pipe(
-            Effect.withParentSpan(
-              Tracer.externalSpan({
-                traceId: span.value.traceId,
-                spanId: span.value.spanId,
-                sampled: false,
-              }),
-            ),
-          )
-        : effect,
-    ),
-  );
+export const ignoreBrowserSampling = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+  Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const span = yield* Effect.option(Effect.currentSpan);
+    if (
+      request.headers["sec-fetch-site"] === undefined ||
+      Option.isNone(span) ||
+      !span.value.sampled
+    )
+      return yield* effect;
+    return yield* effect.pipe(
+      Effect.withParentSpan(
+        Tracer.externalSpan({
+          traceId: span.value.traceId,
+          spanId: span.value.spanId,
+          sampled: false,
+        }),
+      ),
+    );
+  });
 
 /** Forward browser events to the host's private destination. Call only after authorizing the origin. */
 export const receiveBrowserTelemetry = (signal: "traces" | "logs", build?: string) =>

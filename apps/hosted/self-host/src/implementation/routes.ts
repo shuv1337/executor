@@ -36,7 +36,7 @@ import {
   ProductAnalytics,
 } from "@executor-js/hosted-server";
 import {
-  ignoreCallerSampling,
+  ignoreBrowserSampling,
   recordRequestRejections,
   requestTiming,
 } from "@executor-js/telemetry/http";
@@ -237,10 +237,9 @@ export const selfHostRouteMap = <DashboardE, DashboardR>(options: {
         Effect.gen(function* () {
           const request = yield* HttpServerRequest.HttpServerRequest;
           if (Option.isSome(addresses.fromHost(request.headers.host)))
-            // Only pages use app origins; see `ignoreCallerSampling`.
-            return yield* observed(apps.pipe(requestTiming, ignoreCallerSampling));
+            return yield* observed(apps.pipe(ignoreBrowserSampling, requestTiming));
           if (addresses.ownsHost(request.headers.host)) return notFound;
-          return yield* observed(product);
+          return yield* observed(product.pipe(ignoreBrowserSampling));
         }).pipe(recordRequestRejections),
       ),
     );
