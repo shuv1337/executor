@@ -194,11 +194,10 @@ const prepare = (state: DurableObjectState, env: Environment) =>
           ),
         );
       });
-      const handle = HttpEffect.toWebHandlerWith<never, Effect.Services<typeof addressed>>(context)(
-        addressed,
-      );
       return {
-        fetch: (request: Request) => handle(appPageTraceContext(request)),
+        fetch: HttpEffect.toWebHandlerWith<never, Effect.Services<typeof addressed>>(context)(
+          addressed,
+        ),
         workflow: HttpEffect.toWebHandlerWith<never, Effect.Services<typeof workflow>>(context)(
           workflow,
         ),
@@ -206,25 +205,6 @@ const prepare = (state: DurableObjectState, env: Environment) =>
       };
     }).pipe(Effect.provideContext(common));
   });
-
-/**
- * Only app pages call `/_executor/api/`, and every page marks its requests sampled: a page built
- * with an earlier `apps` release always does. The server's own sampling policy decides these
- * traces instead, so open pages and their live updates cannot make it record every request. A
- * failed or slow request is still kept by that policy.
- */
-const appPageTraceContext = (request: Request): Request => {
-  const parts = request.headers
-    .get("traceparent")
-    ?.match(/^(?<context>00-[0-9a-f]{32}-[0-9a-f]{16}-)(?<flags>[0-9a-f]{2})$/)?.groups;
-  if (parts?.context === undefined || parts.flags === undefined) return request;
-  const flags = Number.parseInt(parts.flags, 16);
-  if ((flags & 1) === 0 || !new URL(request.url).pathname.startsWith("/_executor/api/"))
-    return request;
-  const headers = new Headers(request.headers);
-  headers.set("traceparent", parts.context + (flags & ~1).toString(16).padStart(2, "0"));
-  return new Request(request, { headers });
-};
 
 /**
  * The product store has its own disk service, namespace and migration journal.

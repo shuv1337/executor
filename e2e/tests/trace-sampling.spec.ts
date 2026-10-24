@@ -303,10 +303,12 @@ layer(HostedLive, { excludeTestServices: true })("Trace sampling", (it) => {
           ),
         );
         yield* evidence.json("app-page-traces.json", { pageTraces, recorded });
+        // The earlier client's request keeps its own server span, which it asked for; nothing the
+        // live query did inside it is recorded.
         expect(
           recorded.map((spans) => spans.map(({ operationName }) => operationName)),
-          "the server recorded nothing for either page's ordinary live query",
-        ).toEqual([[], []]);
+          "the server recorded none of either page's live query work",
+        ).toEqual([[], ["http.server POST"]]);
       }),
     ),
   );

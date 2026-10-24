@@ -35,7 +35,11 @@ import {
   lazyHostedApiDocument,
   ProductAnalytics,
 } from "@executor-js/hosted-server";
-import { recordRequestRejections, requestTiming } from "@executor-js/telemetry/http";
+import {
+  ignoreCallerSampling,
+  recordRequestRejections,
+  requestTiming,
+} from "@executor-js/telemetry/http";
 import { appAddresses, hostedAppUi } from "@executor-js/hosted-server/app-ui";
 import { appSignInCallbackPath } from "apps/ui/auth";
 import { AppUiApi } from "apps/ui/contracts";
@@ -233,7 +237,8 @@ export const selfHostRouteMap = <DashboardE, DashboardR>(options: {
         Effect.gen(function* () {
           const request = yield* HttpServerRequest.HttpServerRequest;
           if (Option.isSome(addresses.fromHost(request.headers.host)))
-            return yield* observed(apps.pipe(requestTiming));
+            // Only pages use app origins; see `ignoreCallerSampling`.
+            return yield* observed(apps.pipe(requestTiming, ignoreCallerSampling));
           if (addresses.ownsHost(request.headers.host)) return notFound;
           return yield* observed(product);
         }).pipe(recordRequestRejections),
