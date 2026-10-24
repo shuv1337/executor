@@ -53,7 +53,7 @@ export const telemetryLayer = (
         // Without a sampling policy, record every operation. A caller's unsampled flag
         // never suppresses server diagnostics: with a policy, failed and slow traces are
         // kept whatever the head decision, and a caller's sampled flag is honoured.
-        spanAttributes(config.clock, true, sampler).pipe(
+        spanAttributes(config.clock, true, sampler, config.propagation).pipe(
           Layer.provideMerge(
             OtlpTracer.layer(signal(config.traces, "traces")).pipe(
               Layer.provide(OtlpSerialization.layerJson),

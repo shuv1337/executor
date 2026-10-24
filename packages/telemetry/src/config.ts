@@ -57,6 +57,13 @@ export const TelemetryConfig = Schema.Struct({
   metricsProtocol: Schema.optional(Schema.Literals(["http/json", "http/protobuf"])),
   /** Absent: record every trace. Only process exporters (`telemetryLayer`) apply it. */
   sampling: Schema.optional(TraceSampling),
+  /**
+   * The sampled flag this process's spans send to the services they call. Absent or `sampled`: the
+   * flag says the span was recorded. `unsampled`: spans are still recorded here, but callees apply
+   * their own sampling policy. Browser pages use it so a page cannot make the server keep every
+   * trace it starts.
+   */
+  propagation: Schema.optional(Schema.Literals(["sampled", "unsampled"])),
 });
 /** Resolved telemetry configuration. */
 export type TelemetryConfig = typeof TelemetryConfig.Type;
