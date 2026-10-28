@@ -9,7 +9,6 @@ import { App } from "../support/contracts.ts";
 import { Evidence } from "../support/evidence.ts";
 import { HostedLive, withHostedCase } from "../support/case.ts";
 import { McpClient } from "../support/mcp-client.ts";
-import { advertisedInputPatterns, hostedConnectorMatches } from "../support/mcp-input-patterns.ts";
 import { appsManifest } from "../support/apps-release.ts";
 
 const source = `import { defineApp, mutation, query, object, string, router } from "apps";
@@ -51,7 +50,6 @@ const Unavailable = Schema.Struct({
 });
 /** The synthetic approval id from issue #20. It is not a live request. */
 const syntheticApprovalId = "apr_00000000-0000-4000-8000-000000000001";
-const syntheticElicitationId = "elc_00000000-0000-4000-8000-000000000001";
 
 /** A personal access token and the app above, deployed for one scenario. */
 const fixture = Effect.gen(function* () {
@@ -120,20 +118,13 @@ layer(HostedLive, { excludeTestServices: true })("MCP direct calls", (it) => {
           "search",
           "skills",
         ]);
-        // The patterns that used to be advertised both reduce to `^apr_`, which a whole-string
-        // match rejects. The live pattern must accept a real id and an elicitation id, and reject
-        // a bare prefix and a string with no prefix.
-        expect(hostedConnectorMatches("^(?:apr|elc)_.+$", syntheticApprovalId)).toBe(false);
-        expect(hostedConnectorMatches(String.raw`^apr_[\s\S]+$`, syntheticApprovalId)).toBe(false);
-        const patterns = yield* advertisedInputPatterns(listed.tools, "resume", "requestId");
-        expect(patterns.length).toBeGreaterThan(0);
-        for (const pattern of patterns) {
-          expect(pattern).not.toContain("(?:");
-          expect(hostedConnectorMatches(pattern, syntheticApprovalId)).toBe(true);
-          expect(hostedConnectorMatches(pattern, syntheticElicitationId)).toBe(true);
-          expect(hostedConnectorMatches(pattern, "apr_")).toBe(false);
-          expect(hostedConnectorMatches(pattern, "not-an-id")).toBe(false);
-        }
+        // resume.requestId is a plain string. The handler decodes it as an interaction id.
+        const resume = listed.tools.find((entry) => entry.name === "resume");
+        const requestId = resume?.inputSchema.properties?.requestId;
+        if (requestId === undefined) return yield* Effect.die("resume is not advertised");
+        expect(requestId).toMatchObject({ type: "string" });
+        expect(requestId).not.toHaveProperty("pattern");
+        expect(requestId).not.toHaveProperty("anyOf");
         const unknown = yield* Schema.decodeUnknownEffect(Unavailable)(
           yield* tool("Resume a synthetic approval id", "resume", {
             requestId: syntheticApprovalId,
@@ -154,7 +145,7 @@ layer(HostedLive, { excludeTestServices: true })("MCP direct calls", (it) => {
             ),
         );
         expect(malformed.isError, JSON.stringify(malformed.content)).toBe(true);
-        expect(JSON.stringify(malformed.content)).toContain("Invalid parameters for tool 'resume'");
+        expect(JSON.stringify(malformed.content)).toContain("ElicitationResponseInvalid");
 
         // Search returns the exact paths call and execute both accept.
         const found = yield* Schema.decodeUnknownEffect(SearchResult)(
@@ -207,16 +198,15 @@ layer(HostedLive, { excludeTestServices: true })("MCP direct calls", (it) => {
           `"matches":[${JSON.stringify(echo)}`,
         );
 
-        // An approval pauses the call; resume runs it once and returns its outcome.
+        // A real approval pauses the call. Approving it resumes that same apr_ id.
         const pending = yield* Schema.decodeUnknownEffect(Pending)(
           yield* tool("Call a tool that needs approval", "call", {
             calls: { path: review, input: { note: "ship it" } },
           }),
         );
-        for (const pattern of patterns)
-          expect(hostedConnectorMatches(pattern, pending.requestId)).toBe(true);
+        expect(pending.requestId).toMatch(/^apr_/);
         const resumed = yield* Schema.decodeUnknownEffect(Completed)(
-          yield* tool("Approve the call", "resume", {
+          yield* tool("Approve the call and resume its apr_ id", "resume", {
             requestId: pending.requestId,
             response: { action: "accept" },
           }),

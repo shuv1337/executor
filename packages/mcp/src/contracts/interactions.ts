@@ -17,16 +17,17 @@ export const ElicitationRequestId = Schema.String.pipe(
 export const InteractionId = Schema.Union([ApprovalRequestId, ElicitationRequestId]);
 export type InteractionId = typeof InteractionId.Type;
 /**
- * A request ID as MCP `resume` advertises it. The pattern stays inside the regular-expression
- * subset JSON Schema tells validators to implement: literals, `^`, `$`, `.`, `+` and top-level
- * alternation. Handlers still decode it as an `InteractionId`.
+ * A request ID as MCP `resume` advertises it: a plain string, with no `pattern` and no `anyOf`.
  *
- * The hosted Apps connector full-matches a pattern, and for syntax outside that subset it keeps
- * only the literal prefix. `^apr_[\s\S]+$` stops at the character class, and `^(?:apr|elc)_.+$`
- * stops inside the non-capturing group; both become `^apr_`. A real `apr_<uuid>` is longer than
- * that prefix, so the connector rejects it before the call reaches Executor (#20).
+ * The hosted Apps connector full-matches JSON Schema patterns and reduces ones it does not keep
+ * to a literal prefix. Both the original `anyOf` of `^apr_[\s\S]+$` / `^elc_[\s\S]+$` and the
+ * later `^(?:apr|elc)_.+$` were applied as `^apr_`, so a real `apr_<uuid>` never matched.
+ * `^apr_.+$` and an `anyOf` of that with `^elc_.+$` still end in a variable suffix, which is the
+ * part that reduction drops, so they are not safer. Omitting `pattern` leaves nothing to reduce.
+ * Handlers still decode the value as an `InteractionId`, which rejects a bare prefix and any
+ * string that does not start with `apr_` or `elc_`.
  */
-export const AdvertisedInteractionId = Schema.String.check(Schema.isPattern(/^apr_.+$|^elc_.+$/u));
+export const AdvertisedInteractionId = Schema.String;
 /**
  * The running call that asked. A call without accounts, such as one to an account-free app, omits
  * the accounts key: pending interactions are MCP results, and JSON has no undefined.

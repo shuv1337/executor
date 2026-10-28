@@ -152,7 +152,7 @@ const withLink = (
         .pipe(Effect.map((approvalUrl) => ({ ...result, approvalUrl })))
     : Effect.succeed(result);
 
-/** Resume tools advertise a plain pattern (`AdvertisedInteractionId`); decode the typed ID here. */
+/** Resume tools advertise a plain string (`AdvertisedInteractionId`); decode the typed ID here. */
 const interactionId = (requestId: string) =>
   Schema.decodeUnknownEffect(InteractionId)(requestId).pipe(
     Effect.mapError(() => new ElicitationResponseInvalid()),
