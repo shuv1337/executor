@@ -9,6 +9,7 @@ import { App } from "../support/contracts.ts";
 import { Evidence } from "../support/evidence.ts";
 import { HostedLive, withHostedCase } from "../support/case.ts";
 import { McpClient } from "../support/mcp-client.ts";
+import { advertisedInputPatterns, hostedConnectorMatches } from "../support/mcp-input-patterns.ts";
 import { appsManifest } from "../support/apps-release.ts";
 
 const source = `import { defineApp, mutation, query, object, string, router } from "apps";
@@ -43,6 +44,14 @@ const Pending = Schema.Struct({
   status: Schema.Literal("approval-required"),
   requestId: Schema.String,
 });
+const Unavailable = Schema.Struct({
+  status: Schema.Literal("unavailable"),
+  requestId: Schema.String,
+  reason: Schema.Literal("not-found"),
+});
+/** The synthetic approval id from issue #20. It is not a live request. */
+const syntheticApprovalId = "apr_00000000-0000-4000-8000-000000000001";
+const syntheticElicitationId = "elc_00000000-0000-4000-8000-000000000001";
 
 /** A personal access token and the app above, deployed for one scenario. */
 const fixture = Effect.gen(function* () {
@@ -111,6 +120,41 @@ layer(HostedLive, { excludeTestServices: true })("MCP direct calls", (it) => {
           "search",
           "skills",
         ]);
+        // The patterns that used to be advertised both reduce to `^apr_`, which a whole-string
+        // match rejects. The live pattern must accept a real id and an elicitation id, and reject
+        // a bare prefix and a string with no prefix.
+        expect(hostedConnectorMatches("^(?:apr|elc)_.+$", syntheticApprovalId)).toBe(false);
+        expect(hostedConnectorMatches(String.raw`^apr_[\s\S]+$`, syntheticApprovalId)).toBe(false);
+        const patterns = yield* advertisedInputPatterns(listed.tools, "resume", "requestId");
+        expect(patterns.length).toBeGreaterThan(0);
+        for (const pattern of patterns) {
+          expect(pattern).not.toContain("(?:");
+          expect(hostedConnectorMatches(pattern, syntheticApprovalId)).toBe(true);
+          expect(hostedConnectorMatches(pattern, syntheticElicitationId)).toBe(true);
+          expect(hostedConnectorMatches(pattern, "apr_")).toBe(false);
+          expect(hostedConnectorMatches(pattern, "not-an-id")).toBe(false);
+        }
+        const unknown = yield* Schema.decodeUnknownEffect(Unavailable)(
+          yield* tool("Resume a synthetic approval id", "resume", {
+            requestId: syntheticApprovalId,
+            response: { action: "cancel" },
+          }),
+        );
+        expect(unknown.requestId).toBe(syntheticApprovalId);
+        const malformed = yield* client.use(
+          "Resume rejects a malformed request id",
+          (client, signal) =>
+            client.callTool(
+              {
+                name: "resume",
+                arguments: { requestId: "not-an-id", response: { action: "cancel" } },
+              },
+              undefined,
+              { signal },
+            ),
+        );
+        expect(malformed.isError, JSON.stringify(malformed.content)).toBe(true);
+        expect(JSON.stringify(malformed.content)).toContain("Invalid parameters for tool 'resume'");
 
         // Search returns the exact paths call and execute both accept.
         const found = yield* Schema.decodeUnknownEffect(SearchResult)(
@@ -169,6 +213,8 @@ layer(HostedLive, { excludeTestServices: true })("MCP direct calls", (it) => {
             calls: { path: review, input: { note: "ship it" } },
           }),
         );
+        for (const pattern of patterns)
+          expect(hostedConnectorMatches(pattern, pending.requestId)).toBe(true);
         const resumed = yield* Schema.decodeUnknownEffect(Completed)(
           yield* tool("Approve the call", "resume", {
             requestId: pending.requestId,

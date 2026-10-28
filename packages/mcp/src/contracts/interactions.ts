@@ -17,10 +17,16 @@ export const ElicitationRequestId = Schema.String.pipe(
 export const InteractionId = Schema.Union([ApprovalRequestId, ElicitationRequestId]);
 export type InteractionId = typeof InteractionId.Type;
 /**
- * A request ID as MCP tool parameters advertise it: one plain pattern that strict JSON Schema
- * validators in MCP connectors accept. Handlers still decode it as an `InteractionId`.
+ * A request ID as MCP `resume` advertises it. The pattern stays inside the regular-expression
+ * subset JSON Schema tells validators to implement: literals, `^`, `$`, `.`, `+` and top-level
+ * alternation. Handlers still decode it as an `InteractionId`.
+ *
+ * The hosted Apps connector full-matches a pattern, and for syntax outside that subset it keeps
+ * only the literal prefix. `^apr_[\s\S]+$` stops at the character class, and `^(?:apr|elc)_.+$`
+ * stops inside the non-capturing group; both become `^apr_`. A real `apr_<uuid>` is longer than
+ * that prefix, so the connector rejects it before the call reaches Executor (#20).
  */
-export const AdvertisedInteractionId = Schema.String.check(Schema.isPattern(/^(?:apr|elc)_.+$/u));
+export const AdvertisedInteractionId = Schema.String.check(Schema.isPattern(/^apr_.+$|^elc_.+$/u));
 /**
  * The running call that asked. A call without accounts, such as one to an account-free app, omits
  * the accounts key: pending interactions are MCP results, and JSON has no undefined.
