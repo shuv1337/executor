@@ -43,6 +43,13 @@ const Pending = Schema.Struct({
   status: Schema.Literal("approval-required"),
   requestId: Schema.String,
 });
+const Unavailable = Schema.Struct({
+  status: Schema.Literal("unavailable"),
+  requestId: Schema.String,
+  reason: Schema.Literal("not-found"),
+});
+/** The synthetic approval id from issue #20. It is not a live request. */
+const syntheticApprovalId = "apr_00000000-0000-4000-8000-000000000001";
 
 /** A personal access token and the app above, deployed for one scenario. */
 const fixture = Effect.gen(function* () {
@@ -111,6 +118,36 @@ layer(HostedLive, { excludeTestServices: true })("MCP direct calls", (it) => {
           "search",
           "skills",
         ]);
+        // resume.requestId is a plain string. The handler decodes it as an interaction id.
+        const resume = listed.tools.find((entry) => entry.name === "resume");
+        const requestId = resume?.inputSchema.properties?.requestId;
+        if (requestId === undefined) return yield* Effect.die("resume is not advertised");
+        expect(requestId).toMatchObject({ type: "string" });
+        expect(requestId).not.toHaveProperty("pattern");
+        expect(requestId).not.toHaveProperty("anyOf");
+        const unknown = yield* Schema.decodeUnknownEffect(Unavailable)(
+          yield* tool("Resume a synthetic approval id", "resume", {
+            requestId: syntheticApprovalId,
+            response: { action: "cancel" },
+          }),
+        );
+        expect(unknown.requestId).toBe(syntheticApprovalId);
+        const malformed = yield* client.use(
+          "Resume rejects a malformed request id",
+          (client, signal) =>
+            client.callTool(
+              {
+                name: "resume",
+                arguments: { requestId: "not-an-id", response: { action: "cancel" } },
+              },
+              undefined,
+              { signal },
+            ),
+        );
+        expect(malformed.isError, JSON.stringify(malformed.content)).toBe(true);
+        expect(JSON.stringify(malformed.content)).toContain(
+          "Approval ids start with apr_ or elc_.",
+        );
 
         // Search returns the exact paths call and execute both accept.
         const found = yield* Schema.decodeUnknownEffect(SearchResult)(
@@ -163,14 +200,15 @@ layer(HostedLive, { excludeTestServices: true })("MCP direct calls", (it) => {
           `"matches":[${JSON.stringify(echo)}`,
         );
 
-        // An approval pauses the call; resume runs it once and returns its outcome.
+        // A real approval pauses the call. Approving it resumes that same apr_ id.
         const pending = yield* Schema.decodeUnknownEffect(Pending)(
           yield* tool("Call a tool that needs approval", "call", {
             calls: { path: review, input: { note: "ship it" } },
           }),
         );
+        expect(pending.requestId).toMatch(/^apr_/);
         const resumed = yield* Schema.decodeUnknownEffect(Completed)(
-          yield* tool("Approve the call", "resume", {
+          yield* tool("Approve the call and resume its apr_ id", "resume", {
             requestId: pending.requestId,
             response: { action: "accept" },
           }),

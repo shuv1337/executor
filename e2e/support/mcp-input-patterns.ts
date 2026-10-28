@@ -24,5 +24,9 @@ export const wholeStringInputPattern = (tools: unknown, tool: string, property: 
     const patterns = [pattern, ...anyOf.map((branch) => branch.pattern)].filter(
       (source) => source !== undefined,
     );
+    if (patterns.length === 0)
+      return yield* Effect.die(
+        `MCP tool ${tool} advertises ${property} without a pattern; match the value directly`,
+      );
     return new RegExp(`^(?:${patterns.map((source) => `(?:${source})`).join("|")})$`, "u");
   });

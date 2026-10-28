@@ -6,7 +6,6 @@ import { scenarios } from "../test-plan.ts";
 import { Api, body, type Session } from "../support/api.ts";
 import { Actors } from "../support/actors.ts";
 import { McpClient } from "../support/mcp-client.ts";
-import { wholeStringInputPattern } from "../support/mcp-input-patterns.ts";
 import { Evidence } from "../support/evidence.ts";
 import { HostedLive, withHostedCase } from "../support/case.ts";
 import { App, Organization } from "../support/contracts.ts";
@@ -344,9 +343,13 @@ layer(HostedLive, { excludeTestServices: true })("PAT MCP", (it) => {
         const listed = yield* ownerClient.use("Discover the resume input schema", (client) =>
           client.listTools(),
         );
-        expect(pending.requestId).toMatch(
-          yield* wholeStringInputPattern(listed.tools, "resume", "requestId"),
-        );
+        expect(pending.requestId).toMatch(/^apr_/);
+        const resume = listed.tools.find((entry) => entry.name === "resume");
+        const requestId = resume?.inputSchema.properties?.requestId;
+        if (requestId === undefined) return yield* Effect.die("resume is not advertised");
+        expect(requestId).toMatchObject({ type: "string" });
+        expect(requestId).not.toHaveProperty("pattern");
+        expect(requestId).not.toHaveProperty("anyOf");
         const otherClient = yield* mcp.connect(other.key, "pat-other", { organization });
         const wrong = yield* otherClient.use(
           "A different PAT cannot resume this continuation",
