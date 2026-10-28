@@ -155,7 +155,7 @@ const withLink = (
 /** Resume tools advertise a plain string (`AdvertisedInteractionId`); decode the typed ID here. */
 const interactionId = (requestId: string) =>
   Schema.decodeUnknownEffect(InteractionId)(requestId).pipe(
-    Effect.mapError(() => new ElicitationResponseInvalid()),
+    Effect.mapError(() => new ElicitationResponseInvalid({ reason: "request-id" })),
   );
 
 /** Build protocol state and its browser accessors together. Hosts authorize browser calls separately from MCP. */

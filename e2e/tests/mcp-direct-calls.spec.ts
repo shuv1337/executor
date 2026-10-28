@@ -145,7 +145,9 @@ layer(HostedLive, { excludeTestServices: true })("MCP direct calls", (it) => {
             ),
         );
         expect(malformed.isError, JSON.stringify(malformed.content)).toBe(true);
-        expect(JSON.stringify(malformed.content)).toContain("ElicitationResponseInvalid");
+        expect(JSON.stringify(malformed.content)).toContain(
+          "Approval ids start with apr_ or elc_.",
+        );
 
         // Search returns the exact paths call and execute both accept.
         const found = yield* Schema.decodeUnknownEffect(SearchResult)(

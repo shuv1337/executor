@@ -49,8 +49,15 @@ export const ToolInputPending = Schema.Struct({
 /** Transport-neutral pending interaction; its status distinguishes the continuation it owns. */
 export const PendingInteraction = Schema.Union([ToolPending, ToolInputPending]);
 export type PendingInteraction = typeof PendingInteraction.Type;
-/** Invalid form response. It does not consume the SDK request or its live continuation. */
+/**
+ * The resume answer or its request id is not usable. It does not consume the SDK request or its
+ * live continuation. `request-id` means the id is not an approval or elicitation id.
+ */
 export class ElicitationResponseInvalid extends Schema.TaggedError<ElicitationResponseInvalid>()(
   "ElicitationResponseInvalid",
-  {},
-) {}
+  { reason: Schema.optionalKey(Schema.Literal("request-id")) },
+) {
+  override get message(): string {
+    return this.reason === "request-id" ? "Approval ids start with apr_ or elc_." : "";
+  }
+}
