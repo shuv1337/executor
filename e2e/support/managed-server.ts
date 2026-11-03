@@ -140,6 +140,8 @@ export const startManagedServer = (
     let saveWorkerdCoverage: Effect.Effect<void> = Effect.void;
     const env = {
       PATH: runtimePath,
+      // Every Windows process has it: the local server runs Windows's own programs from there.
+      ...(process.env.SystemRoot === undefined ? {} : { SystemRoot: process.env.SystemRoot }),
       NODE_ENV: "test",
       HOST: "127.0.0.1",
       PORT: port,
@@ -598,6 +600,18 @@ export const startFreshSelfHost = (
   target: typeof Target.Service,
   environment: Readonly<Record<string, string>> = {},
 ) => startIsolatedSelfHost(target, "product", environment).pipe(Effect.map(({ origin }) => origin));
+
+/**
+ * Start an unconfigured product instance as `startFreshSelfHost` does, and return its origin and
+ * the file its output is written to.
+ */
+export const startLoggedSelfHost = (
+  target: typeof Target.Service,
+  environment: Readonly<Record<string, string>> = {},
+) =>
+  startIsolatedSelfHost(target, "product", environment).pipe(
+    Effect.map(({ origin, directory }) => ({ origin, log: `${directory}/server.log` })),
+  );
 
 /**
  * Start an unconfigured product instance as `startFreshSelfHost` does, and return the target that

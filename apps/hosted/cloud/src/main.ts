@@ -59,6 +59,7 @@ import { Config, Effect, Layer, Option, Path, Ref } from "effect";
 import { HttpRouter, HttpServer, HttpServerResponse } from "effect/http";
 import { cloudAuth } from "./infrastructure/auth.ts";
 import { cloudAccountCallback } from "./implementation/account-callback.ts";
+import { v1HandoffPath } from "./implementation/v1-session-handoff.ts";
 import { cloudOnboarding, cloudV1ImportSettings } from "./infrastructure/onboarding.ts";
 import {
   V1ImportConfiguration,
@@ -81,6 +82,7 @@ import {
   selfBinding,
   type BackgroundJob,
 } from "./infrastructure/background-jobs.ts";
+import { handledJob, jobCompleted, jobFailed } from "./contracts/job-outcome.ts";
 import { cloudEgress } from "./infrastructure/executor.ts";
 import { cloudProduct } from "./infrastructure/product.ts";
 import { cloudAuthDatabase } from "./infrastructure/auth-database.ts";
@@ -193,7 +195,12 @@ export default Api.make(
       limits: { subrequests: 50_000 },
       compatibility: {
         date: "2026-09-08",
-        flags: ["nodejs_compat", "global_fetch_strictly_public", "enable_request_signal"],
+        flags: [
+          "nodejs_compat",
+          "global_fetch_strictly_public",
+          "enable_request_signal",
+          "no_brotli_content_encoding",
+        ],
       },
       dev: {
         host: "127.0.0.1",
@@ -244,7 +251,8 @@ export default Api.make(
     );
     const v1Import = yield* v1ImportRoutes(
       yield* V1ImportWorkflow.pipe(
-        Effect.provide(Layer.mergeAll(executor, auth.mcpIdentity, v1ImportConfiguration)),
+        // A paid organization's subscription carries over to v2's billing, which syncs its seats.
+        Effect.provide(Layer.mergeAll(executor, auth.mcpIdentity, v1ImportConfiguration, billing)),
       ),
     ).pipe(Effect.provide(v1ImportConfiguration));
     const removals = Layer.merge(
@@ -275,7 +283,9 @@ export default Api.make(
         // fresh scope so execution memos cannot reuse that closed pool.
         Effect.scoped,
         Effect.withSpan("job.provisioning.dispatch"),
-        Effect.catch(() => Effect.logWarning("Provisioning outbox unavailable")),
+        Effect.catch((error) =>
+          Effect.logWarning("Provisioning outbox unavailable").pipe(Effect.as(jobFailed(error))),
+        ),
       );
     // Cron only recovers lost dispatches; their workflows install any team.
     const dispatch = dispatchWith(() => Effect.void);
@@ -283,6 +293,7 @@ export default Api.make(
     const organizationRemovals = dispatchOrganizationRemovals.pipe(
       Effect.provide(Layer.merge(executor, removals)),
       Effect.scoped,
+      Effect.as(jobCompleted),
     );
     // Jobs are queued by triggers on users, teams and members. Only auth and dashboard API
     // writes change those rows, so only their requests start the jobs at once. MCP, telemetry
@@ -319,14 +330,15 @@ export default Api.make(
       Effect.provide(executor),
       reportErrors,
       Effect.scoped,
-      Effect.catch(() => Effect.logWarning("Data steps unavailable")),
+      handledJob(Effect.logWarning("Data steps unavailable")),
     );
     const repositoryRecovery = Effect.flatten(AppRepositoryRecovery).pipe(
       Effect.provide(executor),
       reportErrors,
       Effect.scoped,
       Effect.withSpan("job.repository.recover"),
-      Effect.catch(() => Effect.logWarning("App repository recovery failed")),
+      Effect.as(jobCompleted),
+      handledJob(Effect.logWarning("App repository recovery failed")),
     );
     const appDomains = yield* cloudAppDomains;
     const siteAssets = yield* cloudSiteAssets;
@@ -334,7 +346,8 @@ export default Api.make(
     const siteAssetRetention = siteAssets.retainCurrent.pipe(
       reportErrors,
       Effect.scoped,
-      Effect.catch(() => Effect.logWarning("Site asset retention failed")),
+      Effect.as(jobCompleted),
+      handledJob(Effect.logWarning("Site asset retention failed")),
     );
     const dashboard = cloudDashboard(yield* Cloudflare.Workers.bindWorker(Dashboard), {
       resourceOrigins: auth.resourceOrigins,
@@ -360,7 +373,8 @@ export default Api.make(
       reportErrors,
       Effect.scoped,
       Effect.withSpan("job.workflow.reconcile"),
-      Effect.catch(() => Effect.logWarning("Workflow queue reconciliation failed")),
+      Effect.as(jobCompleted),
+      handledJob(Effect.logWarning("Workflow queue reconciliation failed")),
     );
     // Membership changes sync seats through durable provisioning jobs. This daily
     // pass only repairs what those jobs cannot see, such as edits made in Autumn.
@@ -368,7 +382,8 @@ export default Api.make(
       reportErrors,
       Effect.scoped,
       Effect.withSpan("job.billing.reconcile"),
-      Effect.catch(() => Effect.logError("Billing seat reconciliation failed")),
+      Effect.as(jobCompleted),
+      handledJob(Effect.logError("Billing seat reconciliation failed")),
     );
     // Repeats the reviewed idle grant data step for grants that became idle since; it does
     // nothing until that step has applied here.
@@ -381,7 +396,8 @@ export default Api.make(
       Effect.provide(executor),
       reportErrors,
       Effect.scoped,
-      Effect.catch(() => Effect.logWarning("Idle agent grant expiry failed")),
+      Effect.as(jobCompleted),
+      handledJob(Effect.logWarning("Idle agent grant expiry failed")),
     );
     const jobs = yield* cloudBackgroundJobs;
     yield* jobs.schedule(
@@ -405,7 +421,7 @@ export default Api.make(
       provisioning: dispatch,
       "data-steps": dataSteps,
       "repository-recovery": repositoryRecovery,
-      "schedule-wake": schedules.wake,
+      "schedule-wake": schedules.wake.pipe(Effect.as(jobCompleted)),
       "site-assets": siteAssetRetention,
       "app-domain-heartbeat": appDomains.heartbeat,
       "welcome-emails": welcomeEmails.deliver,
@@ -436,7 +452,10 @@ export default Api.make(
           document.document,
           catalogFeedUrl === undefined
             ? egress
-            : { ...egress, client: cachedFeedClient(apiOrigin, catalogFeedUrl, egress.client) },
+            : {
+                ...egress,
+                client: yield* cachedFeedClient(apiOrigin, catalogFeedUrl, egress.client),
+              },
           clientMetadata,
           apiOrigin,
           catalogFeedUrl,
@@ -538,18 +557,43 @@ export default Api.make(
     const routes = Layer.mergeAll(
       HttpRouter.add("POST", "/api/internal/app-domains/resume", appDomains.control("resume")),
       HttpRouter.add("POST", "/api/internal/app-domains/drain", appDomains.control("drain")),
-      HttpRouter.add("POST", "/api/internal/v1-import/start", v1Import.start),
+      // Starting an import reads the allow table (`writes.ts`) from the product database.
+      HttpRouter.add("POST", "/api/internal/v1-import/start", v1Import.start).pipe(
+        HttpRouter.provideRequest(executor),
+      ),
       HttpRouter.add(
         "GET",
         "/api/internal/v1-import/runs/:run/orgs/:organization",
         v1Import.report,
       ),
       HttpRouter.add("POST", "/api/internal/v1-import/runs/:run/aggregate", v1Import.aggregate),
+      // A rollback out of an existing organization revokes members' toolkit copies there.
       HttpRouter.add(
         "POST",
         "/api/internal/v1-import/orgs/:organization/rollback",
         v1Import.rollback,
+      ).pipe(HttpRouter.provideRequest(Layer.mergeAll(executor, auth.mcpIdentity))),
+      // The repair deploys apps with the importer's context, which holds the MCP connection store.
+      HttpRouter.add(
+        "POST",
+        "/api/internal/v1-import/orgs/:organization/repair",
+        v1Import.repair,
+      ).pipe(HttpRouter.provideRequest(Layer.mergeAll(executor, auth.mcpIdentity, billing))),
+      HttpRouter.add(
+        "POST",
+        "/api/internal/v1-import/orgs/:organization/restore",
+        v1Import.restore,
       ).pipe(HttpRouter.provideRequest(executor)),
+      HttpRouter.add(
+        "POST",
+        "/api/internal/v1-import/orgs/:organization/accounts",
+        v1Import.accounts,
+      ).pipe(HttpRouter.provideRequest(Layer.mergeAll(executor, auth.mcpIdentity, billing))),
+      HttpRouter.add(
+        "POST",
+        "/api/internal/v1-import/orgs/:organization/return-billing",
+        v1Import.giveBillingBack,
+      ).pipe(HttpRouter.provideRequest(Layer.merge(executor, billing))),
       jobs.route((job) => backgroundJobs[job]),
       authoringRoutes,
       ...(["login", "login/sso", "create"] as const).map((page) =>
@@ -600,6 +644,8 @@ export default Api.make(
         auth.handler.pipe(Effect.flatMap(hideRemovedOrganizations), Effect.provide(executor)),
       ),
       HttpRouter.add("*", "/api/auth/*", dispatchAfterWrites(auth.handler)),
+      // A member of a moved v1 workspace, signed in to v1, opens it here without signing in again.
+      HttpRouter.add("GET", v1HandoffPath, auth.v1Handoff),
       HttpRouter.add("*", "/api/email/unsubscribe", welcomeEmails.unsubscribe),
       HttpRouter.add(
         "GET",

@@ -41,6 +41,7 @@ import {
   AuthenticationUnavailable,
   ConnectionKeyRefused,
   Unauthorized,
+  callerSpanAttributes,
 } from "../contracts/auth.ts";
 import { OrganizationForbidden } from "../contracts/organization.ts";
 import { isApiKey } from "./api-keys.ts";
@@ -153,6 +154,17 @@ const requestedOrganization = (
       return yield* forbidden("organization_mismatch");
     return byUrl ?? byHeader;
   });
+
+/**
+ * Name the caller's own organization and the caller on the caller's span (`auth.authenticate`), by
+ * their opaque IDs, once the check knows the organization is theirs, so a refusal after this point
+ * still names both: an OAuth grant's organization and user, or a pinned key's organization and its
+ * user, from when the statement answers, and the organization an unpinned key names only after its
+ * user's membership there holds. Neither is recorded before then, so refused requests for another
+ * organization never count against it, nor count their user among its users.
+ */
+const recordCaller = (organization: string, user: string) =>
+  Effect.annotateCurrentSpan(callerSpanAttributes(organization, user));
 
 /** Organizations matching a reference by ID or slug; two rows prove the reference ambiguous. */
 const matches = (sql: SqlClient.SqlClient, reference: string | null) =>
@@ -357,6 +369,9 @@ const oauthAccess = (
     const organization = yield* Schema.decodeUnknownEffect(OrganizationId)(row.grantResource).pipe(
       Effect.mapError(() => forbidden("membership")),
     );
+    // The grant's organization and user are the caller's own, whatever organization the request
+    // names; the grant's user is the token's subject (checked above).
+    yield* recordCaller(organization, row.subject);
     const role = yield* Schema.decodeUnknownEffect(OrganizationRole)(row.role).pipe(
       Effect.mapError(() => forbidden("membership")),
     );
@@ -525,6 +540,9 @@ const patAccess = (sql: SqlClient.SqlClient, token: string, request: BearerReque
       Effect.mapError(() => unauthorized),
     );
     const pinned = metadata?.organization;
+    // A pinned key's organization is its own, so a refusal from here on names that one and the
+    // key's user, never another organization the request names.
+    if (pinned !== undefined) yield* recordCaller(pinned, row.userId);
     // The named organization, else the one the key is pinned to.
     const organization =
       (yield* requestedOrganization(
@@ -544,6 +562,8 @@ const patAccess = (sql: SqlClient.SqlClient, token: string, request: BearerReque
     const role = yield* Schema.decodeUnknownEffect(OrganizationRole)(membership?.role).pipe(
       Effect.mapError(() => forbidden("membership")),
     );
+    // An unpinned key can name any organization; it is the caller's own once membership holds.
+    if (pinned === undefined) yield* recordCaller(organization, row.userId);
     return {
       userId: row.userId,
       email: row.userEmail ?? null,

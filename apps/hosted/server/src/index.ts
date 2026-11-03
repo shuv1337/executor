@@ -8,11 +8,14 @@ export { HostedCatalog } from "./contracts/catalog.ts";
 export { hostedHandlers } from "./implementation/api.ts";
 export { catalogLive } from "./implementation/catalog.ts";
 export {
+  hostedApi,
   hostedApiDocumentRoute,
+  hostedApiRevision,
   lazyHostedApiDocument,
   type LazyHostedApiDocument,
 } from "./implementation/api-document.ts";
 export {
+  callerSpanAttributes,
   CurrentUserId,
   ApiAuthentication,
   Authentication,
@@ -35,6 +38,7 @@ export { organizationDefaults } from "./implementation/organization-defaults.ts"
 export { executorDefaultRedeployed } from "./implementation/executor-app-upgrades.ts";
 export { hostedAppCopies } from "./implementation/profile-app-copies.ts";
 export { linkAppAccount, linkUserAccount } from "./implementation/app-accounts.ts";
+export { memberSetupProgress, type SetupProgress } from "./implementation/setup-progress.ts";
 export {
   lookupMembership,
   lookupOrganizationSlug,

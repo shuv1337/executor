@@ -100,6 +100,7 @@ export const makeSkills = (
                       app: app.id,
                       build: state.version.build,
                       sharedRuntime: sharesRuntime(state.version.requirements),
+                      hostApi: declarations.hostApi(state.version),
                       sources,
                       ...context,
                     })

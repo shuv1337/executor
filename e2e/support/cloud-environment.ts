@@ -1,5 +1,6 @@
 import {
   Clock,
+  Console,
   Deferred,
   Effect,
   FileSystem,
@@ -22,6 +23,7 @@ import {
   v1DatabaseWriter,
 } from "./cloud-postgres.ts";
 import { v1McpForwardFile } from "./v1-mcp-forward.ts";
+import { v1SessionHandoffFile } from "./v1-session-handoff.ts";
 import { isAlchemyDevFailure, outputLines } from "./alchemy-dev-output.ts";
 import { startFixtureControl, fixtureRequest } from "../sdk/fixtures.ts";
 import { roleHost } from "./role-hosts.ts";
@@ -126,6 +128,8 @@ export const startCloudEnvironment = (input: {
   readonly browserOrigin: "app" | "deployment";
   /** Registry the local Cloud compiler resolves app packages from. */
   readonly npmRegistry?: string;
+  /** The run's synthetic official app feed (`public-catalogs.ts`), which Add app and setup list. */
+  readonly catalogs?: string;
   /**
    * Better Auth's OAuth proxy is on, as in production. Without this, this Cloud is the proxy's
    * production: its edge exchanges the codes of stages that sign in through it. With it, this
@@ -169,9 +173,12 @@ export const startCloudEnvironment = (input: {
     yield* Effect.addFinalizer(() =>
       Effect.forEach(
         Object.values(Redacted.value(fixture).services),
-        (service) => emulatorRequest(service.baseUrl, "/_emulate/reset", {}),
-        { concurrency: 5 },
-      ).pipe(Effect.asVoid, Effect.orDie),
+        (service) =>
+          emulatorRequest(service.baseUrl, "/_emulate/reset", {}).pipe(
+            Effect.catch(() => Console.error("Could not reset one external test emulator.")),
+          ),
+        { concurrency: 5, discard: true },
+      ),
     );
     const emulators = `${directory}/emulators.json`;
     yield* fs.writeFileString(emulators, JSON.stringify(Redacted.value(fixture)), { mode: 0o600 });
@@ -224,6 +231,13 @@ export const startCloudEnvironment = (input: {
       mode: 0o600,
     });
     yield* Effect.addFinalizer(() => fs.remove(v1Forward).pipe(Effect.orDie));
+    // The secret the synthetic v1 signs session handoffs with; scenarios read it from here.
+    const v1HandoffSecret = randomBytes(32).toString("hex");
+    const v1Handoff = `${directory}/${v1SessionHandoffFile}`;
+    yield* fs.writeFileString(v1Handoff, JSON.stringify({ secret: v1HandoffSecret }), {
+      mode: 0o600,
+    });
+    yield* Effect.addFinalizer(() => fs.remove(v1Handoff).pipe(Effect.orDie));
     const env = {
       PATH: [path.join(cloud, "node_modules/.bin"), process.env.PATH ?? ""].join(
         process.platform === "win32" ? ";" : ":",
@@ -264,6 +278,9 @@ export const startCloudEnvironment = (input: {
       CLOUD_DEV_APP_UI_PORT: String(input.appPort),
       EXECUTOR_APP_UI_BASE_URL: `http://localhost:${input.appPort}`,
       ...(input.npmRegistry === undefined ? {} : { EXECUTOR_NPM_REGISTRY: input.npmRegistry }),
+      ...(input.catalogs === undefined
+        ? {}
+        : { EXECUTOR_CATALOG_URL: `${input.catalogs}/catalog/index.json` }),
       CLOUD_DEV_DATABASE_PORT: String(input.databasePort),
       CLOUD_DEV_DATABASE_PASSWORD: databasePassword,
       CLOUD_DEV_EXTERNAL_DATABASE: "true",
@@ -275,6 +292,7 @@ export const startCloudEnvironment = (input: {
       // Imports freeze and cut over each organization in the emulated v1 through this login.
       V1_IMPORT_WRITER_DATABASE_URL: `postgresql://${v1DatabaseWriter}:${v1WriterPassword}@127.0.0.1:${input.databasePort}/executor_v1?sslmode=disable`,
       V1_MCP_FORWARD_SECRET: v1ForwardSecret,
+      V1_SESSION_HANDOFF_SECRET: v1HandoffSecret,
       // Serve the role hosts as production does, at `app.`, `mcp.` and `api.` of the origin's host.
       EXECUTOR_ROLE_HOSTS_DOMAIN: new URL(input.origin).hostname,
       CLOUD_BROWSER_ORIGIN: input.browserOrigin,

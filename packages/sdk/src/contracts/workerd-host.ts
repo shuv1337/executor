@@ -13,6 +13,7 @@ import {
   WorkflowValue,
 } from "apps/contracts";
 import { WorkflowSeed } from "./workflow-runtime.ts";
+import { HostApiCheck } from "./host-api.ts";
 import { RetainedWorkerBuild, WorkerBundle, WorkerFramework } from "./worker-build.ts";
 import { CodeFiles } from "./source.ts";
 import {
@@ -29,6 +30,8 @@ import type { RpcTarget } from "capnweb";
 export const WorkerInvocation = Schema.Struct({
   app: Schema.NonEmptyString,
   build: Schema.NonEmptyString,
+  /** The host API revision the app's cache belongs to, for an app that reads it; see `HostApiCheck`. */
+  hostApi: Schema.optionalKey(HostApiCheck),
   database: Schema.Boolean,
   /** Sent only for builds that declare `sharedRuntime`; see `appWorker`. */
   sharedRuntime: Schema.optionalKey(Schema.Literal(true)),

@@ -33,8 +33,12 @@ const pascal = (value: string) => {
 };
 
 const version = /^v\d+(?:[._-]\d+)?$/i;
+/**
+ * The path's segments. A fixed query or fragment, as in `/search?type=items`, names nothing; only
+ * the last round, the hash, reads the whole path, so paths that differ only there stay distinct.
+ */
 const segments = (path: string) =>
-  path
+  (path.split(/[?#]/)[0] ?? path)
     .split("/")
     .map((segment) => segment.trim())
     .filter((segment) => segment.length > 0);
@@ -128,12 +132,16 @@ export const planOperationNames = <I extends OperationNameInput>(
     return { input, group, leaf, prefix, versionSegment, tokens, name: `${group}.${leaf}` };
   });
   type Staged = (typeof staged)[number];
+  // A name only one operation wanted is kept. A refined name that lands on it is refined again.
+  const wanted = new Map<string, number>();
+  for (const item of staged) wanted.set(item.name, (wanted.get(item.name) ?? 0) + 1);
+  const settled = new Set(staged.filter((item) => wanted.get(item.name) === 1));
   const refine = (rename: (item: Staged, bucket: readonly Staged[]) => string) => {
     const buckets = new Map<string, Staged[]>();
     for (const item of staged) buckets.set(item.name, [...(buckets.get(item.name) ?? []), item]);
     for (const bucket of buckets.values())
       if (bucket.length > 1) {
-        const names = bucket.map((item) => rename(item, bucket));
+        const names = bucket.map((item) => (settled.has(item) ? item.name : rename(item, bucket)));
         for (const [index, item] of bucket.entries()) item.name = names[index] ?? item.name;
       }
   };

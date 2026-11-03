@@ -218,7 +218,7 @@ layer(HostedLive, { excludeTestServices: true })("Connection keys", (it) => {
           page.goto(`/org/${actors.organization.slug}/connect`),
         );
         yield* browser.use("Open the bound connection", (page) =>
-          page.getByRole("button", { name: new RegExp(bound.name) }).click(),
+          page.getByRole("link", { name: bound.name, exact: true }).click(),
         );
         yield* browser.use("Start a connection key", (page) =>
           page.getByRole("button", { name: "Create connection key", exact: true }).click(),
@@ -505,7 +505,7 @@ layer(HostedLive, { excludeTestServices: true })("Connection keys", (it) => {
           page.goto(`/org/${actors.organization.slug}/connect`),
         );
         yield* browser.use("Open the seat's connection", (page) =>
-          page.getByRole("button", { name: new RegExp(seat.name) }).click(),
+          page.getByRole("link", { name: seat.name, exact: true }).click(),
         );
         const keyName = `Replacement ${receipt.slice(0, 6)}`;
         const keyList = (page: Page) => page.getByRole("region", { name: "Connection keys" });

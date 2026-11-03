@@ -9,7 +9,7 @@ import {
   untargetedLinkRefusal,
   type Grant,
 } from "@executor-js/mcp-auth";
-import { localRequest } from "./auth.ts";
+import { localBearer, localRequest } from "./auth.ts";
 import type { ServerConfig } from "../contracts/config.ts";
 import { LocalMcpUnauthorized, type LocalMcpOAuth } from "./mcp-oauth.ts";
 /** Local access and documentation I/O for the shared MCP implementation. */
@@ -25,7 +25,7 @@ import {
 } from "@executor-js/sdk/core";
 import { appVersion, versionRequirementAccounts } from "./app-accounts.ts";
 import type { SqlClient } from "effect/sql";
-import { Context, Effect, Redacted } from "effect";
+import { Context, Effect } from "effect";
 
 /** The user requirements' linked accounts; the app's are its app links, never shown to agents. */
 const linkedAccountsOf = (
@@ -219,14 +219,13 @@ export const localMcp = (
       if (address === undefined) return oauth.invalidAddress;
       const current = Effect.gen(function* () {
         // The administrative key is full access on the plain URL only; it never enters a connection.
-        const grant =
-          request.headers.authorization === `Bearer ${Redacted.value(config.apiKey)}`
-            ? {
-                id: GrantId.make("local-administrator"),
-                policy: { kind: "all" as const },
-                target: { kind: "mcp" as const, mode: address.mode },
-              }
-            : (yield* oauth.authenticate(new Headers(request.headers))).grant;
+        const grant = localBearer(config, request.headers.authorization)
+          ? {
+              id: GrantId.make("local-administrator"),
+              policy: { kind: "all" as const },
+              target: { kind: "mcp" as const, mode: address.mode },
+            }
+          : (yield* oauth.authenticate(new Headers(request.headers))).grant;
         const refusal = deliveryRefusal(grant, address);
         if (refusal !== undefined) return yield* new GrantForbidden({ refusal });
         return grant;

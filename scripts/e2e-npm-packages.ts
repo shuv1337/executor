@@ -53,7 +53,7 @@ const roots: ReadonlyArray<Root> = [
   dependency("zod", "3.25.76"),
   // The compiler installs Tailwind at the version the host bundles for `@import "tailwindcss"`.
   alone("tailwindcss", tailwind.version),
-  ...[0, 1, 2, 4, 5, 9, 10, 14, 22, 33, 35, 59, 84].map((beta) =>
+  ...[0, 1, 2, 4, 5, 9, 10, 14, 22, 33, 35, 59, 84, 95].map((beta) =>
     alone("apps", `0.0.1-beta.${beta}`),
   ),
 ];

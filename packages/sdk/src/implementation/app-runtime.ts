@@ -28,6 +28,7 @@ import {
   ToolResultObservation,
   type HostContext,
   type HostRequest,
+  type WebhookCommand,
   scopedSlots,
 } from "apps/contracts";
 import {
@@ -44,6 +45,7 @@ import {
   type Runtime,
   type RuntimeBuildUnavailable,
 } from "../contracts/runtime.ts";
+import type { HostApiCheck } from "../contracts/host-api.ts";
 import { Json, type BuildId } from "../contracts/shared.ts";
 import type { LoadedWorkerBuild } from "../contracts/worker-build.ts";
 import type { BlobStore } from "../contracts/blobs.ts";
@@ -55,6 +57,16 @@ import { runtimeCallParts } from "./tool-call-overhead.ts";
 
 /** What telemetry records for an error an app's reply carried, beside the error's name. */
 const appErrorRecorded = "The app returned this error; its text is not recorded";
+
+/** The part of a webhook's life each command runs, as its span records it. */
+const webhookOperations = {
+  webhooks: "definitions",
+  "webhook-validate": "validate",
+  "webhook-complete": "complete",
+  "webhook-register": "register",
+  "webhook-unregister": "unregister",
+  "webhook-handle": "handle",
+} as const satisfies Record<WebhookCommand["operation"], string>;
 
 /** The span recorded each time a host reads a build, to learn its protocol or cold-start it. */
 export const buildLoadSpan = "runtime.app.build.load";
@@ -126,6 +138,11 @@ export const invocationBuildLoader = <R>(
 export interface AppRuntimeHost {
   /** Span prefix for this host's runtime operations. */
   readonly name: string;
+  /**
+   * Opaque ids of whom the current operation runs for, such as its organization, read from its
+   * context without I/O. Each runtime operation's span records them.
+   */
+  readonly actor?: Effect.Effect<Readonly<Record<string, string>>>;
   /** Read one retained build, with the protocol its framework speaks, from this host's store. */
   readonly loadBuild: (
     build: BuildId,
@@ -148,6 +165,7 @@ export const appRuntime = (host: AppRuntimeHost) =>
       input: {
         readonly app: string;
         readonly build: BuildId;
+        readonly hostApi: HostApiCheck | undefined;
         readonly database: boolean;
         readonly sharedRuntime: boolean;
         readonly observeRevision?: (revision: number) => void;
@@ -176,6 +194,7 @@ export const appRuntime = (host: AppRuntimeHost) =>
             accounts: Redacted.value(input.accounts),
             // Workers RPC structured-clones its arguments; Effect headers carry a prototype it rejects.
             headers: Object.fromEntries(Object.entries(yield* traceHeaders)),
+            ...(input.hostApi === undefined ? {} : { hostApi: input.hostApi }),
             ...(input.approval === undefined ? {} : { approval: input.approval }),
             ...(input.caller === undefined ? {} : { caller: input.caller }),
             ...(input.approvedBy === undefined ? {} : { approvedBy: input.approvedBy }),
@@ -337,9 +356,22 @@ export const appRuntime = (host: AppRuntimeHost) =>
         ),
       );
     };
-    const span = (operation: string) => `${host.name}.${operation}`;
+    const actor: Effect.Effect<Readonly<Record<string, string>>> = host.actor ?? Effect.succeed({});
+    /**
+     * One runtime operation's span. It records the app the operation runs and whom the host says
+     * it runs for, so one app's or organization's failures can be told from the runtime's own.
+     */
+    const traced =
+      (operation: string, attributes: Readonly<Record<string, string>> = {}) =>
+      <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+        Effect.flatMap(actor, (ids) =>
+          Effect.withSpan(effect, `${host.name}.${operation}`, {
+            attributes: { ...ids, ...attributes },
+          }),
+        );
+    const app = (input: { readonly app: string }) => ({ "executor.app.id": input.app });
     return {
-      build: (input) => host.build(input).pipe(Effect.withSpan(span("build"))),
+      build: (input) => host.build(input).pipe(traced("build")),
       asset: host.asset,
       changes: host.changes,
       skills: ({ sources, ...input }) =>
@@ -348,7 +380,7 @@ export const appRuntime = (host: AppRuntimeHost) =>
           skillsCommand(sources === true),
           SkillCatalogResponse,
           HostInspectError,
-        ).pipe(Effect.map(skillCatalog), Effect.withSpan(span("skills"))),
+        ).pipe(Effect.map(skillCatalog), traced("skills", app(input))),
       inspect: ({ tools, scheduled, definitions, ...input }) =>
         (definitions === "shared"
           ? dispatch(
@@ -370,28 +402,28 @@ export const appRuntime = (host: AppRuntimeHost) =>
               HostedCatalog,
               HostInspectError,
             )
-        ).pipe(Effect.map(selectTools(tools)), Effect.withSpan(span("inspect"))),
+        ).pipe(Effect.map(selectTools(tools)), traced("inspect", app(input))),
       index: (input) =>
         dispatch(
           { ...input, database: false },
           indexCommand,
           HostedCatalogSummary,
           HostInspectError,
-        ).pipe(Effect.withSpan(span("index"))),
+        ).pipe(traced("index", app(input))),
       query: (input) =>
         dispatch(
           input,
           { operation: "query", name: input.name, input: input.input },
           Json,
           HostDataError,
-        ).pipe(Effect.withSpan(span("query"))),
+        ).pipe(traced("query", app(input))),
       mutate: (input) =>
         dispatch(
           input,
           { operation: "mutate", name: input.name, input: input.input },
           Json,
           HostDataError,
-        ).pipe(Effect.withSpan(span("mutate"))),
+        ).pipe(traced("mutate", app(input))),
       call: (input) =>
         dispatch(
           input,
@@ -403,32 +435,42 @@ export const appRuntime = (host: AppRuntimeHost) =>
           },
           Json,
           HostCallError,
-        ).pipe(Effect.withSpan(span("call"))),
+        ).pipe(traced("call", app(input))),
       webhook: (input) =>
-        dispatch(input, input.command, Json, HostCallError).pipe(Effect.withSpan(span("webhook"))),
+        dispatch(input, input.command, Json, HostCallError).pipe(
+          traced("webhook", {
+            ...app(input),
+            "executor.webhook.operation": webhookOperations[input.command.operation],
+          }),
+        ),
       checkAccount: ({ requirement, ...input }) =>
         dispatch(
           { ...input, database: false },
           { operation: "account-check", requirement },
           AccountCheckResult,
           HostAccountCheckError,
-        ).pipe(Effect.withSpan(span("checkAccount"))),
+        ).pipe(traced("checkAccount", app(input))),
       migrate: (input) =>
         dispatch(
-          // Named by build alone either way: a migration runs without accounts.
-          { ...input, database: true, sharedRuntime: false, accounts: Redacted.make({ app: {} }) },
+          // Migrations run the build's SQL files only, so they read no cache or API. Named by build
+          // alone either way: a migration runs without accounts.
+          {
+            ...input,
+            hostApi: undefined,
+            database: true,
+            sharedRuntime: false,
+            accounts: Redacted.make({ app: {} }),
+          },
           { operation: "migrate" },
           MigrateResult,
           HostCallError,
-        ).pipe(Effect.withSpan(span("migrate"))),
+        ).pipe(traced("migrate", app(input))),
       workflow: (input) =>
         dispatch({ ...input, database: false }, input.command, Json, HostCallError).pipe(
-          Effect.withSpan(span("workflow"), {
-            attributes: {
-              "executor.app.id": input.app,
-              "executor.build.id": input.build,
-              ...(input.workflow === undefined ? {} : { "executor.run.id": input.workflow.runId }),
-            },
+          traced("workflow", {
+            ...app(input),
+            "executor.build.id": input.build,
+            ...(input.workflow === undefined ? {} : { "executor.run.id": input.workflow.runId }),
           }),
         ),
     } satisfies Runtime<BlobStore>;
