@@ -2528,6 +2528,13 @@
                     "isOptional": true
                   },
                   {
+                    "name": "kindConfirmed",
+                    "type": {
+                      "_tag": "Boolean"
+                    },
+                    "isOptional": true
+                  },
+                  {
                     "name": "title",
                     "type": {
                       "_tag": "String"
@@ -2721,6 +2728,13 @@
                     "isOptional": true
                   },
                   {
+                    "name": "kindConfirmed",
+                    "type": {
+                      "_tag": "Boolean"
+                    },
+                    "isOptional": true
+                  },
+                  {
                     "name": "title",
                     "type": {
                       "_tag": "String"
@@ -2886,6 +2900,13 @@
                   },
                   {
                     "name": "readOnly",
+                    "type": {
+                      "_tag": "Boolean"
+                    },
+                    "isOptional": true
+                  },
+                  {
+                    "name": "kindConfirmed",
                     "type": {
                       "_tag": "Boolean"
                     },

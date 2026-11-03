@@ -9,6 +9,7 @@ import { JSON_SCHEMA, YAMLException, load as loadYaml } from "js-yaml";
 import { isLoopbackHostname } from "@executor-js/utils/url-policy";
 import type { V1StaleCategory } from "../../contracts/v1-import-run.ts";
 import type { OpenApiConfig, OpenApiOperationRow } from "./formats.ts";
+import { Entries, mapEntries, noEntries, parserReason } from "./stored-document.ts";
 
 type Json = Record<string, unknown>;
 const isObject = (value: unknown): value is Json =>
@@ -16,19 +17,24 @@ const isObject = (value: unknown): value is Json =>
 
 const methods = ["get", "put", "post", "delete", "patch", "head", "options", "trace"] as const;
 
-/** A stored specification as an object, or why it is not one, without any of its text. */
+/**
+ * A stored specification as an object, the URL v1 stored in its place, or why it is neither,
+ * without any of its text.
+ */
 export type ParsedSpec =
   | { readonly ok: true; readonly document: Json }
+  | { readonly ok: "url"; readonly url: string }
   | { readonly ok: false; readonly reason: string };
+
+/** A specification v1 stored only as its URL, which v1 fetched when the integration was added. */
+const specificationUrl = (value: unknown) => {
+  if (typeof value !== "string") return undefined;
+  const url = value.trim();
+  return /^https?:\/\//iu.test(url) && URL.canParse(url) ? url : undefined;
+};
 
 const kindOf = (value: unknown) =>
   value === null ? "null" : Array.isArray(value) ? "a list" : `a ${typeof value}`;
-
-/**
- * The parser's reason up to the first quoted name, tag or value it carries, so a failure names the
- * kind of error and never the specification's text.
- */
-const parserReason = (reason: string) => reason.split(/[:"'`!<]/)[0]?.trim() ?? "";
 
 const utf8 = new TextDecoder("utf-8", { fatal: true });
 const lossyUtf8 = new TextDecoder("utf-8");
@@ -64,9 +70,12 @@ export const parseSpec = (bytes: Uint8Array): ParsedSpec => {
   // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: the YAML parser throws on input it cannot read
   try {
     const yaml = loadYaml(text, { schema: JSON_SCHEMA, json: true });
+    const url = specificationUrl(yaml);
     return isObject(yaml)
       ? { ok: true, document: yaml }
-      : unreadable(`it is ${kindOf(yaml)}, not an object`);
+      : url !== undefined
+        ? { ok: "url", url }
+        : unreadable(`it is ${kindOf(yaml)}, not an object`);
   } catch (error) {
     if (!(error instanceof YAMLException))
       return unreadable(
@@ -276,29 +285,44 @@ export const plainHttpHosts = (origins: readonly string[]) =>
     return url.protocol === "https:" || isLoopbackHostname(url.hostname) ? [] : [url.host];
   });
 
-/** Every `#/components/...` reference reachable from a value. */
+/**
+ * The component each `#/components/<section>/<name>` reference reachable from a value names, as
+ * `[section, name]` in JSON. A reference's tokens are read as the compiler reads them: percent
+ * decoded, then unescaped, so `#/components/schemas/Paper%20Input` names `Paper Input`.
+ */
 const references = (value: unknown, found: Set<string>) => {
   if (Array.isArray(value)) for (const item of value) references(item, found);
   else if (isObject(value))
     for (const [key, item] of Object.entries(value))
-      if (key === "$ref" && typeof item === "string" && item.startsWith("#/components/"))
-        found.add(item);
-      else references(item, found);
+      if (key === "$ref" && typeof item === "string" && item.startsWith("#/components/")) {
+        const [section, name] = item
+          .slice("#/components/".length)
+          .split("/")
+          .map((token) => unescape(safeDecode(token)));
+        if (section !== undefined && name !== undefined) found.add(JSON.stringify([section, name]));
+      } else references(item, found);
 };
 const unescape = (token: string) => token.replaceAll("~1", "/").replaceAll("~0", "~");
 
-/** Keep only components the rest of the document reaches, directly or through other components. */
+/**
+ * Keep only components the rest of the document reaches, directly or through other components.
+ * The components can be the stored document's, read entry by entry, so that only those the rest
+ * reaches are parsed.
+ */
 const pruneComponents = (document: Json) => {
-  const components = isObject(document.components) ? document.components : undefined;
+  const components = mapEntries(document.components);
   if (components === undefined) return document;
   const reached = new Set<string>();
   const { components: _components, ...rest } = document;
   references(rest, reached);
+  const targets = new Map<string, unknown>();
   const queue = [...reached];
   for (let next = queue.pop(); next !== undefined; next = queue.pop()) {
-    const [section, name] = next.slice("#/components/".length).split("/").map(unescape);
-    const sectionValue = section === undefined ? undefined : components[section];
-    const target = isObject(sectionValue) && name !== undefined ? sectionValue[name] : undefined;
+    const [section, name] = Schema.decodeUnknownSync(Schema.Tuple([Schema.String, Schema.String]))(
+      JSON.parse(next),
+    );
+    const target = child(components.get(section), name);
+    targets.set(next, target);
     const more = new Set<string>();
     references(target, more);
     for (const reference of more)
@@ -308,15 +332,54 @@ const pruneComponents = (document: Json) => {
       }
   }
   const kept: Json = {};
-  for (const [section, entries] of Object.entries(components)) {
-    if (section === "securitySchemes" || !isObject(entries)) continue;
-    const names = Object.keys(entries).filter((name) =>
-      reached.has(`#/components/${section}/${name.replaceAll("~", "~0").replaceAll("/", "~1")}`),
-    );
+  for (const section of components.keys) {
+    const entries = mapEntries(components.get(section));
+    if (section === "securitySchemes" || entries === undefined) continue;
+    const names = entries.keys.filter((name) => reached.has(JSON.stringify([section, name])));
     if (names.length > 0)
-      kept[section] = Object.fromEntries(names.map((name) => [name, entries[name]]));
+      kept[section] = Object.fromEntries(
+        names.map((name) => [name, targets.get(JSON.stringify([section, name]))]),
+      );
   }
   return { ...document, components: kept };
+};
+
+/** A map's own value at a key, whether the map is read entry by entry or parsed. */
+const child = (node: unknown, key: string) =>
+  node instanceof Entries
+    ? node.get(key)
+    : isObject(node) && Object.hasOwn(node, key)
+      ? node[key]
+      : undefined;
+
+/**
+ * The object a local reference reaches, following references it reaches in turn, or the value
+ * itself when it is no reference. An operation can be a reference, which the compiler follows: the
+ * cut keeps the operation it reaches, so its security is removed like any other's. A reference
+ * that does not resolve, or a cycle, reaches nothing, and neither does one to a whole map the
+ * document is read through entry by entry, such as `#/paths`, which is no operation.
+ */
+const localTarget = (document: Entries, value: unknown): unknown => {
+  const seen = new Set<string>();
+  let current = value;
+  while (isObject(current) && typeof current.$ref === "string") {
+    const ref = current.$ref;
+    if (seen.has(ref) || !ref.startsWith("#/")) return undefined;
+    seen.add(ref);
+    let node: unknown = document;
+    for (const token of ref.slice(2).split("/").map(unescape))
+      node = child(node, safeDecode(token));
+    current = node instanceof Entries ? undefined : node;
+  }
+  return current;
+};
+const safeDecode = (token: string) => {
+  // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: decodeURIComponent throws on a malformed escape, which is then read literally
+  try {
+    return decodeURIComponent(token);
+  } catch {
+    return token;
+  }
 };
 
 /**
@@ -327,40 +390,56 @@ const pruneComponents = (document: Json) => {
  * no row matches is kept under the name in `compiled` (by method and document path), for the tools
  * v1 bound by compiling the document because it stored no binding for them. TRACE operations are
  * left out, as v2 sends no TRACE requests, and their v1 tools are returned as `traced` (decision 16).
+ * The stored document is read entry by entry: each path item once, and the components the cut
+ * reaches.
  */
 export const importedDocument = (
-  document: Json,
+  document: Entries,
   operations: readonly OpenApiOperationRow[],
   compiled: ReadonlyMap<string, string>,
 ) => {
   const named = new Map<string, string>();
   const traced = new Set<string>();
   const paths: Record<string, Json> = {};
-  const source = isObject(document.paths) ? document.paths : {};
-  // The tool paths operations name for themselves: a row one of them claims is not another's.
+  const source = mapEntries(document.get("paths")) ?? noEntries;
+  const rows = new Map<string, OpenApiOperationRow[]>();
+  for (const row of operations) {
+    const key = `${row.method.toLowerCase()} ${row.path}`;
+    const same = rows.get(key);
+    if (same === undefined) rows.set(key, [row]);
+    else same.push(row);
+  }
+  const templateOf = (operation: Json, path: string) =>
+    typeof operation["x-executor-pathTemplate"] === "string"
+      ? operation["x-executor-pathTemplate"]
+      : path;
+  // The tool paths operations name for themselves: a row one of them claims is not another's. The
+  // path items with an operation a row or `compiled` names are the only ones the cut keeps from.
   const claimed = new Set<string>();
-  for (const item of Object.values(source))
-    if (isObject(item))
-      for (const method of methods) {
-        const operation = item[method];
-        if (isObject(operation) && typeof operation["x-executor-toolPath"] === "string")
-          claimed.add(operation["x-executor-toolPath"]);
-      }
-  for (const [path, item] of Object.entries(source)) {
+  const bound: Array<readonly [string, Json]> = [];
+  for (const path of source.keys) {
+    const item = source.get(path);
     if (!isObject(item)) continue;
+    let wanted = false;
+    for (const method of methods) {
+      const operation = localTarget(document, item[method]);
+      if (!isObject(operation)) continue;
+      if (typeof operation["x-executor-toolPath"] === "string")
+        claimed.add(operation["x-executor-toolPath"]);
+      wanted ||=
+        rows.has(`${method} ${templateOf(operation, path)}`) || compiled.has(`${method} ${path}`);
+    }
+    if (wanted) bound.push([path, item]);
+  }
+  for (const [path, item] of bound) {
     const shared: Json = {};
     for (const [key, value] of Object.entries(item))
       if (!(methods as readonly string[]).includes(key)) shared[key] = value;
     for (const method of methods) {
-      const operation = item[method];
+      const operation = localTarget(document, item[method]);
       if (!isObject(operation)) continue;
-      const template =
-        typeof operation["x-executor-pathTemplate"] === "string"
-          ? operation["x-executor-pathTemplate"]
-          : path;
-      const candidates = operations.filter(
-        (row) => row.method.toLowerCase() === method && row.path === template,
-      );
+      const template = templateOf(operation, path);
+      const candidates = rows.get(`${method} ${template}`) ?? [];
       // The row of the operation's own tool path, or the only row of its method and template
       // unless another operation names that row's tool as its own: v1 merged documents whose
       // operations share a template, such as Calendar's and Drive's `POST /channels/stop`.
@@ -387,46 +466,10 @@ export const importedDocument = (
     }
   }
   // Webhooks are requests the API sends, never tools v1 exposed.
-  const { security: _security, webhooks: _webhooks, ...rest } = document;
-  return { document: pruneComponents({ ...rest, paths }), named, traced: [...traced].sort() };
-};
-
-const OperationNaming = Schema.Struct({
-  operationId: Schema.optional(Schema.String),
-  tags: Schema.optional(Schema.Array(Schema.Unknown)),
-});
-
-/**
- * Each operation of the imported document as v2's name planner reads it (operationId, first
- * non-empty tag, method and path, in document order), with v1's name for it.
- */
-export const documentOperations = (prepared: {
-  readonly document: Json;
-  readonly named: ReadonlyMap<string, string>;
-}) => {
-  const paths = isObject(prepared.document.paths) ? prepared.document.paths : {};
-  return Object.entries(paths).flatMap(([path, item]) =>
-    isObject(item)
-      ? methods.flatMap((method) => {
-          const operation = item[method];
-          if (!isObject(operation)) return [];
-          const naming = Option.getOrUndefined(
-            Schema.decodeUnknownOption(OperationNaming)(operation),
-          );
-          const tag = naming?.tags?.find(
-            (candidate): candidate is string =>
-              typeof candidate === "string" && candidate.trim() !== "",
-          );
-          return [
-            {
-              operationId: naming?.operationId,
-              tag,
-              method: method.toUpperCase(),
-              path,
-              v1: prepared.named.get(`${method} ${path}`),
-            },
-          ];
-        })
-      : [],
+  const rest = Object.fromEntries(
+    document.keys
+      .filter((key) => key !== "security" && key !== "webhooks")
+      .map((key) => [key, document.get(key)]),
   );
+  return { document: pruneComponents({ ...rest, paths }), named, traced: [...traced].sort() };
 };

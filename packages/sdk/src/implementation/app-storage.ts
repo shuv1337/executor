@@ -16,6 +16,8 @@ import { database } from "./database.ts";
 import { callerContext, resolve, snapshot, type InvocationSnapshot } from "./tools.ts";
 import type { makeOAuth } from "./oauth.ts";
 import { ownsDatabase, sharesRuntime } from "../contracts/apps.ts";
+import type { HostApi } from "../contracts/executor.ts";
+import { versionHostApi } from "./declarations.ts";
 import { refreshAtMostEvery } from "./live-refresh.ts";
 
 /**
@@ -42,6 +44,7 @@ export const makeAppData = (
   storage: ExecutorDatabase,
   resolveAccount: ReturnType<typeof makeOAuth>["resolveSelected"],
   runtime: Runtime,
+  hostApi: HostApi | undefined,
   workflows?: (state: InvocationSnapshot) => WorkflowHostControls,
 ) => {
   const db = database(storage);
@@ -56,6 +59,7 @@ export const makeAppData = (
       const accounts = yield* resolve(state, resolveAccount);
       return yield* runtime[kind]({
         build: state.version.build,
+        hostApi: versionHostApi(hostApi, state.version),
         database: ownsDatabase(state.version.requirements),
         sharedRuntime: sharesRuntime(state.version.requirements),
         ...accounts,

@@ -26,6 +26,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { appsManifest, withApps } from "../support/apps-release.ts";
 import { containerNpmRegistry } from "../support/npm-registry.ts";
 import { connectionsPath } from "../support/app-accounts.ts";
+import { currentClient } from "../support/api.ts";
 
 /**
  * `workerd --version` prints the release date of the workerd the checkout pins, which the image
@@ -1902,11 +1903,19 @@ it.live("released image serves management tools at a tailnet origin with private
             }),
         );
       };
-      const request = (route: string, data?: unknown, cookie?: string) =>
+      // Like the dashboard, each request states the wire revision this release reads, unless it
+      // stands in for a client released before revisions, which sends none.
+      const request = (
+        route: string,
+        data?: unknown,
+        cookie?: string,
+        client: Record<string, string> = currentClient,
+      ) =>
         driver("tailnet image HTTP request", () =>
           hostFetch(`${origin}${route}`, {
             method: data === undefined ? "GET" : "POST",
             headers: {
+              ...client,
               origin,
               "content-type": "application/json",
               ...(cookie === undefined ? {} : { cookie }),

@@ -56,7 +56,7 @@ export default class AppPages extends Cloudflare.Worker<AppPages>()(
       },
       compatibility: {
         date: "2026-09-08",
-        flags: ["nodejs_compat", "global_fetch_strictly_public"],
+        flags: ["nodejs_compat", "global_fetch_strictly_public", "no_brotli_content_encoding"],
       },
       ...(dev
         ? {}
@@ -81,7 +81,6 @@ export default class AppPages extends Cloudflare.Worker<AppPages>()(
     const protectedRoutes = Layer.mergeAll(
       HttpRouter.add("GET", appSignInCallbackPath, appUi.callback),
       HttpRouter.add("GET", "/_executor/assets/:version/*", appUi.asset),
-      HttpRouter.add("GET", "/_executor/watch.js", appUi.watch),
       HttpRouter.add("GET", "/_executor/version", appUi.versions),
       HttpRouter.add("POST", "/_executor/api/telemetry/traces", appUi.telemetry("traces")),
       HttpRouter.add("POST", "/_executor/api/telemetry/logs", appUi.telemetry("logs")),

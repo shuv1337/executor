@@ -4,19 +4,106 @@
  * v1 rows into the managed Cloud's emulated v1 database, members into the emulated v1 WorkOS and
  * secrets into its Vault, and read v2's own rows to prove what was and was not written.
  */
+import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import { randomUUID } from "node:crypto";
+import { createServer } from "node:http";
 import { expect, layer } from "@effect/vitest";
-import { Effect, Layer, Schedule, Schema } from "effect";
+import { Effect, FileSystem, Layer, Redacted, Schedule, Schema } from "effect";
+import {
+  FetchHttpClient,
+  HttpClient,
+  HttpClientRequest,
+  HttpRouter,
+  HttpServer,
+  HttpServerRequest,
+  HttpServerResponse,
+} from "effect/http";
 import { TestLive, withCase } from "../support/case.ts";
 import { Browser } from "../support/browser.ts";
 import { writeRows, type RowStatement } from "../support/cloud-rows.ts";
 import { Emulators } from "../support/emulators.ts";
+import { McpClient } from "../support/mcp-client.ts";
 import { Telemetry } from "../support/evidence.ts";
 import { Onboarding } from "../support/onboarding.ts";
-import { v1ImportOperator, v1RunId } from "../support/v1-import.ts";
+import { Target } from "../support/platform.ts";
+import {
+  allowV1Import,
+  listV1Into,
+  listV1SlugDisplacement,
+  v1ImportOperator,
+  v1RunId,
+  type V1Report,
+} from "../support/v1-import.ts";
+import {
+  V1McpForwardSecret,
+  v1ForwardBearer,
+  v1McpForwardFile,
+} from "../support/v1-mcp-forward.ts";
 import { scenarios } from "../test-plan.ts";
 
 const services = Layer.mergeAll(Onboarding.layer, Emulators.layer);
+
+/**
+ * OAuth MCP servers at `/<name>/mcp` on loopback, for each of `names`, as far as a sign-in reaches
+ * them: each refuses a request without a token with a challenge naming its resource metadata,
+ * which names this origin's authorization server. The import discovers them before it saves an
+ * account, and the dry run does too.
+ */
+const mcpSignInServers = (names: readonly string[]) =>
+  Effect.gen(function* () {
+    const at = Effect.map(
+      HttpServerRequest.HttpServerRequest,
+      (request) => `http://${request.headers.host}`,
+    );
+    const routes = Layer.mergeAll(
+      HttpRouter.add(
+        "GET",
+        "/.well-known/oauth-authorization-server",
+        Effect.flatMap(at, (origin) =>
+          HttpServerResponse.json({
+            issuer: origin,
+            authorization_endpoint: `${origin}/authorize`,
+            token_endpoint: `${origin}/token`,
+            response_types_supported: ["code"],
+            code_challenge_methods_supported: ["S256"],
+            token_endpoint_auth_methods_supported: ["client_secret_post"],
+          }),
+        ),
+      ),
+      ...names.flatMap((name) => [
+        HttpRouter.add(
+          "*",
+          `/${name}/mcp`,
+          Effect.map(at, (origin) =>
+            HttpServerResponse.empty({
+              status: 401,
+              headers: {
+                "www-authenticate": `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource/${name}/mcp"`,
+              },
+            }),
+          ),
+        ),
+        HttpRouter.add(
+          "GET",
+          `/.well-known/oauth-protected-resource/${name}/mcp`,
+          Effect.flatMap(at, (origin) =>
+            HttpServerResponse.json({
+              resource: `${origin}/${name}/mcp`,
+              authorization_servers: [origin],
+            }),
+          ),
+        ),
+      ]),
+    );
+    const built = yield* Layer.build(
+      HttpRouter.serve(routes, { disableLogger: true, disableListenLog: true }).pipe(
+        Layer.provideMerge(NodeHttpServer.layer(createServer, { host: "127.0.0.1", port: 0 })),
+      ),
+    );
+    const server = yield* HttpServer.HttpServer.pipe(Effect.provideContext(built));
+    if (!("port" in server.address)) return yield* Effect.die("Fixture must listen on TCP");
+    return `127.0.0.1:${server.address.port}`;
+  });
 
 const row = (sql: string, ...params: string[]): RowStatement => ({ sql, params });
 const Rows = Schema.Array(Schema.Array(Schema.Unknown));
@@ -228,7 +315,157 @@ const seedShared = (
 
 const IdRow = Schema.Struct({ id: Schema.String });
 
+/** A synthetic address no other scenario uses. */
+const syntheticEmail = (label: string) => `${label}-${randomUUID().slice(0, 8)}@example.test`;
+
+/** A v2 user with a verified email, as v2 sign-in leaves them. */
+const v2User = (email: string) =>
+  Effect.gen(function* () {
+    const id = randomUUID();
+    yield* writeRows("sso-database.json", [
+      row(
+        `insert into "user" (id, name, email, "emailVerified", "createdAt", "updatedAt") values ($1, 'Synthetic member', $2, true, now(), now())`,
+        id,
+        email,
+      ),
+    ]);
+    return id;
+  });
+
+/** A v2 team its owner made. */
+const v2Team = (owner: string) =>
+  Effect.gen(function* () {
+    const id = randomUUID();
+    yield* writeRows("sso-database.json", [
+      row(
+        `insert into organization (id, name, slug, "createdAt") values ($1, 'Synthetic team', $2, now())`,
+        id,
+        `team-${randomUUID().slice(0, 8)}`,
+      ),
+      row(
+        `insert into member (id, "organizationId", "userId", role, "createdAt") values ($1, $2, $3, 'owner', now())`,
+        randomUUID(),
+        id,
+        owner,
+      ),
+    ]);
+    return id;
+  });
+
+/** A v2 user and the team they own. */
+const ownV2Team = (email: string) => Effect.flatMap(v2User(email), v2Team);
+
+/** A v1 workspace of these members, allowed and listed to move into `into`, in `mode`. */
+const listedV1Workspace = (
+  label: string,
+  members: readonly [string, ...string[]],
+  into: string,
+  mode?: string,
+) =>
+  Effect.gen(function* () {
+    const emulators = yield* Emulators;
+    const created = yield* emulators.v1Workspace(members);
+    yield* writeRows("v1-database.json", [
+      row(
+        "insert into organizations (id, name, slug) values ($1, $2, $3)",
+        created.organization,
+        `Synthetic ${label} workspace`,
+        `v1-${randomUUID().slice(0, 8)}`,
+      ),
+    ]);
+    yield* allowV1Import(created.organization);
+    yield* listV1Into(created.organization, into, mode);
+    return created;
+  });
+
+/** A rule of an integration v1 deleted: an item the import plans, with nothing to run. */
+const goneRule = (organization: string) =>
+  row(
+    "insert into tool_policy (tenant, owner, subject, pattern, action, position) values ($1, 'org', '', $2, 'block', 'a0')",
+    organization,
+    `gone_${randomUUID().slice(0, 6)}.*.*.search`,
+  );
+
 layer(TestLive, { excludeTestServices: true })("Cloud v1 import runs", (it) => {
+  it.effect(scenarios.v1ImportSplitNames.title, (context) =>
+    withCase(
+      context,
+      Effect.gen(function* () {
+        const emulators = yield* Emulators;
+        const operator = yield* v1ImportOperator;
+        const older = `older-${randomUUID().slice(0, 8)}@example.test`;
+        const first = yield* emulators.identity("google");
+        const workspace = yield* emulators.v1Workspace([older, first.email]);
+        const olderUser = workspace.user;
+        const firstUser = yield* emulators.v1User(first.email);
+        yield* emulators.setV1MemberRole(workspace.organization, olderUser, "member");
+        const former = yield* emulators.v1Workspace([
+          `former-${randomUUID().slice(0, 8)}@example.test`,
+        ]);
+        const { tracker } = yield* seedShared(
+          workspace.organization,
+          `v1-${randomUUID().slice(0, 8)}`,
+          { first: firstUser, second: olderUser, former: former.user },
+        );
+        // A workspace rule blocks searching through the team connection alone, so each connection
+        // becomes its own app; both members named their own connection `mine`.
+        yield* writeRows("v1-database.json", [
+          row(
+            "insert into tool_policy (tenant, owner, subject, pattern, action, position) values ($1, 'org', '', $2, 'block', 'b0')",
+            workspace.organization,
+            `${tracker}.org.team.search`,
+          ),
+        ]);
+        yield* signInOnV1(first.email);
+        yield* allowV1Import(workspace.organization);
+        const run = v1RunId("split-names");
+        const started = yield* operator.start({
+          mode: "import",
+          runId: run,
+          organizations: [workspace.organization],
+        });
+        expect(started.status, JSON.stringify(started.body)).toBe(200);
+        const report = yield* operator.waitForReport(run, workspace.organization);
+        expect(report.status, report.reason ?? "").toBe("imported");
+        const target = report.v2Organization;
+        if (target === undefined) return yield* Effect.die("The import named no organization");
+        expect(
+          (report.splitIntegrations?.[0]?.apps ?? []).map((app) => [app.name, app.status]).sort(),
+        ).toEqual([
+          ["Shared Tracker (mine 2)", "imported"],
+          ["Shared Tracker (mine)", "imported"],
+          ["Shared Tracker (team)", "imported"],
+        ]);
+        // The first member made their `mine` first, so theirs keeps the name; each member's app is
+        // theirs alone, and the team connection's is everyone's, made by the owner.
+        const userOf = (email: string) =>
+          cloudRows(
+            Schema.Struct({ id: Schema.String }),
+            `select id from "user" where lower(email) = lower($1)`,
+            email,
+          ).pipe(Effect.map((users) => users[0]?.id));
+        const firstV2 = yield* userOf(first.email);
+        const olderV2 = yield* userOf(older);
+        const access = yield* cloudRows(
+          Schema.Struct({
+            name: Schema.String,
+            audience: Schema.String,
+            creator: Schema.NullOr(Schema.String),
+          }),
+          `select a.name, h.audience, h.creator_id as creator from executor_apps a
+            join hosted_app_access h on h.id = a.id
+            where a.owner = $1 and a.name like 'Shared Tracker%'`,
+          `organization:${target.id}`,
+        );
+        expect([...access].sort((a, b) => (a.name < b.name ? -1 : 1))).toEqual([
+          { name: "Shared Tracker (mine 2)", audience: "private", creator: olderV2 },
+          { name: "Shared Tracker (mine)", audience: "private", creator: firstV2 },
+          { name: "Shared Tracker (team)", audience: "everyone", creator: firstV2 },
+        ]);
+      }).pipe(Effect.provide(services)),
+    ),
+  );
+
   it.effect(scenarios.v1ImportShared.title, (context) =>
     withCase(
       context,
@@ -258,6 +495,7 @@ layer(TestLive, { excludeTestServices: true })("Cloud v1 import runs", (it) => {
         // The first member already has a v2 account with the same verified email.
         yield* signInOnV1(first.email);
 
+        yield* allowV1Import(workspace.organization);
         const run = v1RunId("shared");
         const started = yield* operator.start({
           mode: "import",
@@ -496,6 +734,7 @@ layer(TestLive, { excludeTestServices: true })("Cloud v1 import runs", (it) => {
         ]);
         yield* signInOnV1(identity.email);
 
+        yield* allowV1Import(workspace.organization);
         const run = v1RunId("rollback");
         const started = yield* operator.start({
           mode: "import",
@@ -550,6 +789,1249 @@ layer(TestLive, { excludeTestServices: true })("Cloud v1 import runs", (it) => {
             workspace.organization,
           ),
         ).toEqual([{ v1_kind: "user" }]);
+      }).pipe(Effect.provide(services)),
+    ),
+  );
+
+  it.effect(scenarios.v1ImportPaidBilling.title, (context) =>
+    withCase(
+      context,
+      Effect.gen(function* () {
+        const emulators = yield* Emulators;
+        const operator = yield* v1ImportOperator;
+        const identity = yield* emulators.identity("google");
+        const workspace = (label: string, email: string) =>
+          Effect.gen(function* () {
+            const created = yield* emulators.v1Workspace([email]);
+            yield* writeRows("v1-database.json", [
+              row(
+                "insert into organizations (id, name, slug) values ($1, $2, $3)",
+                created.organization,
+                `Synthetic ${label} workspace`,
+                `v1-${randomUUID().slice(0, 8)}`,
+              ),
+            ]);
+            return created.organization;
+          });
+        const seats = yield* workspace("per-member", identity.email);
+        const flat = yield* workspace("flat", `flat-${randomUUID().slice(0, 8)}@example.test`);
+        const hobby = yield* workspace("hobby", `hobby-${randomUUID().slice(0, 8)}@example.test`);
+        // v1's Team version 3 per member, cancelled at the end of its period; version 1 at a flat
+        // USD 49 with executions metered on top; and grandfathered Hobby, which moves to Free.
+        const perMember = yield* emulators.v1TeamSubscription(seats, {
+          version: 3,
+          seats: 1,
+          cancelled: true,
+        });
+        const flatPrice = yield* emulators.v1TeamSubscription(flat, { version: 1 });
+        yield* emulators.v1Plan(hobby, "hobby");
+        yield* signInOnV1(identity.email);
+
+        yield* allowV1Import(seats, flat, hobby);
+        const run = v1RunId("paid");
+        const started = yield* operator.start({
+          mode: "import",
+          runId: run,
+          organizations: [seats, flat, hobby],
+        });
+        expect(started.status, JSON.stringify(started.body)).toBe(200);
+
+        const carried = (organization: string) =>
+          Effect.gen(function* () {
+            const report = yield* operator.waitForReport(run, organization);
+            expect(report.status, report.reason ?? "").toBe("imported");
+            expect(report.cutover).toBe(true);
+            const target = report.v2Organization;
+            if (target === undefined) return yield* Effect.die("The import named no organization");
+            // v1's customer became the v2 organization's: v1's id has none left.
+            expect(yield* emulators.autumnCustomer(organization)).toBeNull();
+            const customerId = yield* emulators.v2BillingCustomer(target.id);
+            const namespace = customerId.slice(0, customerId.indexOf(":organization:"));
+            const customer = yield* emulators.autumnCustomer(customerId);
+            if (customer === null) return yield* Effect.die("The v2 organization has no customer");
+            return { report, target, customerId, namespace, customer };
+          });
+
+        const moved = yield* carried(seats);
+        expect(moved.report.billing).toEqual({
+          subscription: {
+            plan: "team",
+            version: 3,
+            pricing: "per_member",
+            v2Pricing: "per_member",
+            trialing: false,
+            cancelling: true,
+          },
+          problem: null,
+          carried: true,
+        });
+        // v2's Team plan alone bills it, on v1's Stripe subscription, renewing when v1's did and
+        // still cancelled then. v1's free plan stays scheduled after it, which v2 ignores.
+        const team = moved.customer.subscriptions.filter((sub) => sub.status !== "scheduled");
+        expect(team).toMatchObject([
+          {
+            plan_id: `${moved.namespace}-team`,
+            current_period_end: perMember.periodEnd,
+            expires_at: perMember.periodEnd,
+          },
+        ]);
+        expect(team[0]?.canceled_at).not.toBeNull();
+        expect(yield* emulators.autumnStripeSubscriptions(moved.customerId)).toEqual([
+          perMember.stripeSubscription,
+        ]);
+        // Its seats synced once the subscription was v2's.
+        expect(moved.customer.balances[`${moved.namespace}-members`]?.usage).toBe(1);
+        expect(
+          yield* cloudRows(
+            Schema.Struct({ state: Schema.String, stripe_subscription_id: Schema.String }),
+            "select state, stripe_subscription_id from private_v1_import_billing where organization_id = $1",
+            moved.target.id,
+          ),
+        ).toEqual([{ state: "carried", stripe_subscription_id: perMember.stripeSubscription }]);
+        const overview = yield* call(
+          "Read the moved organization's billing",
+          `/api/organizations/${moved.target.id}/billing`,
+        );
+        expect(overview.status).toBe(200);
+        expect(overview.body).toMatchObject({
+          subscriptions: [{ planId: `${moved.namespace}-team` }],
+        });
+
+        // A flat price stays the price, with unlimited members, on its Stripe subscription.
+        const kept = yield* carried(flat);
+        expect(kept.report.billing).toMatchObject({
+          subscription: { version: 1, pricing: "flat", v2Pricing: "flat", cancelling: false },
+          carried: true,
+        });
+        expect(kept.customer.subscriptions).toMatchObject([
+          {
+            plan_id: `${kept.namespace}-team`,
+            current_period_end: flatPrice.periodEnd,
+            canceled_at: null,
+            plan: { price: { amount: 49, interval: "month" } },
+          },
+        ]);
+        expect(kept.customer.balances[`${kept.namespace}-members`]?.unlimited).toBe(true);
+        expect(yield* emulators.autumnStripeSubscriptions(kept.customerId)).toEqual([
+          flatPrice.stripeSubscription,
+        ]);
+
+        // Hobby moves as a free organization does: nothing carries over and v1's customer is
+        // left as it was, while v2's billing puts the organization on its Free plan.
+        const free = yield* operator.waitForReport(run, hobby);
+        expect(free.status, free.reason ?? "").toBe("imported");
+        expect(free.cutover).toBe(true);
+        expect(free.billing).toBeUndefined();
+        expect(free.flags).toMatchObject({ paidPlans: ["hobby"] });
+        const freeTarget = free.v2Organization;
+        if (freeTarget === undefined) return yield* Effect.die("The import named no organization");
+        expect(yield* movedFlag(hobby)).toEqual([
+          { state: "moved", v2_org_id: freeTarget.id, v2_org_slug: freeTarget.slug },
+        ]);
+        expect(
+          yield* cloudRows(
+            Schema.Struct({ state: Schema.String }),
+            "select state from private_v1_import_billing where organization_id = $1",
+            freeTarget.id,
+          ),
+        ).toEqual([]);
+        expect((yield* emulators.autumnCustomer(hobby))?.subscriptions).toMatchObject([
+          { plan_id: "hobby" },
+        ]);
+        const freeCustomerId = yield* emulators.v2BillingCustomer(freeTarget.id);
+        const freePlan = `${freeCustomerId.slice(0, freeCustomerId.indexOf(":organization:"))}-free`;
+        const onFree = yield* emulators.autumnCustomer(freeCustomerId).pipe(
+          Effect.flatMap((customer) =>
+            customer === null
+              ? Effect.fail(new Error("v2 has not made the organization's customer yet"))
+              : Effect.succeed(customer),
+          ),
+          Effect.retry(Schedule.spaced("1 second").pipe(Schedule.upTo({ duration: "50 seconds" }))),
+        );
+        expect(onFree.subscriptions.map((sub) => sub.plan_id)).toEqual([freePlan]);
+        expect(yield* emulators.autumnStripeSubscriptions(freeCustomerId)).toEqual([]);
+      }).pipe(Effect.provide(services)),
+    ),
+  );
+
+  it.effect(scenarios.v1ImportBillingReturn.title, (context) =>
+    withCase(
+      context,
+      Effect.gen(function* () {
+        const emulators = yield* Emulators,
+          browser = yield* Browser;
+        const operator = yield* v1ImportOperator;
+        const identity = yield* emulators.identity("google");
+        const workspace = yield* emulators.v1Workspace([identity.email]);
+        yield* writeRows("v1-database.json", [
+          row(
+            "insert into organizations (id, name, slug) values ($1, $2, $3)",
+            workspace.organization,
+            "Synthetic returned workspace",
+            `v1-${randomUUID().slice(0, 8)}`,
+          ),
+        ]);
+        const v1 = yield* emulators.v1TeamSubscription(workspace.organization, {
+          version: 3,
+          seats: 1,
+        });
+        yield* signInOnV1(identity.email);
+        yield* allowV1Import(workspace.organization);
+
+        // Autumn refuses the attach once, after the customer took v2's id.
+        const fault = yield* emulators.failAutumnReads("billing.attach", { status: 400, times: 1 });
+        yield* Effect.addFinalizer(() => emulators.clearAutumnFault(fault).pipe(Effect.orDie));
+        const run = v1RunId("billing-return");
+        const started = yield* operator.start({
+          mode: "import",
+          runId: run,
+          organizations: [workspace.organization],
+        });
+        expect(started.status, JSON.stringify(started.body)).toBe(200);
+        const report = yield* operator.waitForReport(run, workspace.organization);
+        expect(report.status).toBe("failed");
+        expect(report.reason).toContain("Its subscription did not carry over");
+        expect(report.cutover).toBe(false);
+        expect(report.billing).toMatchObject({ carried: false });
+        const target = report.v2Organization;
+        if (target === undefined) return yield* Effect.die("The import named no organization");
+        // It stays frozen in v1, charged nothing, and its billing stays held.
+        expect((yield* movedFlag(workspace.organization))[0]?.state).toBe("moving");
+        const customerId = yield* emulators.v2BillingCustomer(target.id);
+        const halfway = yield* emulators.autumnCustomer(customerId);
+        expect(halfway?.subscriptions).toMatchObject([{ plan_id: "team" }]);
+        expect(
+          yield* cloudRows(
+            Schema.Struct({ state: Schema.String }),
+            "select state from private_v1_import_billing where organization_id = $1",
+            target.id,
+          ),
+        ).toEqual([{ state: "held" }]);
+        // While held, v2's billing makes no customer and offers no checkout.
+        const overview = yield* call(
+          "Read the held organization's billing",
+          `/api/organizations/${target.id}/billing`,
+        );
+        expect(overview.status).toBe(503);
+        const checkout = yield* browser.use("Try a checkout for the held organization", (page) =>
+          page.evaluate(
+            (id) =>
+              fetch(`/api/organizations/${id}/billing/checkout`, {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ plan: "team" }),
+              }).then((response) => response.status),
+            target.id,
+          ),
+        );
+        expect(checkout).toBe(503);
+        // v1 meters an execution meanwhile and makes itself a free customer under its id.
+        yield* emulators.v1MeteredCustomer(workspace.organization);
+
+        const returned = yield* operator.returnBilling(workspace.organization);
+        expect(returned).toEqual({
+          status: 200,
+          body: { organization: workspace.organization, billing: "returned" },
+        });
+        // v1's Team plan bills it again, on the same Stripe subscription, with v1's seats.
+        expect(yield* emulators.autumnCustomer(customerId)).toBeNull();
+        const back = yield* emulators.autumnCustomer(workspace.organization);
+        expect(back?.subscriptions).toMatchObject([
+          {
+            plan_id: "team",
+            current_period_end: v1.periodEnd,
+            canceled_at: null,
+            plan: { version: 3 },
+          },
+        ]);
+        expect(back?.balances.members?.usage).toBe(1);
+        expect(yield* emulators.autumnStripeSubscriptions(workspace.organization)).toEqual([
+          v1.stripeSubscription,
+        ]);
+        // A second return changes nothing.
+        expect((yield* operator.returnBilling(workspace.organization)).status).toBe(200);
+
+        // Deleting the v2 organization now cancels nothing, and the organization rolls back.
+        const deleted = yield* browser.use("Delete the imported v2 organization", (page) =>
+          page.evaluate(
+            (id) => fetch(`/api/organizations/${id}`, { method: "DELETE" }).then((r) => r.status),
+            target.id,
+          ),
+        );
+        expect(deleted).toBeLessThan(300);
+        const rolledBack = yield* operator.rollback(workspace.organization).pipe(
+          Effect.flatMap((response) =>
+            response.status === 200
+              ? Effect.succeed(response)
+              : Effect.fail(new Error(JSON.stringify(response.body))),
+          ),
+          Effect.retry(Schedule.spaced("1 second").pipe(Schedule.upTo({ duration: "50 seconds" }))),
+        );
+        expect(rolledBack.body).toEqual({
+          organization: workspace.organization,
+          state: "rolled_back",
+        });
+        expect(
+          (yield* emulators.autumnCustomer(workspace.organization))?.subscriptions,
+        ).toMatchObject([{ plan_id: "team", canceled_at: null }]);
+        expect(yield* emulators.autumnStripeSubscriptions(workspace.organization)).toEqual([
+          v1.stripeSubscription,
+        ]);
+      }).pipe(Effect.provide(services)),
+    ),
+  );
+
+  it.effect(scenarios.v1ImportSlugDisplacement.title, (context) =>
+    withCase(
+      context,
+      Effect.gen(function* () {
+        const emulators = yield* Emulators,
+          onboarding = yield* Onboarding,
+          browser = yield* Browser;
+        const operator = yield* v1ImportOperator;
+        // Someone else's v2 team, with its Executor app, holds the slug a v1 workspace has.
+        yield* onboarding.socialSignIn("google");
+        const team = yield* onboarding.confirmTeam(yield* onboarding.prepareTeam);
+        const slug = team.slug;
+        const SlugRow = Schema.Struct({ slug: Schema.String });
+        const slugOf = (organization: string) =>
+          cloudRows(SlugRow, "select slug from organization where id = $1", organization).pipe(
+            Effect.map((rows) => rows[0]?.slug),
+          );
+        const MemberRow = Schema.Struct({ userId: Schema.String, role: Schema.String });
+        const membersOf = (organization: string) =>
+          cloudRows(
+            MemberRow,
+            `select "userId", role from member where "organizationId" = $1 order by "userId"`,
+            organization,
+          );
+        const teamMembers = yield* membersOf(team.id);
+        const domainJobs = (organization: string) =>
+          cloudRows(
+            Schema.Struct({ jobs: Schema.Number }),
+            "select count(*)::int as jobs from hosted_provisioning where kind = 'domain' and organization_id = $1",
+            organization,
+          ).pipe(Effect.map((rows) => rows[0]?.jobs ?? 0));
+        const jobsBefore = yield* domainJobs(team.id);
+        const workspace = (label: string, workspaceSlug: string) =>
+          Effect.gen(function* () {
+            const created = yield* emulators.v1Workspace([
+              `${label}-${randomUUID().slice(0, 8)}@example.test`,
+            ]);
+            yield* writeRows("v1-database.json", [
+              row(
+                "insert into organizations (id, name, slug) values ($1, $2, $3)",
+                created.organization,
+                `Synthetic ${label} workspace`,
+                workspaceSlug,
+              ),
+            ]);
+            yield* allowV1Import(created.organization);
+            return created.organization;
+          });
+        const listed = yield* workspace("listed", slug);
+        yield* listV1SlugDisplacement(listed, team.id);
+        // Listed, but the team does not hold this workspace's slug.
+        const freeSlug = `v1-${randomUUID().slice(0, 8)}`;
+        const mislisted = yield* workspace("mislisted", freeSlug);
+        yield* listV1SlugDisplacement(mislisted, team.id);
+        // Another v2 organization holds this one's slug, and nobody listed it.
+        const heldSlug = `v1-${randomUUID().slice(0, 8)}`;
+        const holder = randomUUID();
+        yield* writeRows("sso-database.json", [
+          row(
+            `insert into organization (id, name, slug, "createdAt") values ($1, 'Synthetic holder', $2, now())`,
+            holder,
+            heldSlug,
+          ),
+        ]);
+        const unlisted = yield* workspace("unlisted", heldSlug);
+
+        const dry = v1RunId("displace-dry");
+        expect(
+          (yield* operator.start({
+            mode: "dry-run",
+            runId: dry,
+            organizations: [listed, mislisted, unlisted],
+          })).status,
+        ).toBe(200);
+        const planned = yield* operator.waitForReport(dry, listed);
+        expect(planned.status, planned.reason ?? "").toBe("planned");
+        const renamedTo = planned.slug?.displaced?.slug;
+        if (renamedTo === undefined || renamedTo === null)
+          return yield* Effect.die(
+            `The dry run planned no rename: ${JSON.stringify(planned.slug)}`,
+          );
+        // The team's new slug is its own slug with a suffix; the workspace keeps the slug as it is.
+        expect(renamedTo).toMatch(/^[a-z0-9-]+-[0-9a-f]{6}$/u);
+        expect(slug.startsWith(renamedTo.slice(0, -7))).toBe(true);
+        expect(planned.slug).toEqual({
+          v1: slug,
+          v2: slug,
+          changed: false,
+          displaced: { organization: team.id, slug: renamedTo },
+        });
+        expect((yield* operator.waitForReport(dry, mislisted)).slug).toEqual({
+          v1: freeSlug,
+          v2: freeSlug,
+          changed: false,
+          displaced: {
+            organization: team.id,
+            slug: null,
+            reason: `The listed v2 organization does not hold ${freeSlug}, which is free.`,
+          },
+        });
+        const unlistedPlan = yield* operator.waitForReport(dry, unlisted);
+        expect(unlistedPlan.slug?.changed).toBe(true);
+        expect(unlistedPlan.slug?.displaced).toBeUndefined();
+        expect(unlistedPlan.slug?.v2).toMatch(new RegExp(`^${heldSlug}-[0-9a-f]{6}$`, "u"));
+        // A dry run renames nothing.
+        expect(yield* slugOf(team.id)).toBe(slug);
+
+        const run = v1RunId("displace");
+        const started = yield* operator.start({
+          mode: "import",
+          runId: run,
+          organizations: [listed, unlisted],
+        });
+        expect(started.status, JSON.stringify(started.body)).toBe(200);
+        const report = yield* operator.waitForReport(run, listed);
+        expect(report.status, report.reason ?? "").toBe("imported");
+        expect(report.cutover).toBe(true);
+        const target = report.v2Organization;
+        if (target === undefined) return yield* Effect.die("The import named no organization");
+        expect(target.slug).toBe(slug);
+        expect(report.slug).toEqual({
+          v1: slug,
+          v2: slug,
+          changed: false,
+          displaced: { organization: team.id, slug: renamedTo },
+        });
+        expect(yield* movedFlag(listed)).toEqual([
+          { state: "moved", v2_org_id: target.id, v2_org_slug: slug },
+        ]);
+        // The team is renamed as a rename in its settings is: its app domain is queued again.
+        expect(yield* slugOf(team.id)).toBe(renamedTo);
+        expect(yield* membersOf(team.id)).toEqual(teamMembers);
+        expect(yield* domainJobs(team.id)).toBeGreaterThan(jobsBefore);
+        expect(
+          yield* cloudRows(
+            Schema.Struct({ reason: Schema.NullOr(Schema.String) }),
+            "select reason from private_v1_import_map where v1_kind = 'organization' and v1_id = $1",
+            listed,
+          ),
+        ).toEqual([
+          {
+            reason: `Renamed v2 organization ${team.id} from ${slug} to ${renamedTo} to take its slug.`,
+          },
+        ]);
+
+        // The team's member keeps the team and its apps at the new slug; the old one is the
+        // workspace's now, which they are not a member of.
+        expect(
+          (yield* call(
+            "Read the team at its new slug",
+            `/api/organizations/${renamedTo}/inventory`,
+          )).status,
+        ).toBe(200);
+        expect(
+          (yield* call("Read the team by its id", `/api/organizations/${team.id}/inventory`))
+            .status,
+        ).toBe(200);
+        expect(
+          (yield* call("The old slug names the workspace", `/api/organizations/${slug}/inventory`))
+            .status,
+        ).toBe(403);
+        expect(yield* onboarding.organizations).toEqual([{ ...team, slug: renamedTo }]);
+        yield* browser.use("Open the team's apps at its new slug", (page) =>
+          page.goto(`/org/${renamedTo}/apps`),
+        );
+        yield* browser.use("The team's Executor app is still there", (page) =>
+          page
+            .getByRole("link", { name: "Open Executor", exact: true })
+            .waitFor({ state: "visible" }),
+        );
+
+        // Without a listing, the holder keeps its slug and the workspace takes its suffix.
+        const suffixed = yield* operator.waitForReport(run, unlisted);
+        expect(suffixed.status, suffixed.reason ?? "").toBe("imported");
+        expect(suffixed.v2Organization?.slug).toBe(unlistedPlan.slug?.v2);
+        expect(yield* slugOf(holder)).toBe(heldSlug);
+      }).pipe(Effect.provide(services)),
+    ),
+  );
+
+  it.effect(scenarios.v1ImportInto.title, (context) =>
+    withCase(
+      context,
+      Effect.gen(function* () {
+        const emulators = yield* Emulators,
+          onboarding = yield* Onboarding,
+          fs = yield* FileSystem.FileSystem,
+          target = yield* Target,
+          mcp = yield* McpClient;
+        const operator = yield* v1ImportOperator;
+        // The member already has their own v2 team.
+        const identity = yield* onboarding.socialSignIn("google");
+        const team = yield* onboarding.confirmTeam(yield* onboarding.prepareTeam);
+        const user = (yield* cloudRows(
+          IdRow,
+          `select id from "user" where email = $1`,
+          identity.email,
+        ))[0]?.id;
+        if (user === undefined) return yield* Effect.die("The member has no v2 user");
+        // Their v1 workspace has nothing to copy.
+        const workspace = yield* emulators.v1Workspace([identity.email]);
+        const slug = `v1-${randomUUID().slice(0, 8)}`;
+        yield* writeRows("v1-database.json", [
+          row(
+            "insert into organizations (id, name, slug) values ($1, $2, $3)",
+            workspace.organization,
+            "Synthetic empty workspace",
+            slug,
+          ),
+        ]);
+        yield* allowV1Import(workspace.organization);
+        yield* listV1Into(workspace.organization, team.id);
+
+        const teamRow = cloudRows(
+          Schema.Struct({ name: Schema.String, slug: Schema.String }),
+          "select name, slug from organization where id = $1",
+          team.id,
+        );
+        const teamMembers = cloudRows(
+          Schema.Struct({ userId: Schema.String, role: Schema.String }),
+          `select "userId", role from member where "organizationId" = $1 order by "userId"`,
+          team.id,
+        );
+        const before = { team: yield* teamRow, members: yield* teamMembers };
+        expect(before.team).toEqual([{ name: team.name, slug: team.slug }]);
+        /** Nothing in v2 is created or changed: the team, its members, the member's teams, billing. */
+        const unchanged = Effect.gen(function* () {
+          expect(yield* teamRow).toEqual(before.team);
+          expect(yield* teamMembers).toEqual(before.members);
+          expect(
+            yield* cloudRows(
+              Schema.Struct({ organizationId: Schema.String }),
+              `select "organizationId" from member where "userId" = $1`,
+              user,
+            ),
+          ).toEqual([{ organizationId: team.id }]);
+          expect(
+            yield* cloudRows(IdRow, "select id from organization where slug like $1", `${slug}%`),
+          ).toEqual([]);
+          expect(
+            yield* cloudRows(
+              IdRow,
+              "select organization_id as id from private_v1_import_billing where organization_id = $1",
+              team.id,
+            ),
+          ).toEqual([]);
+          expect(
+            yield* cloudRows(IdRow, `select id from "user" where email = $1`, identity.email),
+          ).toEqual([{ id: user }]);
+        });
+        const MapEntry = Schema.Struct({
+          v1_kind: Schema.String,
+          v2_kind: Schema.NullOr(Schema.String),
+          v2_id: Schema.NullOr(Schema.String),
+        });
+        const mapRows = cloudRows(
+          MapEntry,
+          "select v1_kind, v2_kind, v2_id from private_v1_import_map where v1_org_id = $1 order by v1_kind",
+          workspace.organization,
+        );
+        const plannedInto = (report: V1Report) => {
+          expect(report.status, report.reason ?? "").toBe("planned");
+          expect(report.into).toEqual({ organization: team.id, mode: "nothing_to_copy" });
+          expect(report.slug).toEqual({ v1: slug, v2: team.slug, changed: true });
+          expect(report.emailMatches).toEqual([{ email: identity.email, match: "merge" }]);
+          expect(report.counts.v2).toMatchObject({
+            users: 0,
+            mergedUsers: 1,
+            apps: 0,
+            accounts: 0,
+            mcpConnections: 0,
+            undeployedApps: 0,
+            policies: 0,
+          });
+        };
+
+        // The dry run plans the move and writes nothing.
+        const dry = v1RunId("into-dry");
+        expect(
+          (yield* operator.start({
+            mode: "dry-run",
+            runId: dry,
+            organizations: [workspace.organization],
+          })).status,
+        ).toBe(200);
+        plannedInto(yield* operator.waitForReport(dry, workspace.organization));
+        expect(yield* movedFlag(workspace.organization)).toEqual([]);
+        expect(yield* mapRows).toEqual([]);
+        yield* unchanged;
+
+        const run = v1RunId("into");
+        const started = yield* operator.start({
+          mode: "import",
+          runId: run,
+          organizations: [workspace.organization],
+        });
+        expect(started.status, JSON.stringify(started.body)).toBe(200);
+        const report = yield* operator.waitForReport(run, workspace.organization);
+        expect(report.status, report.reason ?? "").toBe("imported");
+        expect(report.into).toEqual({ organization: team.id, mode: "nothing_to_copy" });
+        expect(report.v2Organization).toEqual({ id: team.id, slug: team.slug });
+        expect(report.slug).toEqual({ v1: slug, v2: team.slug, changed: true });
+        expect(report.verification).toEqual({
+          items: { planned: 0, withResult: 0, failed: 0 },
+          members: { planned: 1, inV2: 1 },
+          accounts: { checked: 0, unreadable: 0 },
+          apps: { checked: 0, withoutVersion: 0 },
+          passed: true,
+        });
+        expect(report.cutover).toBe(true);
+        // v1 redirects and forwards the workspace to the team, at the team's own slug.
+        expect(yield* movedFlag(workspace.organization)).toEqual([
+          { state: "moved", v2_org_id: team.id, v2_org_slug: team.slug },
+        ]);
+        expect(yield* importState(workspace.organization)).toEqual([{ state: "cutover" }]);
+        const moved = [
+          { v1_kind: "organization", v2_kind: "existing_organization", v2_id: team.id },
+          { v1_kind: "user", v2_kind: "merged_user", v2_id: user },
+        ];
+        expect(yield* mapRows).toEqual(moved);
+        yield* unchanged;
+
+        // A request v1 forwards for the workspace runs in the team, as its member.
+        const { secret } = yield* fs
+          .readFileString(`${target.directory}/${v1McpForwardFile}`)
+          .pipe(
+            Effect.flatMap(Schema.decodeUnknownEffect(Schema.fromJsonString(V1McpForwardSecret))),
+          );
+        let minted = 0;
+        const sign = () =>
+          Redacted.make(
+            v1ForwardBearer(secret, {
+              account: workspace.user,
+              organization: workspace.organization,
+              exp: Math.floor(Date.now() / 1000) + 300 + minted++,
+            }),
+          );
+        const forwarded = yield* mcp.connect(sign, "forwarded-into-team");
+        const listed = yield* forwarded.use(
+          "List the forwarded session's tools",
+          (client, signal) => client.listTools(undefined, { signal }),
+        );
+        expect(listed.tools.map((tool) => tool.name)).toContain("execute");
+        /** The status of one initialize request v1 forwards for the workspace. */
+        const initialize = Effect.scoped(
+          Effect.gen(function* () {
+            const http = yield* HttpClient.HttpClient;
+            const request = HttpClientRequest.post(`${target.metadata.origin}/mcp`).pipe(
+              HttpClientRequest.setHeaders({
+                accept: "application/json, text/event-stream",
+                authorization: `Bearer ${Redacted.value(sign())}`,
+              }),
+            );
+            const response = yield* http.execute(
+              yield* HttpClientRequest.bodyJson(request, {
+                jsonrpc: "2.0",
+                id: 1,
+                method: "initialize",
+                params: {
+                  protocolVersion: "2025-06-18",
+                  capabilities: {},
+                  clientInfo: { name: "forwarded-into", version: "1" },
+                },
+              }),
+            );
+            yield* response.text;
+            return response.status;
+          }),
+        ).pipe(Effect.provide(FetchHttpClient.layer));
+        expect(yield* initialize).toBe(200);
+
+        // Starting it again finds the same instance; a later dry run finds the team through the
+        // workspace's map row. Neither writes anything.
+        expect(
+          (yield* operator.start({
+            mode: "import",
+            runId: run,
+            organizations: [workspace.organization],
+          })).status,
+        ).toBe(200);
+        const later = v1RunId("into-later");
+        expect(
+          (yield* operator.start({
+            mode: "dry-run",
+            runId: later,
+            organizations: [workspace.organization],
+          })).status,
+        ).toBe(200);
+        plannedInto(yield* operator.waitForReport(later, workspace.organization));
+        expect(yield* mapRows).toEqual(moved);
+        yield* unchanged;
+
+        // No billing carried over, so there is none to give back.
+        const billing = yield* operator.returnBilling(workspace.organization);
+        expect(billing.status).toBe(409);
+        expect(billing.body).toEqual({
+          error: "It moved into an existing v2 organization, and no billing carried over.",
+        });
+
+        // The team is the member's own: the workspace goes back to v1 and the team stays.
+        const rolledBack = yield* operator.rollback(workspace.organization);
+        expect(rolledBack.status, JSON.stringify(rolledBack.body)).toBe(200);
+        expect(rolledBack.body).toEqual({
+          organization: workspace.organization,
+          state: "rolled_back",
+          removed: { apps: 0, accounts: 0, toolkitCopies: 0, members: 0 },
+        });
+        expect(yield* movedFlag(workspace.organization)).toEqual([
+          { state: "rolled_back", v2_org_id: null, v2_org_slug: null },
+        ]);
+        expect(yield* importState(workspace.organization)).toEqual([{ state: "rolled_back" }]);
+        expect(yield* mapRows).toEqual([{ v1_kind: "user", v2_kind: "merged_user", v2_id: user }]);
+        yield* unchanged;
+        // v2 no longer maps the workspace, so it refuses what v1 would have forwarded.
+        expect(yield* initialize).toBe(403);
+      }).pipe(Effect.provide(Layer.mergeAll(services, McpClient.layer))),
+    ),
+  );
+
+  it.effect(scenarios.v1ImportIntoLeave.title, (context) =>
+    withCase(
+      context,
+      Effect.gen(function* () {
+        const operator = yield* v1ImportOperator;
+        // The member works in their own v2 team; their v1 workspace still has an integration and
+        // a rule, which stay in v1.
+        const address = syntheticEmail("leave");
+        const user = yield* v2User(address);
+        const team = yield* v2Team(user);
+        const teamSlug = (yield* cloudRows(
+          Schema.Struct({ slug: Schema.String }),
+          "select slug from organization where id = $1",
+          team,
+        ))[0]?.slug;
+        const workspace = yield* listedV1Workspace("leave", [address], team, "leave_v1_data");
+        const organization = workspace.organization;
+        const tracker = `left_${randomUUID().slice(0, 6)}`;
+        const toolkitRow = (collection: string, data: Record<string, string>) =>
+          row(
+            "insert into plugin_storage (tenant, owner, subject, plugin_id, collection, key, data) values ($1, 'org', '', 'toolkits', $2, $3, $4::json)",
+            organization,
+            collection,
+            data.id ?? "",
+            JSON.stringify(data),
+          );
+        yield* writeRows("v1-database.json", [
+          row(
+            "insert into integration (tenant, slug, plugin_id, name, config) values ($1, $2, 'mcp', 'Left Tracker', $3::json)",
+            organization,
+            tracker,
+            JSON.stringify({
+              transport: "remote",
+              endpoint: "https://left.example.com/mcp",
+              remoteTransport: "auto",
+            }),
+          ),
+          row(
+            "insert into tool_policy (tenant, owner, subject, pattern, action, position) values ($1, 'org', '', $2, 'block', 'a0')",
+            organization,
+            `${tracker}.*.*.search`,
+          ),
+          goneRule(organization),
+          toolkitRow("toolkits", { id: "tk_left", name: "Left kit", slug: "left" }),
+          toolkitRow("toolkitConnections", {
+            id: "tc_left",
+            toolkitId: "tk_left",
+            pattern: `${tracker}.org.*.*`,
+            position: "a0",
+          }),
+        ]);
+        const v1Data = v1Rows(
+          Schema.Struct({ row_id: Schema.String }),
+          "select row_id::text from integration where tenant = $1 union all select row_id::text from tool_policy where tenant = $1 union all select row_id::text from plugin_storage where tenant = $1 order by 1",
+          organization,
+        );
+        const before = yield* v1Data;
+        expect(before).toHaveLength(5);
+        const teamMembers = cloudRows(
+          Schema.Struct({ userId: Schema.String, role: Schema.String }),
+          `select "userId", role from member where "organizationId" = $1`,
+          team,
+        );
+        const mapRows = cloudRows(
+          Schema.Struct({ v1_kind: Schema.String, v2_kind: Schema.NullOr(Schema.String) }),
+          "select v1_kind, v2_kind from private_v1_import_map where v1_org_id = $1 order by v1_kind",
+          organization,
+        );
+        const into = { organization: team, mode: "leave_v1_data" };
+
+        const dry = v1RunId("leave-dry");
+        expect(
+          (yield* operator.start({ mode: "dry-run", runId: dry, organizations: [organization] }))
+            .status,
+        ).toBe(200);
+        const planned = yield* operator.waitForReport(dry, organization);
+        expect(planned.status, planned.reason ?? "").toBe("planned");
+        expect(planned.into).toEqual(into);
+        expect(planned.slug?.v2).toBe(teamSlug);
+        // v1's items are counted, and none is planned in v2: no app, rule or toolkit copy.
+        expect(planned.counts.v1).toMatchObject({ integrations: 1, policies: 2, toolkits: 1 });
+        expect(planned.counts.v2).toMatchObject({
+          users: 0,
+          mergedUsers: 1,
+          apps: 0,
+          accounts: 0,
+          policies: 0,
+          skippedPolicies: 0,
+          mcpConnections: 0,
+        });
+        expect(planned.integrationFailures).toEqual([]);
+        expect(planned.unmatchedRules).toEqual([]);
+
+        const run = v1RunId("leave");
+        const started = yield* operator.start({
+          mode: "import",
+          runId: run,
+          organizations: [organization],
+        });
+        expect(started.status, JSON.stringify(started.body)).toBe(200);
+        const report = yield* operator.waitForReport(run, organization);
+        expect(report.status, report.reason ?? "").toBe("imported");
+        expect(report.into).toEqual(into);
+        expect(report.items).toEqual([]);
+        expect(report.verification).toMatchObject({
+          items: { planned: 0, withResult: 0, failed: 0 },
+          members: { planned: 1, inV2: 1 },
+          passed: true,
+        });
+        expect(report.cutover).toBe(true);
+        expect(yield* movedFlag(organization)).toEqual([
+          { state: "moved", v2_org_id: team, v2_org_slug: teamSlug },
+        ]);
+        expect(yield* mapRows).toEqual([
+          { v1_kind: "organization", v2_kind: "existing_organization" },
+          { v1_kind: "user", v2_kind: "merged_user" },
+        ]);
+        expect(yield* teamMembers).toEqual([{ userId: user, role: "owner" }]);
+        // v1's data stays where it was.
+        expect(yield* v1Data).toEqual(before);
+
+        const rolledBack = yield* operator.rollback(organization);
+        expect(rolledBack.status, JSON.stringify(rolledBack.body)).toBe(200);
+        expect(rolledBack.body).toEqual({
+          organization,
+          state: "rolled_back",
+          removed: { apps: 0, accounts: 0, toolkitCopies: 0, members: 0 },
+        });
+        expect(yield* movedFlag(organization)).toEqual([
+          { state: "rolled_back", v2_org_id: null, v2_org_slug: null },
+        ]);
+        expect(yield* teamMembers).toEqual([{ userId: user, role: "owner" }]);
+        expect(yield* v1Data).toEqual(before);
+      }).pipe(Effect.provide(services)),
+    ),
+  );
+
+  it.effect(scenarios.v1ImportIntoCopy.title, (context) =>
+    withCase(
+      context,
+      Effect.gen(function* () {
+        const emulators = yield* Emulators,
+          onboarding = yield* Onboarding;
+        const operator = yield* v1ImportOperator;
+        // The owner made a v2 team and set nothing up in it beyond what every team gets.
+        const identity = yield* onboarding.socialSignIn("google");
+        const team = yield* onboarding.confirmTeam(yield* onboarding.prepareTeam);
+        // Their paid v1 workspace has a teammate and the shared seed's integration, connections,
+        // rules and toolkits.
+        const teammate = syntheticEmail("teammate");
+        const workspace = yield* emulators.v1Workspace([identity.email, teammate]);
+        const organization = workspace.organization;
+        const former = yield* emulators.v1Workspace([syntheticEmail("former")]);
+        yield* seedShared(organization, `v1-${randomUUID().slice(0, 8)}`, {
+          first: workspace.user,
+          second: yield* emulators.v1User(teammate),
+          former: former.user,
+        });
+        const subscription = yield* emulators.v1TeamSubscription(organization, {
+          version: 3,
+          seats: 2,
+        });
+        yield* allowV1Import(organization);
+        yield* listV1Into(organization, team.id, "copy_into_empty");
+
+        const Contents = Schema.Struct({
+          name: Schema.String,
+          slug: Schema.String,
+          apps: Schema.Number,
+          accounts: Schema.Number,
+          connections: Schema.Number,
+          members: Schema.Number,
+        });
+        /**
+         * The team's own row and everything in it, its Executor app included; accounts leave out
+         * the Executor keys v2 gives each owner and admin, which a member the import adds also gets.
+         */
+        const contents = cloudRows(
+          Contents,
+          `select o.name, o.slug,
+            (select count(*)::int from executor_apps a where a.owner = 'organization:' || o.id) as apps,
+            (select count(*)::int from executor_accounts a where a.owner = 'organization:' || o.id
+              and not exists (
+                select 1 from jsonb_each_text(coalesce(o.metadata::jsonb -> 'executorKeyAccounts', '{}'::jsonb)) k
+                where k.value = a.id
+              )) as accounts,
+            (select count(*)::int from "mcpConnection" c where c.resource = o.id and not c.revoked) as connections,
+            (select count(*)::int from member m where m."organizationId" = o.id) as members
+          from organization o where o.id = $1`,
+          team.id,
+        ).pipe(Effect.map((rows) => rows[0]));
+        const before = yield* contents;
+        if (before === undefined) return yield* Effect.die("The team has no row");
+        expect(before).toMatchObject({
+          name: team.name,
+          slug: team.slug,
+          accounts: 0,
+          connections: 0,
+          members: 1,
+        });
+        const into = { organization: team.id, mode: "copy_into_empty" };
+
+        const dry = v1RunId("copy-dry");
+        expect(
+          (yield* operator.start({ mode: "dry-run", runId: dry, organizations: [organization] }))
+            .status,
+        ).toBe(200);
+        const planned = yield* operator.waitForReport(dry, organization);
+        expect(planned.status, planned.reason ?? "").toBe("planned");
+        expect(planned.into).toEqual(into);
+        expect(planned.slug?.v2).toBe(team.slug);
+        expect(planned.counts.v2).toMatchObject({ apps: 1, accounts: 3, mcpConnections: 3 });
+        expect(planned.billing).toMatchObject({ subscription: { plan: "team" }, problem: null });
+        expect(yield* contents).toEqual(before);
+
+        const run = v1RunId("copy");
+        const started = yield* operator.start({
+          mode: "import",
+          runId: run,
+          organizations: [organization],
+        });
+        expect(started.status, JSON.stringify(started.body)).toBe(200);
+        const report = yield* operator.waitForReport(run, organization);
+        expect(report.status, report.reason ?? "").toBe("imported");
+        expect(report.into).toEqual(into);
+        expect(report.v2Organization).toEqual({ id: team.id, slug: team.slug });
+        expect(report.cutover).toBe(true);
+        expect(report.verification).toMatchObject({ members: { planned: 2, inV2: 2 } });
+        expect(report.billing).toMatchObject({ carried: true });
+        expect(yield* movedFlag(organization)).toEqual([
+          { state: "moved", v2_org_id: team.id, v2_org_slug: team.slug },
+        ]);
+        // The team keeps its name and slug, gains the workspace's app, accounts and toolkit
+        // copies, and the teammate joins it.
+        expect(yield* contents).toEqual({
+          ...before,
+          apps: before.apps + 1,
+          accounts: before.accounts + 3,
+          connections: 3,
+          members: 2,
+        });
+        // The subscription now bills the team, on v1's Stripe subscription.
+        const customerId = yield* emulators.v2BillingCustomer(team.id);
+        expect(yield* emulators.autumnStripeSubscriptions(customerId)).toEqual([
+          subscription.stripeSubscription,
+        ]);
+        expect(yield* emulators.autumnCustomer(organization)).toBeNull();
+
+        // Another workspace of the owner cannot copy into the team now: it is no longer empty.
+        const second = yield* emulators.v1Workspace([identity.email]);
+        yield* writeRows("v1-database.json", [
+          row(
+            "insert into organizations (id, name, slug) values ($1, $2, $3)",
+            second.organization,
+            "Synthetic second workspace",
+            `v1-${randomUUID().slice(0, 8)}`,
+          ),
+          goneRule(second.organization),
+        ]);
+        yield* allowV1Import(second.organization);
+        yield* listV1Into(second.organization, team.id, "copy_into_empty");
+        const secondDry = v1RunId("copy-second");
+        expect(
+          (yield* operator.start({
+            mode: "dry-run",
+            runId: secondDry,
+            organizations: [second.organization],
+          })).status,
+        ).toBe(200);
+        const refused = yield* operator.waitForReport(secondDry, second.organization);
+        expect(refused.status, refused.reason ?? "").toBe("held_back");
+        expect(refused.into?.refused).toMatch(
+          /^The listed v2 organization is not empty \(apps: 1, accounts: 3, connections: 3\)\.$/u,
+        );
+
+        // A rollback keeps the team and removes what the import added, once billing went back.
+        const early = yield* operator.rollback(organization);
+        expect(early.status).toBe(409);
+        expect(JSON.stringify(early.body)).toContain("return-billing");
+        const returned = yield* operator.returnBilling(organization);
+        expect(returned.status, JSON.stringify(returned.body)).toBe(200);
+        const rolledBack = yield* operator.rollback(organization);
+        expect(rolledBack.status, JSON.stringify(rolledBack.body)).toBe(200);
+        expect(rolledBack.body).toEqual({
+          organization,
+          state: "rolled_back",
+          removed: { apps: 1, accounts: 3, toolkitCopies: 3, members: 1 },
+        });
+        expect(yield* contents).toEqual(before);
+        expect(yield* movedFlag(organization)).toEqual([
+          { state: "rolled_back", v2_org_id: null, v2_org_slug: null },
+        ]);
+        // v1 bills the workspace again, and the team's billing is its own once more.
+        expect(yield* emulators.autumnCustomer(organization)).not.toBeNull();
+        expect(
+          yield* cloudRows(
+            IdRow,
+            "select organization_id as id from private_v1_import_billing where organization_id = $1",
+            team.id,
+          ),
+        ).toEqual([]);
+      }).pipe(Effect.provide(services)),
+    ),
+  );
+
+  it.effect(scenarios.v1ImportIntoRefused.title, (context) =>
+    withCase(
+      context,
+      Effect.gen(function* () {
+        const emulators = yield* Emulators;
+        const operator = yield* v1ImportOperator;
+        /** A v1 workspace of these members, with no rows of its own, listed to move into `into`. */
+        const listed = (
+          label: string,
+          members: readonly [string, ...string[]],
+          into: string,
+          mode?: string,
+        ) =>
+          Effect.gen(function* () {
+            const created = yield* listedV1Workspace(label, members, into, mode);
+            return { organization: created.organization, into };
+          });
+        /** A one-member workspace listed to move into the team its member owns in v2. */
+        const ownWorkspace = (label: string, mode?: string) =>
+          Effect.gen(function* () {
+            const address = syntheticEmail(label);
+            return yield* listed(label, [address], yield* ownV2Team(address), mode);
+          });
+        const email = syntheticEmail;
+        const ownTeam = ownV2Team;
+
+        const items = yield* ownWorkspace("items");
+        yield* writeRows("v1-database.json", [goneRule(items.organization)]);
+        const sharedOwner = email("shared");
+        const shared = yield* listed(
+          "shared",
+          [sharedOwner, email("teammate")],
+          yield* ownTeam(sharedOwner),
+        );
+        const invited = yield* ownWorkspace("invited");
+        yield* emulators.inviteV1Member(invited.organization, email("invitee"));
+        const paid = yield* ownWorkspace("paid");
+        yield* emulators.v1Plan(paid.organization, "team");
+        // No v2 user has the member's email.
+        const unknown = yield* listed(
+          "unknown",
+          [email("unknown")],
+          yield* ownTeam(email("other")),
+        );
+        // The member is an admin of someone else's team.
+        const adminAddress = email("admin");
+        const adminUser = yield* v2User(adminAddress);
+        const othersTeam = yield* ownTeam(email("teamowner"));
+        yield* writeRows("sso-database.json", [
+          row(
+            `insert into member (id, "organizationId", "userId", role, "createdAt") values ($1, $2, $3, 'admin', now())`,
+            randomUUID(),
+            othersTeam,
+            adminUser,
+          ),
+        ]);
+        // Even a copy needs its owner to own the organization it goes into.
+        const admin = yield* listed("admin", [adminAddress], othersTeam, "copy_into_empty");
+        const missingAddress = email("missing");
+        yield* v2User(missingAddress);
+        const missing = yield* listed("missing", [missingAddress], randomUUID());
+        // Leaving v1's data behind takes only a free workspace of one member too.
+        const leavePaid = yield* ownWorkspace("leave-paid", "leave_v1_data");
+        yield* writeRows("v1-database.json", [goneRule(leavePaid.organization)]);
+        yield* emulators.v1Plan(leavePaid.organization, "team");
+        const leaveOwner = email("leave-shared");
+        const leaveShared = yield* listed(
+          "leave-shared",
+          [leaveOwner, email("teammate")],
+          yield* ownTeam(leaveOwner),
+          "leave_v1_data",
+        );
+        const unlisted = yield* ownWorkspace("mode", "everything");
+        const onlyOne =
+          "only a workspace of one moves into an existing v2 organization without its data.";
+        const refusals = [
+          [items, "nothing_to_copy", "It has items to copy (policies: 1)."],
+          [shared, "nothing_to_copy", `It has 2 active members; ${onlyOne}`],
+          [invited, "nothing_to_copy", "It has 1 pending invitations."],
+          [paid, "nothing_to_copy", "It has a paid v1 plan (team)."],
+          [unknown, "nothing_to_copy", "Its owner has no v2 account."],
+          [admin, "copy_into_empty", "Its owner is not an owner of the listed v2 organization."],
+          [missing, "nothing_to_copy", "The listed v2 organization does not exist."],
+          [leavePaid, "leave_v1_data", "It has a paid v1 plan (team)."],
+          [leaveShared, "leave_v1_data", `It has 2 active members; ${onlyOne}`],
+          [unlisted, null, "The allow table lists a mode the import does not know."],
+        ] as const;
+        const organizations = refusals.map(([workspace]) => workspace.organization);
+        const TeamMember = Schema.Struct({ userId: Schema.String, role: Schema.String });
+        const membersOf = (organization: string) =>
+          cloudRows(
+            TeamMember,
+            `select "userId", role from member where "organizationId" = $1 order by "userId"`,
+            organization,
+          );
+        const before = yield* Effect.forEach(refusals, ([workspace]) => membersOf(workspace.into));
+
+        const dry = v1RunId("refused-dry");
+        expect((yield* operator.start({ mode: "dry-run", runId: dry, organizations })).status).toBe(
+          200,
+        );
+        for (const [workspace, mode, refused] of refusals) {
+          const report = yield* operator.waitForReport(dry, workspace.organization);
+          expect(report.status, report.reason ?? "").toBe("held_back");
+          expect(report.reason).toBe(
+            `It does not move into the listed v2 organization: ${refused}`,
+          );
+          expect(report.into).toEqual({ organization: workspace.into, mode, refused });
+        }
+
+        const run = v1RunId("refused");
+        const started = yield* operator.start({ mode: "import", runId: run, organizations });
+        expect(started.status, JSON.stringify(started.body)).toBe(200);
+        for (const [index, [workspace, mode, refused]] of refusals.entries()) {
+          const report = yield* operator.waitForReport(run, workspace.organization);
+          expect(report.status, report.reason ?? "").toBe("held_back");
+          expect(report.into).toEqual({ organization: workspace.into, mode, refused });
+          expect(report.v2Organization).toBeUndefined();
+          // Nothing was copied, so v1 has it back at once; v2 recorded nothing for it.
+          expect(yield* movedFlag(workspace.organization)).toEqual([
+            { state: "rolled_back", v2_org_id: null, v2_org_slug: null },
+          ]);
+          expect(yield* importState(workspace.organization)).toEqual([{ state: "rolled_back" }]);
+          expect(
+            yield* cloudRows(
+              Schema.Struct({ v1_kind: Schema.String }),
+              "select v1_kind from private_v1_import_map where v1_org_id = $1",
+              workspace.organization,
+            ),
+          ).toEqual([]);
+          expect(yield* membersOf(workspace.into)).toEqual(before[index]);
+        }
+      }).pipe(Effect.provide(services)),
+    ),
+  );
+
+  it.effect(scenarios.v1ImportAllowed.title, (context) =>
+    withCase(
+      context,
+      Effect.gen(function* () {
+        const emulators = yield* Emulators;
+        const operator = yield* v1ImportOperator;
+        const workspace = (label: string) =>
+          Effect.gen(function* () {
+            const created = yield* emulators.v1Workspace([
+              `${label}-${randomUUID().slice(0, 8)}@example.test`,
+            ]);
+            yield* writeRows("v1-database.json", [
+              row(
+                "insert into organizations (id, name, slug) values ($1, $2, $3)",
+                created.organization,
+                `Synthetic ${label} workspace`,
+                `v1-${randomUUID().slice(0, 8)}`,
+              ),
+            ]);
+            return created.organization;
+          });
+        const unlisted = yield* workspace("unlisted");
+        const listed = yield* workspace("listed");
+        yield* allowV1Import(listed);
+        const notAllowed = (organization: string) => ({
+          error: `private_v1_import_allowed has no row for ${organization}, so it is not imported.`,
+        });
+        const nothingWritten = (organization: string) =>
+          Effect.gen(function* () {
+            expect(yield* movedFlag(organization)).toEqual([]);
+            expect(yield* importState(organization)).toEqual([]);
+          });
+
+        // The operator token alone allows nothing: without a row, the import is refused.
+        const refused = yield* operator.start({
+          mode: "import",
+          runId: v1RunId("unlisted"),
+          organizations: [unlisted],
+        });
+        expect(refused.status).toBe(409);
+        expect(refused.body).toEqual(notAllowed(unlisted));
+        yield* nothingWritten(unlisted);
+
+        // One organization without a row refuses the whole start, naming only that one.
+        const mixed = yield* operator.start({
+          mode: "import",
+          runId: v1RunId("mixed"),
+          organizations: [listed, unlisted],
+        });
+        expect(mixed.status).toBe(409);
+        expect(mixed.body).toEqual(notAllowed(unlisted));
+        yield* nothingWritten(listed);
+        yield* nothingWritten(unlisted);
+
+        // An import never pages through v1, whatever the table holds.
+        const paged = yield* operator.start({
+          mode: "import",
+          runId: v1RunId("paged"),
+          after: listed,
+          limit: 1,
+        });
+        expect(paged.status).toBe(409);
+        expect(paged.body).toEqual({
+          error:
+            "An import names its organizations with `organizations`; it never pages through v1 with `after` or `limit`.",
+        });
+
+        // A dry run ignores the table: it runs for the organization without a row.
+        const dry = v1RunId("unlisted-dry");
+        const dryStarted = yield* operator.start({
+          mode: "dry-run",
+          runId: dry,
+          organizations: [unlisted],
+        });
+        expect(dryStarted.status, JSON.stringify(dryStarted.body)).toBe(200);
+        const dryReport = yield* operator.waitForReport(dry, unlisted);
+        expect(dryReport.status, dryReport.reason ?? "").toBe("planned");
+        yield* nothingWritten(unlisted);
+
+        // With its row, the organization imports and is cut over.
+        const run = v1RunId("listed");
+        const started = yield* operator.start({
+          mode: "import",
+          runId: run,
+          organizations: [listed],
+        });
+        expect(started.status, JSON.stringify(started.body)).toBe(200);
+        const report = yield* operator.waitForReport(run, listed);
+        expect(report.status, report.reason ?? "").toBe("imported");
+        expect(report.cutover).toBe(true);
+        expect((yield* movedFlag(listed))[0]?.state).toBe("moved");
       }).pipe(Effect.provide(services)),
     ),
   );
@@ -1103,9 +2585,11 @@ layer(TestLive, { excludeTestServices: true })("Cloud v1 import runs", (it) => {
             clientId,
             secretItem ?? "",
           );
-        const oauthMcp = (headers: Record<string, string>, host: string) => ({
+        // Reachable, so their sign-ins can be discovered as the import discovers them.
+        const signIn = yield* mcpSignInServers(["pasted", "gated"]);
+        const oauthMcp = (headers: Record<string, string>, name: string) => ({
           transport: "remote",
-          endpoint: `https://${host}/mcp`,
+          endpoint: `http://${signIn}/${name}/mcp`,
           remoteTransport: "auto",
           headers,
           authenticationTemplate: [{ slug: "oauth", kind: "oauth2" }],
@@ -1196,7 +2680,7 @@ layer(TestLive, { excludeTestServices: true })("Cloud v1 import runs", (it) => {
                 CLIENT_ID: "synthetic-stale-client-0123456789",
                 CLIENT_SECRET: "synthetic-stale-secret-0123456789",
               },
-              "pasted.example.com",
+              "pasted",
             ),
           ),
           // A self-hosted MCP server behind a gateway that takes its own client ID and secret.
@@ -1209,7 +2693,7 @@ layer(TestLive, { excludeTestServices: true })("Cloud v1 import runs", (it) => {
                 "CF-Access-Client-Id": "synthetic0gateway1client2id.access",
                 "CF-Access-Client-Secret": "synthetic-gateway-secret-0123456789",
               },
-              "gated.example.com",
+              "gated",
             ),
           ),
           row(

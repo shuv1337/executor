@@ -104,7 +104,7 @@ layer(HostedLive, { excludeTestServices: true })("Empty states", (it) => {
             yield* browser.use("The next action is visible", (page) =>
               page
                 .locator(".empty-state")
-                .getByRole(section === "tokens" ? "button" : "link", {
+                .getByRole(section === "tokens" || section === "apps" ? "button" : "link", {
                   name:
                     section === "apps"
                       ? "Add app"
@@ -185,8 +185,13 @@ layer(HostedLive, { excludeTestServices: true })("Empty states", (it) => {
           "Open Add app during the failure",
           `/org/${actors.organization.slug}/apps/add`,
         );
+        // Read alone, the aborted read is a lost connection. Batched with another read that starts
+        // with it, such as Cloud's v1 import notice, its batch ends without answering it.
         yield* browser.use("The catalog error is visible", (page) =>
-          page.getByText("Unable to complete this request", { exact: true }).first().waitFor(),
+          page
+            .getByText(/^(Can’t reach Executor|Unable to complete this request)$/)
+            .first()
+            .waitFor(),
         );
         expect(
           yield* browser.use("Failure is not a search result", (page) =>

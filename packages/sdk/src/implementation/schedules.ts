@@ -10,6 +10,7 @@ import {
 } from "../contracts/executor.ts";
 import { AccountRequired, type AccountScope } from "../contracts/apps.ts";
 import {
+  CredentialsError,
   StorageError,
   RequestInvalid,
   type AccountId,
@@ -30,7 +31,7 @@ import {
   ScheduleInvalid,
   ScheduleScopeRequired,
 } from "../contracts/schedules.ts";
-import { InvocationRun } from "../contracts/runtime.ts";
+import { CallFailureSources, InvocationRun, type CallFailureSource } from "../contracts/runtime.ts";
 import { ScheduleObservation } from "../contracts/scheduler.ts";
 import type { ScheduleDispatcher } from "../contracts/scheduler.ts";
 import type { Credentials } from "../contracts/storage.ts";
@@ -49,6 +50,25 @@ const diagnostic = (error: unknown) =>
   error instanceof Error && Schema.isSchema(error.constructor)
     ? (SchemaAST.resolveIdentifier(error.constructor.ast) ?? "ExecutionFailed")
     : "ExecutionFailed";
+/**
+ * What a failed run names as its cause when no runtime failure of its call did: Executor's own
+ * storage, or anything else, such as an account or authorization the run cannot use.
+ */
+const failureSource = (error: unknown): CallFailureSource =>
+  Schema.is(StorageError)(error) || Schema.is(CredentialsError)(error) ? "storage" : "other";
+/**
+ * Collect the source of a run's call failures (`CallFailureSources`) for `source`, which falls back
+ * to `failureSource` when its call did not fail in the runtime.
+ */
+const observedSources = () => {
+  let observed: CallFailureSource | undefined;
+  return {
+    observe: (source: CallFailureSource) => {
+      observed = source;
+    },
+    source: (error: unknown) => observed ?? failureSource(error),
+  };
+};
 const sameTiming = Schema.toEquivalence(ScheduleTiming);
 const nextOccurrence = (timing: ScheduleTiming, after: Date) =>
   Effect.try({
@@ -217,10 +237,12 @@ export const makeSchedules = (
       if (row === null) return yield* new ScheduleNotFound();
       return yield* parse(ScheduleSettings, row);
     });
+  /** `source` is what a run that did not succeed failed with (`executor.failure.source`). */
   const finish = (
     run: StoredScheduledRun,
     status: ScheduledRun["status"],
     failure: string | null = null,
+    source: CallFailureSource | null = null,
   ) =>
     transaction(db, () =>
       Effect.gen(function* () {
@@ -304,6 +326,7 @@ export const makeSchedules = (
                     ? "cancelled"
                     : "failed",
               ...(failure === null ? {} : { "error.type": failure }),
+              ...(source === null ? {} : { "executor.failure.source": source }),
             }).pipe(
               Effect.andThen(
                 Effect.flatMap(ScheduleObservation, (observer) => observer.completed(completed)),
@@ -487,14 +510,17 @@ export const makeSchedules = (
         yield* apps.get(input);
         const settings = yield* savedFor(input.app);
         // Enabled schedules report what they wait on, so the owner sees why none run.
-        return yield* Effect.forEach(settings, (setting) =>
-          setting.enabled
-            ? waitingOn(setting).pipe(
-                Effect.map((waiting) =>
-                  waiting === undefined ? setting : { ...setting, ...waiting },
-                ),
-              )
-            : Effect.succeed(setting),
+        return yield* Effect.forEach(
+          settings,
+          (setting) =>
+            setting.enabled
+              ? waitingOn(setting).pipe(
+                  Effect.map((waiting) =>
+                    waiting === undefined ? setting : { ...setting, ...waiting },
+                  ),
+                )
+              : Effect.succeed(setting),
+          { concurrency: 4 },
         );
       }),
     configure: (input: typeof ScheduleInputs.configure.Type) =>
@@ -658,23 +684,27 @@ export const makeSchedules = (
   const complete = (
     run: StoredScheduledRun,
     result: Awaited<Effect.Success<ReturnType<typeof tools.resume>>>,
+    source: (error: unknown) => CallFailureSource,
   ) => {
     switch (result.status) {
       case "completed":
+        // Only an MCP tool's error result, which its server returned, marks a completed call.
         return result.toolError === true
-          ? finish(run, "failed", "McpToolError")
+          ? finish(run, "failed", "McpToolError", "upstream")
           : finish(run, "succeeded");
       case "denied":
-        return finish(run, "denied");
+        return finish(run, "denied", null, "approval");
       case "cancelled":
         return finish(run, "cancelled");
       case "already-consumed":
-        return finish(run, "interrupted", "AlreadyConsumed");
+        return finish(run, "interrupted", "AlreadyConsumed", "approval");
       case "failed":
         // A resumed call that failed records its own error, as a live call's failure does.
         return result.reason === "execution-failed"
-          ? finish(run, "failed", diagnostic(result.error))
-          : finish(run, result.reason === "expired" ? "expired" : "failed", result.reason);
+          ? finish(run, "failed", diagnostic(result.error), source(result.error))
+          : result.reason === "expired"
+            ? finish(run, "expired", result.reason, "approval")
+            : finish(run, "failed", result.reason, "other");
     }
   };
   // Retire only the scanned occurrence. A concurrent configuration or claim owns
@@ -700,7 +730,7 @@ export const makeSchedules = (
           }),
         );
         const runs = yield* parse(Schema.Array(StoredScheduledRun), rows);
-        for (const run of runs) yield* finish(run, "interrupted", "RunnerStopped");
+        for (const run of runs) yield* finish(run, "interrupted", "RunnerStopped", "runtime");
       }),
     nextWake: Effect.gen(function* () {
       const settings = yield* query(() =>
@@ -745,7 +775,7 @@ export const makeSchedules = (
             execute(
               Effect.gen(function* () {
                 if (pending.expiresAt !== null && pending.expiresAt <= time) {
-                  yield* finish(pending, "expired", "ApprovalExpired");
+                  yield* finish(pending, "expired", "ApprovalExpired", "approval");
                   return;
                 }
                 if (pending.requestId === null || pending.answer === null) return;
@@ -767,6 +797,7 @@ export const makeSchedules = (
                   }),
                 );
                 if (claim === null) return;
+                const sources = observedSources();
                 yield* Effect.gen(function* () {
                   const settings = yield* readSettings(claim.scheduleId);
                   yield* authorize({ ...settings, phase: "resume" });
@@ -783,11 +814,14 @@ export const makeSchedules = (
                         systemCaller("schedule", settings.actor ?? undefined),
                       ),
                     );
-                  yield* complete(claim, response);
+                  yield* complete(claim, response, sources.source);
                 }).pipe(
                   Effect.withErrorReporting,
-                  Effect.catch((error) => finish(claim, "failed", diagnostic(error))),
-                  Effect.onInterrupt(() => finish(claim, "interrupted", "Interrupted")),
+                  Effect.catch((error) =>
+                    finish(claim, "failed", diagnostic(error), sources.source(error)),
+                  ),
+                  Effect.onInterrupt(() => finish(claim, "interrupted", "Interrupted", "runtime")),
+                  Effect.provideService(CallFailureSources, sources.observe),
                   Effect.provideService(InvocationRun, claim.id),
                   Effect.withSpan("schedule.run", {
                     attributes: {
@@ -814,6 +848,15 @@ export const makeSchedules = (
             orderBy: ["nextAt", "asc"],
           }),
         ).pipe(Effect.flatMap((rows) => parse(Schema.Array(ScheduleSettings), rows)));
+        // The due work this pass found, at most `maxCandidates`, and how long the oldest of it has
+        // waited, before any of it is claimed: a pass that admits none of it records nothing else.
+        const oldest = due.at(0)?.nextAt;
+        yield* Effect.annotateCurrentSpan({
+          "executor.schedule.due": due.length,
+          ...(oldest instanceof Date
+            ? { "executor.schedule.oldest_due_ms": Math.max(0, time.getTime() - oldest.getTime()) }
+            : {}),
+        });
         yield* Effect.forEach(
           due,
           (setting) =>
@@ -907,6 +950,7 @@ export const makeSchedules = (
                   }),
                 ).pipe(Effect.catchTags({ AppNotFound: () => retireMissingTarget(setting) }));
                 if (claim === null) return;
+                const sources = observedSources();
                 yield* Effect.gen(function* () {
                   const nextKnownAt = yield* nextOccurrence(setting.timing, yield* now);
                   yield* query(() =>
@@ -945,7 +989,7 @@ export const makeSchedules = (
                   });
                   if (response.status === "completed") {
                     yield* response.toolError === true
-                      ? finish(claim, "failed", "McpToolError")
+                      ? finish(claim, "failed", "McpToolError", "upstream")
                       : finish(claim, "succeeded");
                     return;
                   }
@@ -958,6 +1002,7 @@ export const makeSchedules = (
                         owner: setting.owner,
                         response: { action: "accept" },
                       }),
+                      sources.source,
                     );
                   } else {
                     // Serialized with reconcile by the app lock: a schedule removed while this
@@ -995,6 +1040,7 @@ export const makeSchedules = (
                           owner: setting.owner,
                           response: { action: "decline" },
                         }),
+                        sources.source,
                       );
                   }
                 }).pipe(
@@ -1005,7 +1051,9 @@ export const makeSchedules = (
                     Effect.annotateCurrentSpan(
                       "executor.schedule.skip_reason",
                       "account_reconnect",
-                    ).pipe(Effect.andThen(finish(claim, "failed", "OAuthReconnectRequired"))),
+                    ).pipe(
+                      Effect.andThen(finish(claim, "failed", "OAuthReconnectRequired", "other")),
+                    ),
                   ),
                   Effect.withErrorReporting,
                   Effect.catch((error) =>
@@ -1027,10 +1075,10 @@ export const makeSchedules = (
                           set: { enabled: false, nextAt: null },
                         }),
                       );
-                      yield* finish(claim, "failed", diagnostic(error));
+                      yield* finish(claim, "failed", diagnostic(error), sources.source(error));
                     }),
                   ),
-                  Effect.onInterrupt(() => finish(claim, "interrupted", "Interrupted")),
+                  Effect.onInterrupt(() => finish(claim, "interrupted", "Interrupted", "runtime")),
                   // Every account the run resolves is checked against the saved actor; an app
                   // schedule has none and runs with the app's accounts.
                   Effect.provideService(CurrentActor, setting.actor ?? undefined),
@@ -1038,6 +1086,7 @@ export const makeSchedules = (
                     CurrentCaller,
                     systemCaller("schedule", setting.actor ?? undefined),
                   ),
+                  Effect.provideService(CallFailureSources, sources.observe),
                   Effect.provideService(InvocationRun, claim.id),
                   Effect.withSpan("schedule.run", {
                     attributes: {

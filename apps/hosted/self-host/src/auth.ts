@@ -14,6 +14,7 @@ import {
   provisionHostedOAuthResources,
   ApiAuthentication,
   apiBearerAccess,
+  callerSpanAttributes,
   mcpBearerAccess,
   Authentication,
   AuthenticationUnavailable,
@@ -104,8 +105,8 @@ export const selfHostAuth = Effect.gen(function* () {
     authenticate: (headers, mode, organization, connection) =>
       mcpBearerAccess(origins, { headers, mode, organization, connection }).pipe(
         Effect.provideService(SqlClient.SqlClient, sql),
-        Effect.tap(({ access }) =>
-          Effect.annotateCurrentSpan("executor.organization.id", access.organization),
+        Effect.tap(({ access, userId }) =>
+          Effect.annotateCurrentSpan(callerSpanAttributes(access.organization, userId)),
         ),
         Effect.withSpan("auth.authenticate"),
       ),
@@ -140,8 +141,8 @@ export const selfHostAuth = Effect.gen(function* () {
     authenticate: (headers, organization) =>
       apiBearerAccess(origins, { headers, organization }).pipe(
         Effect.provideService(SqlClient.SqlClient, sql),
-        Effect.tap(({ access }) =>
-          Effect.annotateCurrentSpan("executor.organization.id", access.organization),
+        Effect.tap(({ access, userId }) =>
+          Effect.annotateCurrentSpan(callerSpanAttributes(access.organization, userId)),
         ),
         Effect.withSpan("auth.authenticate"),
       ),

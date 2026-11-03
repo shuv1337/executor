@@ -51,6 +51,7 @@ import {
 } from "../contracts/runtime.ts";
 import type { LoadedWorkerBuild, WorkerBundle } from "../contracts/worker-build.ts";
 import type { StartedPart } from "../contracts/runtime.ts";
+import { appCacheNamespace, type HostApiCheck } from "../contracts/host-api.ts";
 import { appProtocol, type AppProtocol } from "./app-protocols.ts";
 import { appFacetBridge, appNetworkModuleName, appRpcBridge } from "./worker-bridge.ts";
 import { appNetworkModule } from "./app-network.ts";
@@ -92,9 +93,10 @@ export interface AppRunnerHost {
   readonly loader: Pick<WorkerLoader, "get">;
   /**
    * The network an app's isolates use for global `fetch`, bound to that app. It opens the
-   * credential handles the runner seals with `credentialKey`; see credential-handles.ts.
+   * credential handles the runner seals with `credentialKey`; see credential-handles.ts. Bound to
+   * a host API revision, it refuses that API's document unless it has the revision.
    */
-  readonly outbound: (app: string) => Fetcher;
+  readonly outbound: (app: string, hostApi: HostApiCheck | undefined) => Fetcher;
   /** Seals the secret fields of providers that declare hosts. App code never holds it. */
   readonly credentialKey: Effect.Effect<CryptoKey>;
   /**
@@ -128,6 +130,11 @@ export interface AppRunnerHost {
 export interface AppInvocation {
   readonly app: string;
   readonly build: string;
+  /**
+   * The host API revision the app's cache belongs to, for an app that reads this host's API. Its
+   * Worker's network refuses that API's document unless it has this revision; see `HostApiCheck`.
+   */
+  readonly hostApi?: HostApiCheck;
   readonly database: boolean;
   /**
    * The build declares `sharedRuntime`: its runtime is named by build alone, so every caller's
@@ -383,7 +390,7 @@ class ColdStartFailed extends Schema.TaggedError<ColdStartFailed>()("ColdStartFa
 export const appWorker = (
   invocation: Pick<
     AppInvocation,
-    "app" | "build" | "database" | "sharedRuntime" | "command" | "accounts"
+    "app" | "build" | "database" | "sharedRuntime" | "command" | "accounts" | "hostApi"
   >,
 ) =>
   // Requirement names are unique across scopes, so one record names the account set.
@@ -391,11 +398,19 @@ export const appWorker = (
     invocation.build,
     invocation.sharedRuntime === true ? {} : Object.fromEntries(scopedSlots(invocation.accounts)),
   ).pipe(
-    Effect.map((identity) => ({
-      identity,
-      mode: runsInFacet(invocation) ? ("facet" as const) : ("worker" as const),
-      name: `${invocation.app}:${identity}`,
-    })),
+    Effect.map((selection) => {
+      // A Worker's network is bound when it loads, so each host API revision has its own app
+      // Worker and its own facet Worker. The facet's database is the supervisor's, whichever loads.
+      const identity =
+        invocation.hostApi === undefined
+          ? selection
+          : `${selection}:${invocation.hostApi.revision}`;
+      return {
+        identity,
+        mode: runsInFacet(invocation) ? ("facet" as const) : ("worker" as const),
+        name: `${invocation.app}:${identity}`,
+      };
+    }),
   );
 
 /** Whether a call runs in the app's data facet, under its data supervisor, rather than its Worker. */
@@ -594,7 +609,7 @@ export const makeAppRunner = (host: AppRunnerHost) => {
             mainModule: "__executor_rpc.js",
             modules: read.success.modules,
             compatibilityDate,
-            compatibilityFlags: ["nodejs_compat"],
+            compatibilityFlags: ["nodejs_compat", "no_brotli_content_encoding"],
             globalOutbound: options.globalOutbound,
           };
         };
@@ -740,7 +755,8 @@ export const makeAppRunner = (host: AppRunnerHost) => {
             id,
             app: invocation.app,
             identity,
-            cacheNamespace: invocation.build,
+            cacheNamespace: appCacheNamespace(invocation.build, invocation.hostApi),
+            ...(invocation.hostApi === undefined ? {} : { hostApi: invocation.hostApi }),
             body,
             headers: invocation.headers,
             write:
@@ -901,7 +917,9 @@ export const makeAppRunner = (host: AppRunnerHost) => {
           (lanes: Semaphore.Semaphore): CacheTransport =>
           (command) =>
             lanes
-              .withPermits(1)(data.cache(invocation.build, command))
+              .withPermits(1)(
+                data.cache(appCacheNamespace(invocation.build, invocation.hostApi), command),
+              )
               .pipe(
                 Effect.flatMap(Schema.decodeUnknownEffect(CacheReply)),
                 Effect.mapError(() => new CacheError({ reason: "storage" })),
@@ -940,7 +958,7 @@ export const makeAppRunner = (host: AppRunnerHost) => {
         const reply = yield* start(name, load, {
           body,
           headers: invocation.headers,
-          globalOutbound: host.outbound(invocation.app),
+          globalOutbound: host.outbound(invocation.app, invocation.hostApi),
           elicit: capabilities.elicit,
           controls: capabilities.controls,
           ...(capabilities.workflow === undefined

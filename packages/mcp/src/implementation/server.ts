@@ -32,8 +32,9 @@ import { ElicitationResponseInvalid, InteractionId } from "../contracts/interact
 import { makeExecutions } from "./executions.ts";
 import { executeNative } from "./native-elicitation.ts";
 import { callTools, describeCatalog, executeProgram, searchCatalog } from "./execute.ts";
-import { skills } from "./skills.ts";
+import { decodeSkillsInput, skills } from "./skills.ts";
 import { eventsHandler } from "./events.ts";
+import { withOperationSpan } from "./telemetry.ts";
 
 // Observe the final protocol value after timeout, admission and resume handling.
 const observeExecution =
@@ -95,7 +96,7 @@ const observeExecution =
           }),
         ),
       );
-    }).pipe(Effect.withSpan(name));
+    }).pipe(withOperationSpan(name));
 
 /**
  * MCP revisions every product serves, newest first. An initialize offering an unlisted revision
@@ -161,7 +162,11 @@ const interactionId = (requestId: string) =>
 /** Build protocol state and its browser accessors together. Hosts authorize browser calls separately from MCP. */
 export const makeMcp = (options: McpOptions) =>
   Effect.gen(function* () {
-    const executions = yield* makeExecutions(options.limits, options.beforeExecute);
+    const executions = yield* makeExecutions(
+      options.limits,
+      options.beforeExecute,
+      options.interactions,
+    );
     const handler = (mode: ElicitationMode) =>
       Effect.gen(function* () {
         const delivery = options.browser;
@@ -186,22 +191,26 @@ export const makeMcp = (options: McpOptions) =>
           };
         });
         // Which skills agents read, and in what order, shows whether they follow the entry skill.
-        const skill = (input: Parameters<typeof skills>[0]) =>
-          skills(input, options.backend).pipe(
-            Effect.tap((result) =>
-              "content" in result ? options.annotateSkillRead(result) : Effect.void,
+        const skill = (params: unknown) =>
+          decodeSkillsInput(params).pipe(
+            Effect.flatMap((input) =>
+              skills(input, options.backend).pipe(
+                Effect.tap((result) =>
+                  "content" in result ? options.annotateSkillRead(result) : Effect.void,
+                ),
+                withOperationSpan("mcp.skills", {
+                  attributes: {
+                    "executor.skill.operation": input.name === undefined ? "list" : "read",
+                  },
+                }),
+              ),
             ),
-            Effect.withSpan("mcp.skills", {
-              attributes: {
-                "executor.skill.operation": input.name === undefined ? "list" : "read",
-              },
-            }),
           );
         // Search and describe read the catalog directly; call runs as an execution so it can pause.
-        const search = (input: Parameters<typeof searchCatalog>[2]) =>
-          searchCatalog(options.backend, options.limits, input).pipe(Effect.withSpan("mcp.search"));
+        const search = (input: Parameters<typeof searchCatalog>[1]) =>
+          searchCatalog(options.backend, input).pipe(withOperationSpan("mcp.search"));
         const describe = (input: Parameters<typeof describeCatalog>[1]) =>
-          describeCatalog(options.backend, input).pipe(Effect.withSpan("mcp.describe"));
+          describeCatalog(options.backend, input).pipe(withOperationSpan("mcp.describe"));
         /**
          * In model mode, a request only a person may approve carries the browser page they approve
          * it on. The agent shows it and resumes; the person's answer is used, never the agent's.
@@ -451,7 +460,7 @@ export const makeMcp = (options: McpOptions) =>
           approver,
         ),
     };
-    return { http, approvals };
+    return { http, approvals, programs: executions.live };
   });
 
 /** Mount MCP alone when a host does not need direct browser accessors. */
