@@ -113,7 +113,11 @@ export const makeImportStore = (sql: SqlClient.SqlClient) => {
       Effect.map((found) => found[0]),
       unavailable,
     );
-  /** Record an attempt. A v1 item keeps one row; a later attempt replaces its result. */
+  /**
+   * Record an attempt. A v1 item keeps one row; a later attempt replaces its result. A failure
+   * keeps the v2 id an earlier attempt saved, so a retry updates that resource instead of
+   * starting again.
+   */
   const record = (input: {
     readonly organization: string;
     readonly kind: MapKind;
@@ -130,8 +134,12 @@ export const makeImportStore = (sql: SqlClient.SqlClient) => {
       values (${input.organization}, ${input.kind}, ${input.id}, ${imported?.v2Kind ?? null},
         ${imported?.v2Id ?? null}, ${input.result.status}, ${reason}, ${input.hash}, now())
       on conflict (v1_kind, v1_id) do update set
-        v2_kind = excluded.v2_kind, v2_id = excluded.v2_id, status = excluded.status,
-        reason = excluded.reason, source_hash = excluded.source_hash, updated_at = now()
+        v2_kind = case when excluded.status = 'failed'
+          then coalesce(excluded.v2_kind, private_v1_import_map.v2_kind) else excluded.v2_kind end,
+        v2_id = case when excluded.status = 'failed'
+          then coalesce(excluded.v2_id, private_v1_import_map.v2_id) else excluded.v2_id end,
+        status = excluded.status, reason = excluded.reason,
+        source_hash = excluded.source_hash, updated_at = now()
       where private_v1_import_map.v1_org_id = excluded.v1_org_id
     `.pipe(Effect.asVoid, unavailable);
   };

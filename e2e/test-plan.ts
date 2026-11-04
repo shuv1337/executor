@@ -493,6 +493,16 @@ export const scenarios = plan({
       local: na("Role hosts are Cloud's; local serves one origin."),
     },
   },
+  cloudOAuthProxyRefusal: {
+    file: "cloud-oauth-proxy.spec.ts",
+    title:
+      "Production's OAuth proxy refuses an untrusted redirect and a state it cannot decrypt, and still accepts a trusted redirect",
+    targets: {
+      cloud: managedCloud,
+      "self-host": na("The OAuth proxy and role hosts are Cloud's."),
+      local: na("The OAuth proxy and role hosts are Cloud's."),
+    },
+  },
   cloudOAuthProxyOwnSignIn: {
     file: "cloud-oauth-proxy.spec.ts",
     title: "Cloud's own social sign-ins on app. return through the edge without its OAuth proxy",
@@ -9172,6 +9182,12 @@ export const scenarios = plan({
     file: "cloud-v1-import.spec.ts",
     title:
       "Cloud v1 import repairs an MCP app moved before v1's approval stamps became rules: it plans without writing, deploys the earlier importer's app with the stamp as its own rule, gives an app an earlier import deployed the importer's source now, leaves an app whose users turned its approvals off or dropped them in v2 as they chose, keeps the code of an app its users changed beside its approvals and adds v1's approvals beneath it, finds nothing left on a second run, and runs the version a repair replaced again only while the app still runs the repair's",
+    targets: { ...cloudOnboarding, cloud: managedCloud },
+  },
+  v1ImportRevokedRetry: {
+    file: "cloud-v1-import-run.spec.ts",
+    title:
+      "Cloud v1 import leaves a rolled-back toolkit copy revoked when a failed retry runs again, and the next copy stays the one rollback can reach",
     targets: { ...cloudOnboarding, cloud: managedCloud },
   },
   v1ImportRollback: {

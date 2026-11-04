@@ -91,6 +91,9 @@ const check = Effect.gen(function* () {
           if (label.startsWith(`viewer${path.sep}`) && specifier === "media-chrome/react") return;
           // The only database driver: runner-applied legacy rows for declared scenarios.
           if (label === legacyStorage && specifier === "@electric-sql/pglite") return;
+          // Encrypts a proxy package with better-auth 1.7.16, resolved from the Cloud package.
+          if (label === `support${path.sep}oauth-proxy-state.ts` && specifier === "node:module")
+            return;
           if (
             specifier.startsWith(".") &&
             path.resolve(path.dirname(file), specifier) === path.join(root, legacyStorage) &&

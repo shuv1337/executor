@@ -2212,11 +2212,12 @@ const importToolkitItem = (context: ItemContext, id: string) =>
             note: keptInV2,
           });
         // Otherwise its connection follows the apps and accounts imported since; saving it again
-        // is safe.
+        // is safe. A failed attempt keeps the connection it already saved, so the retry updates
+        // that copy instead of starting again at generation 0.
         const record: ToolkitCopyRecord =
           existing === undefined
             ? { kind: "unmapped" }
-            : existing.status === "imported" && existing.v2_id !== null
+            : existing.v2_id !== null
               ? { kind: "saved", connection: existing.v2_id }
               : { kind: "unsaved" };
         return yield* importToolkit(context, planning, toolkit, member, record).pipe(
@@ -2256,8 +2257,10 @@ const importArtifactItem = (context: ItemContext, id: string) =>
     // Its source and the mapping written into it.
     const hash = yield* sourceHash({ artifact: row, mapping });
     const existing = yield* store.find("artifact", id);
+    // A failed attempt keeps the app it already created, so the retry updates that app.
+    const keptId = existing !== undefined && existing.v2_id !== null ? existing.v2_id : undefined;
     const since =
-      existing?.status === "imported" && existing.v2_id !== null
+      existing?.status === "imported" && keptId !== undefined
         ? yield* store.sinceImported("artifact", id)
         : "kept";
     // An app its users removed or deployed again in v2 since stays as they left it.
@@ -2278,10 +2281,7 @@ const importArtifactItem = (context: ItemContext, id: string) =>
             ? {}
             : { note: existing.reason }),
       });
-    const app =
-      existing?.status === "imported" && existing.v2_id !== null
-        ? AppId.make(existing.v2_id)
-        : undefined;
+    const app = keptId === undefined ? undefined : AppId.make(keptId);
     return yield* importArtifact(context, row, mapping, app).pipe(
       Effect.tap(recorded(context, "artifact", id, hash)),
       Effect.map((result) => ({

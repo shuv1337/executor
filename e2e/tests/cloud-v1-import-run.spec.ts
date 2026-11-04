@@ -1643,6 +1643,106 @@ layer(TestLive, { excludeTestServices: true })("Cloud v1 import runs", (it) => {
     ),
   );
 
+  it.effect(scenarios.v1ImportRevokedRetry.title, (context) =>
+    withCase(
+      context,
+      Effect.gen(function* () {
+        const emulators = yield* Emulators,
+          onboarding = yield* Onboarding;
+        const operator = yield* v1ImportOperator;
+        const identity = yield* onboarding.socialSignIn("google");
+        const team = yield* onboarding.confirmTeam(yield* onboarding.prepareTeam);
+        const teammate = syntheticEmail("retry-teammate");
+        const workspace = yield* emulators.v1Workspace([identity.email, teammate]);
+        const teammateUser = yield* emulators.v1User(teammate);
+        const former = yield* emulators.v1Workspace([syntheticEmail("retry-former")]);
+        const toolkits = { team: randomUUID(), mine: randomUUID() };
+        const organization = workspace.organization;
+        yield* seedShared(
+          organization,
+          `v1-${randomUUID().slice(0, 8)}`,
+          { first: workspace.user, second: teammateUser, former: former.user },
+          toolkits,
+        );
+        yield* emulators.v1TeamSubscription(organization, { version: 3, seats: 2 });
+        yield* allowV1Import(organization);
+        yield* listV1Into(organization, team.id, "copy_into_empty");
+        const run = v1RunId("revoked-retry");
+        expect(
+          (yield* operator.start({ mode: "import", runId: run, organizations: [organization] }))
+            .status,
+        ).toBe(200);
+        const report = yield* operator.waitForReport(run, organization);
+        expect(report.status, report.reason ?? "").toBe("imported");
+        const first = (yield* liveCopies(team.id)).map((copy) => copy.id);
+        expect(first).toHaveLength(3);
+        expect((yield* operator.returnBilling(organization)).status).toBe(200);
+        const rolledBack = yield* operator.rollback(organization).pipe(
+          Effect.flatMap((response) =>
+            response.status === 200
+              ? Effect.succeed(response)
+              : Effect.fail(new Error(JSON.stringify(response.body))),
+          ),
+          Effect.retry(Schedule.spaced("1 second").pipe(Schedule.upTo({ duration: "50 seconds" }))),
+        );
+        expect(rolledBack.status).toBe(200);
+        expect(yield* connectionsRevoked(first)).toEqual(
+          first.toSorted().map((id) => ({ id, revoked: true })),
+        );
+
+        // A failed retry of the re-import: generation 1 was saved, then a non-transient failure
+        // recorded the copy failed. The map row is what that failure leaves when it drops the id.
+        const twin = yield* emulators.v1Workspace([identity.email, teammate]);
+        expect(twin.user).toBe(workspace.user);
+        yield* seedShared(
+          twin.organization,
+          `v1-${randomUUID().slice(0, 8)}`,
+          { first: workspace.user, second: teammateUser, former: former.user },
+          toolkits,
+        );
+        yield* allowV1Import(twin.organization);
+        yield* listV1Into(twin.organization, team.id, "copy_into_empty");
+        const copyKey = (toolkit: string, member: string) => `${toolkit}:${member}`;
+        for (const id of [
+          copyKey(toolkits.team, workspace.user),
+          copyKey(toolkits.team, teammateUser),
+          copyKey(toolkits.mine, workspace.user),
+        ])
+          yield* cloudRows(
+            Schema.Struct({ v1_id: Schema.String }),
+            `insert into private_v1_import_map
+              (v1_org_id, v1_kind, v1_id, status, reason, source_hash)
+            values ($1, 'toolkit', $2, 'failed', 'Its member is not imported.', 'failed-retry')
+            returning v1_id`,
+            twin.organization,
+            id,
+          );
+        const again = v1RunId("revoked-again");
+        const startedAgain = yield* operator.start({
+          mode: "import",
+          runId: again,
+          organizations: [twin.organization],
+        });
+        expect(startedAgain.status, JSON.stringify(startedAgain.body)).toBe(200);
+        const retried = yield* operator.waitForReport(again, twin.organization);
+        expect(retried.status, retried.reason ?? "").toBe("imported");
+        const second = (yield* liveCopies(team.id)).map((copy) => copy.id);
+        expect(second).toHaveLength(3);
+        expect(second.filter((id) => first.includes(id))).toEqual([]);
+        expect(yield* connectionsRevoked(first)).toEqual(
+          first.toSorted().map((id) => ({ id, revoked: true })),
+        );
+        const mapped = yield* cloudRows(
+          Schema.Struct({ v2_id: Schema.String }),
+          `select v2_id from private_v1_import_map
+            where v1_org_id = $1 and v1_kind = 'toolkit' and status = 'imported'`,
+          twin.organization,
+        );
+        expect(mapped.map((row) => row.v2_id).toSorted()).toEqual(second.toSorted());
+      }).pipe(Effect.provide(services)),
+    ),
+  );
+
   it.effect(scenarios.v1ImportPaidBilling.title, (context) =>
     withCase(
       context,

@@ -10,9 +10,13 @@
  * `oAuthProxy` so its before hooks run first.
  *
  * Recognition of a proxy package matches the plugin's own truthiness test. A
- * stricter test would let a package the plugin still accepts skip this guard, and
- * anything that decrypts under the proxy secret but cannot be understood is
- * refused rather than waved through.
+ * stricter test would let a package the plugin still accepts skip this guard.
+ * better-auth 1.7.16 encrypts that package and its state cookie under
+ * purpose-derived keys, not the raw secret. Decrypting with the raw secret fails,
+ * and treating that failure as "not a proxy package" lets the plugin redirect to
+ * whatever target the ciphertext names. A decrypt or parse failure of anything
+ * other than a normal sign-in state is refused here: a redirect thrown later, in
+ * the plugin's before hook, never reaches the after hooks.
  *
  * The plugin also rewrites the outgoing `Location` on `/callback/:id` from an
  * unvalidated `callbackURL` parameter. `oauthProxyLocationGuard` re-checks that
@@ -21,7 +25,7 @@
  */
 import type { BetterAuthPlugin } from "better-auth";
 import { APIError, createAuthMiddleware } from "better-auth/api";
-import { symmetricDecrypt } from "better-auth/crypto";
+import { derivePurposeKey, symmetricDecrypt } from "better-auth/crypto";
 
 /** Endpoints that only a test stage needs; production must not accept a profile. */
 const completionPaths = new Set(["/callback/:id/oauth-proxy", "/oauth-proxy-callback"]);
@@ -83,6 +87,15 @@ export const proxyRedirectOrigins = (stateData: unknown): ReadonlyArray<string> 
   return [...origins];
 };
 
+/**
+ * Production's own sign-in state: `generateRandomString(32)`. It is not ciphertext.
+ * A proxy package is hex from `symmetricEncrypt` and is far longer.
+ */
+const regularSignInState = /^[A-Za-z0-9_-]{32}$/u;
+
+const decryptJson = async (key: string, data: string): Promise<unknown> =>
+  JSON.parse(await symmetricDecrypt({ key, data }));
+
 const proxiedRedirectOrigins = async (
   secret: string,
   state: unknown,
@@ -90,17 +103,20 @@ const proxiedRedirectOrigins = async (
   if (typeof state !== "string" || state.length === 0) return undefined;
   let statePackage: unknown;
   try {
-    statePackage = JSON.parse(await symmetricDecrypt({ key: secret, data: state }));
+    statePackage = await decryptJson(derivePurposeKey(secret, "oauth-proxy-package"), state);
   } catch {
-    // Not a proxy package. Production's own sign-ins use the regular callback.
-    return undefined;
+    // The plugin uses this same key. A normal sign-in token is not a package, so the
+    // callback continues. Anything else that will not decrypt is refused: the plugin
+    // must not be left to follow a target this guard could not read.
+    if (regularSignInState.test(state)) return undefined;
+    throw badState("OAuth proxy state cannot be read.");
   }
-  if (!isProxyStatePackage(statePackage)) return undefined;
+  if (!isProxyStatePackage(statePackage)) throw badState("OAuth proxy state cannot be read.");
   const stateCookie = (statePackage as { stateCookie: unknown }).stateCookie;
   if (typeof stateCookie !== "string") throw badState("OAuth proxy state cannot be read.");
   let stateData: unknown;
   try {
-    stateData = JSON.parse(await symmetricDecrypt({ key: secret, data: stateCookie }));
+    stateData = await decryptJson(derivePurposeKey(secret, "oauth-proxy-state"), stateCookie);
   } catch {
     throw badState("OAuth proxy state cannot be read.");
   }

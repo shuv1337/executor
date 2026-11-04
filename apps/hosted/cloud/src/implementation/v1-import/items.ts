@@ -2614,8 +2614,9 @@ export const toolkitCopyKey = (toolkit: Pick<V1Toolkit, "row">, member: string) 
  * an unmapped copy's id, one a rolled-back import made, the copy takes the next generation's: that
  * connection stays revoked under its id, so its grants and tokens never come back. An owner may
  * make a connection again with a revoked connection's id, which would revive this one, so the
- * import does not: it leaves the revoked copy and uses the next generation. Otherwise a taken id
- * means its users removed the copy. `planning` is the step's, shared by every copy it saves.
+ * import does not, on the first attempt or a failed retry: it leaves the revoked copy and uses
+ * the next generation. Otherwise a taken id means its users removed the copy. `planning` is the
+ * step's, shared by every copy it saves.
  */
 export const importToolkit = (
   context: ItemContext,
@@ -2661,7 +2662,8 @@ export const importToolkit = (
     // generation after them. A retry finds the copy it saved there live and updates it.
     for (let generation = 0; ; generation++) {
       const id = yield* toolkitConnectionId(context.target.id, toolkit, member, generation);
-      if (record.kind === "unmapped" && (yield* heldByRevokedCopy(id))) continue;
+      // Saved copies returned above. A failed retry is `unsaved` and must not revive either.
+      if (yield* heldByRevokedCopy(id)) continue;
       const saved = yield* save(id).pipe(
         Effect.map(Option.some),
         Effect.catchTag("ConnectionIdTaken", (taken) =>

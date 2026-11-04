@@ -15,7 +15,7 @@
  * when it trusts that origin, and the stage completes the sign-in itself.
  */
 import { expect, layer } from "@effect/vitest";
-import { Effect, Schema } from "effect";
+import { Effect, FileSystem, Schema } from "effect";
 import { Actors } from "../support/actors.ts";
 import { Api, body } from "../support/api.ts";
 import { appsManifest } from "../support/apps-release.ts";
@@ -25,6 +25,7 @@ import { Resource } from "../support/contracts.ts";
 import { oauthSetupIssuer } from "../support/oauth-setup-issuer.ts";
 import { Onboarding } from "../support/onboarding.ts";
 import { Target } from "../support/platform.ts";
+import { oauthProxyState } from "../support/oauth-proxy-state.ts";
 import { rawRequest, roleHost, targetHosts } from "../support/role-hosts.ts";
 import { scenarios } from "../test-plan.ts";
 import { connectionsPath } from "../support/app-accounts.ts";
@@ -280,6 +281,51 @@ export default defineApp({user: { accounts:{service} }},async()=>({tools:router(
         );
         expect(untrusted.status).toBe(400);
         expect(untrusted.location).toBeNull();
+      }),
+    ),
+  );
+
+  it.effect(scenarios.cloudOAuthProxyRefusal.title, (context) =>
+    withCase(
+      context,
+      Effect.gen(function* () {
+        const target = yield* Target,
+          fs = yield* FileSystem.FileSystem;
+        const { browser } = targetHosts(target);
+        const { secret } = yield* fs
+          .readFileString(`${target.directory}/oauth-proxy.json`)
+          .pipe(
+            Effect.flatMap(
+              Schema.decodeUnknownEffect(
+                Schema.fromJsonString(Schema.Struct({ secret: Schema.String })),
+              ),
+            ),
+          );
+        // The edge only bounces this callback to the browser origin, where the guard runs.
+        const callback = `${browser}/api/auth/callback/google`;
+        const ask = (state: string) => rawRequest(`${callback}?state=${encodeURIComponent(state)}`);
+
+        const untrusted = yield* ask(yield* oauthProxyState(secret, "https://evil.example/steal"));
+        expect(untrusted.status, untrusted.text).toBe(403);
+        expect(untrusted.location).toBeNull();
+        expect(untrusted.text).toContain("not a trusted origin");
+
+        const trusted = yield* ask(yield* oauthProxyState(secret, `${browser}/done`));
+        expect(trusted.status, trusted.text).not.toBe(403);
+        expect(trusted.text).not.toContain("not a trusted origin");
+        expect(trusted.location ?? "").not.toContain("evil.example");
+
+        const malformed = yield* ask("not-a-sign-in-token");
+        expect(malformed.status, malformed.text).toBe(400);
+        expect(malformed.text).toContain("cannot be read");
+        const undecryptable = yield* ask("ab".repeat(80));
+        expect(undecryptable.status, undecryptable.text).toBe(400);
+        expect(undecryptable.text).toContain("cannot be read");
+
+        // A normal sign-in token is not a proxy package. The guard must not refuse it.
+        const own = yield* ask("a".repeat(32));
+        expect(own.text).not.toContain("cannot be read");
+        expect(own.text).not.toContain("not a trusted origin");
       }),
     ),
   );
