@@ -5,8 +5,12 @@
  * Requirements and resolved accounts are nested by scope: `app` for accounts linked to the app for
  * everyone, `user` for the caller's; a tool's schedule may run in the `app` scope. Tools may say their kind is confirmed (`kindConfirmed`). A
  * build may declare `capabilities.sharedDefinitions`; the host then may ask an inspection for
- * `definitions: "shared"`, answered with a shared catalog that sends each `$defs` once. Every other
- * message is protocol 12's, re-exported unchanged.
+ * `definitions: "shared"`, answered with a shared catalog that sends each `$defs` once.
+ *
+ * The fork's protocol 13 also carries caller identity and shared runtimes. A build may declare
+ * `capabilities.callerIdentity` and then receive `caller` and `approvedBy`, and `sharedRuntime`
+ * when every caller shares one runtime. An approval failure may set `human`. Builds from before
+ * those fields omit them. Every other message is protocol 12's, re-exported unchanged.
  *
  * Released and frozen like the earlier ones: `bun run check` compares `protocol13` with
  * `packages/apps/protocols/13.json`. The module imports only `effect` and earlier protocol modules,
@@ -16,9 +20,12 @@
 import { Schema } from "effect";
 import {
   AccountId,
+  ApprovalElicitation,
   AppSkillName,
+  ElicitationFailed,
   JsonObject,
   JsonValue,
+  OpenapiResponseError,
   OperationSchedule as PreviousSchedule,
   ToolAnnotations,
   WebhookCommand,
@@ -26,6 +33,24 @@ import {
   WorkflowReplay,
   WorkflowRunId,
 } from "./1.ts";
+import { DatabaseFieldReserved, DatabaseLimitExceeded, WorkflowFailure } from "./3.ts";
+import {
+  HostAccountsInvalid,
+  HostDeclarationInvalid,
+  HostEvaluationFailed,
+  HostInputInvalid,
+  HostKindMismatch,
+  HostOperationFailed,
+  HostOperationNotFound,
+  HostOutputInvalid,
+  HostRequestInvalid,
+  HostToolBlocked,
+  HostToolNotFound,
+  HostToolPolicyFailed,
+  ProviderError,
+} from "./8.ts";
+import { McpError, SkillLoadFailed } from "./9.ts";
+import { EmittedEvents } from "./11.ts";
 import {
   AccountCheckCommand,
   DeclaredProvider,
@@ -65,6 +90,11 @@ export const DeclaredRequirements = Schema.Struct({
       skillSources: Schema.optionalKey(Schema.Literal(true)),
       scheduledTools: Schema.optionalKey(Schema.Literal(true)),
       sharedDefinitions: Schema.optionalKey(Schema.Literal(true)),
+      /**
+       * Accepts the invocation's verified `caller` and, on a resumed approval, `approvedBy`.
+       * Earlier builds are never sent either.
+       */
+      callerIdentity: Schema.optionalKey(Schema.Literal(true)),
     }),
   ),
   database: PreviousRequirements.fields.database,
@@ -72,6 +102,12 @@ export const DeclaredRequirements = Schema.Struct({
   sql: PreviousRequirements.fields.sql,
   events: PreviousRequirements.fields.events,
   icons: PreviousRequirements.fields.icons,
+  /**
+   * The author declared that every caller may share one runtime: hosts name the app's Worker and
+   * data facet by build alone, not by the caller's account selection. Hosts that predate it, and
+   * builds that do not declare it, keep one runtime per selection.
+   */
+  sharedRuntime: Schema.optionalKey(Schema.Literal(true)),
 });
 export type DeclaredRequirements = typeof DeclaredRequirements.Type;
 
@@ -98,6 +134,70 @@ export const ResolvedAccounts = Schema.Struct({
   user: Schema.optionalKey(ResolvedAccountSlots),
 });
 export type ResolvedAccounts = typeof ResolvedAccounts.Type;
+
+/**
+ * What started an invocation: a person, an agent acting for one, or the host's own background work.
+ * Agents are MCP clients and API keys; they act for the person who owns the grant or key.
+ */
+export const CallerKind = Schema.Literals(["human", "agent", "system"]);
+export type CallerKind = typeof CallerKind.Type;
+
+/** The surface an invocation arrived through. Every invocation names one. */
+export const CallerChannel = Schema.Literals([
+  "ui",
+  "mcp",
+  "api",
+  "dashboard",
+  "schedule",
+  "workflow",
+  "webhook",
+]);
+export type CallerChannel = typeof CallerChannel.Type;
+
+/**
+ * Unverified client details, for logs only. The host relays what the client presented; never
+ * authorize anything with them.
+ */
+export const CallerProvenance = Schema.Struct({
+  trusted: Schema.Literal(false),
+  /** The MCP OAuth client, or `pat:<id>` for a personal access token. */
+  clientId: Schema.optionalKey(Schema.String),
+  /** The scoped MCP connection the grant was issued for. */
+  connectionId: Schema.optionalKey(Schema.String),
+});
+export type CallerProvenance = typeof CallerProvenance.Type;
+
+/**
+ * The verified caller of one invocation. `subject` is the user the invocation acts for, or null
+ * for background work that has none. `issuer` is the authority that verified it.
+ */
+export const Caller = Schema.Struct({
+  kind: CallerKind,
+  subject: Schema.NullOr(Schema.String),
+  issuer: Schema.NullOr(Schema.String),
+  email: Schema.NullOr(Schema.String),
+  organizationId: Schema.NullOr(Schema.String),
+  channel: CallerChannel,
+  provenance: Schema.optionalKey(CallerProvenance),
+});
+export type Caller = typeof Caller.Type;
+
+/** How a person or agent answered an approval request. */
+export const ApprovalMethod = Schema.Literals([
+  "model",
+  "client",
+  "native",
+  "browser",
+  "dashboard",
+]);
+export type ApprovalMethod = typeof ApprovalMethod.Type;
+
+/**
+ * Who answered the approval a resumed call runs under. `caller` stays the original requester;
+ * `approvedBy` has its own channel, such as a browser approval of an MCP call.
+ */
+export const ApprovedBy = Schema.Struct({ ...Caller.fields, method: ApprovalMethod });
+export type ApprovedBy = typeof ApprovedBy.Type;
 
 /** Protocol 12's operation schedule; an app's schedule may run with its app accounts. */
 export const OperationSchedule = Schema.Struct({
@@ -217,6 +317,57 @@ export const HostRequest = Schema.Union([
 ]);
 export type HostRequest = typeof HostRequest.Type;
 
+/**
+ * Protocol 12's approval failure, plus `human` when a person has to approve. An agent's own answer
+ * never counts. Older bundles omit it.
+ */
+export class HostToolApprovalRequired extends Schema.TaggedError<HostToolApprovalRequired>()(
+  "HostToolApprovalRequired",
+  {
+    input: JsonValue,
+    elicitation: ApprovalElicitation,
+    human: Schema.optionalKey(Schema.Literal(true)),
+  },
+) {}
+
+/** Protocol 9's error envelope, with this protocol's approval failure. */
+export const HostError = Schema.Union([
+  OpenapiResponseError,
+  ProviderError,
+  McpError,
+  SkillLoadFailed,
+  WorkflowFailure,
+  HostRequestInvalid,
+  HostAccountsInvalid,
+  HostDeclarationInvalid,
+  HostEvaluationFailed,
+  HostOperationNotFound,
+  HostOperationFailed,
+  DatabaseLimitExceeded,
+  DatabaseFieldReserved,
+  HostToolNotFound,
+  HostInputInvalid,
+  HostOutputInvalid,
+  HostToolBlocked,
+  HostToolApprovalRequired,
+  HostToolPolicyFailed,
+  ElicitationFailed,
+  HostKindMismatch,
+]);
+export type HostError = typeof HostError.Type;
+
+/** Protocol 11's response envelope, carrying this protocol's errors. */
+export const HostResponse = Schema.Union([
+  Schema.Struct({
+    ok: Schema.Literal(true),
+    value: JsonValue,
+    toolError: Schema.optionalKey(Schema.Literal(true)),
+    events: Schema.optionalKey(EmittedEvents),
+  }),
+  Schema.Struct({ ok: Schema.Literal(false), error: HostError }),
+]);
+export type HostResponse = typeof HostResponse.Type;
+
 /** The JSON body the host sends to a bundle's generated server entry. */
 export const HostInvocation = Schema.Struct({
   command: HostRequest,
@@ -225,6 +376,10 @@ export const HostInvocation = Schema.Struct({
   replay: Schema.optionalKey(WorkflowReplay),
   deadline: Schema.optionalKey(InvocationDeadline),
   workflowRun: Schema.optionalKey(WorkflowRunId),
+  /** Sent only to builds that declare the callerIdentity capability. */
+  caller: Schema.optionalKey(Caller),
+  /** On a resumed approval, to builds that declare callerIdentity. */
+  approvedBy: Schema.optionalKey(ApprovedBy),
 });
 export type HostInvocation = typeof HostInvocation.Type;
 
@@ -235,6 +390,7 @@ export const protocol13 = {
     ...protocol12.schemas,
     invocation: HostInvocation,
     request: HostRequest,
+    response: HostResponse,
     requirements: DeclaredRequirements,
     catalog: HostedCatalog,
     catalogSummary: HostedCatalogSummary,

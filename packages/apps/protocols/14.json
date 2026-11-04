@@ -144,6 +144,351 @@
             ]
           },
           "isOptional": true
+        },
+        {
+          "name": "caller",
+          "type": {
+            "_tag": "Objects",
+            "propertySignatures": [
+              {
+                "name": "kind",
+                "type": {
+                  "_tag": "Union",
+                  "types": [
+                    {
+                      "_tag": "Literal",
+                      "literal": "human"
+                    },
+                    {
+                      "_tag": "Literal",
+                      "literal": "agent"
+                    },
+                    {
+                      "_tag": "Literal",
+                      "literal": "system"
+                    }
+                  ]
+                },
+                "isOptional": false
+              },
+              {
+                "name": "subject",
+                "type": {
+                  "_tag": "Union",
+                  "types": [
+                    {
+                      "_tag": "String"
+                    },
+                    {
+                      "_tag": "Null"
+                    }
+                  ]
+                },
+                "isOptional": false
+              },
+              {
+                "name": "issuer",
+                "type": {
+                  "_tag": "Union",
+                  "types": [
+                    {
+                      "_tag": "String"
+                    },
+                    {
+                      "_tag": "Null"
+                    }
+                  ]
+                },
+                "isOptional": false
+              },
+              {
+                "name": "email",
+                "type": {
+                  "_tag": "Union",
+                  "types": [
+                    {
+                      "_tag": "String"
+                    },
+                    {
+                      "_tag": "Null"
+                    }
+                  ]
+                },
+                "isOptional": false
+              },
+              {
+                "name": "organizationId",
+                "type": {
+                  "_tag": "Union",
+                  "types": [
+                    {
+                      "_tag": "String"
+                    },
+                    {
+                      "_tag": "Null"
+                    }
+                  ]
+                },
+                "isOptional": false
+              },
+              {
+                "name": "channel",
+                "type": {
+                  "_tag": "Union",
+                  "types": [
+                    {
+                      "_tag": "Literal",
+                      "literal": "ui"
+                    },
+                    {
+                      "_tag": "Literal",
+                      "literal": "mcp"
+                    },
+                    {
+                      "_tag": "Literal",
+                      "literal": "api"
+                    },
+                    {
+                      "_tag": "Literal",
+                      "literal": "dashboard"
+                    },
+                    {
+                      "_tag": "Literal",
+                      "literal": "schedule"
+                    },
+                    {
+                      "_tag": "Literal",
+                      "literal": "workflow"
+                    },
+                    {
+                      "_tag": "Literal",
+                      "literal": "webhook"
+                    }
+                  ]
+                },
+                "isOptional": false
+              },
+              {
+                "name": "provenance",
+                "type": {
+                  "_tag": "Objects",
+                  "propertySignatures": [
+                    {
+                      "name": "trusted",
+                      "type": {
+                        "_tag": "Literal",
+                        "literal": false
+                      },
+                      "isOptional": false
+                    },
+                    {
+                      "name": "clientId",
+                      "type": {
+                        "_tag": "String"
+                      },
+                      "isOptional": true
+                    },
+                    {
+                      "name": "connectionId",
+                      "type": {
+                        "_tag": "String"
+                      },
+                      "isOptional": true
+                    }
+                  ]
+                },
+                "isOptional": true
+              }
+            ]
+          },
+          "isOptional": true
+        },
+        {
+          "name": "approvedBy",
+          "type": {
+            "_tag": "Objects",
+            "propertySignatures": [
+              {
+                "name": "kind",
+                "type": {
+                  "_tag": "Union",
+                  "types": [
+                    {
+                      "_tag": "Literal",
+                      "literal": "human"
+                    },
+                    {
+                      "_tag": "Literal",
+                      "literal": "agent"
+                    },
+                    {
+                      "_tag": "Literal",
+                      "literal": "system"
+                    }
+                  ]
+                },
+                "isOptional": false
+              },
+              {
+                "name": "subject",
+                "type": {
+                  "_tag": "Union",
+                  "types": [
+                    {
+                      "_tag": "String"
+                    },
+                    {
+                      "_tag": "Null"
+                    }
+                  ]
+                },
+                "isOptional": false
+              },
+              {
+                "name": "issuer",
+                "type": {
+                  "_tag": "Union",
+                  "types": [
+                    {
+                      "_tag": "String"
+                    },
+                    {
+                      "_tag": "Null"
+                    }
+                  ]
+                },
+                "isOptional": false
+              },
+              {
+                "name": "email",
+                "type": {
+                  "_tag": "Union",
+                  "types": [
+                    {
+                      "_tag": "String"
+                    },
+                    {
+                      "_tag": "Null"
+                    }
+                  ]
+                },
+                "isOptional": false
+              },
+              {
+                "name": "organizationId",
+                "type": {
+                  "_tag": "Union",
+                  "types": [
+                    {
+                      "_tag": "String"
+                    },
+                    {
+                      "_tag": "Null"
+                    }
+                  ]
+                },
+                "isOptional": false
+              },
+              {
+                "name": "channel",
+                "type": {
+                  "_tag": "Union",
+                  "types": [
+                    {
+                      "_tag": "Literal",
+                      "literal": "ui"
+                    },
+                    {
+                      "_tag": "Literal",
+                      "literal": "mcp"
+                    },
+                    {
+                      "_tag": "Literal",
+                      "literal": "api"
+                    },
+                    {
+                      "_tag": "Literal",
+                      "literal": "dashboard"
+                    },
+                    {
+                      "_tag": "Literal",
+                      "literal": "schedule"
+                    },
+                    {
+                      "_tag": "Literal",
+                      "literal": "workflow"
+                    },
+                    {
+                      "_tag": "Literal",
+                      "literal": "webhook"
+                    }
+                  ]
+                },
+                "isOptional": false
+              },
+              {
+                "name": "provenance",
+                "type": {
+                  "_tag": "Objects",
+                  "propertySignatures": [
+                    {
+                      "name": "trusted",
+                      "type": {
+                        "_tag": "Literal",
+                        "literal": false
+                      },
+                      "isOptional": false
+                    },
+                    {
+                      "name": "clientId",
+                      "type": {
+                        "_tag": "String"
+                      },
+                      "isOptional": true
+                    },
+                    {
+                      "name": "connectionId",
+                      "type": {
+                        "_tag": "String"
+                      },
+                      "isOptional": true
+                    }
+                  ]
+                },
+                "isOptional": true
+              },
+              {
+                "name": "method",
+                "type": {
+                  "_tag": "Union",
+                  "types": [
+                    {
+                      "_tag": "Literal",
+                      "literal": "model"
+                    },
+                    {
+                      "_tag": "Literal",
+                      "literal": "client"
+                    },
+                    {
+                      "_tag": "Literal",
+                      "literal": "native"
+                    },
+                    {
+                      "_tag": "Literal",
+                      "literal": "browser"
+                    },
+                    {
+                      "_tag": "Literal",
+                      "literal": "dashboard"
+                    }
+                  ]
+                },
+                "isOptional": false
+              }
+            ]
+          },
+          "isOptional": true
         }
       ]
     },
@@ -189,6 +534,14 @@
               },
               {
                 "name": "sharedDefinitions",
+                "type": {
+                  "_tag": "Literal",
+                  "literal": true
+                },
+                "isOptional": true
+              },
+              {
+                "name": "callerIdentity",
                 "type": {
                   "_tag": "Literal",
                   "literal": true
@@ -639,6 +992,14 @@
                 }
               }
             ]
+          },
+          "isOptional": true
+        },
+        {
+          "name": "sharedRuntime",
+          "type": {
+            "_tag": "Literal",
+            "literal": true
           },
           "isOptional": true
         }
