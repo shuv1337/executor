@@ -2612,9 +2612,10 @@ export const toolkitCopyKey = (toolkit: Pick<V1Toolkit, "row">, member: string) 
  * import map records keeps its connection, which for a copy the opt-in import made is not the id an
  * import gives a copy now. Any other copy takes generation 0's id. When another connection holds
  * an unmapped copy's id, one a rolled-back import made, the copy takes the next generation's: that
- * connection stays revoked under its id, so its grants and tokens never come back. Otherwise a
- * taken id means its users removed the copy. `planning` is the step's, shared by every copy it
- * saves.
+ * connection stays revoked under its id, so its grants and tokens never come back. An owner may
+ * make a connection again with a revoked connection's id, which would revive this one, so the
+ * import does not: it leaves the revoked copy and uses the next generation. Otherwise a taken id
+ * means its users removed the copy. `planning` is the step's, shared by every copy it saves.
  */
 export const importToolkit = (
   context: ItemContext,
@@ -2640,6 +2641,18 @@ export const importToolkit = (
           ? yield* context.connections.update(owner, { id, name, policy })
           : yield* context.connections.create(owner, { id, name, policy });
       });
+    // A revoked connection is absent from `live`, and creating with its id would revive it. An
+    // unmapped copy leaves that connection revoked and takes another generation.
+    const RevokedHolder = Schema.Array(Schema.Struct({ revoked: Schema.Boolean }));
+    const heldByRevokedCopy = (id: ConnectionId) =>
+      context.sql`
+        select revoked from "mcpConnection"
+        where id = ${id} and "userId" = ${owner.userId} and resource = ${owner.resource}
+      `.pipe(
+        Effect.flatMap(Schema.decodeUnknownEffect(RevokedHolder)),
+        Effect.map((rows) => rows.some((row) => row.revoked)),
+        Effect.mapError(() => new V1ImportUnavailable()),
+      );
     if (record.kind === "saved") {
       const saved = yield* save(ConnectionId.make(record.connection));
       return imported("mcp_connection", saved.id, note);
@@ -2648,6 +2661,7 @@ export const importToolkit = (
     // generation after them. A retry finds the copy it saved there live and updates it.
     for (let generation = 0; ; generation++) {
       const id = yield* toolkitConnectionId(context.target.id, toolkit, member, generation);
+      if (record.kind === "unmapped" && (yield* heldByRevokedCopy(id))) continue;
       const saved = yield* save(id).pipe(
         Effect.map(Option.some),
         Effect.catchTag("ConnectionIdTaken", (taken) =>
