@@ -493,6 +493,16 @@ export const scenarios = plan({
       local: na("Role hosts are Cloud's; local serves one origin."),
     },
   },
+  cloudOAuthProxyRefusal: {
+    file: "cloud-oauth-proxy.spec.ts",
+    title:
+      "Production's OAuth proxy refuses an untrusted redirect and a state it cannot decrypt, and still accepts a trusted redirect",
+    targets: {
+      cloud: managedCloud,
+      "self-host": na("The OAuth proxy and role hosts are Cloud's."),
+      local: na("The OAuth proxy and role hosts are Cloud's."),
+    },
+  },
   cloudOAuthProxyOwnSignIn: {
     file: "cloud-oauth-proxy.spec.ts",
     title: "Cloud's own social sign-ins on app. return through the edge without its OAuth proxy",
@@ -3557,6 +3567,17 @@ export const scenarios = plan({
     file: "credential-hosts.spec.ts",
     title:
       "the outbound network substitutes secret fields for declared hosts and hides echoed values",
+    targets: {
+      "self-host": scheduled,
+      cloud: na("Uses a loopback service; Cloud app Workers reach only public addresses."),
+      local: na("Local runs apps through the same workerd runner and outbound as self-host."),
+    },
+  },
+  credentialHostsUnderscore: {
+    fixtures: "actors",
+    file: "credential-hosts.spec.ts",
+    title:
+      "a provider may declare a host with an underscore, as Docker names containers, and its credentials reach it",
     targets: {
       "self-host": scheduled,
       cloud: na("Uses a loopback service; Cloud app Workers reach only public addresses."),
@@ -9163,10 +9184,16 @@ export const scenarios = plan({
       "Cloud v1 import repairs an MCP app moved before v1's approval stamps became rules: it plans without writing, deploys the earlier importer's app with the stamp as its own rule, gives an app an earlier import deployed the importer's source now, leaves an app whose users turned its approvals off or dropped them in v2 as they chose, keeps the code of an app its users changed beside its approvals and adds v1's approvals beneath it, finds nothing left on a second run, and runs the version a repair replaced again only while the app still runs the repair's",
     targets: { ...cloudOnboarding, cloud: managedCloud },
   },
+  v1ImportRevokedRetry: {
+    file: "cloud-v1-import-run.spec.ts",
+    title:
+      "Cloud v1 import leaves a rolled-back toolkit copy revoked when a failed retry runs again, and the next copy stays the one rollback can reach",
+    targets: { ...cloudOnboarding, cloud: managedCloud },
+  },
   v1ImportRollback: {
     file: "cloud-v1-import-run.spec.ts",
     title:
-      "Cloud v1 import marks a verified workspace moved in v1 and gives it back on rollback only once its v2 organization is deleted, clearing its import map but its users",
+      "Cloud v1 import marks a verified workspace moved in v1 and gives it back on rollback only once its v2 organization is deleted, clearing its import map but its users, and imports it again into a new organization where every member's toolkit copy is live and v1's toolkit URL forwards to it",
     targets: { ...cloudOnboarding, cloud: managedCloud },
   },
   v1ImportPaidBilling: {
@@ -9224,6 +9251,12 @@ export const scenarios = plan({
       "Cloud v1 import retries v1 plan reads that time out or fail and still reports the organization",
     targets: { ...cloudOnboarding, cloud: managedCloud },
   },
+  v1ImportLongNames: {
+    file: "cloud-v1-import-run.spec.ts",
+    title:
+      "Cloud v1 import gives every app an address of its own when its name is longer than an address holds: a long integration label's apps per connection, numbered for members' connections of one long name, shorten the label so each keeps its connection's name and number, artifacts of one long title are numbered by retries that each change the address, the dry run plans those names and reports the artifact left without one, and the import started again after it is renamed keeps every app the first run made",
+    targets: { ...cloudOnboarding, cloud: managedCloud },
+  },
   v1ImportSplitNames: {
     file: "cloud-v1-import-run.spec.ts",
     title:
@@ -9234,6 +9267,12 @@ export const scenarios = plan({
     file: "cloud-v1-import-run.spec.ts",
     title:
       "Cloud v1 import moves a shared workspace on the server and cuts it over once it verifies: the oldest admin owns it, members keep their roles without a welcome email, org connections become shared accounts linked for everyone and members' their own, a member's approve rule is dropped while their block applies to everyone, every member gets their own copy of an org toolkit, and a former member's rows stay behind",
+    targets: { ...cloudOnboarding, cloud: managedCloud },
+  },
+  v1ImportToolkitScale: {
+    file: "cloud-v1-import-run.spec.ts",
+    title:
+      "Cloud v1 import dry runs and moves a workspace of 20 members with 10 toolkits of over a thousand rules over 8 MCP servers of 200 tools, one of them an app per connection, planning and saving every member's copy of each toolkit with exactly the tools its rules and the workspace's allow",
     targets: { ...cloudOnboarding, cloud: managedCloud },
   },
   v1ImportSlugDisplacement: {
@@ -9257,13 +9296,19 @@ export const scenarios = plan({
   v1ImportIntoCopy: {
     file: "cloud-v1-import-run.spec.ts",
     title:
-      "Cloud v1 import copies a paid, shared v1 workspace into the empty v2 team its owner owns when the operator lists it: the team keeps its name and slug, gains the workspace's app, accounts and toolkit copies, its teammate joins, its subscription carries over to the team, a second copy into the team is refused as it is no longer empty, and after its billing goes back a rollback removes only what the import added",
+      "Cloud v1 import copies a paid, shared v1 workspace into the empty v2 team its owner owns when the operator lists it: the team keeps its name and slug, gains the workspace's app, accounts and toolkit copies, its teammate joins, its subscription carries over to the team, a second copy into the team is refused as it is no longer empty, after its billing goes back a rollback removes only what the import added, and importing it again copies it into the team once more, each member's toolkit copy under a new live connection v1's toolkit URL forwards to while the first import's copies stay revoked",
+    targets: { ...cloudOnboarding, cloud: managedCloud },
+  },
+  v1ImportIntoEnterprise: {
+    file: "cloud-v1-import-run.spec.ts",
+    title:
+      "Cloud v1 import copies an Enterprise v1 workspace into the empty v2 team on v2's Enterprise plan that its owner owns when the operator lists it to copy: the dry run plans it with no billing and still flags SSO, the import copies its items, its newcomer joins, a member already in the team keeps their membership and role, the team's and v1's billing stay as they were with no hold, a rollback needs no billing return and removes only what the import added, and an Enterprise workspace the operator did not list is still held back",
     targets: { ...cloudOnboarding, cloud: managedCloud },
   },
   v1ImportIntoRefused: {
     file: "cloud-v1-import-run.spec.ts",
     title:
-      "Cloud v1 import refuses to move a v1 workspace into a listed existing v2 organization when it has items to copy, a second active member, a pending invitation or a paid plan, also when it would leave its data behind, when its owner has no v2 account or does not own the organization, also to copy into it, when the organization does not exist, and when the listed mode is unknown: the dry run says why, and the import holds it back and gives it to v1 again without writing its import map or changing the organization",
+      "Cloud v1 import refuses to move a v1 workspace into a listed existing v2 organization when it has items to copy, a second active member, a pending invitation or a paid plan, Enterprise included, also when it would leave its data behind, when its owner has no v2 account or does not own the organization, also to copy into it, when the organization does not exist, and when the listed mode is unknown: the dry run says why, and the import holds it back and gives it to v1 again without writing its import map or changing the organization",
     targets: { ...cloudOnboarding, cloud: managedCloud },
   },
   v1ImportAllowed: {

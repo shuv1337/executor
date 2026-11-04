@@ -145,6 +145,19 @@ export const migrateV1ImportMap = Effect.gen(function* () {
 }).pipe(Effect.mapError(migrationFailed("product")));
 
 /**
+ * A failed retry may keep the v2 id an earlier attempt saved. Imported rows still require one.
+ * The previous check required every non-imported row to have no id, so a failure erased it and
+ * the next attempt could revive a revoked toolkit copy. Relaxing the check leaves every row the
+ * running server writes valid: it still records a failure with no id.
+ */
+export const migrateV1ImportFailedKeepsId = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  yield* sql`alter table private_v1_import_map drop constraint if exists private_v1_import_map_check`;
+  yield* sql`alter table private_v1_import_map add constraint private_v1_import_map_imported_has_id
+    check (status <> 'imported' or v2_id is not null)`;
+}).pipe(Effect.mapError(migrationFailed("product")));
+
+/**
  * Each v1 organization's import state (`notes/v1-import.md`): the durable record v1's freeze,
  * redirect and forwarding will read, which outlives a Workflow instance's retention. Only an import
  * that writes v2 writes it; a dry run writes only its report. Additive: the running server never
@@ -302,6 +315,7 @@ export const migrateCloudDatabase = Effect.scoped(
         "11_v1_import_billing": migrateV1ImportBilling,
         "12_v1_import_displacement": migrateV1ImportDisplacement,
         "13_v1_import_into": migrateV1ImportInto,
+        "14_v1_import_failed_keeps_id": migrateV1ImportFailedKeepsId,
       });
     });
     yield* migrateHostedDatabase(setup.options, cloudMigrations).pipe(

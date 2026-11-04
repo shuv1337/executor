@@ -238,6 +238,14 @@ export const startCloudEnvironment = (input: {
       mode: 0o600,
     });
     yield* Effect.addFinalizer(() => fs.remove(v1Handoff).pipe(Effect.orDie));
+    // Scenarios encrypt OAuth proxy state with the same secret this Cloud's guard decrypts.
+    const oauthProxySecretFile = `${directory}/oauth-proxy.json`;
+    yield* fs.writeFileString(
+      oauthProxySecretFile,
+      JSON.stringify({ secret: Redacted.value(oauthProxy.secret) }),
+      { mode: 0o600 },
+    );
+    yield* Effect.addFinalizer(() => fs.remove(oauthProxySecretFile).pipe(Effect.orDie));
     const env = {
       PATH: [path.join(cloud, "node_modules/.bin"), process.env.PATH ?? ""].join(
         process.platform === "win32" ? ";" : ":",

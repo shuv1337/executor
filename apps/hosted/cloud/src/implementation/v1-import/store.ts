@@ -37,14 +37,23 @@ export type MapKind =
 export const toolkitCopyId = (toolkitRow: string, member: string) => `${toolkitRow}:${member}`;
 
 /**
- * The id the import gives a member's copy of a toolkit in a v2 organization, which v1 computes too
- * when it forwards the toolkit's URL. A copy the opt-in import made before copies were per member
+ * The id the import gives a member's copy of a toolkit in a v2 organization. Generation 0 is the
+ * id v1 computes too when it forwards the toolkit's URL. A rollback leaves the copies it revoked
+ * under their ids, which are never used again, so an import after it gives such a copy the next
+ * generation's id (`importToolkit`). A copy the opt-in import made before copies were per member
  * keeps the id it got then (`adoptToolkitCopy`).
  */
-export const toolkitCopyConnectionId = (organization: string, toolkitRow: string, member: string) =>
-  sourceHash([organization, toolkitRow, member]).pipe(
-    Effect.map((hash) => `v1-${hash.slice(0, 40)}`),
-  );
+export const toolkitCopyConnectionId = (
+  organization: string,
+  toolkitRow: string,
+  member: string,
+  generation: number,
+) =>
+  sourceHash(
+    generation === 0
+      ? [organization, toolkitRow, member]
+      : [organization, toolkitRow, member, generation],
+  ).pipe(Effect.map((hash) => `v1-${hash.slice(0, 40)}`));
 
 export const MapRow = Schema.Struct({
   v1_kind: Schema.String,
@@ -104,7 +113,11 @@ export const makeImportStore = (sql: SqlClient.SqlClient) => {
       Effect.map((found) => found[0]),
       unavailable,
     );
-  /** Record an attempt. A v1 item keeps one row; a later attempt replaces its result. */
+  /**
+   * Record an attempt. A v1 item keeps one row; a later attempt replaces its result. A failure
+   * keeps the v2 id an earlier attempt saved, so a retry updates that resource instead of
+   * starting again.
+   */
   const record = (input: {
     readonly organization: string;
     readonly kind: MapKind;
@@ -121,8 +134,12 @@ export const makeImportStore = (sql: SqlClient.SqlClient) => {
       values (${input.organization}, ${input.kind}, ${input.id}, ${imported?.v2Kind ?? null},
         ${imported?.v2Id ?? null}, ${input.result.status}, ${reason}, ${input.hash}, now())
       on conflict (v1_kind, v1_id) do update set
-        v2_kind = excluded.v2_kind, v2_id = excluded.v2_id, status = excluded.status,
-        reason = excluded.reason, source_hash = excluded.source_hash, updated_at = now()
+        v2_kind = case when excluded.status = 'failed'
+          then coalesce(excluded.v2_kind, private_v1_import_map.v2_kind) else excluded.v2_kind end,
+        v2_id = case when excluded.status = 'failed'
+          then coalesce(excluded.v2_id, private_v1_import_map.v2_id) else excluded.v2_id end,
+        status = excluded.status, reason = excluded.reason,
+        source_hash = excluded.source_hash, updated_at = now()
       where private_v1_import_map.v1_org_id = excluded.v1_org_id
     `.pipe(Effect.asVoid, unavailable);
   };
