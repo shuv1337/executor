@@ -166,6 +166,19 @@ export const scenarios = plan({
       local: na("Local does not publish apps."),
     },
   },
+  selfHostShortNames: {
+    fixtures: "actors",
+    file: "self-host-short-names.spec.ts",
+    title:
+      "Self-host resolves an older client's short package name and a current client's full name to the same organization listing",
+    targets: {
+      "self-host": scheduled,
+      cloud: na(
+        "Cloud's public registry already resolves short names; this checks the organization catalog self-host serves.",
+      ),
+      local: na("Local does not publish apps."),
+    },
+  },
   registryMigration: {
     fixtures: "actors",
     legacyStorage: true,

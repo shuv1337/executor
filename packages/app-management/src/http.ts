@@ -157,16 +157,34 @@ const projectApp = <A extends App>(
   identity: Context.Service.Shape<typeof AppIdentity>,
 ) => capabilities(host, app, identity).pipe(Effect.as(app));
 /**
- * The catalog reads this caller gets: the product's narrowed view, or the executor's own as a
- * client reading wire `revision` sees it. A narrowed view names listings as its product does.
+ * The executor's registry reads take `{ name }`. A product's narrowed catalog reads the name
+ * itself. Wire-revision resolution speaks the executor's shape, and only ever sees this catalog.
+ */
+const revisionRegistry = (
+  registry: Pick<Registry, "list" | "snapshot" | "file">,
+): Executor["registry"] => ({
+  list: (input = {}) => registry.list(input.name),
+  snapshot: (input) => registry.snapshot(input.name, input.commit),
+  file: (input) => registry.file(input.name, input.commit, input.path),
+});
+/**
+ * The catalog reads this caller gets, as a client reading wire `revision` sees them. A product
+ * that narrows the catalog still resolves a short name inside that view: `@acme/notes` for
+ * `@acme.executor.community/notes`, which is the name a CLI released before publisher scopes sends.
+ * A listing the caller cannot see is not a candidate, and a name two visible listings share is
+ * refused, as it is on the public catalog. Revision 1 reads each name as stored.
  */
 const readableRegistry = (
   host: ManagementHost,
   identity: Context.Service.Shape<typeof AppIdentity>,
   revision: number,
 ): Pick<Registry, "list" | "snapshot"> => {
-  if (host.registry !== undefined) return host.registry(identity);
-  const registry = registryForRevision(host.executor.registry, revision);
+  const registry = registryForRevision(
+    host.registry === undefined
+      ? host.executor.registry
+      : revisionRegistry(host.registry(identity)),
+    revision,
+  );
   return {
     list: (name) => registry.list(name === undefined ? {} : { name }),
     snapshot: (name, commit) => registry.snapshot({ name, commit }),
@@ -346,10 +364,11 @@ export const appManagementHandlers = <I extends HttpApiMiddleware.AnyId, S, Id e
         Effect.gen(function* () {
           const identity = yield* writeIdentity;
           const host = yield* Effect.flatten(AppManagementHost);
+          const narrowed = host.registry?.(identity);
           const from =
             "app" in payload.from
               ? (yield* ownedSource(host, identity, payload.from.app)).app.id
-              : host.registry === undefined
+              : narrowed === undefined
                 ? {
                     ...payload.from,
                     package: yield* packageNameFromRevision(
@@ -358,9 +377,16 @@ export const appManagementHandlers = <I extends HttpApiMiddleware.AnyId, S, Id e
                       payload.from.package,
                     ),
                   }
-                : // The narrowed catalog resolves the files; a listing this caller may not read
-                  // does not exist for it.
-                  yield* host.registry(identity).copy(payload.from);
+                : // The narrowed catalog resolves the files, including a short name an older CLI
+                  // sends. A listing this caller may not read does not exist for it.
+                  yield* narrowed.copy({
+                    ...payload.from,
+                    package: yield* packageNameFromRevision(
+                      revisionRegistry(narrowed),
+                      yield* clientRevision,
+                      payload.from.package,
+                    ),
+                  });
           return yield* host.executor.apps
             .copy({
               owner: identity.owner,
