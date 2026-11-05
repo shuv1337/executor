@@ -2520,9 +2520,7 @@ export const scenarios = plan({
     file: "resource-isolation.spec.ts",
     title: "Group resource grants and account connections cannot cross organizations",
     targets: {
-      "self-host": na(
-        "Self-host permits one organization; real cross-organization grants are a Cloud scenario.",
-      ),
+      "self-host": scheduled,
       cloud: scheduled,
       local: na("Local has no organization sharing policy."),
     },
@@ -3233,9 +3231,7 @@ export const scenarios = plan({
     title: "Group identities and memberships cannot cross organization boundaries",
     targets: {
       cloud: scheduled,
-      "self-host": na(
-        "Self-host permits only one organization; foreign organization references are checked in the shared groups scenario.",
-      ),
+      "self-host": scheduled,
       local: na("Local has no organizations or groups."),
     },
   },
@@ -7326,9 +7322,7 @@ export const scenarios = plan({
     file: "pat-mcp.spec.ts",
     title: "PAT MCP calls keep their organization when its slug is renamed mid-request",
     targets: {
-      "self-host": na(
-        "Self-host permits one organization, which every parallel scenario shares; renaming it would move theirs.",
-      ),
+      "self-host": scheduled,
       cloud: scheduled,
       local: na("Local has no organizations."),
     },
