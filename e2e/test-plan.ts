@@ -227,6 +227,19 @@ export const scenarios = plan({
       local: na("Local has no hosted organizations."),
     },
   },
+  selfHostOrganizationSwitcher: {
+    fixtures: "actors",
+    file: "self-host-organization-switcher.spec.ts",
+    title:
+      "the self-host switcher offers creation only to root owners, and switching shows each organization its own apps",
+    targets: {
+      "self-host": scheduled,
+      cloud: na(
+        "Cloud offers creation to every signed-in account; its switcher has its own scenarios.",
+      ),
+      local: na("Local has no hosted organizations."),
+    },
+  },
   selfHostOrganizationCreationBootstrap: {
     legacyStorage: true,
     file: "self-host-organization-creation.spec.ts",
