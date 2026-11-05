@@ -96,7 +96,11 @@ export interface AppRunnerHost {
    * credential handles the runner seals with `credentialKey`; see credential-handles.ts. Bound to
    * a host API revision, it refuses that API's document unless it has the revision.
    */
-  readonly outbound: (app: string, hostApi: HostApiCheck | undefined) => Fetcher;
+  readonly outbound: (
+    app: string,
+    hostApi: HostApiCheck | undefined,
+    callerConnection?: string,
+  ) => Fetcher;
   /** Seals the secret fields of providers that declare hosts. App code never holds it. */
   readonly credentialKey: Effect.Effect<CryptoKey>;
   /**
@@ -146,6 +150,11 @@ export interface AppInvocation {
   readonly approval?: typeof TrustedToolApproval.Type;
   /** Sent only to builds that declare callerIdentity; see `callerContext`. */
   readonly caller?: Caller;
+  /**
+   * The MCP connection this call arrived on. Sealed into managed credentials; never sent to the
+   * app bundle. Set beside `caller` so a build that does not receive `caller` still cannot widen.
+   */
+  readonly callerConnection?: string;
   readonly approvedBy?: ApprovedBy;
   readonly replay?: typeof WorkflowReplay.Type;
   readonly deadline?: typeof InvocationDeadline.Type;
@@ -390,7 +399,14 @@ class ColdStartFailed extends Schema.TaggedError<ColdStartFailed>()("ColdStartFa
 export const appWorker = (
   invocation: Pick<
     AppInvocation,
-    "app" | "build" | "database" | "sharedRuntime" | "command" | "accounts" | "hostApi"
+    | "app"
+    | "build"
+    | "database"
+    | "sharedRuntime"
+    | "command"
+    | "accounts"
+    | "hostApi"
+    | "callerConnection"
   >,
 ) =>
   // Requirement names are unique across scopes, so one record names the account set.
@@ -401,10 +417,10 @@ export const appWorker = (
     Effect.map((selection) => {
       // A Worker's network is bound when it loads, so each host API revision has its own app
       // Worker and its own facet Worker. The facet's database is the supervisor's, whichever loads.
-      const identity =
-        invocation.hostApi === undefined
-          ? selection
-          : `${selection}:${invocation.hostApi.revision}`;
+      // The network binding is fixed when the Worker loads, and it carries the calling connection.
+      const identity = [selection, invocation.hostApi?.revision, invocation.callerConnection]
+        .filter((part) => part !== undefined && part !== "")
+        .join(":");
       return {
         identity,
         mode: runsInFacet(invocation) ? ("facet" as const) : ("worker" as const),
@@ -428,9 +444,14 @@ const bundleAccounts = (
   app: string,
   key: Effect.Effect<CryptoKey>,
   accounts: HostAccounts,
+  callerConnection?: string,
 ): Effect.Effect<ResolvedAccounts, RuntimeProtocolFailed> => {
   if (protocol.sealedCredentials)
-    return sealAccounts(accounts, { app, key }).pipe(Effect.map(protocol.accounts));
+    return sealAccounts(accounts, {
+      app,
+      key,
+      ...(callerConnection === undefined ? {} : { callerConnection }),
+    }).pipe(Effect.map(protocol.accounts));
   const unsealed = unsealedAccounts(accounts);
   return unsealed === undefined ? failed("managed") : Effect.succeed(protocol.accounts(unsealed));
 };
@@ -867,7 +888,13 @@ export const makeAppRunner = (host: AppRunnerHost) => {
         const refused = protocol.refuse(invocation.command);
         if (refused !== undefined) return { ok: false, error: refused };
         const accountsFor = (resolved: HostAccounts) =>
-          bundleAccounts(protocol, invocation.app, host.credentialKey, resolved);
+          bundleAccounts(
+            protocol,
+            invocation.app,
+            host.credentialKey,
+            resolved,
+            invocation.callerConnection ?? invocation.caller?.provenance?.connectionId,
+          );
         const accounts = yield* accountsFor(invocation.accounts);
         const body = protocol.invocation({
           command: invocation.command,
@@ -959,7 +986,11 @@ export const makeAppRunner = (host: AppRunnerHost) => {
         const reply = yield* start(name, load, {
           body,
           headers: invocation.headers,
-          globalOutbound: host.outbound(invocation.app, invocation.hostApi),
+          globalOutbound: host.outbound(
+            invocation.app,
+            invocation.hostApi,
+            invocation.callerConnection ?? invocation.caller?.provenance?.connectionId,
+          ),
           elicit: capabilities.elicit,
           controls: capabilities.controls,
           ...(capabilities.workflow === undefined

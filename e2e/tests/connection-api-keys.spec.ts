@@ -1,7 +1,8 @@
 /**
- * Agents are provisioned without a browser: an organization admin's API key creates a scoped
- * connection, the same key runs at the connection's URL with only that connection's narrower
- * policy, and revoking it stops those calls. Members' keys cannot manage connections.
+ * Agents are provisioned without a browser: an API key creates a scoped connection for its own
+ * user, the same key runs at the connection's URL with only that connection's narrower policy,
+ * and revoking it stops those calls. A member's key manages that member's connections and cannot
+ * see or change another member's.
  */
 import { expect, layer } from "@effect/vitest";
 import { Effect, Exit, Redacted, Schema } from "effect";
@@ -83,13 +84,14 @@ layer(HostedLive, { excludeTestServices: true })("Connection API keys", (it) => 
           { app: scopedApp.app.id, runsAs: [{ kind: "app" }], tools: { kind: "readOnly" } },
         ];
 
-        // A member's key cannot manage connections, even its own.
-        const refused = yield* asKey(member, "POST", `${prefix}/mcp-connections`, {
+        // A member's key creates that member's own connection.
+        const memberCreated = yield* asKey(member, "POST", `${prefix}/mcp-connections`, {
           id: randomUUID(),
           name: "Member connection",
           apps: policy,
         });
-        expect(refused.status).toBe(403);
+        expect(memberCreated.status, JSON.stringify(memberCreated.body)).toBe(200);
+        const memberOwned = yield* body(ConnectionView, memberCreated);
 
         // An admin's key creates one and lists it, with no browser session.
         const created = yield* asKey(admin, "POST", `${prefix}/mcp-connections`, {
@@ -103,6 +105,16 @@ layer(HostedLive, { excludeTestServices: true })("Connection API keys", (it) => 
         const listed = yield* asKey(admin, "GET", `${prefix}/mcp-connections`);
         expect(listed.status).toBe(200);
         expect(JSON.stringify(listed.body)).toContain(connection.id);
+        expect(JSON.stringify(listed.body)).not.toContain(memberOwned.id);
+        // The member's key lists only their connection and cannot revoke the admin's.
+        const memberListed = yield* asKey(member, "GET", `${prefix}/mcp-connections`);
+        expect(memberListed.status).toBe(200);
+        expect(JSON.stringify(memberListed.body)).toContain(memberOwned.id);
+        expect(JSON.stringify(memberListed.body)).not.toContain(connection.id);
+        expect(
+          (yield* asKey(member, "POST", `${prefix}/mcp-connections/${connection.id}/revoke`))
+            .status,
+        ).toBe(404);
 
         // The same key at the connection's URL runs with only the connection's policy.
         const scoped = yield* mcp.connect(admin.key, "key-at-connection", {

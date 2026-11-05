@@ -47,6 +47,7 @@ export const appOutboundBindings = Effect.gen(function* () {
 const OutboundProps = Schema.Struct({
   appOutbound: Schema.NonEmptyString,
   hostApi: Schema.optionalKey(HostApiCheck),
+  callerConnection: Schema.optionalKey(Schema.String),
 });
 /** The private network service, as the outbound sends to it. */
 interface Network {
@@ -98,9 +99,13 @@ export const appCredentialOutbound = Effect.gen(function* () {
     /** The network one app's isolates use for global `fetch`. */
     outbound: Effect.gen(function* () {
       const exports = yield* loopback;
-      return (app: string, hostApi: HostApiCheck | undefined) =>
+      return (app: string, hostApi: HostApiCheck | undefined, callerConnection?: string) =>
         exports.default({
-          props: hostApi === undefined ? { appOutbound: app } : { appOutbound: app, hostApi },
+          props: {
+            appOutbound: app,
+            ...(hostApi === undefined ? {} : { hostApi }),
+            ...(callerConnection === undefined ? {} : { callerConnection }),
+          },
         });
     }),
     /** Serve a request sent by an app's isolate, or pass any other request to `handler`. */
@@ -135,6 +140,9 @@ export const appCredentialOutbound = Effect.gen(function* () {
             credentialFetch(source, {
               app: props.value.appOutbound,
               ...(props.value.hostApi === undefined ? {} : { hostApi: props.value.hostApi }),
+              ...(props.value.callerConnection === undefined
+                ? {}
+                : { callerConnection: props.value.callerConnection }),
               key: sealing,
               // Cloud's own origin is public, so it needs no exemption.
               egress: { refusePrivateAddresses: !privateFetch, selfOrigin: undefined },

@@ -645,16 +645,22 @@ connection. The connection's `runsAs` names the account the agent's calls use, s
 that account in `ctx.user.accounts`, and `ctx.caller.provenance` names the connection for logs.
 A connection can only narrow its owner's own access: it never grants another person's account.
 
-An organization admin creates connections without a browser through the routes under
-`/api/organizations/:organization/mcp-connections` (`list`, `create`, `update`, `revoke`), with
-their own API key or a full-access API grant, or in the dashboard. Members manage their own from
-the dashboard. Every change an API credential makes is logged.
+A member creates, lists, updates and revokes their own connections, and mints and revokes keys on
+them, from the dashboard or with their own API key or full API grant. The routes are
+`/api/organizations/:organization/mcp-connections` (`list`, `create`, `update`, `revoke`, and
+`.../keys`). The API refuses MCP tokens, so an agent does not call them with its grant. The
+Executor app can call them with the member's managed key. That self-call carries the MCP
+connection that invoked it, attached by the host. Authority is that connection's policy, not the
+key's full grant.
 
-These routes are deliberately not tools. Every MCP caller is an agent (`ctx.caller.kind` is
-`"agent"`, even when a person drives the client), and the API refuses MCP tokens here, so an agent
-cannot create, widen or revoke connections. A tool limited to human owners and admins would never
-be callable over MCP, so connection management stays with people in the dashboard and with admin
-API keys.
+A connection may create, update or mint only within its own scope: each app, tool, event and
+`runsAs` account on the new connection is already on the calling connection. It cannot escalate
+to all apps or to a wider key. A key's lifetime stays within 5 seconds and 90 days. A narrowed
+connection that does not grant every tool of its apps has no `manage` authority and is refused
+with 403. A connection that grants every tool of its apps can create a narrower one, such as a
+dedicated connection for one agent. `runsAs` names a personal account that member owns. A
+group-shared account is refused, even when the member can use it. Every change an API credential
+makes is logged with the caller kind and, for a self-call, the calling connection.
 
 An agent then connects to the connection's `url` (`/mcp?connection=<id>`) with an OAuth grant, or
 with its owner's API key: at that URL the key runs with only the connection's apps, tools and

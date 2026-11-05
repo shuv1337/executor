@@ -1,8 +1,9 @@
 /**
- * A member's own scoped MCP connections and connected agents in one organization. Browser sessions
- * manage both. An organization admin's full-authority API key or API grant may also list, create,
- * update and revoke the admin's own connections, so agents can be provisioned without a browser;
- * connected agents stay browser-only.
+ * A member's own scoped MCP connections and connected agents in one organization. A member lists,
+ * creates, updates and revokes their own connections, and mints and revokes keys on them, from a
+ * browser session or from an API key or full API grant that carries their authority. Each saved
+ * entry is limited to apps the member can use and accounts the member can use. Another member's
+ * connections are omitted and cannot be changed. Connected agents stay browser-only.
  */
 import {
   AccountNotFound,
@@ -93,8 +94,10 @@ export const ConnectionKeyNotFound = ApiError.define({
 });
 export type ConnectionKeyNotFound = typeof ConnectionKeyNotFound.Type;
 /**
- * MCP grants, including a connection's own, cannot manage connections: the API refuses MCP tokens.
- * Connections only narrow their owner's own access, so an admin key cannot widen anything.
+ * The API refuses MCP tokens. An Executor app self-call is the caller's managed key plus the
+ * connection the host attached. That connection's policy is the authority: create, update and
+ * mint stay within its apps, tools and runsAs accounts, with no all-apps escalation. A narrowed
+ * connection without manage is refused. A key's lifetime stays within 5 seconds and 90 days.
  */
 export const HostedMcpConnections = HttpApiGroup.make("mcpConnections")
   .add(

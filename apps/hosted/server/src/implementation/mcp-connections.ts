@@ -1,23 +1,39 @@
 /** Members manage their own connections and connected agents; apps and accounts use the same access checks as calls. */
+import { isToolSelectionSubset } from "@executor-js/authorization";
 import {
   ConnectionAccessInvalid,
+  ConnectionId,
   ConnectionNotFound,
+  connectionPermissions,
   type Connection,
   type ConnectionApp,
+  type ConnectionPolicy,
 } from "@executor-js/mcp-auth/connections";
 import { mcpResource } from "@executor-js/mcp-auth";
-import type { App, Executor, OwnerId } from "@executor-js/sdk/core";
-import { Effect, Option } from "effect";
+import {
+  callerConnectionHeader,
+  CurrentCaller,
+  type App,
+  type Executor,
+  type OwnerId,
+} from "@executor-js/sdk/core";
+import { Effect, Option, Schema } from "effect";
 import { HttpApiBuilder } from "effect/http-api";
+import { HttpServerRequest } from "effect/http";
 import { HostedApi } from "../contracts/api.ts";
 import { CurrentPrincipal, CurrentUserId } from "../contracts/auth.ts";
 import { HostedExecutor } from "../contracts/executor.ts";
-import { McpAuthentication } from "../contracts/mcp.ts";
+import { McpAuthentication, type McpConnectionStore } from "../contracts/mcp.ts";
 import { CurrentOrganization, OrganizationForbidden } from "../contracts/organization.ts";
 import { ScheduleWakeup } from "../contracts/schedules.ts";
 import { checkAccounts, currentOwner, usableApp } from "./access.ts";
 import { addLink, linkedAccounts, lockedChange } from "./app-accounts.ts";
-import { policyDatabase, requireAccountAccessAs } from "./resource-policy.ts";
+import {
+  accountAccess,
+  currentResourceAuthority,
+  policyDatabase,
+  requireAccountAccessAs,
+} from "./resource-policy.ts";
 
 const owner = Effect.gen(function* () {
   const organization = yield* CurrentOrganization;
@@ -27,11 +43,12 @@ const owner = Effect.gen(function* () {
 });
 
 /**
- * Who may change connections through this request. A signed-in person manages their own. Without a
- * browser session the request carried a bearer that RequireOrganization accepted for `manage`, so it
- * holds its user's full authority (an API key or a full API grant; MCP tokens never reach the API);
- * of those, only an organization admin's or owner's may manage connections. Every bearer change is
- * logged, as connections decide which accounts an agent runs as.
+ * Who may change connections through this request. Any current member manages their own, from a
+ * browser session or from a bearer that RequireOrganization accepted for `manage` (an API key or a
+ * full API grant; MCP tokens never reach the API). A self-call from a scoped MCP connection is
+ * limited to that connection's policy before this runs. The store returns and changes only that
+ * member's connections. Bearer changes are logged with the caller and, when the host attached
+ * one, the calling connection.
  */
 const manager = (
   action: "list" | "create" | "update" | "revoke" | "mint-key" | "list-keys" | "revoke-key",
@@ -40,12 +57,11 @@ const manager = (
   Effect.gen(function* () {
     const current = yield* owner;
     const person = yield* Effect.serviceOption(CurrentPrincipal);
-    if (Option.isSome(person)) return current;
-    const organization = yield* CurrentOrganization;
-    if (organization.role !== "admin" && organization.role !== "owner")
-      return yield* new OrganizationForbidden();
     // Minting and revoking a key record their own audit line for every caller, with the key.
-    if (action === "create" || action === "update" || action === "revoke")
+    if (
+      Option.isNone(person) &&
+      (action === "create" || action === "update" || action === "revoke")
+    )
       yield* Effect.logInfo("MCP connection changed with an API credential").pipe(
         Effect.annotateLogs({
           "executor.audit": "mcp-connection",
@@ -53,10 +69,70 @@ const manager = (
           "executor.user.id": current.userId,
           "executor.organization.id": current.resource,
           ...(connection === undefined ? {} : { "executor.mcp.connection": connection }),
+          ...(yield* callerAudit),
         }),
       );
     return current;
   });
+
+/** The host-attached calling connection, or undefined when this request did not arrive on one. */
+const callingConnection = (auth: { readonly connections: McpConnectionStore }) =>
+  Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const header = new Headers(request.headers).get(callerConnectionHeader);
+    if (header === null || header === "") return undefined;
+    const id = yield* Schema.decodeUnknownEffect(ConnectionId)(header).pipe(
+      Effect.mapError(() => new OrganizationForbidden()),
+    );
+    const current = yield* owner;
+    const found = (yield* auth.connections.list(current)).find(
+      (connection) => connection.id === id,
+    );
+    if (found === undefined) return yield* new OrganizationForbidden();
+    return found;
+  });
+
+/**
+ * A connection whose every app grants all of its tools and events may manage connections inside
+ * that policy. Read-only and selected tool scopes do not: they have no `manage` authority.
+ */
+const connectionMayManage = (policy: ConnectionPolicy) =>
+  policy.apps.length > 0 &&
+  policy.apps.every(
+    (app) => app.tools.kind === "all" && (app.events === undefined || app.events.kind === "all"),
+  );
+
+/** The next policy is no wider than the calling connection: apps, tools, events and runsAs. */
+const withinCallingConnection = (caller: ConnectionPolicy, next: ConnectionPolicy) =>
+  isToolSelectionSubset(
+    { kind: "tools", apps: connectionPermissions(caller) },
+    { kind: "tools", apps: connectionPermissions(next) },
+  );
+
+/**
+ * Refuse a calling connection that cannot manage, and a change whose policy is wider than that
+ * connection. No calling connection keeps the member's own full authority.
+ */
+const requireCallingScope = (caller: Connection | undefined, next?: ConnectionPolicy) =>
+  Effect.gen(function* () {
+    if (caller === undefined) return;
+    if (!connectionMayManage(caller.policy)) return yield* new OrganizationForbidden();
+    if (next !== undefined && !withinCallingConnection(caller.policy, next))
+      return yield* new OrganizationForbidden();
+  });
+
+/** Caller kind and the host-attached connection, for the connection audit lines. */
+const callerAudit = Effect.gen(function* () {
+  const caller = Option.getOrUndefined(yield* Effect.serviceOption(CurrentCaller));
+  const request = yield* HttpServerRequest.HttpServerRequest;
+  const connection = new Headers(request.headers).get(callerConnectionHeader);
+  return {
+    ...(caller === undefined ? {} : { "executor.caller.kind": caller.kind }),
+    ...(connection === null || connection === ""
+      ? {}
+      : { "executor.mcp.caller_connection": connection }),
+  };
+});
 
 /**
  * Check one app's runs-as targets. An account target the member has not linked to any of the app's
@@ -101,15 +177,27 @@ const resolveApp = (
             AccountNotFound: () => Effect.fail(invalid("account")),
           }),
         );
+        // Group-shared accounts are usable by the group. A connection may run only as an account
+        // this member owns: their personal account.
+        const actor = yield* currentResourceAuthority.pipe(
+          Effect.catchTag("OrganizationForbidden", () => Effect.fail(invalid("account"))),
+        );
+        const owned = yield* accountAccess(account.id, actor).pipe(
+          Effect.catchTag("OrganizationForbidden", () => Effect.fail(invalid("account"))),
+        );
+        if (owned.ownership.kind !== "personal" || owned.ownership.user !== userId)
+          return yield* invalid("account");
         const linked = yield* linkedAccounts(sql, { subject: userId, apps: [app.id] });
         if (linked.some((link) => link.id === account.id)) return false;
         // Check both again under the app's link lock: either may have been revoked while the
         // change waited for it (see `lockedChange`).
         return yield* lockedChange(executor, { app: app.id, access: "use" }, (locked, actor) =>
           Effect.gen(function* () {
-            yield* requireAccountAccessAs(actor, account.id, "use").pipe(
+            const access = yield* requireAccountAccessAs(actor, account.id, "use").pipe(
               Effect.catchTag("OrganizationForbidden", () => Effect.fail(invalid("account"))),
             );
+            if (access.ownership.kind !== "personal" || access.ownership.user !== userId)
+              return yield* invalid("account");
             return yield* Effect.forEach(
               requirements.filter((requirement) => requirement.provider === account.provider),
               (requirement) =>
@@ -148,7 +236,11 @@ const resolvePolicy = (apps: readonly ConnectionApp[]) =>
     };
   });
 
-/** RequireOrganization checks current membership; `manager` limits API credentials to admins. */
+/**
+ * Membership is current. A request the host marked with a calling connection may create, update
+ * and mint only within that connection's policy, and a narrowed connection without manage is
+ * refused. Key lifetime stays inside the declared 5-second to 90-day bound.
+ */
 export const hostedMcpConnectionHandlers = HttpApiBuilder.group(
   HostedApi,
   "mcpConnections",
@@ -161,12 +253,15 @@ export const hostedMcpConnectionHandlers = HttpApiBuilder.group(
       });
       return handlers
         .handle("list", () =>
-          Effect.flatMap(manager("list"), (current) => auth.connections.list(current)).pipe(
-            Effect.map((connections) => connections.map(view)),
-          ),
+          Effect.gen(function* () {
+            yield* requireCallingScope(yield* callingConnection(auth));
+            return (yield* auth.connections.list(yield* manager("list"))).map(view);
+          }),
         )
         .handle("create", ({ payload }) =>
           Effect.gen(function* () {
+            // Refuse a wider policy before linking any account for it.
+            yield* requireCallingScope(yield* callingConnection(auth), { apps: payload.apps });
             const current = yield* manager("create", payload.id);
             const policy = yield* resolvePolicy(payload.apps);
             return view(
@@ -180,14 +275,20 @@ export const hostedMcpConnectionHandlers = HttpApiBuilder.group(
         )
         .handle("update", ({ params, payload }) =>
           Effect.gen(function* () {
-            // Check ownership before linking any account for this connection.
-            const current = yield* manager("update", params.connection);
-            const existing = yield* auth.connections.list(current);
-            if (!existing.some((connection) => connection.id === params.connection))
+            const caller = yield* callingConnection(auth);
+            yield* requireCallingScope(caller);
+            const current = yield* owner;
+            const found = (yield* auth.connections.list(current)).find(
+              (connection) => connection.id === params.connection,
+            );
+            if (found === undefined)
               return yield* new ConnectionNotFound({ connection: params.connection });
+            yield* requireCallingScope(caller, found.policy);
+            yield* requireCallingScope(caller, { apps: payload.apps });
+            const actor = yield* manager("update", params.connection);
             const policy = yield* resolvePolicy(payload.apps);
             return view(
-              yield* auth.connections.update(current, {
+              yield* auth.connections.update(actor, {
                 id: params.connection,
                 name: payload.name,
                 policy,
@@ -196,14 +297,33 @@ export const hostedMcpConnectionHandlers = HttpApiBuilder.group(
           }),
         )
         .handle("revoke", ({ params }) =>
-          Effect.flatMap(manager("revoke", params.connection), (current) =>
-            auth.connections.revoke(current, params.connection),
-          ),
+          Effect.gen(function* () {
+            const caller = yield* callingConnection(auth);
+            yield* requireCallingScope(caller);
+            if (caller !== undefined) {
+              const found = (yield* auth.connections.list(yield* owner)).find(
+                (connection) => connection.id === params.connection,
+              );
+              if (found !== undefined) yield* requireCallingScope(caller, found.policy);
+            }
+            return yield* auth.connections.revoke(
+              yield* manager("revoke", params.connection),
+              params.connection,
+            );
+          }),
         )
         .handle("mintKey", ({ params, payload }) =>
           Effect.gen(function* () {
             // Only the connection's owner: the store mints only for the caller's own standing
             // connection, and reports any other as not found.
+            const caller = yield* callingConnection(auth);
+            yield* requireCallingScope(caller);
+            if (caller !== undefined) {
+              const found = (yield* auth.connections.list(yield* owner)).find(
+                (connection) => connection.id === params.connection,
+              );
+              if (found !== undefined) yield* requireCallingScope(caller, found.policy);
+            }
             const current = yield* manager("mint-key", params.connection);
             const minted = yield* auth.connections.mintKey(current, {
               id: params.connection,
@@ -221,6 +341,7 @@ export const hostedMcpConnectionHandlers = HttpApiBuilder.group(
                 "executor.mcp.connection": params.connection,
                 "executor.api_key.id": minted.id,
                 "executor.api_key.expires_at": minted.expiresAt,
+                ...(yield* callerAudit),
               }),
             );
             return {
@@ -236,13 +357,32 @@ export const hostedMcpConnectionHandlers = HttpApiBuilder.group(
           }),
         )
         .handle("listKeys", ({ params }) =>
-          // Only the connection's owner: the store reports any other connection as not found.
-          Effect.flatMap(manager("list-keys", params.connection), (current) =>
-            auth.connections.keys(current, params.connection),
-          ),
+          Effect.gen(function* () {
+            // Only the connection's owner: the store reports any other connection as not found.
+            const caller = yield* callingConnection(auth);
+            yield* requireCallingScope(caller);
+            if (caller !== undefined) {
+              const found = (yield* auth.connections.list(yield* owner)).find(
+                (connection) => connection.id === params.connection,
+              );
+              if (found !== undefined) yield* requireCallingScope(caller, found.policy);
+            }
+            return yield* auth.connections.keys(
+              yield* manager("list-keys", params.connection),
+              params.connection,
+            );
+          }),
         )
         .handle("revokeKey", ({ params }) =>
           Effect.gen(function* () {
+            const caller = yield* callingConnection(auth);
+            yield* requireCallingScope(caller);
+            if (caller !== undefined) {
+              const found = (yield* auth.connections.list(yield* owner)).find(
+                (connection) => connection.id === params.connection,
+              );
+              if (found !== undefined) yield* requireCallingScope(caller, found.policy);
+            }
             const current = yield* manager("revoke-key", params.connection);
             yield* auth.connections.revokeKey(current, {
               id: params.connection,
@@ -258,6 +398,7 @@ export const hostedMcpConnectionHandlers = HttpApiBuilder.group(
                 "executor.organization.id": current.resource,
                 "executor.mcp.connection": params.connection,
                 "executor.api_key.id": params.key,
+                ...(yield* callerAudit),
               }),
             );
           }),

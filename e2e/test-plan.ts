@@ -6825,6 +6825,28 @@ export const scenarios = plan({
       local: na("The shared connections page is exercised through the hosted dashboard."),
     },
   },
+  memberConnectionNoWidening: {
+    fixtures: "actors",
+    file: "mcp-connections.spec.ts",
+    title:
+      "A full member connection can create a narrower Mesh connection through the Executor app, and a scoped connection cannot create an all-apps connection or mint a wider key",
+    targets: {
+      "self-host": scheduled,
+      cloud: scheduled,
+      local: na("Local has one operator and no organization roles or managed Executor keys."),
+    },
+  },
+  memberOwnScopedConnections: {
+    fixtures: "actors",
+    file: "mcp-connections.spec.ts",
+    title:
+      "Members create, list, update and revoke their own scoped connection from the dashboard and with an API key, mint and revoke a key on it, and cannot use another member's connection, an account they do not own, or an app they cannot see",
+    targets: {
+      "self-host": scheduled,
+      cloud: scheduled,
+      local: na("Local has one operator and no organization roles or API keys."),
+    },
+  },
   localScopedConnections: {
     file: "local-mcp-connections.spec.ts",
     title: "Local scoped connections limit an OAuth client to their tools and revoke it",
@@ -8496,7 +8518,7 @@ export const scenarios = plan({
     fixtures: "actors",
     file: "connection-api-keys.spec.ts",
     title:
-      "an admin's API key creates, uses and revokes a scoped connection without a browser, and a member's key cannot",
+      "an API key creates, uses and revokes its user's scoped connection without a browser, and a member's key cannot see or change an admin's connection",
     targets: {
       "self-host": scheduled,
       cloud: scheduled,
