@@ -40,7 +40,7 @@ These settings override the defaults:
 | `DO_NOT_TRACK` or `EXECUTOR_DISABLE_ANALYTICS` | no | Set to `1` to turn off anonymous usage analytics and feedback. See [usage analytics](/run/usage-analytics). |
 | `SSO_DISCOVERY_URL`                  | no       | OIDC discovery document. Leave it empty to keep SSO off.                 |
 | `SSO_CLIENT_ID`, `SSO_CLIENT_SECRET` | no       | Credentials for that identity provider.                                  |
-| `SSO_ALLOWED_DOMAINS`                | no       | Comma-separated email domains allowed to join through SSO.               |
+| `SSO_ALLOWED_DOMAINS`                | no       | Comma-separated email domains whose members may sign in with SSO.        |
 | `EXECUTOR_TRACE_SAMPLE_RATE`         | no       | Fraction of ordinary request traces to record, from `0` to `1`. The default is `0.1`; `1` records every trace. See below. |
 | `EXECUTOR_TRACE_SLOW_MS`             | no       | Record every trace that runs at least this many milliseconds. The default is `1000`. |
 
@@ -122,8 +122,9 @@ docker stop executor-v2
 ```
 
 The first person to finish setup becomes the owner, and one organization is
-created. After that, people join through invitations, or through SSO when you
-have configured it.
+created. After that, people join only through invitations. SSO signs in people
+who already belong to an organization and have connected SSO on their account's
+Security page; it never adds anyone to an organization.
 
 ## Deploy on Railway
 

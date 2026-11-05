@@ -1,9 +1,5 @@
 /** Atomic setup and invitation redemption over Better Auth's transaction adapter. */
-import {
-  defineRequestState,
-  getCurrentAdapter,
-  runWithTransaction,
-} from "@better-auth/core/context";
+import { getCurrentAdapter, runWithTransaction } from "@better-auth/core/context";
 import type {
   BetterAuthOptions,
   BetterAuthPlugin,
@@ -15,14 +11,8 @@ import { SsoRefusal } from "@executor-js/hosted-self-host-web/sso";
 import { Cause, Effect, Exit, Schema } from "effect";
 import { z } from "zod";
 import type { selfHostAuthSettings } from "./auth-options.ts";
+import { rootModel, rootRecordId } from "./root-organization.ts";
 
-const admittedSsoUser = defineRequestState<boolean>(() => false);
-
-const User = Schema.Struct({
-  id: Schema.String,
-  email: Schema.String,
-  emailVerified: Schema.Boolean,
-});
 const Organization = Schema.Struct({ id: Schema.String });
 const Invitation = Schema.Struct({
   id: Schema.String,
@@ -70,21 +60,12 @@ const adapterFor = (ctx: GenericEndpointContext) =>
   call(() => getCurrentAdapter(ctx.context.adapter));
 const isSsoCallback = (ctx: GenericEndpointContext) =>
   ctx.path === "/callback/:id" && ctx.params?.id === "sso";
+const notMember = "Your account is not a member of this instance.";
 
-const instanceOrganization = (ctx: GenericEndpointContext) =>
-  Effect.gen(function* () {
-    const adapter = yield* adapterFor(ctx);
-    const organizations = yield* call(() => adapter.findMany({ model: "organization", limit: 2 }));
-    if (organizations.length !== 1) {
-      const message = "The instance must have exactly one organization. Contact its administrator.";
-      return yield* isSsoCallback(ctx)
-        ? refuseSso(SsoRefusal.instanceNotReady, message)
-        : deny(message);
-    }
-    return yield* decode(Organization, organizations[0]);
-  });
-
-/** Reject non-SSO user creation; only verified, allowlisted OIDC users can join automatically. */
+/**
+ * Invitations are the only way in after setup. SSO signs in people who already belong to an
+ * organization; it never creates an account or a membership.
+ */
 export const selfHostUserHooks = (settings: Effect.Success<typeof selfHostAuthSettings>) =>
   ({
     user: {
@@ -95,7 +76,7 @@ export const selfHostUserHooks = (settings: Effect.Success<typeof selfHostAuthSe
               if (ctx?.path === "/self-host/setup" || ctx?.path === "/self-host/register") return;
               if (!ctx || !isSsoCallback(ctx) || settings.sso === null)
                 return yield* deny("Create the first account through setup, or use an invitation.");
-              // Only an address the provider vouches for joins; an absent claim is not a yes.
+              // A provider problem is explained before the missing membership is.
               if (!user.emailVerified)
                 return yield* refuseSso(
                   SsoRefusal.emailUnverified,
@@ -107,8 +88,13 @@ export const selfHostUserHooks = (settings: Effect.Success<typeof selfHostAuthSe
                   SsoRefusal.domainNotAllowed,
                   "Use an account from an approved SSO domain.",
                 );
-              yield* instanceOrganization(ctx);
-              yield* call(() => admittedSsoUser.set(true));
+              const adapter = yield* adapterFor(ctx);
+              if ((yield* call(() => adapter.count({ model: "organization" }))) === 0)
+                return yield* refuseSso(
+                  SsoRefusal.instanceNotReady,
+                  "This instance is not set up yet.",
+                );
+              return yield* refuseSso(SsoRefusal.notMember, notMember);
             }),
           ),
       },
@@ -120,55 +106,17 @@ export const selfHostUserHooks = (settings: Effect.Success<typeof selfHostAuthSe
             Effect.gen(function* () {
               if (!ctx) return yield* deny("A sign-in request is required.");
               const adapter = yield* adapterFor(ctx);
-              const org = yield* instanceOrganization(ctx);
               const member = yield* call(() =>
                 adapter.findOne({
                   model: "member",
-                  where: [
-                    { field: "userId", value: session.userId },
-                    { field: "organizationId", value: org.id },
-                  ],
+                  where: [{ field: "userId", value: session.userId }],
+                  select: ["id"],
                 }),
               );
-              if (member === null) {
-                // Re-check the policy on every SSO login; no email/password login can auto-join.
-                if (!isSsoCallback(ctx) || settings.sso === null)
-                  return yield* deny("Your account is not a member of this instance.");
-                if (!(yield* call(() => admittedSsoUser.get())))
-                  return yield* refuseSso(
-                    SsoRefusal.notMember,
-                    "Your account is not a member of this instance.",
-                  );
-                const user = yield* call(() =>
-                  adapter.findOne({
-                    model: "user",
-                    where: [{ field: "id", value: session.userId }],
-                  }),
-                ).pipe(Effect.flatMap((value) => decode(User, value)));
-                const domain = user.email.toLowerCase().split("@")[1];
-                if (!user.emailVerified)
-                  return yield* refuseSso(
-                    SsoRefusal.emailUnverified,
-                    "The identity provider did not verify this email address.",
-                  );
-                if (!domain || !settings.sso.allowedDomains.includes(domain))
-                  return yield* refuseSso(
-                    SsoRefusal.domainNotAllowed,
-                    "Use an account from an approved SSO domain.",
-                  );
-                yield* call(() =>
-                  adapter.create({
-                    model: "member",
-                    data: {
-                      organizationId: org.id,
-                      userId: user.id,
-                      role: "member",
-                      createdAt: new Date(),
-                    },
-                  }),
-                );
-              }
-              return { data: { ...session, activeOrganizationId: org.id } };
+              if (member === null)
+                return yield* isSsoCallback(ctx)
+                  ? refuseSso(SsoRefusal.notMember, notMember)
+                  : deny(notMember);
             }),
           ),
       },
@@ -209,10 +157,16 @@ const register = (
                     },
                   }),
                 ).pipe(Effect.flatMap((value) => decode(Organization, value)));
+                yield* call(() =>
+                  adapter.create({
+                    model: rootModel,
+                    data: { id: rootRecordId, organizationId: org.id, createdAt: new Date() },
+                    forceAllowId: true,
+                  }),
+                );
                 organizationId = org.id;
                 role = "owner";
               } else {
-                const org = yield* instanceOrganization(ctx);
                 const invitation = yield* call(() =>
                   adapter.findOne({
                     model: "invitation",
@@ -222,13 +176,12 @@ const register = (
                 if (
                   invitation.status !== "pending" ||
                   invitation.expiresAt.getTime() <= Date.now() ||
-                  invitation.email.toLowerCase() !== email ||
-                  invitation.organizationId !== org.id
+                  invitation.email.toLowerCase() !== email
                 )
                   return yield* deny(
                     "This invitation is invalid, expired, or for a different email.",
                   );
-                organizationId = org.id;
+                organizationId = invitation.organizationId;
                 role = invitation.role;
                 yield* call(() =>
                   adapter.update({

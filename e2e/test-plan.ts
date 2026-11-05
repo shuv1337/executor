@@ -179,6 +179,42 @@ export const scenarios = plan({
       local: na("Local does not publish apps."),
     },
   },
+  selfHostRootRecord: {
+    fixtures: "actors",
+    legacyStorage: true,
+    file: "self-host-many-organizations.spec.ts",
+    title:
+      "self-host setup records its organization as the root, and an upgrade records an install's only organization once",
+    targets: {
+      "self-host": scheduled,
+      cloud: na("Cloud has no root organization; every team is its own."),
+      local: na("Local has no hosted organizations."),
+    },
+  },
+  selfHostRootUnsetAmongSeveral: {
+    fixtures: "actors",
+    legacyStorage: true,
+    file: "self-host-many-organizations.spec.ts",
+    title:
+      "a self-host upgraded with several organizations and no root record leaves the root unset and keeps serving each",
+    targets: {
+      "self-host": scheduled,
+      cloud: na("Cloud has no root organization; every team is its own."),
+      local: na("Local has no hosted organizations."),
+    },
+  },
+  selfHostSeveralOrganizations: {
+    fixtures: "actors",
+    legacyStorage: true,
+    file: "self-host-many-organizations.spec.ts",
+    title:
+      "a self-host with several organizations signs in their members, admits invitations into the inviting organization and refuses anyone without one",
+    targets: {
+      "self-host": scheduled,
+      cloud: na("Cloud invitations need a verified recipient instead of password registration."),
+      local: na("Local has no hosted organizations."),
+    },
+  },
   registryMigration: {
     fixtures: "actors",
     legacyStorage: true,
@@ -5603,6 +5639,16 @@ export const scenarios = plan({
       "self-host": scheduled,
       cloud: na("Cloud's sign-in has no instance settings to read."),
       local: na("Local has no hosted sign-in."),
+    },
+  },
+  selfHostSsoNoAutoJoin: {
+    file: "self-host-sso.spec.ts",
+    title:
+      "Self-host SSO admits no one automatically and refuses a verified, approved address without an invitation",
+    targets: {
+      "self-host": scheduled,
+      cloud: na("Cloud customer SSO has its own OIDC scenario."),
+      local: na("Local has no sign-in or SSO."),
     },
   },
   selfHostSsoUnverifiedEmail: {
