@@ -27,10 +27,10 @@ const owner = Effect.gen(function* () {
 });
 
 /**
- * Who may change connections through this request. A signed-in person manages their own. Without a
- * browser session the request carried a bearer that RequireOrganization accepted for `manage`, so it
- * holds its user's full authority (an API key or a full API grant; MCP tokens never reach the API);
- * of those, only an organization admin's or owner's may manage connections. Every bearer change is
+ * Who may change connections through this request. Any current member manages their own, from a
+ * browser session or from a bearer that RequireOrganization accepted for `manage` (an API key or a
+ * full API grant; MCP tokens never reach the API). The store returns and changes only that
+ * member's connections. Apps and accounts are checked the same way as a call. Bearer changes are
  * logged, as connections decide which accounts an agent runs as.
  */
 const manager = (
@@ -40,12 +40,11 @@ const manager = (
   Effect.gen(function* () {
     const current = yield* owner;
     const person = yield* Effect.serviceOption(CurrentPrincipal);
-    if (Option.isSome(person)) return current;
-    const organization = yield* CurrentOrganization;
-    if (organization.role !== "admin" && organization.role !== "owner")
-      return yield* new OrganizationForbidden();
     // Minting and revoking a key record their own audit line for every caller, with the key.
-    if (action === "create" || action === "update" || action === "revoke")
+    if (
+      Option.isNone(person) &&
+      (action === "create" || action === "update" || action === "revoke")
+    )
       yield* Effect.logInfo("MCP connection changed with an API credential").pipe(
         Effect.annotateLogs({
           "executor.audit": "mcp-connection",

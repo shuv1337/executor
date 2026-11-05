@@ -950,4 +950,276 @@ export default defineApp({ app: { accounts: { team } } }, async () => ({ tools: 
       }).pipe(Effect.provide(McpClient.layer)),
     ),
   );
+
+  it.effect(scenarios.memberOwnScopedConnections.title, (context) =>
+    withHostedCase(
+      context,
+      Effect.gen(function* () {
+        const api = yield* Api,
+          actors = yield* Actors,
+          browser = yield* Browser;
+        const prefix = `/api/organizations/${actors.organization.id}`;
+        const hidden = yield* deployReadWriteApp;
+        const deployed = yield* api.request(actors.owner, "POST", `${prefix}/apps/deploy`, {
+          name: `Member connection app ${randomUUID().slice(0, 8)}`,
+          files: [
+            {
+              path: "index.ts",
+              content: `import { defineApp, defineProvider, secrets, query, object, string, router } from "apps";
+const service = defineProvider({ name: "Member connection account", auth: { key: secrets({ label: "Key", fields: object({ token: string() }) }) } });
+export default defineApp({ user: { accounts: { service } } }, async () => ({ tools: router({ who: query({ input: object({}) }, async ctx => ctx.user.accounts.service.fields.token) }) }));`,
+            },
+            appsManifest,
+          ],
+        });
+        expect(deployed.status, JSON.stringify(deployed.body)).toBe(200);
+        const app = yield* body(App, deployed),
+          path = `${prefix}/apps/${app.id}`;
+        const accounts: string[] = [];
+        yield* Effect.addFinalizer(() =>
+          Effect.gen(function* () {
+            yield* api.request(actors.owner, "DELETE", path);
+            for (const id of accounts)
+              yield* api.request(actors.owner, "DELETE", `${prefix}/accounts/${id}`);
+          }).pipe(Effect.orDie),
+        );
+        const shared = yield* api.request(actors.owner, "GET", `${path}/access`);
+        const { revision } = yield* body(Schema.Struct({ revision: Schema.String }), shared);
+        expect(
+          (yield* api.request(actors.owner, "PATCH", `${path}/access`, {
+            revision,
+            audience: { kind: "everyone" },
+          })).status,
+        ).toBe(200);
+        const connectAccount = (actor: typeof actors.owner, token: string) =>
+          Effect.gen(function* () {
+            const started = yield* api.request(
+              actor,
+              "POST",
+              connectionsPath(path, "user", "service"),
+              { destination: { kind: "personal" } },
+            );
+            expect(started.status, JSON.stringify(started.body)).toBe(200);
+            const submitted = yield* api.request(
+              actor,
+              "POST",
+              `${prefix}/connections/${(yield* body(Resource, started)).id}/submit`,
+              { method: "key", label: `${token} account`, fields: { token } },
+            );
+            expect(submitted.status, JSON.stringify(submitted.body)).toBe(200);
+            const account = (yield* body(Resource, submitted)).id;
+            accounts.push(account);
+            return account;
+          });
+        const ownerAccount = yield* connectAccount(actors.owner, "owner");
+        const memberAccount = yield* connectAccount(actors.member, "member");
+        const ownerName = `Owner seat ${randomUUID().slice(0, 6)}`;
+        const memberName = `Member seat ${randomUUID().slice(0, 6)}`;
+        const renamed = `${memberName} renamed`;
+        const save = (actor: typeof actors.owner, apps: readonly unknown[], name: string) =>
+          api.request(actor, "POST", `${prefix}/mcp-connections`, {
+            id: randomUUID(),
+            name,
+            apps,
+          });
+        const ownedApps = [
+          { app: app.id, runsAs: [{ kind: "account", id: memberAccount }], tools: { kind: "all" } },
+        ];
+        const ownerSaved = yield* save(
+          actors.owner,
+          [
+            {
+              app: app.id,
+              runsAs: [{ kind: "account", id: ownerAccount }],
+              tools: { kind: "all" },
+            },
+          ],
+          ownerName,
+        );
+        expect(ownerSaved.status, JSON.stringify(ownerSaved.body)).toBe(200);
+        const ownerConnection = yield* body(ConnectionView, ownerSaved);
+        const created = yield* save(actors.member, ownedApps, memberName);
+        expect(created.status, JSON.stringify(created.body)).toBe(200);
+        const connection = yield* body(ConnectionView, created);
+        expect(connection.policy.apps).toEqual(ownedApps);
+        const memberListed = yield* api.request(actors.member, "GET", `${prefix}/mcp-connections`);
+        expect(memberListed.status, JSON.stringify(memberListed.body)).toBe(200);
+        const listed = yield* body(Schema.Array(ConnectionView), memberListed);
+        expect(listed.map((item) => item.id)).toContain(connection.id);
+        expect(listed.map((item) => item.id)).not.toContain(ownerConnection.id);
+        const updated = yield* api.request(
+          actors.member,
+          "PUT",
+          `${prefix}/mcp-connections/${connection.id}`,
+          { name: renamed, apps: ownedApps },
+        );
+        expect(updated.status, JSON.stringify(updated.body)).toBe(200);
+        expect((yield* body(ConnectionView, updated)).name).toBe(renamed);
+        expect(
+          (yield* api.request(
+            actors.member,
+            "PUT",
+            `${prefix}/mcp-connections/${ownerConnection.id}`,
+            {
+              name: renamed,
+              apps: ownedApps,
+            },
+          )).status,
+        ).toBe(404);
+        expect(
+          (yield* api.request(
+            actors.member,
+            "POST",
+            `${prefix}/mcp-connections/${ownerConnection.id}/revoke`,
+          )).status,
+        ).toBe(404);
+
+        yield* browser.login(actors.member);
+        yield* browser.use("Open Connections", (page) =>
+          page.goto(`/org/${actors.organization.slug}/connect`),
+        );
+        yield* browser.use("The member's connection is listed", (page) =>
+          page.getByRole("listitem", { name: renamed, exact: true }).waitFor(),
+        );
+        expect(
+          yield* browser.use("Another member's connection is not listed", (page) =>
+            page.getByRole("listitem", { name: ownerName, exact: true }).count(),
+          ),
+        ).toBe(0);
+
+        const issued = yield* api.request(actors.member, "POST", "/api/auth/api-key/create", {
+          name: "Member connection key",
+        });
+        expect(issued.status).toBe(200);
+        const token = yield* body(
+          Schema.Struct({ key: Schema.RedactedFromValue(Schema.String), id: Schema.String }),
+          issued,
+        );
+        yield* Effect.addFinalizer(() =>
+          api
+            .request(actors.member, "POST", "/api/auth/api-key/delete", { keyId: token.id })
+            .pipe(Effect.ignore),
+        );
+        const bearer = {
+          authorization: `Bearer ${Redacted.value(token.key)}`,
+        };
+        const asKey = (method: "GET" | "POST" | "PUT", route: string, data?: unknown) =>
+          Effect.gen(function* () {
+            return yield* api.request(yield* api.session(), method, route, data, bearer);
+          });
+        const keyList = yield* asKey("GET", `${prefix}/mcp-connections`);
+        expect(keyList.status).toBe(200);
+        const keyViews = yield* body(Schema.Array(ConnectionView), keyList);
+        expect(keyViews.map((item) => item.id)).toContain(connection.id);
+        expect(keyViews.map((item) => item.id)).not.toContain(ownerConnection.id);
+        const keyUpdated = yield* asKey("PUT", `${prefix}/mcp-connections/${connection.id}`, {
+          name: renamed,
+          apps: ownedApps,
+        });
+        expect(keyUpdated.status, JSON.stringify(keyUpdated.body)).toBe(200);
+        const keysPath = `${prefix}/mcp-connections/${connection.id}/keys`;
+        const minted = yield* asKey("POST", keysPath, { expiresInSeconds: 3600 });
+        expect(minted.status, JSON.stringify(minted.body)).toBe(200);
+        const KeySummary = Schema.Struct({
+          id: Schema.String,
+          name: Schema.NullOr(Schema.String),
+          start: Schema.NullOr(Schema.String),
+          createdAt: Schema.String,
+          expiresAt: Schema.NullOr(Schema.String),
+          lastRequest: Schema.NullOr(Schema.String),
+        });
+        const key = yield* body(Schema.Struct({ id: Schema.String }), minted);
+        const listedKeys = yield* asKey("GET", keysPath);
+        expect(listedKeys.status, JSON.stringify(listedKeys.body)).toBe(200);
+        const keys = yield* body(Schema.Array(KeySummary), listedKeys);
+        expect(keys.map((item) => item.id)).toContain(key.id);
+        expect((yield* asKey("POST", `${keysPath}/${key.id}/revoke`)).status).toBeLessThan(300);
+        const keysAfter = yield* asKey("GET", keysPath);
+        expect(keysAfter.status, JSON.stringify(keysAfter.body)).toBe(200);
+        expect(
+          (yield* body(Schema.Array(KeySummary), keysAfter)).map((item) => item.id),
+        ).not.toContain(key.id);
+        const keyOwned = yield* asKey("POST", `${prefix}/mcp-connections`, {
+          id: randomUUID(),
+          name: `Key seat ${randomUUID().slice(0, 6)}`,
+          apps: ownedApps,
+        });
+        expect(keyOwned.status, JSON.stringify(keyOwned.body)).toBe(200);
+        expect((yield* body(ConnectionView, keyOwned)).policy.apps).toEqual(ownedApps);
+
+        const hiddenAttempt = yield* asKey("POST", `${prefix}/mcp-connections`, {
+          id: randomUUID(),
+          name: "Hidden app",
+          apps: [{ app: hidden.app.id, runsAs: [{ kind: "app" }], tools: { kind: "all" } }],
+        });
+        expect(hiddenAttempt.status, JSON.stringify(hiddenAttempt.body)).toBe(400);
+        expect(hiddenAttempt.body).toMatchObject({
+          _tag: "ConnectionAccessInvalid",
+          reason: "app",
+        });
+        const borrowed = yield* asKey("POST", `${prefix}/mcp-connections`, {
+          id: randomUUID(),
+          name: "Borrowed account",
+          apps: [
+            {
+              app: app.id,
+              runsAs: [{ kind: "account", id: ownerAccount }],
+              tools: { kind: "all" },
+            },
+          ],
+        });
+        expect(borrowed.status, JSON.stringify(borrowed.body)).toBe(400);
+        expect(borrowed.body).toMatchObject({
+          _tag: "ConnectionAccessInvalid",
+          reason: "account",
+        });
+        expect(yield* linkedAccountIds(actors.member, path)).toEqual([memberAccount]);
+        const foreign = [
+          yield* asKey("PUT", `${prefix}/mcp-connections/${ownerConnection.id}`, {
+            name: renamed,
+            apps: ownedApps,
+          }),
+          yield* asKey("POST", `${prefix}/mcp-connections/${ownerConnection.id}/revoke`),
+          yield* asKey("POST", `${prefix}/mcp-connections/${ownerConnection.id}/keys`, {
+            expiresInSeconds: 3600,
+          }),
+          yield* asKey(
+            "POST",
+            `${prefix}/mcp-connections/${ownerConnection.id}/keys/${key.id}/revoke`,
+          ),
+        ];
+        for (const response of foreign) {
+          expect(response.status, JSON.stringify(response.body)).toBe(404);
+          expect(response.body).toMatchObject({ _tag: "ConnectionNotFound" });
+        }
+
+        const group = {
+          name: "Members cannot",
+          description: "",
+          memberIds: [] as const,
+        };
+        for (const response of [
+          yield* api.request(actors.member, "POST", `${prefix}/groups`, group),
+          yield* asKey("POST", `${prefix}/groups`, group),
+        ]) {
+          expect(response.status, JSON.stringify(response.body)).toBe(403);
+          expect(response.body).toMatchObject({ _tag: "OrganizationForbidden" });
+        }
+
+        expect(
+          (yield* asKey("POST", `${prefix}/mcp-connections/${connection.id}/revoke`)).status,
+        ).toBeLessThan(300);
+        const afterRevoke = yield* asKey("GET", `${prefix}/mcp-connections`);
+        expect(afterRevoke.status, JSON.stringify(afterRevoke.body)).toBe(200);
+        expect(
+          (yield* body(Schema.Array(ConnectionView), afterRevoke)).map((item) => item.id),
+        ).not.toContain(connection.id);
+        const ownerListed = yield* api.request(actors.owner, "GET", `${prefix}/mcp-connections`);
+        expect(ownerListed.status, JSON.stringify(ownerListed.body)).toBe(200);
+        expect(
+          (yield* body(Schema.Array(ConnectionView), ownerListed)).map((item) => item.id),
+        ).toContain(ownerConnection.id);
+      }),
+    ),
+  );
 });
