@@ -11,11 +11,20 @@ import {
 import { RequiredAction, CurrentAuthorization } from "../contracts/authorization.ts";
 import {
   fullAuthority,
+  isToolSelectionSubset,
   permitsAction,
   permitsApp,
   permittedAppIds,
+  type AuthorizationPolicy,
+  type ToolSelection,
 } from "@executor-js/authorization";
-import { AppId, CurrentCaller } from "@executor-js/sdk/core";
+import { AppId, callerConnectionHeader, CurrentCaller } from "@executor-js/sdk/core";
+import {
+  ConnectionId,
+  connectionPermissions,
+  type ConnectionPolicy,
+} from "@executor-js/mcp-auth/connections";
+import { McpAuthentication } from "../contracts/mcp.ts";
 import { apiCaller, personCaller } from "./caller.ts";
 import { Context } from "effect";
 import { currentResourceAuthority, visibleAccountsAs, visibleAppsAs } from "./resource-policy.ts";
@@ -106,6 +115,43 @@ const refuseRemoved = (organization: OrganizationId) =>
     Effect.flatMap((gone) => (gone ? Effect.fail(new OrganizationForbidden()) : Effect.void)),
   );
 
+/** The connection's tools, no wider than the credential's own selection. */
+const narrowToConnection = (grant: ToolSelection, policy: ConnectionPolicy): ToolSelection => {
+  const bound: ToolSelection = { kind: "tools", apps: [...connectionPermissions(policy)] };
+  if (grant.kind === "all" || isToolSelectionSubset(grant, bound)) return bound;
+  if (isToolSelectionSubset(bound, grant)) return grant;
+  return {
+    kind: "tools",
+    apps: bound.apps.filter((item) =>
+      isToolSelectionSubset(grant, { kind: "tools", apps: [item] }),
+    ),
+  };
+};
+
+/**
+ * The host-attached calling connection, when this request arrived on one. A missing or foreign id
+ * is refused. The credential's actions stay; its tools narrow to that connection, and the caller
+ * carries the id so a nested app call binds the same connection.
+ */
+const scopedAuthority = (userId: string, organization: string, policy: AuthorizationPolicy) =>
+  Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const header = new Headers(request.headers).get(callerConnectionHeader);
+    if (header === null || header === "") return { policy, connectionId: undefined };
+    const id = yield* Schema.decodeUnknownEffect(ConnectionId)(header).pipe(
+      Effect.mapError(() => new OrganizationForbidden()),
+    );
+    const store = yield* McpAuthentication;
+    const found = (yield* store.connections.list({ userId, resource: organization })).find(
+      (connection) => connection.id === id,
+    );
+    if (found === undefined) return yield* new OrganizationForbidden();
+    return {
+      policy: { ...policy, tools: narrowToConnection(policy.tools, found.policy) },
+      connectionId: found.id,
+    };
+  });
+
 /** Access resolves only the explicit route ID or slug. Shared session preferences never participate. */
 export const withOrganizationRequest = <E, R>(
   response: (
@@ -134,23 +180,32 @@ export const withOrganizationRequest = <E, R>(
         callerSpanAttributes(grant.access.organization, grant.userId),
       );
       yield* refuseRemoved(grant.access.organization);
-      if (!permitsAction(grant.policy, action)) return yield* new OrganizationForbidden();
+      const scoped = yield* scopedAuthority(grant.userId, grant.access.organization, grant.policy);
+      if (!permitsAction(scoped.policy, action)) return yield* new OrganizationForbidden();
       if (params.app !== undefined) {
         const app = yield* Schema.decodeUnknownEffect(AppId)(params.app).pipe(
           Effect.mapError(() => new OrganizationForbidden()),
         );
-        if (!permitsApp(grant.policy, app)) return yield* new OrganizationForbidden();
+        if (!permitsApp(scoped.policy, app)) return yield* new OrganizationForbidden();
       }
       if (grant.key !== undefined)
         yield* Effect.annotateCurrentSpan("executor.api_key.id", grant.key.id);
       const scope = Effect.succeed(publishingScope(grant.organizationSlug));
       return (yield* response(scope).pipe(
         Effect.tapCause(ErrorReporter.report),
-        Effect.provideService(CurrentAuthorization, grant.policy),
+        Effect.provideService(CurrentAuthorization, scoped.policy),
         Effect.provideService(CurrentOrganization, grant.access),
         Effect.provideService(CurrentOrganizationNamespace, scope),
         Effect.provideService(CurrentUserId, grant.userId),
-        Effect.provideService(CurrentCaller, apiCaller(grant, api.issuer)),
+        Effect.provideService(
+          CurrentCaller,
+          apiCaller(
+            scoped.connectionId === undefined
+              ? grant
+              : { ...grant, connectionId: scoped.connectionId },
+            api.issuer,
+          ),
+        ),
         Effect.provideService(CurrentUsage, { source: "api" }),
       )).pipe(HttpServerResponse.setHeader("cache-control", "no-store"));
     }
@@ -179,6 +234,13 @@ export const withOrganizationRequest = <E, R>(
       owner: organizationOwner(organization),
       role: membership.role,
     };
+    const scoped = yield* scopedAuthority(principal.userId, organization, fullAuthority);
+    if (scoped.connectionId !== undefined && params.app !== undefined) {
+      const app = yield* Schema.decodeUnknownEffect(AppId)(params.app).pipe(
+        Effect.mapError(() => new OrganizationForbidden()),
+      );
+      if (!permitsApp(scoped.policy, app)) return yield* new OrganizationForbidden();
+    }
     const scope = auth.organizationSlug(headers, organization).pipe(Effect.map(publishingScope));
     return (yield* response(scope).pipe(
       Effect.tapCause(ErrorReporter.report),
@@ -187,11 +249,13 @@ export const withOrganizationRequest = <E, R>(
       Effect.provideService(CurrentUserId, principal.userId),
       Effect.provideService(
         CurrentCaller,
-        personCaller(principal, organization, auth.origin, "dashboard"),
+        scoped.connectionId === undefined
+          ? personCaller(principal, organization, auth.origin, "dashboard")
+          : personCaller(principal, organization, auth.origin, "dashboard", scoped.connectionId),
       ),
       Effect.provideService(CurrentUsage, { source: "dashboard" }),
       Effect.provideService(CurrentPrincipal, principal),
-      Effect.provideService(CurrentAuthorization, fullAuthority),
+      Effect.provideService(CurrentAuthorization, scoped.policy),
     )).pipe(HttpServerResponse.setHeader("cache-control", "no-store"));
   });
 
@@ -202,6 +266,7 @@ export const requireOrganizationLive = Layer.effect(
     const auth = yield* Authentication;
     const api = yield* ApiAuthentication;
     const tombstones = yield* OrganizationTombstones;
+    const mcp = yield* McpAuthentication;
     return (response, { endpoint, group }) =>
       withOrganizationRequest(
         () => {
@@ -223,6 +288,7 @@ export const requireOrganizationLive = Layer.effect(
         Effect.provideService(Authentication, auth),
         Effect.provideService(ApiAuthentication, api),
         Effect.provideService(OrganizationTombstones, tombstones),
+        Effect.provideService(McpAuthentication, mcp),
       );
   }),
 );

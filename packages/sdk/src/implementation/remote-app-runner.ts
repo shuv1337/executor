@@ -370,8 +370,11 @@ export const remoteAppRunner = <E>(remote: RemoteAppRunner<Effect.Effect<string,
           Effect.sync(() => new AbortController()),
           (controller) => Effect.sync(() => controller.abort()),
         );
+        const callerConnection =
+          invocation.callerConnection ?? invocation.caller?.provenance?.connectionId;
         const encoded = yield* Schema.encodeEffect(encodedInvocation)({
           ...invocation,
+          ...(callerConnection === undefined ? {} : { callerConnection }),
           elicitation: capabilities.elicit !== null,
           workflowControls: capabilities.controls !== null,
         }).pipe(Effect.mapError(() => new RuntimeProtocolFailed()));

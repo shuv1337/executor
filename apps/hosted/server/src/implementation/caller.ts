@@ -31,6 +31,8 @@ export const apiCaller = (
     readonly email?: string | null | undefined;
     readonly access: Pick<OrganizationAccess, "organization">;
     readonly key?: { readonly id: string } | undefined;
+    /** The scoped MCP connection the host attached to this request, when it arrived on one. */
+    readonly connectionId?: string | undefined;
   },
   issuer: string,
 ): Caller => ({
@@ -40,9 +42,15 @@ export const apiCaller = (
   email: grant.email ?? null,
   organizationId: grant.access.organization,
   channel: "api",
-  ...(grant.key === undefined
+  ...(grant.key === undefined && grant.connectionId === undefined
     ? {}
-    : { provenance: { trusted: false, clientId: `apikey:${grant.key.id}` } }),
+    : {
+        provenance: {
+          trusted: false,
+          ...(grant.key === undefined ? {} : { clientId: `apikey:${grant.key.id}` }),
+          ...(grant.connectionId === undefined ? {} : { connectionId: grant.connectionId }),
+        },
+      }),
 });
 
 /** A signed-in person, in the dashboard or an app's own UI. */
@@ -51,6 +59,7 @@ export const personCaller = (
   organization: string,
   issuer: string,
   channel: "ui" | "dashboard",
+  connectionId?: string,
 ): Caller => ({
   kind: "human",
   subject: person.userId,
@@ -58,6 +67,7 @@ export const personCaller = (
   email: person.email ?? null,
   organizationId: organization,
   channel,
+  ...(connectionId === undefined ? {} : { provenance: { trusted: false as const, connectionId } }),
 });
 
 /** A person who answered an approval request on the browser page or in the dashboard. */

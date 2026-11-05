@@ -1361,4 +1361,254 @@ export default defineApp({ user: { accounts: { service } } }, async () => ({ too
       }).pipe(Effect.provide(Layer.mergeAll(McpOAuth.layer, McpClient.layer))),
     ),
   );
+
+  it.effect(scenarios.adminConnectionKeyNoWidening.title, (context) =>
+    withHostedCase(
+      context,
+      Effect.gen(function* () {
+        const api = yield* Api,
+          actors = yield* Actors,
+          mcp = yield* McpClient;
+        const prefix = `/api/organizations/${actors.organization.id}`;
+        const { app: executorApp, account: executorAccount } = yield* managementApp(actors.admin);
+        const mesh = yield* deployReadWriteApp;
+        const meshPath = `${prefix}/apps/${mesh.app.id}`;
+        const access = yield* body(
+          Schema.Struct({ revision: Schema.String }),
+          yield* api.request(actors.owner, "GET", `${meshPath}/access`),
+        );
+        expect(
+          (yield* api.request(actors.owner, "PATCH", `${meshPath}/access`, {
+            revision: access.revision,
+            audience: { kind: "everyone" },
+          })).status,
+        ).toBe(200);
+        const executorEntry = {
+          app: executorApp.id,
+          runsAs: [{ kind: "account", id: executorAccount }],
+          tools: { kind: "all" },
+        };
+        const meshEntry = {
+          app: mesh.app.id,
+          runsAs: [{ kind: "app" }],
+          tools: { kind: "all" },
+        };
+        const save = (name: string, apps: readonly unknown[]) =>
+          Effect.gen(function* () {
+            const created = yield* api.request(actors.admin, "POST", `${prefix}/mcp-connections`, {
+              id: randomUUID(),
+              name,
+              apps,
+            });
+            expect(created.status, JSON.stringify(created.body)).toBe(200);
+            return yield* body(ConnectionView, created);
+          });
+        const scoped = yield* save(`Scoped ${randomUUID().slice(0, 6)}`, [executorEntry]);
+        const wide = yield* save(`Wide ${randomUUID().slice(0, 6)}`, [executorEntry, meshEntry]);
+        // Another member's connections stay unreachable, including an admin's.
+        expect(
+          (yield* api.request(actors.member, "POST", `${prefix}/mcp-connections/${wide.id}/keys`, {
+            expiresInSeconds: 3600,
+          })).status,
+        ).toBe(404);
+
+        const minted = yield* api.request(
+          actors.admin,
+          "POST",
+          `${prefix}/mcp-connections/${scoped.id}/keys`,
+          { name: "Scoped connection key", expiresInSeconds: 3600 },
+        );
+        expect(minted.status, JSON.stringify(minted.body)).toBe(200);
+        const key = yield* body(
+          Schema.Struct({
+            id: Schema.String,
+            key: Schema.RedactedFromValue(Schema.String),
+          }),
+          minted,
+        );
+        const bearer = {
+          authorization: `Bearer ${Redacted.value(key.key)}`,
+          "x-executor-organization": actors.organization.id,
+        };
+        const asKey = (method: "GET" | "POST", route: string, data?: unknown) =>
+          Effect.gen(function* () {
+            return yield* api.request(yield* api.session(), method, route, data, bearer);
+          });
+        // The connection key is the bearer on the hosted API, with no Executor app self-call.
+        for (const response of [
+          yield* asKey("POST", `${prefix}/mcp-connections`, {
+            id: randomUUID(),
+            name: "Wider than the key",
+            apps: [executorEntry, meshEntry],
+          }),
+          yield* asKey("POST", `${prefix}/mcp-connections/${wide.id}/keys`, {
+            expiresInSeconds: 3600,
+          }),
+          yield* asKey("GET", `${prefix}/mcp-connections/${wide.id}/keys`),
+        ]) {
+          expect(response.status, JSON.stringify(response.body)).toBe(403);
+          expect(response.body).toMatchObject({ _tag: "ConnectionKeyRefused" });
+        }
+
+        // Warm the Executor app from an unscoped key first. A later scoped call must not reuse
+        // that worker's outbound, which has no calling connection.
+        const issued = yield* api.request(actors.admin, "POST", "/api/auth/api-key/create", {
+          name: "Admin full key",
+        });
+        expect(issued.status).toBe(200);
+        const fullKey = yield* body(
+          Schema.Struct({ key: Schema.RedactedFromValue(Schema.String), id: Schema.String }),
+          issued,
+        );
+        yield* Effect.addFinalizer(() =>
+          api
+            .request(actors.admin, "POST", "/api/auth/api-key/delete", { keyId: fullKey.id })
+            .pipe(Effect.ignore),
+        );
+        const tool = `tools[${JSON.stringify(executorApp.slug)}]`;
+        const invoke = (method: string, input: unknown) =>
+          `try { return { ok: true, value: await ${tool}.${method}(${JSON.stringify(input)}) }; } catch (error) { return { ok: false, error: JSON.parse(error.message) }; }`;
+        const Program = Schema.Struct({
+          ok: Schema.Boolean,
+          error: Schema.optional(Schema.Struct({ code: Schema.String, status: Schema.Number })),
+          value: Schema.optional(Schema.Unknown),
+        });
+        const run = (
+          secret: typeof key.key,
+          connection: string | undefined,
+          step: string,
+          code: string,
+        ) =>
+          Effect.gen(function* () {
+            const client = yield* mcp.connect(secret, step, {
+              organization: actors.organization.id,
+              ...(connection === undefined ? {} : { connection }),
+            });
+            const result = yield* executor(client)(step, code);
+            return yield* Schema.decodeUnknownEffect(Program)(result.execution.value);
+          });
+        const warmed = yield* run(
+          fullKey.key,
+          undefined,
+          "An unscoped key lists connections through the Executor app",
+          invoke("mcpConnections.list", {}),
+        );
+        expect(warmed.ok, JSON.stringify(warmed)).toBe(true);
+
+        const widened = yield* run(
+          key.key,
+          scoped.id,
+          "A scoped connection key cannot create a wider connection",
+          invoke("mcpConnections.create", {
+            body: {
+              id: randomUUID(),
+              name: "Wider than the connection",
+              apps: [executorEntry, meshEntry],
+            },
+          }),
+        );
+        expect(widened, JSON.stringify(widened)).toMatchObject({
+          ok: false,
+          error: { status: 403, code: "OrganizationForbidden" },
+        });
+        const outside = yield* run(
+          key.key,
+          scoped.id,
+          "A scoped connection key cannot mint a key outside its scope",
+          invoke("mcpConnections.mintKey", {
+            path: { connection: wide.id },
+            body: { expiresInSeconds: 3600 },
+          }),
+        );
+        expect(outside, JSON.stringify(outside)).toMatchObject({
+          ok: false,
+          error: { status: 403, code: "OrganizationForbidden" },
+        });
+        const listed = yield* run(
+          key.key,
+          scoped.id,
+          "A scoped connection key cannot list keys outside its scope",
+          invoke("mcpConnections.listKeys", { path: { connection: wide.id } }),
+        );
+        expect(listed, JSON.stringify(listed)).toMatchObject({
+          ok: false,
+          error: { status: 403, code: "OrganizationForbidden" },
+        });
+
+        // A connection that grants every tool of its apps can still narrow and mint inside it.
+        const full = yield* save(`Full ${randomUUID().slice(0, 6)}`, [executorEntry, meshEntry]);
+        const fullMinted = yield* api.request(
+          actors.admin,
+          "POST",
+          `${prefix}/mcp-connections/${full.id}/keys`,
+          { expiresInSeconds: 3600 },
+        );
+        expect(fullMinted.status, JSON.stringify(fullMinted.body)).toBe(200);
+        const fullConnectionKey = yield* body(
+          Schema.Struct({ key: Schema.RedactedFromValue(Schema.String) }),
+          fullMinted,
+        );
+        const meshId = randomUUID();
+        const narrowed = yield* run(
+          fullConnectionKey.key,
+          full.id,
+          "A full connection key creates a narrower connection",
+          invoke("mcpConnections.create", {
+            body: { id: meshId, name: "Mesh seat", apps: [meshEntry] },
+          }),
+        );
+        expect(narrowed.ok, JSON.stringify(narrowed)).toBe(true);
+        const mintedInside = yield* run(
+          fullConnectionKey.key,
+          full.id,
+          "A full connection key mints inside its scope",
+          invoke("mcpConnections.mintKey", {
+            path: { connection: meshId },
+            body: { expiresInSeconds: 3600 },
+          }),
+        );
+        expect(mintedInside.ok, JSON.stringify(mintedInside)).toBe(true);
+
+        // Nested tools.call: the Executor app calls the API again. The connection must still bind.
+        const nested = (step: string, app: string, body: unknown) =>
+          run(key.key, scoped.id, step, invoke("tools.call", { path: { app }, body }));
+        const nestedWiden = yield* nested("nestedWiden", executorApp.id, {
+          tool: "mcpConnections.create",
+          input: {
+            body: {
+              id: randomUUID(),
+              name: "Nested wider",
+              apps: [executorEntry, meshEntry],
+            },
+          },
+        });
+        expect(nestedWiden, JSON.stringify(nestedWiden)).toMatchObject({
+          ok: false,
+          error: { status: 403, code: "OrganizationForbidden" },
+        });
+        const nestedMint = yield* nested("nestedMint", executorApp.id, {
+          tool: "mcpConnections.mintKey",
+          input: {
+            path: { connection: wide.id },
+            body: { expiresInSeconds: 3600 },
+          },
+        });
+        expect(nestedMint, JSON.stringify(nestedMint)).toMatchObject({
+          ok: false,
+          error: { status: 403, code: "OrganizationForbidden" },
+        });
+        const directMesh = yield* nested("directMesh", mesh.app.id, {
+          tool: "read",
+          input: {},
+        });
+        expect(directMesh, JSON.stringify(directMesh)).toMatchObject({
+          ok: false,
+          error: { status: 403, code: "OrganizationForbidden" },
+        });
+        const afterNested = yield* api.request(actors.admin, "GET", `${prefix}/mcp-connections`);
+        expect(afterNested.status, JSON.stringify(afterNested.body)).toBe(200);
+        expect(JSON.stringify(afterNested.body)).not.toContain("Nested wider");
+      }).pipe(Effect.provide(McpClient.layer)),
+    ),
+  );
 });

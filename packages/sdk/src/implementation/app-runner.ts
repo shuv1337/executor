@@ -407,6 +407,7 @@ export const appWorker = (
     | "accounts"
     | "hostApi"
     | "callerConnection"
+    | "caller"
   >,
 ) =>
   // Requirement names are unique across scopes, so one record names the account set.
@@ -418,7 +419,9 @@ export const appWorker = (
       // A Worker's network is bound when it loads, so each host API revision has its own app
       // Worker and its own facet Worker. The facet's database is the supervisor's, whichever loads.
       // The network binding is fixed when the Worker loads, and it carries the calling connection.
-      const identity = [selection, invocation.hostApi?.revision, invocation.callerConnection]
+      // A warm worker loaded for another connection, or for none, must not serve this call.
+      const calling = invocation.callerConnection ?? invocation.caller?.provenance?.connectionId;
+      const identity = [selection, invocation.hostApi?.revision, calling]
         .filter((part) => part !== undefined && part !== "")
         .join(":");
       return {
@@ -771,6 +774,8 @@ export const makeAppRunner = (host: AppRunnerHost) => {
     Effect.gen(function* () {
       const id = crypto.randomUUID();
       const { command } = invocation;
+      const callerConnection =
+        invocation.callerConnection ?? invocation.caller?.provenance?.connectionId;
       const result = yield* target
         .invoke(
           {
@@ -779,6 +784,7 @@ export const makeAppRunner = (host: AppRunnerHost) => {
             identity,
             cacheNamespace: appCacheNamespace(invocation.build, invocation.hostApi),
             ...(invocation.hostApi === undefined ? {} : { hostApi: invocation.hostApi }),
+            ...(callerConnection === undefined ? {} : { callerConnection }),
             body,
             headers: invocation.headers,
             write:

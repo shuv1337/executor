@@ -169,6 +169,8 @@ export const appRuntime = (host: AppRuntimeHost) =>
         readonly database: boolean;
         readonly sharedRuntime: boolean;
         readonly observeRevision?: (revision: number) => void;
+        /** The MCP connection this call arrived on, including when `caller` is not sent. */
+        readonly callerConnection?: string;
       } & HostContext,
       command: HostRequest,
       output: Schema.Decoder<A>,
@@ -185,6 +187,9 @@ export const appRuntime = (host: AppRuntimeHost) =>
           );
           const build = input.build;
           const run = yield* InvocationRun;
+          // Bound beside `caller`: a build that does not declare callerIdentity never receives
+          // `caller`, and the connection id on it would otherwise never reach the outbound.
+          const callerConnection = input.callerConnection ?? input.caller?.provenance?.connectionId;
           const invocation: AppInvocation = {
             app: input.app,
             build,
@@ -195,6 +200,7 @@ export const appRuntime = (host: AppRuntimeHost) =>
             // Workers RPC structured-clones its arguments; Effect headers carry a prototype it rejects.
             headers: Object.fromEntries(Object.entries(yield* traceHeaders)),
             ...(input.hostApi === undefined ? {} : { hostApi: input.hostApi }),
+            ...(callerConnection === undefined ? {} : { callerConnection }),
             ...(input.approval === undefined ? {} : { approval: input.approval }),
             ...(input.caller === undefined ? {} : { caller: input.caller }),
             ...(input.approvedBy === undefined ? {} : { approvedBy: input.approvedBy }),

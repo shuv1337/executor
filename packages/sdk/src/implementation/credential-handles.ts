@@ -948,9 +948,9 @@ const forward = async (request: Request, outbound: CredentialOutbound): Promise<
     // share a request.
     stampCaller(headers, outbound);
     if ([...opened.values()].some((sealed) => sealed.managed === true)) {
-      if (callerConnections.length > 1) {
-        const provider = [...opened.values()].find((sealed) => sealed.managed === true)?.provider;
-        return networkRefusalResponse(
+      const provider = [...opened.values()].find((sealed) => sealed.managed === true)?.provider;
+      const mismatch = () =>
+        networkRefusalResponse(
           new NetworkRefused({
             host: url.host,
             refusal: {
@@ -960,10 +960,15 @@ const forward = async (request: Request, outbound: CredentialOutbound): Promise<
             },
           }),
         );
-      }
+      if (callerConnections.length > 1) return mismatch();
+      const [sealedConnection] = callerConnections;
+      // The worker was loaded for one connection. A managed handle from another connection, or
+      // one that dropped it, must not replace that bind.
+      if (outbound.callerConnection !== undefined && sealedConnection !== outbound.callerConnection)
+        return mismatch();
       headers.delete(callerConnectionHeader);
-      const [callerConnection] = callerConnections;
-      if (callerConnection !== undefined) headers.set(callerConnectionHeader, callerConnection);
+      const bound = outbound.callerConnection ?? sealedConnection;
+      if (bound !== undefined) headers.set(callerConnectionHeader, bound);
     }
     const response = await send(
       new Request(replaceAll(placed.success.href, encoded(anywhere, encodings.url)), {

@@ -17,6 +17,7 @@ import { AppIdentity, AppGitAccess, AppAccessDenied } from "@executor-js/app-man
 import { Effect, Layer, Schema } from "effect";
 import { Base64 } from "effect/encoding";
 import { ApiAuthentication, Authentication } from "./contracts/auth.ts";
+import { McpAuthentication } from "./contracts/mcp.ts";
 import { OrganizationTombstones } from "./contracts/organization-removal.ts";
 import {
   OrganizationReference,
@@ -70,6 +71,7 @@ export const hostedAppAccess = Layer.effect(
     const api = yield* ApiAuthentication;
     const auth = yield* Authentication;
     const tombstones = yield* OrganizationTombstones;
+    const mcp = yield* McpAuthentication;
     return (response, { endpoint }) =>
       withOrganizationRequest(
         (namespace) =>
@@ -113,6 +115,7 @@ export const hostedAppAccess = Layer.effect(
         Effect.provideService(Authentication, auth),
         Effect.provideService(ApiAuthentication, api),
         Effect.provideService(OrganizationTombstones, tombstones),
+        Effect.provideService(McpAuthentication, mcp),
       );
   }),
 );

@@ -532,6 +532,11 @@ export interface Runtime<Requirements = never> {
       /** Decides the storage mode before the app runs; the host verifies it. */
       readonly kind?: "query" | "mutation";
       readonly input: Json;
+      /**
+       * The MCP connection this call arrived on. Stays on the invocation when the build does not
+       * declare `callerIdentity`, so the outbound still binds that connection.
+       */
+      readonly callerConnection?: string;
     } & HostContext,
   ) => Effect.Effect<Json, RuntimeLoadError | typeof HostCallError.Type, Requirements>;
   /**

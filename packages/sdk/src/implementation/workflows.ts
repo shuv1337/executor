@@ -219,7 +219,11 @@ export const makeWorkflowRuns = (
       "engine",
       true,
     );
-  /** The run's captured version, scope and accounts, checked against the actor it started for. */
+  /**
+   * The run's captured version, scope and accounts, checked against the actor it started for.
+   * A workflow body is the host's own work. It does not carry the MCP connection that enqueued
+   * it, so a step's API calls are not that connection's self-call.
+   */
   const captured = (row: typeof StoredRun.Type) =>
     snapshot(db, {
       app: row.app,
