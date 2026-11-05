@@ -3,32 +3,92 @@
  * record is written once, by setup or by the upgrade step below, and never inferred from dates or
  * names. A database without it has no root, and every root-only operation is refused.
  */
+import type { AuthContext } from "@better-auth/core";
 import type { BetterAuthPlugin } from "better-auth";
+import { APIError } from "better-auth/api";
 import { migrateProductSteps } from "@executor-js/hosted-server/migrations";
-import { Effect } from "effect";
+import { Cause, Effect, Exit, Option, Schema } from "effect";
 import { SqlClient } from "effect/sql";
 
 /** The only ID the record ever has, so the primary key admits one root. */
 export const rootRecordId = "root";
 export const rootModel = "selfHostRoot";
 
-/** Must follow the organization plugin: Better Auth creates tables in plugin order. */
-export const selfHostRootSchema = {
-  id: "executor-self-host-root",
-  schema: {
-    [rootModel]: {
-      fields: {
-        organizationId: {
-          type: "string",
-          required: true,
-          unique: true,
-          references: { model: "organization", field: "id", onDelete: "restrict" },
-        },
-        createdAt: { type: "date", required: true },
+const Root = Schema.Struct({ organizationId: Schema.NonEmptyString });
+const Membership = Schema.Struct({ role: Schema.Literal("owner") });
+
+const read = <A>(run: () => Promise<A>) =>
+  Effect.tryPromise({
+    try: run,
+    catch: () =>
+      new APIError("SERVICE_UNAVAILABLE", { message: "Authentication is unavailable. Try again." }),
+  });
+
+/** Whether `userId` owns the root organization. Without a root record, no one does. */
+const ownsRoot = (adapter: AuthContext["adapter"], userId: string) =>
+  Effect.gen(function* () {
+    const root = Schema.decodeUnknownOption(Root)(
+      yield* read(() =>
+        adapter.findOne({
+          model: rootModel,
+          where: [{ field: "id", value: rootRecordId }],
+          select: ["organizationId"],
+        }),
+      ),
+    );
+    if (Option.isNone(root)) return false;
+    const member = yield* read(() =>
+      adapter.findOne({
+        model: "member",
+        where: [
+          { field: "userId", value: userId },
+          { field: "organizationId", value: root.value.organizationId },
+        ],
+        select: ["role"],
+      }),
+    );
+    return Option.isSome(Schema.decodeUnknownOption(Membership)(member));
+  });
+
+/**
+ * The root record's table and the check organization creation asks. It must follow the
+ * organization plugin: Better Auth creates tables in plugin order.
+ */
+export const selfHostRoot = () => {
+  let adapter: AuthContext["adapter"] | undefined;
+  return {
+    plugin: {
+      id: "executor-self-host-root",
+      init: (context) => {
+        adapter = context.adapter;
       },
-    },
-  },
-} satisfies BetterAuthPlugin;
+      schema: {
+        [rootModel]: {
+          fields: {
+            organizationId: {
+              type: "string",
+              required: true,
+              unique: true,
+              references: { model: "organization", field: "id", onDelete: "restrict" },
+            },
+            createdAt: { type: "date", required: true },
+          },
+        },
+      },
+    } satisfies BetterAuthPlugin,
+    ownsRoot: (userId: string) =>
+      adapter === undefined
+        ? Promise.resolve(false)
+        : Effect.runPromiseExit(ownsRoot(adapter, userId)).then(
+            Exit.match({
+              onSuccess: (owns) => owns,
+              onFailure: (cause) => {
+                throw Cause.squash(cause);
+              },
+            }),
+          ),
+  };
+};
 
 /**
  * An install from before the record had exactly one organization, its setup's, since nothing
