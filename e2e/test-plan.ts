@@ -215,6 +215,41 @@ export const scenarios = plan({
       local: na("Local has no hosted organizations."),
     },
   },
+  selfHostOrganizationCreationAuthority: {
+    fixtures: "actors",
+    legacyStorage: true,
+    file: "self-host-organization-creation.spec.ts",
+    title:
+      "only an owner of the self-host root organization creates organizations; admins, members, outsiders, other owners, anonymous callers and bearer keys are refused",
+    targets: {
+      "self-host": scheduled,
+      cloud: na("Cloud lets every signed-in account create a team; its onboarding decides."),
+      local: na("Local has no hosted organizations."),
+    },
+  },
+  selfHostOrganizationCreationBootstrap: {
+    legacyStorage: true,
+    file: "self-host-organization-creation.spec.ts",
+    title:
+      "self-host setup bootstraps one root owner once, stays closed as organizations are created, and keeps the root across a restart",
+    targets: {
+      "self-host": scheduled,
+      cloud: na("Cloud has no instance setup."),
+      local: na("Local has no hosted organizations."),
+    },
+  },
+  selfHostOrganizationCreationWithoutRoot: {
+    fixtures: "actors",
+    legacyStorage: true,
+    file: "self-host-organization-creation.spec.ts",
+    title:
+      "a self-host upgraded with one organization lets its owner create more, and one upgraded with several and no root record refuses everyone",
+    targets: {
+      "self-host": scheduled,
+      cloud: na("Cloud has no root organization; every team is its own."),
+      local: na("Local has no hosted organizations."),
+    },
+  },
   registryMigration: {
     fixtures: "actors",
     legacyStorage: true,

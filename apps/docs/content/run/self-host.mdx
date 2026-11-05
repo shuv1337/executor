@@ -122,7 +122,10 @@ docker stop executor-v2
 ```
 
 The first person to finish setup becomes the owner, and one organization is
-created. After that, people join only through invitations. SSO signs in people
+created. Its owners can create more organizations, and each creator becomes the
+new organization's owner; owning another organization does not let anyone create
+one. After that, people join only through invitations, each into the
+organization that sent it. SSO signs in people
 who already belong to an organization and have connected SSO on their account's
 Security page; it never adds anyone to an organization.
 
