@@ -6836,6 +6836,17 @@ export const scenarios = plan({
       local: na("Local has one operator and no organization roles or managed Executor keys."),
     },
   },
+  adminConnectionKeyNoWidening: {
+    fixtures: "actors",
+    file: "mcp-connections.spec.ts",
+    title:
+      "An org admin's connection key cannot widen a connection or mint outside its scope, on the API or through the Executor app",
+    targets: {
+      "self-host": scheduled,
+      cloud: scheduled,
+      local: na("Local has one operator and no organization roles or managed Executor keys."),
+    },
+  },
   memberOwnScopedConnections: {
     fixtures: "actors",
     file: "mcp-connections.spec.ts",

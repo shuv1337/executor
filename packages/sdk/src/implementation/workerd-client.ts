@@ -236,7 +236,8 @@ export const connectedWorkerdApps = (blobs: BlobStorage, transport: WorkerdTrans
         Effect.gen(function* () {
           // A workflow body runs in the apps Worker's own workflow engine, never through a call.
           if (capabilities.workflow !== undefined) return yield* protocolFailure();
-          const callerConnection = invocation.caller?.provenance?.connectionId;
+          const callerConnection =
+            invocation.callerConnection ?? invocation.caller?.provenance?.connectionId;
           const encoded = yield* Schema.encodeEffect(Schema.fromJsonString(WorkerInvocation))({
             ...invocation,
             ...(callerConnection === undefined ? {} : { callerConnection }),

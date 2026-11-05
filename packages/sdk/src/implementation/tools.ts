@@ -291,6 +291,15 @@ export const callerContext = (
       }
     : {};
 
+/**
+ * The verified MCP connection, sent even when {@link callerContext} omits `caller`. The runner
+ * seals it into the outbound; the app bundle never sees it.
+ */
+const boundCallerConnection = (caller: Caller | undefined) => {
+  const connection = caller?.provenance?.connectionId;
+  return connection === undefined ? {} : { callerConnection: connection };
+};
+
 /** Background work names no organization itself; the app's organization owner is the one it runs in. */
 const withOrganization = <C extends Caller>(caller: C, owner: string): C =>
   caller.organizationId !== null || !owner.startsWith("organization:")
@@ -1707,6 +1716,7 @@ export const makeTools = (
                 ...(kind === undefined ? {} : { kind }),
                 input: args,
                 ...callerContext(state),
+                ...boundCallerConnection(state.caller),
                 ...(options?.elicitation === undefined ? {} : { elicitation: options.elicitation }),
               });
             }).pipe(
@@ -1907,6 +1917,7 @@ export const makeTools = (
                             input: originalInput,
                             approval: { tool: saved.tool, input: saved.input },
                             ...callerContext(state, approver),
+                            ...boundCallerConnection(state.caller),
                             ...(options?.elicitation === undefined
                               ? {}
                               : { elicitation: options.elicitation }),
