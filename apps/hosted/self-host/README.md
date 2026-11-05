@@ -155,6 +155,12 @@ Motel volumes separate; the entrypoint prepares their ownership for the non-root
 server user. Do not remove either volume during updates.
 Product upgrades do not import old Motel data.
 
+The database records the organization setup created as the instance's root.
+An upgrade from an older release records it when the database has exactly one
+organization, and leaves it unset otherwise. Releases before the one that added
+the record refuse every sign-in once a database holds a second organization, so
+do not roll back below it after one exists.
+
 ### Trace sampling
 
 Recording every span made Motel the busiest process under load, so the product

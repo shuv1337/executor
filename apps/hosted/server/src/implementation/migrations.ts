@@ -71,7 +71,7 @@ export const migrationFailed =
  * transaction. The caller owns startup access or the hosted migration lock.
  */
 export const migrateProductSteps = (
-  table: "private_hosted_migrations" | "private_cloud_migrations",
+  table: "private_hosted_migrations" | "private_cloud_migrations" | "private_self_host_migrations",
   steps: Record<string, Effect.Effect<void, unknown, SqlClient.SqlClient>>,
 ) =>
   Effect.gen(function* () {

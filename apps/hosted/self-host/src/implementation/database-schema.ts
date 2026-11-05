@@ -6,6 +6,7 @@ import { makeRegistryStorage } from "@executor-js/app-registry";
 import { Effect, Layer, Redacted } from "effect";
 import { AuthDatabase } from "../contracts/database.ts";
 import { makeAuthDatabase } from "./auth-database.ts";
+import { migrateSelfHostSteps } from "./root-organization.ts";
 /** Acquire one engine and initialize both schemas before exposing services. */
 export const selfHostDatabaseSchema = Layer.effect(
   AuthDatabase,
@@ -21,7 +22,10 @@ export const selfHostDatabaseSchema = Layer.effect(
         database,
         secret: Redacted.value(settings.secret),
       },
-      registry.migrate.pipe(Effect.mapError(migrationFailed("product"))),
+      registry.migrate.pipe(
+        Effect.mapError(migrationFailed("product")),
+        Effect.andThen(migrateSelfHostSteps),
+      ),
     );
     return database;
   }),
