@@ -1568,6 +1568,46 @@ export default defineApp({ user: { accounts: { service } } }, async () => ({ too
           }),
         );
         expect(mintedInside.ok, JSON.stringify(mintedInside)).toBe(true);
+
+        // Nested tools.call: the Executor app calls the API again. The connection must still bind.
+        const nested = (step: string, app: string, body: unknown) =>
+          run(key.key, scoped.id, step, invoke("tools.call", { path: { app }, body }));
+        const nestedWiden = yield* nested("nestedWiden", executorApp.id, {
+          tool: "mcpConnections.create",
+          input: {
+            body: {
+              id: randomUUID(),
+              name: "Nested wider",
+              apps: [executorEntry, meshEntry],
+            },
+          },
+        });
+        expect(nestedWiden, JSON.stringify(nestedWiden)).toMatchObject({
+          ok: false,
+          error: { status: 403, code: "OrganizationForbidden" },
+        });
+        const nestedMint = yield* nested("nestedMint", executorApp.id, {
+          tool: "mcpConnections.mintKey",
+          input: {
+            path: { connection: wide.id },
+            body: { expiresInSeconds: 3600 },
+          },
+        });
+        expect(nestedMint, JSON.stringify(nestedMint)).toMatchObject({
+          ok: false,
+          error: { status: 403, code: "OrganizationForbidden" },
+        });
+        const directMesh = yield* nested("directMesh", mesh.app.id, {
+          tool: "read",
+          input: {},
+        });
+        expect(directMesh, JSON.stringify(directMesh)).toMatchObject({
+          ok: false,
+          error: { status: 403, code: "OrganizationForbidden" },
+        });
+        const afterNested = yield* api.request(actors.admin, "GET", `${prefix}/mcp-connections`);
+        expect(afterNested.status, JSON.stringify(afterNested.body)).toBe(200);
+        expect(JSON.stringify(afterNested.body)).not.toContain("Nested wider");
       }).pipe(Effect.provide(McpClient.layer)),
     ),
   );

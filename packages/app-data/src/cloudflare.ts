@@ -48,6 +48,8 @@ export const FacetInvocation = Schema.Struct({
    */
   concurrent: Schema.Boolean,
   headers: Schema.Record(Schema.String, Schema.String),
+  /** The MCP connection this call arrived on. The facet's outbound is bound to it. */
+  callerConnection: Schema.optionalKey(Schema.String),
 });
 /**
  * The supervisor attaches the revision the invocation observed, whether the invocation
@@ -218,7 +220,11 @@ export const makeFacetSupervisor = (
    * cache belongs to, when it reads its host's API. It substitutes credential handles and applies
    * the host's routing rules.
    */
-  globalOutbound: (app: string, hostApi: HostApiCheck | undefined) => Fetcher,
+  globalOutbound: (
+    app: string,
+    hostApi: HostApiCheck | undefined,
+    callerConnection?: string,
+  ) => Fetcher,
   /**
    * Whether this object is the supervisor named for `app`, from its own ID (for example
    * `state.id.equals(namespace.idFromName(app))`). Its storage is that app's, so it refuses an
@@ -432,7 +438,7 @@ export const makeFacetSupervisor = (
       });
     const select = (
       name: string,
-      invocation: Pick<typeof FacetInvocation.Type, "app" | "hostApi">,
+      invocation: Pick<typeof FacetInvocation.Type, "app" | "hostApi" | "callerConnection">,
       load: () => Promise<typeof FacetBundle.Type>,
       starts: FacetStarts,
     ) =>
@@ -452,7 +458,11 @@ export const makeFacetSupervisor = (
                   compatibilityDate: "2026-07-30",
                   // The strictly-public flag would override this outbound and bypass it.
                   compatibilityFlags: ["nodejs_compat", "no_brotli_content_encoding"],
-                  globalOutbound: globalOutbound(invocation.app, invocation.hostApi),
+                  globalOutbound: globalOutbound(
+                    invocation.app,
+                    invocation.hostApi,
+                    invocation.callerConnection,
+                  ),
                 };
               });
               return { class: worker.getDurableObjectClass("ExecutorAppData") };

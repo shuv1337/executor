@@ -774,6 +774,8 @@ export const makeAppRunner = (host: AppRunnerHost) => {
     Effect.gen(function* () {
       const id = crypto.randomUUID();
       const { command } = invocation;
+      const callerConnection =
+        invocation.callerConnection ?? invocation.caller?.provenance?.connectionId;
       const result = yield* target
         .invoke(
           {
@@ -782,6 +784,7 @@ export const makeAppRunner = (host: AppRunnerHost) => {
             identity,
             cacheNamespace: appCacheNamespace(invocation.build, invocation.hostApi),
             ...(invocation.hostApi === undefined ? {} : { hostApi: invocation.hostApi }),
+            ...(callerConnection === undefined ? {} : { callerConnection }),
             body,
             headers: invocation.headers,
             write:

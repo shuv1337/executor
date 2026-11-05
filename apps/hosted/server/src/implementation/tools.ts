@@ -29,6 +29,7 @@ import { HttpApiBuilder } from "effect/http-api";
 import { HostedApi } from "../contracts/api.ts";
 import { HostedExecutor } from "../contracts/executor.ts";
 import { CurrentUserId, Forbidden } from "../contracts/auth.ts";
+import { OrganizationForbidden } from "../contracts/organization.ts";
 import { CurrentAuthorization } from "../contracts/authorization.ts";
 import {
   browserOnly,
@@ -218,6 +219,15 @@ export const callTool = (input: Parameters<Executor["tools"]["call"]>[0]) =>
     result.status === "approval-required"
       ? Effect.fail(approvalRequired(result))
       : Effect.succeed(result.value),
+  ).pipe(
+    // A nested app call that the calling connection refused must stay a 403, not a tool 502.
+    Effect.mapError((error) =>
+      error._tag === "ToolCallFailed" &&
+      error.response?.status === 403 &&
+      error.response.code === "OrganizationForbidden"
+        ? new OrganizationForbidden()
+        : error,
+    ),
   );
 /**
  * The signed-in person's own run from the dashboard. Its approval is saved with this issuer, so only
