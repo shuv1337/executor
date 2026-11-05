@@ -9,6 +9,7 @@ import { Evidence } from "../support/evidence.ts";
 import { HostedLive, withHostedCase } from "../support/case.ts";
 import { holdQuery, refreshVisiblePage } from "../support/query-transition.ts";
 import { Organization } from "../support/contracts.ts";
+import { Target } from "../support/platform.ts";
 import { scenarios } from "../test-plan.ts";
 
 const Group = Schema.Struct({
@@ -458,12 +459,14 @@ layer(HostedLive, { excludeTestServices: true })("Organization groups", (it) => 
         );
         expect(orgResponse.status).toBe(200);
         const other = yield* body(Organization, orgResponse);
-        yield* Effect.addFinalizer(() =>
-          api.request(actors.owner, "DELETE", `/api/organizations/${other.id}`).pipe(
-            Effect.tap((response) => Effect.sync(() => expect(response.status).toBe(200))),
-            Effect.orDie,
-          ),
-        );
+        // Self-host cannot remove organizations; the scenario's own server is discarded instead.
+        if ((yield* Target).metadata.target === "cloud")
+          yield* Effect.addFinalizer(() =>
+            api.request(actors.owner, "DELETE", `/api/organizations/${other.id}`).pipe(
+              Effect.tap((response) => Effect.sync(() => expect(response.status).toBe(200))),
+              Effect.orDie,
+            ),
+          );
         const prefix = `/api/organizations/${actors.organization.id}/groups`;
         const created = yield* api.request(actors.owner, "POST", prefix, {
           name: `Isolation ${randomUUID().slice(0, 8)}`,
