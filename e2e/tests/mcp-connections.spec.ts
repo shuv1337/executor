@@ -30,6 +30,7 @@ import {
 import { holdTools, untilHeld } from "../support/held-call.ts";
 import { Target } from "../support/platform.ts";
 import { appsManifest } from "../support/apps-release.ts";
+import { managementApp } from "../support/management-app.ts";
 import { targetHosts } from "../support/role-hosts.ts";
 
 const Search = Schema.Struct({
@@ -1220,6 +1221,144 @@ export default defineApp({ user: { accounts: { service } } }, async () => ({ too
           (yield* body(Schema.Array(ConnectionView), ownerListed)).map((item) => item.id),
         ).toContain(ownerConnection.id);
       }),
+    ),
+  );
+
+  it.effect(scenarios.memberConnectionNoWidening.title, (context) =>
+    withHostedCase(
+      context,
+      Effect.gen(function* () {
+        const api = yield* Api,
+          actors = yield* Actors,
+          mcp = yield* McpClient;
+        const prefix = `/api/organizations/${actors.organization.id}`;
+        const { app: executor, account: executorAccount } = yield* managementApp(actors.member);
+        const mesh = yield* deployReadWriteApp;
+        const meshPath = `${prefix}/apps/${mesh.app.id}`;
+        const access = yield* body(
+          Schema.Struct({ revision: Schema.String }),
+          yield* api.request(actors.owner, "GET", `${meshPath}/access`),
+        );
+        expect(
+          (yield* api.request(actors.owner, "PATCH", `${meshPath}/access`, {
+            revision: access.revision,
+            audience: { kind: "everyone" },
+          })).status,
+        ).toBe(200);
+        const executorEntry = {
+          app: executor.id,
+          runsAs: [{ kind: "account", id: executorAccount }],
+          tools: { kind: "all" },
+        };
+        const meshEntry = {
+          app: mesh.app.id,
+          runsAs: [{ kind: "app" }],
+          tools: { kind: "all" },
+        };
+        const save = (name: string, apps: readonly unknown[]) =>
+          Effect.gen(function* () {
+            const created = yield* api.request(actors.member, "POST", `${prefix}/mcp-connections`, {
+              id: randomUUID(),
+              name,
+              apps,
+            });
+            expect(created.status, JSON.stringify(created.body)).toBe(200);
+            return yield* body(ConnectionView, created);
+          });
+        const full = yield* save(`Full ${randomUUID().slice(0, 6)}`, [executorEntry, meshEntry]);
+        const scoped = yield* save(`Scoped ${randomUUID().slice(0, 6)}`, [executorEntry]);
+        const narrowed = yield* save(`Narrow ${randomUUID().slice(0, 6)}`, [
+          { ...executorEntry, tools: { kind: "selected", names: ["mcpConnections.create"] } },
+        ]);
+        const clients: string[] = [];
+        yield* revokeClientGrants(actors.member, () => clients);
+        const agent = (connection: typeof full) =>
+          Effect.gen(function* () {
+            const consent = yield* consentTo(actors.member, connection.url);
+            clients.push(consent.clientId);
+            expect(consent.status, JSON.stringify(consent)).toBe(200);
+            const client = yield* mcp.connect(yield* consent.tokens, connection.id, {
+              connection: connection.id,
+            });
+            const tool = `tools[${JSON.stringify(executor.slug)}]`;
+            const run = (step: string, code: string) =>
+              client
+                .use(step, (session, signal) =>
+                  session.callTool({ name: "execute", arguments: { code } }, undefined, { signal }),
+                )
+                .pipe(
+                  Effect.flatMap((result) =>
+                    Schema.decodeUnknownEffect(
+                      Schema.Struct({
+                        status: Schema.Literal("completed"),
+                        execution: Schema.Struct({
+                          ok: Schema.Literal(true),
+                          value: Schema.Struct({
+                            ok: Schema.Boolean,
+                            error: Schema.optional(Schema.Struct({ status: Schema.Number })),
+                            value: Schema.optional(Schema.Unknown),
+                          }),
+                        }),
+                      }),
+                    )(result.structuredContent),
+                  ),
+                );
+            return { run, tool };
+          });
+        const invoke = (tool: string, method: string, input: unknown) =>
+          `try { return { ok: true, value: await ${tool}.${method}(${JSON.stringify(input)}) }; } catch (error) { return { ok: false, error: JSON.parse(error.message) }; }`;
+        const fullAgent = yield* agent(full);
+        const meshId = randomUUID();
+        const created = yield* fullAgent.run(
+          "A full connection creates a narrower Mesh connection",
+          invoke(fullAgent.tool, "mcpConnections.create", {
+            body: { id: meshId, name: "Mesh seat", apps: [meshEntry] },
+          }),
+        );
+        expect(created.execution.value.ok, JSON.stringify(created.execution.value)).toBe(true);
+        const minted = yield* fullAgent.run(
+          "A full connection mints a key inside its scope",
+          invoke(fullAgent.tool, "mcpConnections.mintKey", {
+            path: { connection: meshId },
+            body: { expiresInSeconds: 3600 },
+          }),
+        );
+        expect(minted.execution.value.ok, JSON.stringify(minted.execution.value)).toBe(true);
+
+        const scopedAgent = yield* agent(scoped);
+        const widened = yield* scopedAgent.run(
+          "A scoped connection cannot create an all-apps connection",
+          invoke(scopedAgent.tool, "mcpConnections.create", {
+            body: {
+              id: randomUUID(),
+              name: "All apps",
+              apps: [executorEntry, meshEntry],
+            },
+          }),
+        );
+        expect(widened.execution.value).toMatchObject({ ok: false, error: { status: 403 } });
+        const widerKey = yield* scopedAgent.run(
+          "A scoped connection cannot mint a key for a wider connection",
+          invoke(scopedAgent.tool, "mcpConnections.mintKey", {
+            path: { connection: full.id },
+            body: { expiresInSeconds: 90 * 24 * 60 * 60 },
+          }),
+        );
+        expect(widerKey.execution.value).toMatchObject({ ok: false, error: { status: 403 } });
+
+        const narrowAgent = yield* agent(narrowed);
+        const unmanaged = yield* narrowAgent.run(
+          "A narrowed connection without manage is refused",
+          invoke(narrowAgent.tool, "mcpConnections.create", {
+            body: {
+              id: randomUUID(),
+              name: "Still narrow",
+              apps: [executorEntry],
+            },
+          }),
+        );
+        expect(unmanaged.execution.value).toMatchObject({ ok: false, error: { status: 403 } });
+      }).pipe(Effect.provide(Layer.mergeAll(McpOAuth.layer, McpClient.layer))),
     ),
   );
 });

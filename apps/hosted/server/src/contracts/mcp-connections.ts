@@ -94,8 +94,10 @@ export const ConnectionKeyNotFound = ApiError.define({
 });
 export type ConnectionKeyNotFound = typeof ConnectionKeyNotFound.Type;
 /**
- * MCP grants, including a connection's own, cannot manage connections: the API refuses MCP tokens.
- * Connections only narrow their owner's own access, so an admin key cannot widen anything.
+ * The API refuses MCP tokens. An Executor app self-call is the caller's managed key plus the
+ * connection the host attached. That connection's policy is the authority: create, update and
+ * mint stay within its apps, tools and runsAs accounts, with no all-apps escalation. A narrowed
+ * connection without manage is refused. A key's lifetime stays within 5 seconds and 90 days.
  */
 export const HostedMcpConnections = HttpApiGroup.make("mcpConnections")
   .add(

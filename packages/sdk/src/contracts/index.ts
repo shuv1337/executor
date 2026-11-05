@@ -21,6 +21,7 @@ export * from "./declarations.ts";
 export * from "./storage.ts";
 export * from "./runtime.ts";
 export * from "./blobs.ts";
+export * from "./caller-connection.ts";
 
 export * from "./schedules.ts";
 export * from "./scheduler.ts";

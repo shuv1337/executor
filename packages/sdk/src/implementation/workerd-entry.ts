@@ -148,6 +148,7 @@ const buildFailed = (stage: RuntimeBuildFailed["stage"], cause: unknown) =>
 const OutboundProps = Schema.Struct({
   app: Schema.NonEmptyString,
   hostApi: Schema.optionalKey(HostApiCheck),
+  callerConnection: Schema.optionalKey(Schema.String),
 });
 type OutboundProps = typeof OutboundProps.Type;
 /** Handles are sealed with a key derived from the secret only this host and its runner share. */
@@ -170,6 +171,7 @@ export class AppOutbound extends WorkerEntrypoint<Environment> {
     return credentialFetch(request, {
       app: props.app,
       ...(props.hostApi === undefined ? {} : { hostApi: props.hostApi }),
+      ...(props.callerConnection === undefined ? {} : { callerConnection: props.callerConnection }),
       key: await Effect.runPromise(credentials(this.env)),
       // Refuse a private destination by name, before the public-only network refuses its
       // address with an error app code cannot tell apart from any other connection failure.
@@ -189,9 +191,13 @@ const OutboundExports = Schema.Struct({
 /** The loopback binding to `AppOutbound` that workerd supplies on every context's exports. */
 const appOutbound =
   (context: { readonly exports: unknown }) =>
-  (app: string, hostApi: HostApiCheck | undefined): Fetcher =>
+  (app: string, hostApi: HostApiCheck | undefined, callerConnection?: string): Fetcher =>
     Schema.decodeUnknownSync(OutboundExports)(context.exports).AppOutbound({
-      props: hostApi === undefined ? { app } : { app, hostApi },
+      props: {
+        app,
+        ...(hostApi === undefined ? {} : { hostApi }),
+        ...(callerConnection === undefined ? {} : { callerConnection }),
+      },
     });
 const rpcOptions = { onSendError: () => new Error("App runtime request failed") };
 const json = Schema.decodeUnknownSync(Schema.Json);

@@ -6825,6 +6825,17 @@ export const scenarios = plan({
       local: na("The shared connections page is exercised through the hosted dashboard."),
     },
   },
+  memberConnectionNoWidening: {
+    fixtures: "actors",
+    file: "mcp-connections.spec.ts",
+    title:
+      "A full member connection can create a narrower Mesh connection through the Executor app, and a scoped connection cannot create an all-apps connection or mint a wider key",
+    targets: {
+      "self-host": scheduled,
+      cloud: scheduled,
+      local: na("Local has one operator and no organization roles or managed Executor keys."),
+    },
+  },
   memberOwnScopedConnections: {
     fixtures: "actors",
     file: "mcp-connections.spec.ts",

@@ -37,6 +37,7 @@
  */
 import { Clock, Effect, Option, Result, Schema } from "effect";
 import { Base64, Hex } from "effect/encoding";
+import { callerConnectionHeader } from "../contracts/caller-connection.ts";
 import {
   NetworkRefused,
   type Placement,
@@ -96,6 +97,11 @@ const Sealed = Schema.Struct({
   exposed: Schema.optionalKey(Schema.Array(Schema.String)),
   /** A managed account's value; see `placeManaged`. Only placed handles carry it. */
   managed: Schema.optionalKey(Schema.Literal(true)),
+  /**
+   * The MCP connection whose invocation sealed this handle, when the call arrived on one. The
+   * outbound copies it onto the host API request. App code never supplies it.
+   */
+  callerConnection: Schema.optionalKey(Schema.String),
 });
 type Sealed = typeof Sealed.Type;
 
@@ -202,7 +208,12 @@ const sealValue = (
 
 const sealAccount = (
   { managed, ...account }: HostAccount,
-  context: { readonly app: string; readonly key: CryptoKey; readonly expires: number },
+  context: {
+    readonly app: string;
+    readonly key: CryptoKey;
+    readonly expires: number;
+    readonly callerConnection?: string;
+  },
 ): Effect.Effect<ResolvedAccount> =>
   Effect.gen(function* () {
     const hosts = account.provider.hosts;
@@ -232,6 +243,9 @@ const sealAccount = (
               exposed: [...exposed].sort(),
               ...(field === undefined ? {} : { field }),
               ...(managed === undefined ? {} : { managed }),
+              ...(managed === undefined || context.callerConnection === undefined
+                ? {}
+                : { callerConnection: context.callerConnection }),
             }),
       });
     const fields = yield* Effect.forEach(Object.entries(account.fields), ([name, value]) =>
@@ -266,7 +280,12 @@ export const unsealedAccounts = (accounts: HostAccounts): ResolvedAccounts | und
  */
 export const sealAccounts = (
   accounts: HostAccounts,
-  context: { readonly app: string; readonly key: Effect.Effect<CryptoKey> },
+  context: {
+    readonly app: string;
+    readonly key: Effect.Effect<CryptoKey>;
+    /** The invoking MCP connection, sealed into managed credentials for this call. */
+    readonly callerConnection?: string;
+  },
 ): Effect.Effect<ResolvedAccounts> =>
   Effect.gen(function* () {
     const unsealed = unsealedAccounts(accounts);
@@ -279,6 +298,9 @@ export const sealAccounts = (
       app: context.app,
       key: yield* context.key,
       expires: (yield* Clock.currentTimeMillis) + handleLifetime,
+      ...(context.callerConnection === undefined
+        ? {}
+        : { callerConnection: context.callerConnection }),
     };
     const sealSlot = (selected: Selected): Effect.Effect<ResolvedAccountSlots[string]> =>
       isMany(selected)
@@ -703,6 +725,12 @@ export interface CredentialOutbound {
   readonly egress: AppEgress;
   /** Send the rewritten request on the host's network. It rejects when that network fails. */
   readonly send: (request: Request) => Promise<Response>;
+  /**
+   * The MCP connection this invocation arrived on. The runner binds it into the app's network,
+   * which is fixed when the Worker loads, so each connection has its own Worker. Requests to this
+   * host's own origin carry it; app code cannot choose a different one.
+   */
+  readonly callerConnection?: string;
   /** The host API revision the invocation's cache belongs to; see `hostApiDocument`. */
   readonly hostApi?: HostApiCheck;
 }
@@ -794,6 +822,13 @@ const scrubbed = (error: unknown, values: ReadonlyMap<string, string>) => {
   return copy;
 };
 
+/** Replace any connection id app code wrote with the one this Worker was loaded for. */
+const stampCaller = (headers: Headers, outbound: CredentialOutbound) => {
+  headers.delete(callerConnectionHeader);
+  if (outbound.callerConnection !== undefined)
+    headers.set(callerConnectionHeader, outbound.callerConnection);
+};
+
 const forward = async (request: Request, outbound: CredentialOutbound): Promise<Response> => {
   const url = new URL(request.url);
   const send = (sent: Request) => outbound.send(sent).catch(sendFailed(request.signal));
@@ -808,15 +843,19 @@ const forward = async (request: Request, outbound: CredentialOutbound): Promise<
     ...[...request.headers].flatMap(([, value]) => handlesWithin(value)),
     ...(body?.complete === true ? handlesIn(body.text) : []),
   ]);
-  if (found.size === 0)
-    return send(
+  if (found.size === 0) {
+    const headers = new Headers(request.headers);
+    stampCaller(headers, outbound);
+    const sent =
       body === undefined
-        ? request
+        ? new Request(request, { headers })
         : new Request(request, {
+            headers,
             body: body.complete ? body.text : body.stream,
             ...(body.complete ? {} : { duplex: "half" }),
-          }),
-    ).then(unmarked);
+          });
+    return send(sent).then(unmarked);
+  }
   // TRACE asks the service to send the request back, credentials included.
   if (request.method.toUpperCase() === "TRACE")
     return networkRefusalResponse(
@@ -895,6 +934,37 @@ const forward = async (request: Request, outbound: CredentialOutbound): Promise<
         ? replaceAll(body.text, encoded(anywhere, encodings[kind ?? "text"]))
         : undefined;
     if (text !== undefined) headers.delete("content-length");
+    const callerConnections = [
+      ...new Set(
+        [...opened.values()].flatMap((sealed) =>
+          sealed.managed === true && sealed.callerConnection !== undefined
+            ? [sealed.callerConnection]
+            : [],
+        ),
+      ),
+    ];
+    // A managed credential is the host's. Drop any connection id app code wrote, then attach the
+    // one sealed for this invocation. Two managed credentials from different connections cannot
+    // share a request.
+    stampCaller(headers, outbound);
+    if ([...opened.values()].some((sealed) => sealed.managed === true)) {
+      if (callerConnections.length > 1) {
+        const provider = [...opened.values()].find((sealed) => sealed.managed === true)?.provider;
+        return networkRefusalResponse(
+          new NetworkRefused({
+            host: url.host,
+            refusal: {
+              reason: "credential_placement",
+              provider: provider ?? "managed",
+              location: callerConnectionHeader,
+            },
+          }),
+        );
+      }
+      headers.delete(callerConnectionHeader);
+      const [callerConnection] = callerConnections;
+      if (callerConnection !== undefined) headers.set(callerConnectionHeader, callerConnection);
+    }
     const response = await send(
       new Request(replaceAll(placed.success.href, encoded(anywhere, encodings.url)), {
         method: request.method,
