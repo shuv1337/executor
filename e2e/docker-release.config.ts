@@ -12,6 +12,7 @@ export default defineConfig({
       "e2e/tests/docker-release-watchdog.spec.ts",
       "e2e/tests/docker-release-app-isolation.spec.ts",
       "e2e/tests/docker-oauth-renewal.spec.ts",
+      "e2e/tests/docker-release-sso-admission.spec.ts",
       "e2e/tests/workflow-engine.spec.ts",
     ],
     testTimeout: 180_000,
