@@ -120,4 +120,83 @@ layer(HostedLive, { excludeTestServices: true })("Self-host organization switche
       }),
     ),
   );
+  it.effect(scenarios.selfHostOrganizationSwitcherCapabilityUnavailable.title, (context) =>
+    withHostedCase(
+      context,
+      Effect.gen(function* () {
+        const actors = yield* Actors,
+          browser = yield* Browser;
+        const root = actors.organization;
+        const origin = targetHosts(yield* Target).browser;
+        let arrived = () => {};
+        const arrival = new Promise<void>((resolve) => {
+          arrived = resolve;
+        });
+        let release = () => {};
+        const held = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        const creation = (page: Page) =>
+          page.getByRole("menuitem", { name: "Create organization", exact: true }).count();
+        const openSwitcher = (page: Page) =>
+          switcher(page)
+            .click()
+            .then(() =>
+              page.getByRole("menuitemradio", { name: "Evidence lab", exact: true }).waitFor(),
+            );
+
+        yield* browser.login(actors.owner);
+        yield* browser.use("Hold the capability answer", (page) =>
+          page.route("**/api/auth/self-host/capabilities", (route) => {
+            arrived();
+            return held.then(() =>
+              route.fulfill({
+                status: 503,
+                contentType: "application/json",
+                body: JSON.stringify({ message: "Authentication is unavailable. Try again." }),
+              }),
+            );
+          }),
+        );
+        yield* browser.use("The owner opens the root's apps", (page) =>
+          page.goto(`${origin}/org/${root.slug}/apps`).then(() => arrival),
+        );
+        expect(
+          yield* browser.use("While the answer is pending, no create action", (page) =>
+            openSwitcher(page).then(() => creation(page)),
+          ),
+        ).toBe(0);
+        yield* browser.checkpoint("No create action while the capability is pending");
+        yield* browser.use("Close the switcher", (page) => page.keyboard.press("Escape"));
+
+        yield* browser.use("The capability answer fails", (page) =>
+          Promise.all([
+            page.waitForResponse((response) =>
+              response.url().endsWith("/api/auth/self-host/capabilities"),
+            ),
+            Promise.resolve().then(release),
+          ]),
+        );
+        expect(
+          yield* browser.use("After a failed answer, no create action", (page) =>
+            openSwitcher(page).then(() => creation(page)),
+          ),
+        ).toBe(0);
+        yield* browser.checkpoint("No create action after the capability fails");
+        yield* browser.use("Close the switcher", (page) => page.keyboard.press("Escape"));
+
+        yield* browser.use("The server answers again", (page) =>
+          page.unroute("**/api/auth/self-host/capabilities"),
+        );
+        expect(
+          yield* browser.use("Reload the root's apps", (page) => openApps(page, origin, root.slug)),
+        ).toEqual({ createOrganization: true });
+        expect(
+          yield* browser.use("Once the server answers, the owner may create", (page) =>
+            openSwitcher(page).then(() => creation(page)),
+          ),
+        ).toBe(1);
+      }),
+    ),
+  );
 });
