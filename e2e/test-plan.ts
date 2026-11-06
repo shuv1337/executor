@@ -227,11 +227,57 @@ export const scenarios = plan({
       local: na("Local has no hosted organizations."),
     },
   },
+  selfHostSetupRace: {
+    legacyStorage: true,
+    file: "self-host-setup-integrity.spec.ts",
+    title:
+      "five callers racing to set up a fresh self-host leave one owner, one organization and one root record",
+    targets: {
+      "self-host": scheduled,
+      cloud: na("Cloud has no instance setup."),
+      local: na("Local has no hosted organizations."),
+    },
+  },
+  selfHostSetupRollback: {
+    legacyStorage: true,
+    file: "self-host-setup-integrity.spec.ts",
+    title:
+      "a self-host setup that fails partway leaves no account, organization or root record, and a retry succeeds",
+    targets: {
+      "self-host": scheduled,
+      cloud: na("Cloud has no instance setup."),
+      local: na("Local has no hosted organizations."),
+    },
+  },
+  selfHostOrganizationCreationForgedCallers: {
+    fixtures: "actors",
+    file: "self-host-organization-creation.spec.ts",
+    title:
+      "self-host organization creation ignores a body naming the owner and refuses the owner's own API key and OAuth token",
+    targets: {
+      "self-host": scheduled,
+      cloud: na("Cloud lets every signed-in account create a team; its onboarding decides."),
+      local: na("Local has no hosted organizations."),
+    },
+  },
   selfHostOrganizationSwitcher: {
     fixtures: "actors",
     file: "self-host-organization-switcher.spec.ts",
     title:
       "the self-host switcher offers creation only to root owners, and switching shows each organization its own apps",
+    targets: {
+      "self-host": scheduled,
+      cloud: na(
+        "Cloud offers creation to every signed-in account; its switcher has its own scenarios.",
+      ),
+      local: na("Local has no hosted organizations."),
+    },
+  },
+  selfHostOrganizationSwitcherCapabilityUnavailable: {
+    fixtures: "actors",
+    file: "self-host-organization-switcher.spec.ts",
+    title:
+      "the self-host switcher offers no creation while the capability answer is pending or failed, and recovers on reload",
     targets: {
       "self-host": scheduled,
       cloud: na(

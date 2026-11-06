@@ -99,6 +99,7 @@
     "e2e:billing": "vitest run --config e2e/billing.config.ts",
     "auth:security": "bun apps/hosted/server/scripts/check-better-auth-security.mjs",
     "e2e:pglite": "vitest run --config e2e/pglite.config.ts",
+    "e2e:root-inspection": "vitest run --config e2e/self-host-root-inspection.config.ts",
     "e2e:dashboard-file-names": "vitest run --config e2e/dashboard-file-names.config.ts",
     "e2e:apps-published": "vitest run --config e2e/apps-published.config.ts",
     "e2e:ci-selection": "vitest run --config e2e/ci-selection.config.ts",
