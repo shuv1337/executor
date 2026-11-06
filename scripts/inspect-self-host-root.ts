@@ -1,7 +1,7 @@
 /**
  * Offline gate for the self-host root organization record.
  *
- *   node scripts/inspect-self-host-root.ts <export.tar> <baseline.json>
+ *   node scripts/inspect-self-host-root.ts [--rollout pr81] <export.tar> <baseline.json>
  *
  * `export.tar` is an `executor-host export` archive of a stopped volume copy: a PGlite
  * data-directory dump, loaded here into an in-memory database, never the live volume.
@@ -13,6 +13,10 @@
  * organization; the organization's owners are exactly the recorded set; and the self-host journal
  * records `1 root_organization`. Nothing is taken from the archive as the expected value.
  *
+ * `--rollout pr81` adds the gate for rolling out #81 onto an install: the archive must hold exactly
+ * one organization, and both journals #81 writes must be exactly the pinned ones, nothing missing
+ * and nothing extra.
+ *
  * Exit codes: 0 pass, 1 gate failed, 2 invalid invocation or baseline, 3 the archive or PGlite
  * could not be used. Output is a fixed report: no rows, SQL errors or stack traces are printed.
  */
@@ -23,6 +27,39 @@ import { dirname, join } from "node:path";
 /** The PGlite the self-host product bundles, and the Postgres major it runs. */
 const pgliteVersion = "0.5.8";
 const postgresMajor = 18;
+
+/**
+ * The journals 7c4922535596a6fe86938a8acbe0078107ce2bca (#81) writes on self-host, in full:
+ * `hostedProductMigrations` in apps/hosted/server/src/implementation/migrations.ts and
+ * `migrateSelfHostSteps` in apps/hosted/self-host/src/implementation/root-organization.ts. Effect's
+ * migrator stores each `<id>_<name>` key as that id and name.
+ */
+const rollouts = {
+  pr81: {
+    organizations: 1,
+    journals: {
+      private_hosted_migrations: [
+        [1, "baseline"],
+        [2, "api_key_memberships"],
+        [3, "upgrade_executor_apps"],
+        [4, "data_steps"],
+        [5, "upgrade_executor_apps"],
+        [6, "upgrade_pinned_executor_apps"],
+        [7, "require_connection_targets"],
+        [8, "oauth_client_access"],
+        [9, "app_account_links"],
+      ],
+      private_self_host_migrations: [[1, "root_organization"]],
+    },
+  },
+} as const satisfies Record<
+  string,
+  {
+    readonly organizations: number;
+    readonly journals: Record<string, ReadonlyArray<readonly [number, string]>>;
+  }
+>;
+type Rollout = (typeof rollouts)[keyof typeof rollouts];
 
 type Baseline = { readonly organizationId: string; readonly ownerUserIds: readonly string[] };
 type Exit = { readonly code: 0 | 1 | 2 | 3; readonly report: Record<string, unknown> };
@@ -75,7 +112,11 @@ const installedPgliteVersion = async (entry: string) => {
   return undefined;
 };
 
-const inspect = async (archivePath: string, baselinePath: string): Promise<Exit> => {
+const inspect = async (
+  archivePath: string,
+  baselinePath: string,
+  rollout: Rollout | undefined,
+): Promise<Exit> => {
   let baselineText: string;
   try {
     baselineText = await readFile(baselinePath, "utf8");
@@ -127,10 +168,14 @@ const inspect = async (archivePath: string, baselinePath: string): Promise<Exit>
         await rows(
           `select table_name as name from information_schema.tables
            where table_schema = 'public'
-             and table_name in ('selfHostRoot', 'private_self_host_migrations', 'organization', 'member')`,
+             and table_name in ('selfHostRoot', 'private_self_host_migrations', 'private_hosted_migrations', 'organization', 'member')`,
         )
       ).map((row) => row.name),
     );
+    const [organizationRows] = tables.has("organization")
+      ? await rows(`select count(*)::int as count from "organization"`)
+      : [];
+    const organizationCount = Number(organizationRows?.count ?? 0);
     const root = tables.has("selfHostRoot")
       ? await rows(`select "id", "organizationId" from "selfHostRoot"`)
       : [];
@@ -173,12 +218,38 @@ const inspect = async (archivePath: string, baselinePath: string): Promise<Exit>
       journalRecordsRootOrganization:
         journal.length === 1 && journal[0]?.name === "root_organization",
     };
+    const rolloutReport: Record<string, unknown> = {};
+    if (rollout !== undefined) {
+      Object.assign(checks, {
+        rolloutExactlyOneOrganization: organizationCount === rollout.organizations,
+      });
+      for (const [table, expected] of Object.entries(rollout.journals)) {
+        const found = tables.has(table)
+          ? (
+              await rows(`select migration_id::int as id, name from ${table} order by migration_id`)
+            ).map((row) => `${Number(row.id)}_${String(row.name)}`)
+          : [];
+        const pinned = expected.map(([id, name]) => `${id}_${name}`);
+        const missing = pinned.filter((entry) => !found.includes(entry));
+        const unexpected = found.filter((entry) => !pinned.includes(entry)).length;
+        Object.assign(checks, {
+          [`rolloutJournal_${table}`]:
+            tables.has(table) &&
+            missing.length === 0 &&
+            unexpected === 0 &&
+            found.length === pinned.length,
+        });
+        rolloutReport[table] = { pinned: pinned.length, found: found.length, missing, unexpected };
+      }
+    }
     const pass = Object.values(checks).every(Boolean);
     return {
       code: pass ? 0 : 1,
       report: {
         gate: pass ? "pass" : "fail",
+        ...(rollout === undefined ? {} : { rollout: "pr81", journals: rolloutReport }),
         pglite: installed,
+        organizationCount,
         rootRows: root.length,
         recordedOwners: baseline.ownerUserIds.length,
         ownersFound: owners.length,
@@ -194,12 +265,23 @@ const inspect = async (archivePath: string, baselinePath: string): Promise<Exit>
   }
 };
 
+const usage =
+  "usage: node scripts/inspect-self-host-root.ts [--rollout pr81] <export.tar> <baseline.json>";
+
 const main = async (): Promise<Exit> => {
-  const args = process.argv.slice(2);
-  if (args.length !== 2 || args.some((arg) => arg === ""))
-    return invalid("usage: node scripts/inspect-self-host-root.ts <export.tar> <baseline.json>");
+  let args = process.argv.slice(2);
+  let rollout: Rollout | undefined;
+  if (args[0] === "--rollout") {
+    const name = args[1];
+    if (name === undefined || !Object.hasOwn(rollouts, name))
+      return invalid(`unknown rollout; expected one of: ${Object.keys(rollouts).join(", ")}`);
+    rollout = rollouts[name as keyof typeof rollouts];
+    args = args.slice(2);
+  }
+  if (args.length !== 2 || args.some((arg) => arg === "" || arg.startsWith("--")))
+    return invalid(usage);
   try {
-    return await inspect(args[0]!, args[1]!);
+    return await inspect(args[0]!, args[1]!, rollout);
   } catch {
     return unusable("inspection failed unexpectedly");
   }

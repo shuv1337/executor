@@ -51,6 +51,38 @@ try {
 }
 `;
 
+/** The full journals 7c4922535596a6fe86938a8acbe0078107ce2bca (#81) writes on self-host. */
+const hostedTable = `create table private_hosted_migrations (migration_id integer primary key, created_at timestamptz not null default now(), name text not null)`;
+const hostedJournal = [
+  "baseline",
+  "api_key_memberships",
+  "upgrade_executor_apps",
+  "data_steps",
+  "upgrade_executor_apps",
+  "upgrade_pinned_executor_apps",
+  "require_connection_targets",
+  "oauth_client_access",
+  "app_account_links",
+].map(
+  (name, index) =>
+    `insert into private_hosted_migrations (migration_id, name) values (${index + 1}, '${name}')`,
+);
+/** An install #81 just upgraded: one organization and exactly the journals #81 writes. */
+const rolloutReady = [
+  ...schema,
+  rootTable,
+  journalTable,
+  hostedTable,
+  `insert into "organization" values ('${root}', 'Root', 'executor')`,
+  `insert into "member" values
+    ('m1', '${root}', 'user-owner-a', 'owner'),
+    ('m2', '${root}', 'user-owner-b', 'owner'),
+    ('m3', '${root}', 'user-admin', 'admin')`,
+  ...recorded,
+  ...journal,
+  ...hostedJournal,
+];
+
 const baseline = (ownerUserIds: readonly string[] = owners, organizationId = root) =>
   JSON.stringify({ version: 1, organizationId, ownerUserIds });
 
@@ -60,6 +92,7 @@ const Report = Schema.Struct({
   missingOwners: Schema.optionalKey(Schema.Array(Schema.String)),
   unexpectedOwners: Schema.optionalKey(Schema.Number),
   checks: Schema.optionalKey(Schema.Record(Schema.String, Schema.Boolean)),
+  journals: Schema.optionalKey(Schema.Record(Schema.String, Schema.Json)),
 });
 
 const workspace = Effect.gen(function* () {
@@ -309,12 +342,12 @@ it.live("the root gate refuses an invalid invocation or baseline before reading 
       yield* refused(
         "no arguments",
         [],
-        "usage: node scripts/inspect-self-host-root.ts <export.tar> <baseline.json>",
+        "usage: node scripts/inspect-self-host-root.ts [--rollout pr81] <export.tar> <baseline.json>",
       );
       yield* refused(
         "three arguments",
         [archive, archive, archive],
-        "usage: node scripts/inspect-self-host-root.ts <export.tar> <baseline.json>",
+        "usage: node scripts/inspect-self-host-root.ts [--rollout pr81] <export.tar> <baseline.json>",
       );
       yield* refused(
         "a missing baseline",
@@ -466,4 +499,122 @@ it.live(
       }),
     ).pipe(Effect.provide(NodeServices.layer)),
   120_000,
+);
+
+it.live(
+  "the #81 rollout gate requires exactly one organization and exactly the journals #81 writes",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const gate = yield* workspace;
+        const known = yield* gate.file(baseline());
+        const ready = yield* gate.archive(rolloutReady);
+        const passed = yield* gate.run(["--rollout", "pr81", ready, known]);
+        expect(passed.code).toBe(0);
+        expect(passed.report).toMatchObject({ gate: "pass" });
+        // The general gate accepts an install that already holds several organizations; the
+        // rollout gate does not.
+        const general = yield* gate.run([
+          yield* gate.archive([...valid, hostedTable, ...hostedJournal]),
+          known,
+        ]);
+        expect(general.code, "general gate with two organizations").toBe(0);
+        const fails = (label: string, statements: readonly string[], failed: readonly string[]) =>
+          Effect.gen(function* () {
+            const result = yield* gate.run([
+              "--rollout",
+              "pr81",
+              yield* gate.archive(statements),
+              known,
+            ]);
+            expect(result.code, label).toBe(1);
+            const checks = result.report.checks ?? {};
+            expect(
+              Object.keys(checks)
+                .filter((name) => checks[name] === false)
+                .toSorted(),
+              label,
+            ).toEqual([...failed].toSorted());
+          });
+        yield* fails(
+          "two organizations",
+          [...rolloutReady, `insert into "organization" values ('org-second', 'Second', 'second')`],
+          ["rolloutExactlyOneOrganization"],
+        );
+        yield* fails(
+          "a hosted journal entry missing",
+          [...rolloutReady, "delete from private_hosted_migrations where migration_id = 9"],
+          ["rolloutJournal_private_hosted_migrations"],
+        );
+        yield* fails(
+          "an extra hosted journal entry",
+          [
+            ...rolloutReady,
+            "insert into private_hosted_migrations (migration_id, name) values (10, 'later_step')",
+          ],
+          ["rolloutJournal_private_hosted_migrations"],
+        );
+        yield* fails(
+          "a hosted journal entry under another name",
+          [
+            ...rolloutReady,
+            "update private_hosted_migrations set name = 'other' where migration_id = 5",
+          ],
+          ["rolloutJournal_private_hosted_migrations"],
+        );
+        yield* fails(
+          "no hosted journal",
+          [...rolloutReady, "drop table private_hosted_migrations"],
+          ["rolloutJournal_private_hosted_migrations"],
+        );
+        yield* fails(
+          "an extra self-host journal entry",
+          [
+            ...rolloutReady,
+            "insert into private_self_host_migrations (migration_id, name) values (2, 'later_step')",
+          ],
+          ["rolloutJournal_private_self_host_migrations"],
+        );
+        yield* fails(
+          "the self-host journal entry missing",
+          [...rolloutReady, "delete from private_self_host_migrations"],
+          ["journalRecordsRootOrganization", "rolloutJournal_private_self_host_migrations"],
+        );
+        const report = yield* gate.run([
+          "--rollout",
+          "pr81",
+          yield* gate.archive([
+            ...rolloutReady,
+            "delete from private_hosted_migrations where migration_id = 9",
+            "insert into private_hosted_migrations (migration_id, name) values (11, 'later_step')",
+          ]),
+          known,
+        ]);
+        expect(report.code).toBe(1);
+        expect(report.report).toMatchObject({
+          journals: {
+            private_hosted_migrations: {
+              pinned: 9,
+              found: 9,
+              missing: ["9_app_account_links"],
+              unexpected: 1,
+            },
+          },
+        });
+        for (const [label, args] of [
+          ["an unknown rollout", ["--rollout", "pr82", ready, known]],
+          ["a rollout without a name", ["--rollout"]],
+        ] as const) {
+          const refused = yield* gate.run(args);
+          expect(refused.code, label).toBe(2);
+          expect(refused.report, label).toEqual({
+            gate: "invalid",
+            reason: "unknown rollout; expected one of: pr81",
+          });
+        }
+        const misplaced = yield* gate.run([ready, known, "--rollout", "pr81"]);
+        expect(misplaced.code, "the option after the paths").toBe(2);
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+  180_000,
 );
