@@ -4,7 +4,7 @@ import { genericOAuth } from "better-auth/plugins/generic-oauth";
 import { organization } from "better-auth/plugins/organization";
 import { Config, Effect, Option, Redacted, Schema } from "effect";
 import { FetchHttpClient, HttpClient, HttpClientResponse } from "effect/http";
-import { selfHostRootSchema } from "./root-organization.ts";
+import { selfHostRoot } from "./root-organization.ts";
 
 const httpsUrl = (message: string) =>
   Schema.String.check(
@@ -121,12 +121,17 @@ export const selfHostAuthOptions = (
   discovery: typeof SsoDiscovery.Type | null,
 ) => {
   const base = authOptions(settings, ipAddressHeaders);
+  const root = selfHostRoot();
   return {
     ...base,
     emailAndPassword: { enabled: true, disableSignUp: true },
     plugins: [
-      organization({ disableOrganizationDeletion: true, allowUserToCreateOrganization: false }),
-      selfHostRootSchema,
+      // Only an owner of the root organization creates another; its creator becomes its owner.
+      organization({
+        disableOrganizationDeletion: true,
+        allowUserToCreateOrganization: (user) => root.ownsRoot(user.id),
+      }),
+      root.plugin,
       ...base.plugins,
       genericOAuth({
         config:
