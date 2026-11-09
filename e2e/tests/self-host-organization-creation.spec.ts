@@ -11,6 +11,10 @@ import { Api, body, type Session } from "../support/api.ts";
 import { HostedLive, withCase, withHostedCase } from "../support/case.ts";
 import { Organization, Resource } from "../support/contracts.ts";
 import { legacyStorage } from "../support/legacy-storage.ts";
+import { McpClient } from "../support/mcp-client.ts";
+import { consentTo } from "../support/mcp-connections.ts";
+import { Target } from "../support/platform.ts";
+import { targetHosts } from "../support/role-hosts.ts";
 import { serverControl } from "../support/server-control.ts";
 import { scenarios } from "../test-plan.ts";
 
@@ -22,6 +26,8 @@ const Members = Schema.Struct({
   ),
 });
 const Configuration = Schema.Struct({ setup: Schema.Boolean });
+const SessionUser = Schema.Struct({ user: Schema.Struct({ id: Schema.String }) });
+const Capabilities = Schema.Struct({ createOrganization: Schema.Boolean });
 
 const create = (session: Session, name: string, headers?: Record<string, string>) =>
   Effect.flatMap(Api, (api) =>
@@ -138,6 +144,92 @@ layer(HostedLive, { excludeTestServices: true })("Self-host organization creatio
           (yield* listed(actors.owner)).map((organization) => organization.id).toSorted(),
         ).toEqual([actors.organization.id, second.id].toSorted());
       }),
+    ),
+  );
+
+  it.effect(scenarios.selfHostOrganizationCreationForgedCallers.title, (context) =>
+    withHostedCase(
+      context,
+      Effect.gen(function* () {
+        const api = yield* Api,
+          actors = yield* Actors,
+          target = yield* Target;
+        const root = actors.organization.id;
+        const anonymous = yield* api.session();
+        const owner = yield* body(
+          SessionUser,
+          yield* api.request(actors.owner, "GET", "/api/auth/get-session"),
+        );
+        const capabilities = (session: Session, headers?: Record<string, string>) =>
+          api.request(session, "GET", "/api/auth/self-host/capabilities", undefined, headers);
+        const answer = (session: Session) =>
+          capabilities(session).pipe(
+            Effect.flatMap((response) => body(Capabilities, response)),
+            Effect.map((value) => value.createOrganization),
+          );
+        expect(yield* answer(actors.owner)).toBe(true);
+        expect(yield* answer(actors.admin)).toBe(false);
+        expect(yield* answer(actors.member)).toBe(false);
+        expect((yield* capabilities(anonymous)).status).toBe(401);
+
+        // Better Auth takes the creator from the session; a body naming the owner changes nothing.
+        const spoof = (session: Session) =>
+          api.request(session, "POST", "/api/auth/organization/create", {
+            name: "Spoofed team",
+            slug: `spoof-${randomUUID().slice(0, 8)}`,
+            keepCurrentActiveOrganization: true,
+            userId: owner.user.id,
+          });
+        expect((yield* spoof(actors.admin)).status).toBe(403);
+        expect((yield* spoof(actors.member)).status).toBe(403);
+        expect((yield* spoof(anonymous)).status).toBe(401);
+
+        const key = yield* body(
+          Key,
+          yield* api.request(actors.owner, "POST", "/api/auth/api-key/create", {
+            name: "Owner key",
+          }),
+        );
+        const consent = yield* consentTo(actors.owner, `${targetHosts(target).mcp}/mcp`, {
+          "x-executor-organization": root,
+        });
+        expect(consent.status, JSON.stringify(consent)).toBe(200);
+        const oauth = yield* consent.tokens;
+        // Each credential is the owner's and valid where it was issued: the API key at the
+        // organization API, the OAuth token, bound to the MCP resource, through an MCP client.
+        expect(
+          (yield* api.request(anonymous, "GET", `/api/organizations/${root}/access`, undefined, {
+            authorization: `Bearer ${Redacted.value(key.key)}`,
+          })).status,
+        ).toBe(200);
+        yield* (yield* McpClient).connect(oauth, "creation-refusal", { organization: root });
+        for (const [label, token] of [
+          ["API key", Redacted.value(key.key)],
+          ["OAuth access token", Redacted.value(oauth)],
+        ] as const) {
+          const bearer = { authorization: `Bearer ${token}`, "x-executor-organization": root };
+          expect((yield* create(anonymous, `${label} team`, bearer)).status, label).toBe(401);
+          expect((yield* capabilities(anonymous, bearer)).status, label).toBe(401);
+          expect(
+            (yield* api.request(
+              anonymous,
+              "POST",
+              "/api/auth/organization/create",
+              {
+                name: `${label} spoof`,
+                slug: `bearer-${randomUUID().slice(0, 8)}`,
+                keepCurrentActiveOrganization: true,
+                userId: owner.user.id,
+              },
+              bearer,
+            )).status,
+            `${label} naming the owner`,
+          ).toBe(401);
+        }
+        expect((yield* listed(actors.owner)).map((organization) => organization.id)).toEqual([
+          root,
+        ]);
+      }).pipe(Effect.provide(McpClient.layer)),
     ),
   );
 

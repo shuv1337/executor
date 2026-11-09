@@ -591,6 +591,7 @@ const suiteConfigs: Record<string, () => Promise<unknown>> = {
   "export-public.config.ts": () => import("./export-public.config.ts"),
   "docker-release.config.ts": () => import("./docker-release.config.ts"),
   "self-host-native.config.ts": () => import("./self-host-native.config.ts"),
+  "self-host-root-inspection.config.ts": () => import("./self-host-root-inspection.config.ts"),
   "installer.config.ts": () => import("./installer.config.ts"),
   "local-bootstrap.config.ts": () => import("./local-bootstrap.config.ts"),
   "npm-launcher.config.ts": () => import("./npm-launcher.config.ts"),
