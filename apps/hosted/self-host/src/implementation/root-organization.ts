@@ -5,7 +5,7 @@
  */
 import type { AuthContext } from "@better-auth/core";
 import type { BetterAuthPlugin } from "better-auth";
-import { APIError } from "better-auth/api";
+import { APIError, createAuthEndpoint, sessionMiddleware } from "better-auth/api";
 import { migrateProductSteps } from "@executor-js/hosted-server/migrations";
 import { Cause, Effect, Exit, Option, Schema } from "effect";
 import { SqlClient } from "effect/sql";
@@ -50,8 +50,19 @@ const ownsRoot = (adapter: AuthContext["adapter"], userId: string) =>
     return Option.isSome(Schema.decodeUnknownOption(Membership)(member));
   });
 
+const runOwnsRoot = (adapter: AuthContext["adapter"], userId: string) =>
+  Effect.runPromiseExit(ownsRoot(adapter, userId)).then(
+    Exit.match({
+      onSuccess: (owns) => owns,
+      onFailure: (cause) => {
+        throw Cause.squash(cause);
+      },
+    }),
+  );
+
 /**
- * The root record's table and the check organization creation asks. It must follow the
+ * The root record's table, the check organization creation asks, and the signed-in user's
+ * answer to it, which the dashboard reads to offer creation. It must follow the
  * organization plugin: Better Auth creates tables in plugin order.
  */
 export const selfHostRoot = () => {
@@ -61,6 +72,19 @@ export const selfHostRoot = () => {
       id: "executor-self-host-root",
       init: (context) => {
         adapter = context.adapter;
+      },
+      endpoints: {
+        selfHostCapabilities: createAuthEndpoint(
+          "/self-host/capabilities",
+          { method: "GET", use: [sessionMiddleware] },
+          async (ctx) =>
+            ctx.json({
+              createOrganization: await runOwnsRoot(
+                ctx.context.adapter,
+                ctx.context.session.user.id,
+              ),
+            }),
+        ),
       },
       schema: {
         [rootModel]: {
@@ -77,16 +101,7 @@ export const selfHostRoot = () => {
       },
     } satisfies BetterAuthPlugin,
     ownsRoot: (userId: string) =>
-      adapter === undefined
-        ? Promise.resolve(false)
-        : Effect.runPromiseExit(ownsRoot(adapter, userId)).then(
-            Exit.match({
-              onSuccess: (owns) => owns,
-              onFailure: (cause) => {
-                throw Cause.squash(cause);
-              },
-            }),
-          ),
+      adapter === undefined ? Promise.resolve(false) : runOwnsRoot(adapter, userId),
   };
 };
 

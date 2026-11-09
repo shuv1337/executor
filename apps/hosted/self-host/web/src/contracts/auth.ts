@@ -28,6 +28,21 @@ const liveConfiguration = browserOnly(
   ),
 );
 
+/**
+ * Whether the signed-in user may create organizations: only owners of the root organization may.
+ * It offers the action only; the server checks again when one is created.
+ */
+export const organizationCreationAtom = browserOnly(
+  BrowserAtoms.atom(
+    authRequest((options) => authClient.$fetch<unknown>("/self-host/capabilities", options)).pipe(
+      Effect.flatMap(
+        Schema.decodeUnknownEffect(Schema.Struct({ createOrganization: Schema.Boolean })),
+      ),
+      Effect.map((capabilities) => capabilities.createOrganization),
+    ),
+  ),
+);
+
 /** The settings the server read for this sign-in page, sent to the browser with it. */
 const entryConfiguration = Atom.make<Option.Option<SignInSettings>>(Option.none()).pipe(
   Atom.serializable({ key: "self-host:sign-in-settings", schema: Schema.Option(SignInSettings) }),
