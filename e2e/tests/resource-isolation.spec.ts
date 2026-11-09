@@ -1,10 +1,11 @@
-/** Real Cloud organizations exercise tenant boundaries through the hosted API. */
+/** Real organizations on one host exercise tenant boundaries through the hosted API. */
 import { expect, layer } from "@effect/vitest";
 import { Effect, Schema } from "effect";
 import { randomUUID } from "node:crypto";
 import { Api, body } from "../support/api.ts";
 import { Actors } from "../support/actors.ts";
 import { HostedLive, withHostedCase } from "../support/case.ts";
+import { Target } from "../support/platform.ts";
 import { App, Resource, Organization } from "../support/contracts.ts";
 import { scenarios } from "../test-plan.ts";
 import { appsManifest } from "../support/apps-release.ts";
@@ -32,12 +33,14 @@ layer(HostedLive, { excludeTestServices: true })("Resource isolation", (it) => {
             keepCurrentActiveOrganization: true,
           }),
         );
-        yield* Effect.addFinalizer(() =>
-          api.request(actors.owner, "DELETE", `/api/organizations/${other.id}`).pipe(
-            Effect.tap((response) => Effect.sync(() => expect(response.status).toBe(200))),
-            Effect.orDie,
-          ),
-        );
+        // Self-host cannot remove organizations; the scenario's own server is discarded instead.
+        if ((yield* Target).metadata.target === "cloud")
+          yield* Effect.addFinalizer(() =>
+            api.request(actors.owner, "DELETE", `/api/organizations/${other.id}`).pipe(
+              Effect.tap((response) => Effect.sync(() => expect(response.status).toBe(200))),
+              Effect.orDie,
+            ),
+          );
         const prefix = `/api/organizations/${actors.organization.id}`,
           foreign = `/api/organizations/${other.id}`;
         const app = yield* body(

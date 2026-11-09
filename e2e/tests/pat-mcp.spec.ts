@@ -9,6 +9,7 @@ import { McpClient } from "../support/mcp-client.ts";
 import { Evidence } from "../support/evidence.ts";
 import { HostedLive, withHostedCase } from "../support/case.ts";
 import { App, Organization } from "../support/contracts.ts";
+import { Target } from "../support/platform.ts";
 import { appsManifest } from "../support/apps-release.ts";
 
 const Token = Schema.Struct({
@@ -553,6 +554,7 @@ layer(HostedLive, { excludeTestServices: true })("PAT MCP", (it) => {
         const api = yield* Api,
           actors = yield* Actors,
           mcp = yield* McpClient;
+        const cloud = (yield* Target).metadata.target === "cloud";
         // A temporary organization, so renaming it moves no other scenario's slug.
         const slug = `pat-rename-${randomUUID().slice(0, 8)}`,
           renamed = `${slug}-renamed`;
@@ -569,7 +571,8 @@ layer(HostedLive, { excludeTestServices: true })("PAT MCP", (it) => {
           Effect.gen(function* () {
             for (const keyId of keys)
               yield* api.request(actors.owner, "POST", "/api/auth/api-key/delete", { keyId });
-            yield* api.request(actors.owner, "DELETE", prefix);
+            // Self-host cannot remove organizations; the scenario's own server is discarded.
+            if (cloud) yield* api.request(actors.owner, "DELETE", prefix);
           }).pipe(Effect.orDie),
         );
         const createdKey = yield* api.request(actors.owner, "POST", "/api/auth/api-key/create", {

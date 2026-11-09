@@ -4,7 +4,7 @@ import { HttpClient, HttpClientRequest } from "effect/http";
 import { randomUUID } from "node:crypto";
 import { Actors } from "../support/actors.ts";
 import { Api, body, type Session } from "../support/api.ts";
-import { Organization } from "../support/contracts.ts";
+import { Organization, Resource } from "../support/contracts.ts";
 import { HostedLive, withHostedCase } from "../support/case.ts";
 import { Target } from "../support/platform.ts";
 import { batchPath } from "../support/read-batches.ts";
@@ -213,9 +213,8 @@ layer(HostedLive, { excludeTestServices: true })("Dashboard batch isolation", (i
         expect(yield* roleOf(demoted[1])).toBe("member");
         expect(demoted[2]?.status).toBe(403);
 
-        if (!cloud) return;
-        // Self-host has one organization. On Cloud, one batch spans organizations where the caller
-        // has different roles, one it does not belong to, and aliases of each.
+        // One batch spans organizations where the caller has different roles, one it does not
+        // belong to, and aliases of each.
         const suffix = randomUUID().slice(0, 8);
         const foreign = yield* body(
           Organization,
@@ -225,22 +224,47 @@ layer(HostedLive, { excludeTestServices: true })("Dashboard batch isolation", (i
             keepCurrentActiveOrganization: true,
           }),
         );
-        yield* Effect.addFinalizer(() =>
-          api
-            .request(actors.owner, "DELETE", `/api/organizations/${foreign.id}`)
-            .pipe(Effect.orDie),
-        );
+        // Self-host cannot remove organizations; the scenario's own server is discarded instead.
+        if (cloud)
+          yield* Effect.addFinalizer(() =>
+            api
+              .request(actors.owner, "DELETE", `/api/organizations/${foreign.id}`)
+              .pipe(Effect.orDie),
+          );
+        // On Cloud the member creates its own organization. On self-host only the root's owners
+        // create, so the owner creates it and invites the member as an administrator.
         const own = yield* body(
           Organization,
-          yield* api.request(actors.member, "POST", "/api/auth/organization/create", {
-            name: "Batch isolation own",
-            slug: `batch-own-${suffix}`,
-            keepCurrentActiveOrganization: true,
-          }),
+          yield* api.request(
+            cloud ? actors.member : actors.owner,
+            "POST",
+            "/api/auth/organization/create",
+            {
+              name: "Batch isolation own",
+              slug: `batch-own-${suffix}`,
+              keepCurrentActiveOrganization: true,
+            },
+          ),
         );
-        yield* Effect.addFinalizer(() =>
-          api.request(actors.member, "DELETE", `/api/organizations/${own.id}`).pipe(Effect.orDie),
-        );
+        if (cloud)
+          yield* Effect.addFinalizer(() =>
+            api.request(actors.member, "DELETE", `/api/organizations/${own.id}`).pipe(Effect.orDie),
+          );
+        else {
+          const invitation = yield* body(
+            Resource,
+            yield* api.request(actors.owner, "POST", "/api/auth/organization/invite-member", {
+              organizationId: own.id,
+              email: "member@example.test",
+              role: "admin",
+            }),
+          );
+          expect(
+            (yield* api.request(actors.member, "POST", "/api/auth/organization/accept-invitation", {
+              invitationId: invitation.id,
+            })).status,
+          ).toBe(200);
+        }
         const mixed = [
           read("organization", "access", { organization: home.id }),
           read("oauthClients", "list", { organization: home.id }),
@@ -267,11 +291,15 @@ layer(HostedLive, { excludeTestServices: true })("Dashboard batch isolation", (i
           const of = (index: number) => answers[order.indexOf(index)];
           expect(mixed.map((_, index) => of(index)?.status)).toEqual(expected);
           const roles = yield* Effect.forEach([0, 4, 6, 8], (index) => roleOf(of(index)));
-          expect(roles).toEqual(["member", "owner", "member", "owner"]);
+          const own = cloud ? "owner" : "admin";
+          expect(roles).toEqual(["member", own, "member", own]);
         }
-        // The owner's batch on the same organizations is answered with the owner's roles.
+        // The owner's batch on the same organizations is answered with the owner's roles. On
+        // self-host the owner created the member's organization, so it belongs to that one too.
         const owner = yield* send(actors.owner, mixed);
-        expect(statuses(owner)).toEqual([200, 200, 200, 200, 403, 403, 200, 200, 403, 200]);
+        expect(statuses(owner)).toEqual(
+          cloud ? [200, 200, 200, 200, 403, 403, 200, 200, 403, 200] : mixed.map(() => 200),
+        );
       }),
     ),
   );
