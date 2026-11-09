@@ -7,6 +7,7 @@
 import { expect, layer } from "@effect/vitest";
 import { Effect, FileSystem, Schema } from "effect";
 import type { Page } from "playwright";
+import { password } from "../support/actors.ts";
 import { Browser } from "../support/browser.ts";
 import { TestLive, withCase } from "../support/case.ts";
 import { startControlledSelfHost } from "../support/managed-server.ts";
@@ -56,7 +57,7 @@ const startSsoInstance = (mode: IdentityMode) =>
       });
       yield* serverControl("start");
     }).pipe(Effect.provideService(Target, instance));
-    // SSO admits members into the instance's organization, so the operator sets it up first.
+    // SSO signs in only people an organization admitted, so the operator sets one up first.
     expect(
       yield* browser.use("Set up the instance", (page) =>
         page
@@ -122,6 +123,71 @@ const expectExplainedRejection = (origin: string, step: string, explanation: str
     expect(yield* session(origin)).toBeNull();
   });
 
+const notMember =
+  "Your account is not a member of this instance. Ask an administrator to invite you.";
+
+/** Invitations are the only way in: the owner, still signed in from setup, invites `email`. */
+const invite = (origin: string, email: string) =>
+  Effect.gen(function* () {
+    const browser = yield* Browser;
+    const [organization] = yield* browser
+      .use("Read the organization", (page) =>
+        page
+          .context()
+          .request.get(`${origin}/api/auth/organization/list`)
+          .then((response) => response.json()),
+      )
+      .pipe(
+        Effect.flatMap(
+          Schema.decodeUnknownEffect(Schema.Array(Schema.Struct({ id: Schema.String }))),
+        ),
+      );
+    if (organization === undefined) return yield* Effect.die("Setup created no organization");
+    return yield* browser
+      .use("Invite the SSO member", (page) =>
+        page
+          .context()
+          .request.post(`${origin}/api/auth/organization/invite-member`, {
+            headers: { origin },
+            data: { organizationId: organization.id, email, role: "member" },
+          })
+          .then((response) => response.json()),
+      )
+      .pipe(Effect.flatMap(Schema.decodeUnknownEffect(Schema.Struct({ id: Schema.String }))));
+  });
+
+/** The invited person registers with a password, then connects SSO, signed in as `mode` says. */
+const connectInvited = (
+  origin: string,
+  idp: Effect.Success<ReturnType<typeof selfHostSsoIdp>>,
+  invitation: { readonly id: string },
+  email: string,
+  mode: IdentityMode,
+) =>
+  Effect.gen(function* () {
+    const browser = yield* Browser;
+    yield* browser.use("Sign out", (page) => page.context().clearCookies());
+    expect(
+      yield* browser.use("The invited member registers", (page) =>
+        page
+          .context()
+          .request.post(`${origin}/api/auth/self-host/register`, {
+            headers: { origin },
+            data: { invitation: invitation.id, email, name: "SSO Member", password },
+          })
+          .then((response) => response.status()),
+      ),
+    ).toBe(200);
+    yield* idp.configure(email, mode);
+    yield* browser.use("Open Security", (page) => page.goto(`${origin}/account/security`));
+    yield* browser.use("Connect the member's SSO account", (page) =>
+      page.getByRole("button", { name: "Connect SSO", exact: true }).click(),
+    );
+    yield* browser.use("Security shows SSO connected", (page) =>
+      page.getByText("Connected. You can sign in with SSO or with your password.").waitFor(),
+    );
+  });
+
 const unverified =
   "Your identity provider did not confirm that this email address is verified. Ask your administrator to have the provider mark it verified.";
 
@@ -185,12 +251,13 @@ layer(TestLive, { excludeTestServices: true })("Self-host SSO", (it) => {
       Effect.gen(function* () {
         const browser = yield* Browser;
         const { idp, origin } = yield* startSsoInstance("valid");
+        const invitation = yield* invite(origin, "member@sso.example.test");
         // Keys are fetched on first use and then cached, so the key redirect comes first.
         yield* idp.configure("jwks-redirect@sso.example.test", "jwks-redirect");
         yield* expectRejectedSignIn(origin, "Signing keys redirected to cleartext");
         yield* idp.configure("token-redirect@sso.example.test", "token-redirect");
         yield* expectRejectedSignIn(origin, "Token exchange redirected to cleartext");
-        yield* idp.configure("member@sso.example.test", "valid");
+        yield* connectInvited(origin, idp, invitation, "member@sso.example.test", "valid");
         yield* continueWithSso(origin, "HTTPS provider");
         yield* browser.use("The admitted member opens the organization", (page) =>
           page.waitForURL(`${origin}/org/*/**`),
@@ -208,13 +275,23 @@ layer(TestLive, { excludeTestServices: true })("Self-host SSO", (it) => {
       Effect.gen(function* () {
         const browser = yield* Browser;
         const { idp, origin } = yield* startSsoInstance("valid");
+        const invitation = yield* invite(origin, "member@sso.example.test");
 
         // UserInfo about another subject does not verify this one's address.
         yield* idp.configure("other-subject@sso.example.test", "userinfo-other-subject");
         yield* expectExplainedRejection(origin, "UserInfo for another subject", unverified);
         yield* browser.checkpoint("SSO refused when UserInfo names another subject");
 
+        // Verification passes, so the refusal is the missing membership, not the address.
         yield* idp.configure("member@sso.example.test", "userinfo-verified");
+        yield* expectExplainedRejection(origin, "Verified at UserInfo, not invited", notMember);
+        yield* connectInvited(
+          origin,
+          idp,
+          invitation,
+          "member@sso.example.test",
+          "userinfo-verified",
+        );
         yield* continueWithSso(origin, "Email verified only at UserInfo");
         yield* browser.use("The member leaves sign-in", (page) =>
           page.waitForURL(
@@ -228,6 +305,48 @@ layer(TestLive, { excludeTestServices: true })("Self-host SSO", (it) => {
           user: expect.objectContaining({ email: "member@sso.example.test", emailVerified: true }),
         });
         yield* browser.checkpoint("SSO member admitted from UserInfo's email_verified");
+      }),
+    ),
+  );
+
+  it.effect(scenarios.selfHostSsoNoAutoJoin.title, (context) =>
+    withCase(
+      context,
+      Effect.gen(function* () {
+        const browser = yield* Browser;
+        const { origin } = yield* startSsoInstance("valid");
+        yield* expectExplainedRejection(
+          origin,
+          "Verified, approved domain, not invited",
+          notMember,
+        );
+        yield* browser.checkpoint("SSO refuses a verified, approved address without a membership");
+        // The refusal created nothing, so the next attempt is refused the same way.
+        yield* expectExplainedRejection(origin, "The same person tries again", notMember);
+        const members = yield* browser.use("The owner lists the members", (page) =>
+          page
+            .context()
+            .request.post(`${origin}/api/auth/sign-in/email`, {
+              headers: { origin },
+              data: { email: "owner@sso.example.test", password },
+            })
+            .then(() => page.context().request.get(`${origin}/api/auth/organization/list`))
+            .then((response) => response.json())
+            .then((organizations: ReadonlyArray<{ readonly id: string }>) =>
+              page
+                .context()
+                .request.get(
+                  `${origin}/api/auth/organization/list-members?organizationId=${organizations[0]?.id ?? ""}`,
+                ),
+            )
+            .then((response) => response.json()),
+        );
+        expect(members).toEqual(
+          expect.objectContaining({
+            total: 1,
+            members: [expect.objectContaining({ role: "owner" })],
+          }),
+        );
       }),
     ),
   );

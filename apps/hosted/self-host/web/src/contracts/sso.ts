@@ -15,7 +15,7 @@ const explanations: Readonly<Record<string, string>> = {
   [SsoRefusal.domainNotAllowed]:
     "This email is not from a domain approved for SSO on this instance. Use an approved account or contact your administrator.",
   [SsoRefusal.notMember]:
-    "Your account is not a member of this instance. Contact your administrator.",
+    "Your account is not a member of this instance. Ask an administrator to invite you.",
   [SsoRefusal.instanceNotReady]:
     "This instance is not set up yet. Ask your administrator to finish setup.",
   // Better Auth links SSO only to an account whose email was verified, and password accounts

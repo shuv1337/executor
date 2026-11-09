@@ -4,6 +4,7 @@ import { genericOAuth } from "better-auth/plugins/generic-oauth";
 import { organization } from "better-auth/plugins/organization";
 import { Config, Effect, Option, Redacted, Schema } from "effect";
 import { FetchHttpClient, HttpClient, HttpClientResponse } from "effect/http";
+import { selfHostRootSchema } from "./root-organization.ts";
 
 const httpsUrl = (message: string) =>
   Schema.String.check(
@@ -125,6 +126,7 @@ export const selfHostAuthOptions = (
     emailAndPassword: { enabled: true, disableSignUp: true },
     plugins: [
       organization({ disableOrganizationDeletion: true, allowUserToCreateOrganization: false }),
+      selfHostRootSchema,
       ...base.plugins,
       genericOAuth({
         config:
