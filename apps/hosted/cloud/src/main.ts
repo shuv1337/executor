@@ -127,11 +127,20 @@ import {
 import { roleHostRoutes } from "./infrastructure/role-hosts.ts";
 import { redirectTo, withRoleHosts } from "./implementation/host-roles.ts";
 import { hasSessionCookie } from "./contracts/browser.ts";
-import { clientMetadataBinding, cloudClientMetadata } from "./infrastructure/client-metadata.ts";
+import {
+  clientMetadataBinding,
+  cloudClientMetadata,
+  deploymentClientMetadata,
+} from "./infrastructure/client-metadata.ts";
 import { appDataSupervisors } from "./infrastructure/app-data.ts";
 import { cloudDevelopment } from "./contracts/development.ts";
-import { requestServices } from "@executor-js/hosted-server";
-import { recordRequestRejections, requestTiming } from "@executor-js/telemetry/http";
+import { recordUnclassifiedRefusals, requestServices } from "@executor-js/hosted-server";
+import {
+  toRequestHttpEffect,
+  recordRequestRejections,
+  requestTiming,
+} from "@executor-js/telemetry/http";
+import { recordClientNetwork } from "./implementation/client-network.ts";
 
 import { appCatalogBinding } from "./infrastructure/app-catalog.ts";
 import { Api } from "./infrastructure/api-worker.ts";
@@ -178,7 +187,7 @@ export default Api.make(
         // Only local e2e Clouds may turn the auth rate limit off; deployed Workers get `false`.
         ...(yield* authRateLimitSwitchBindings),
         // A deployed stage identifies Executor to authorization servers by its own document.
-        ...(origin === undefined ? {} : yield* clientMetadataBinding(origin)),
+        ...(origin === undefined ? {} : yield* clientMetadataBinding.pipe(Effect.orDie)),
         // Every deployed stage lists production's official app feed.
         ...(origin === undefined ? {} : yield* appCatalogBinding),
       },
@@ -432,6 +441,7 @@ export default Api.make(
 
     const egress = yield* cloudEgress;
     const clientMetadata = yield* cloudClientMetadata.pipe(Effect.orDie);
+    const deploymentDocument = yield* deploymentClientMetadata(clientMetadata).pipe(Effect.orDie);
     // The official app feed Add app lists; without it, only the built-in Executor app is listed.
     const catalogFeedUrl = Option.getOrUndefined(
       yield* Config.String("EXECUTOR_CATALOG_URL").pipe(Config.option),
@@ -479,7 +489,7 @@ export default Api.make(
     // for the isolate. Building is synchronous: no other request can see a partial build.
     const buildApi = api.pipe(
       Layer.provide(HttpServer.layerServices),
-      HttpRouter.toHttpEffect,
+      toRequestHttpEffect,
       Effect.provideService(Layer.CurrentMemoMap, memoMap),
     );
     const apiServices = yield* Effect.context<Effect.Services<typeof buildApi>>();
@@ -652,10 +662,11 @@ export default Api.make(
         "/api/oauth/callback",
         cloudAccountCallback(auth.returnsStageAccountCallback),
       ).pipe(HttpRouter.provideRequest(auth.identity)),
+      // The document grants issued before it moved to the edge renew with.
       HttpRouter.add(
         "GET",
         clientMetadataDocumentPath,
-        clientMetadataDocument(clientMetadata),
+        clientMetadataDocument(deploymentDocument),
       ).pipe(HttpRouter.provideRequest(auth.identity)),
       mcpRoutes,
       authorizationServerRoutes,
@@ -669,7 +680,7 @@ export default Api.make(
     // Routes are immutable per isolate; requestServices keeps live auth resources in each event.
     const handle = yield* routes.pipe(
       Layer.provide(HttpServer.layerServices),
-      HttpRouter.toHttpEffect,
+      toRequestHttpEffect,
       Effect.provideService(Layer.CurrentMemoMap, memoMap),
     );
     // Each role host has its own router, built from the same route layers, so it can serve no
@@ -681,7 +692,7 @@ export default Api.make(
       HttpRouter.add("GET", "/.well-known/openai-apps-challenge", openAiAppsChallenge),
     ).pipe(
       Layer.provide(HttpServer.layerServices),
-      HttpRouter.toHttpEffect,
+      toRequestHttpEffect,
       Effect.provideService(Layer.CurrentMemoMap, memoMap),
     );
     const apiHost = yield* Layer.mergeAll(
@@ -695,7 +706,7 @@ export default Api.make(
       withGitAccess(registryRoutes),
     ).pipe(
       Layer.provide(HttpServer.layerServices),
-      HttpRouter.toHttpEffect,
+      toRequestHttpEffect,
       Effect.provideService(Layer.CurrentMemoMap, memoMap),
     );
     // The paths v1's edge forwards from `executor.sh`. Issuer metadata is served here, never
@@ -712,6 +723,8 @@ export default Api.make(
         "/api/oauth/callback",
         cloudAccountCallback(auth.returnsStageAccountCallback),
       ).pipe(HttpRouter.provideRequest(auth.identity)),
+      // The OAuth client metadata document sign-ins start with; its callback is the edge's.
+      HttpRouter.add("GET", clientMetadataDocumentPath, clientMetadataDocument(clientMetadata)),
       withGitAccess(gitRoutes),
       // The public site. Nobody is signed in to v2 on the edge, so `/` is always the site's.
       HttpRouter.add("GET", "/", staticDocument("/index.html")),
@@ -720,7 +733,7 @@ export default Api.make(
       publishedSkillRoutes(authoring),
     ).pipe(
       Layer.provide(HttpServer.layerServices),
-      HttpRouter.toHttpEffect,
+      toRequestHttpEffect,
       Effect.provideService(Layer.CurrentMemoMap, memoMap),
     );
     const roleHosts = withRoleHosts(
@@ -746,6 +759,8 @@ export default Api.make(
         recordRequestRejections,
         reportErrors,
         requestTiming,
+        recordClientNetwork,
+        recordUnclassifiedRefusals,
         // Server-rendered pages read the API through this complete pipeline, in-process.
         withHostPipeline,
         lifetime.http,

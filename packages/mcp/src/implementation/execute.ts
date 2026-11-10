@@ -1030,7 +1030,7 @@ function catalog(
           if (outcome !== undefined) listedAtOnce.set(app.id, outcome);
         }
         yield* settled;
-      }).pipe(Effect.withSpan("mcp.discovery.accounts.batch"));
+      }).pipe(withOperationSpan("mcp.discovery.accounts.batch"));
     /**
      * Read something of an app with the accounts discovery lists it with, recording why it has
      * nothing.
