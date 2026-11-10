@@ -32,6 +32,7 @@ import { Context, Effect, type Exit, Result } from "effect";
 import { HttpServerRequest } from "effect/http";
 import type { AppAccess } from "../contracts/resource-access.ts";
 import { CurrentUserId, Forbidden } from "../contracts/auth.ts";
+import { refuse } from "./auth-telemetry.ts";
 import {
   appAccountReads,
   appLinkedAccounts,
@@ -49,18 +50,21 @@ import {
 /** A person's own decisions come from their signed-in browser, never from an API credential. */
 export const browserOnly = Effect.gen(function* () {
   const request = yield* HttpServerRequest.HttpServerRequest;
-  if (request.headers.authorization !== undefined) return yield* new Forbidden();
+  if (request.headers.authorization !== undefined)
+    return yield* refuse("bearer_not_allowed", new Forbidden());
 });
 /** Membership was checked by middleware; administrative actions require the current role. */
 export const requireOrganizationAdmin = Effect.gen(function* () {
   const organization = yield* CurrentOrganization;
-  if (organization.role === "member") return yield* new OrganizationForbidden();
+  if (organization.role === "member")
+    return yield* refuse("insufficient_role", new OrganizationForbidden());
   return organization;
 });
 /** Only an owner may remove the organization itself. */
 export const requireOrganizationOwner = Effect.gen(function* () {
   const organization = yield* CurrentOrganization;
-  if (organization.role !== "owner") return yield* new OrganizationForbidden();
+  if (organization.role !== "owner")
+    return yield* refuse("insufficient_role", new OrganizationForbidden());
   return organization;
 });
 /** Server-derived owners are the only owners used by hosted HTTP handlers. */

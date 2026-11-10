@@ -668,19 +668,22 @@ export const mcpConnectionStore = (
             : new AuthenticationUnavailable(),
         ),
       ),
+    // A revocation's steps run in Better Auth, which a cancelled request does not stop, so the
+    // call is awaited for its stored outcome.
     revoke: (owner, id) =>
       request(
         (api) => api.revokeMcpConnection({ body: { ...owner, id } }),
-        Schema.Struct({ revoked: Schema.Literal(true) }),
+        Schema.Struct({ revoked: Schema.Literal(true), id: ConnectionIdSchema }),
       ).pipe(
-        // Then delete the keys minted for it, which already stopped working with it.
-        Effect.andThen(
+        // Delete bound keys before acknowledging the completed revocation to the audit.
+        Effect.tap(() =>
           request(
             (api) => api.revokeMcpConnectionKeys({ body: { ...owner, id } }),
             Schema.Struct({ deleted: Schema.Number }),
           ),
         ),
-        Effect.asVoid,
+        Effect.map((revoked) => revoked.id),
+        Effect.uninterruptible,
         Effect.mapError((status) =>
           status === 404
             ? new ConnectionNotFound({ connection: id })
@@ -730,9 +733,10 @@ export const mcpConnectionStore = (
     revokeAgent: (owner, id) =>
       request(
         (api) => api.revokeMcpAgent({ body: { ...owner, id } }),
-        Schema.Struct({ revoked: Schema.Literal(true) }),
+        Schema.Struct({ revoked: Schema.Literal(true), id: GrantId }),
       ).pipe(
-        Effect.asVoid,
+        Effect.map((revoked) => revoked.id),
+        Effect.uninterruptible,
         Effect.mapError((status) =>
           status === 404
             ? new ConnectedAgentNotFound({ agent: id })

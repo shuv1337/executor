@@ -1,5 +1,6 @@
 import { apiKeys, apiKeyManagement } from "./api-keys.ts";
 import { requestAuthentication } from "./batch-authentication.ts";
+import { recordNoSession, recordSessionCredential, refuse } from "./auth-telemetry.ts";
 import {
   CurrentUsage,
   isReadMethod,
@@ -131,7 +132,7 @@ export const sessionPrincipal = (
       readonly name: string;
       readonly email?: string | null | undefined;
     };
-    readonly session: { readonly id: string };
+    readonly session: { readonly id: string; readonly impersonatedBy?: string | null | undefined };
   } | null,
 ) =>
   session === null
@@ -141,6 +142,9 @@ export const sessionPrincipal = (
         sessionId: session.session.id,
         name: session.user.name,
         email: session.user.email ?? null,
+        ...(typeof session.session.impersonatedBy === "string"
+          ? { impersonatedBy: session.session.impersonatedBy }
+          : {}),
       }).pipe(Effect.mapError(() => new AuthenticationUnavailable()));
 
 /** Authenticate each request and reject foreign-origin cookie writes. */
@@ -152,17 +156,21 @@ export const requireUserLive = Layer.effect(
       Effect.gen(function* () {
         const request = yield* HttpServerRequest.HttpServerRequest;
         // Browser-only endpoints never fall back from a presented grant to a cookie.
-        if (request.headers.authorization !== undefined) return yield* new Unauthorized();
+        if (request.headers.authorization !== undefined)
+          return yield* refuse("bearer_not_allowed", new Unauthorized());
         if (
           request.method !== "GET" &&
           request.method !== "HEAD" &&
           request.headers.origin !== auth.origin
         ) {
-          return yield* Effect.fail(new Forbidden());
+          return yield* refuse("origin_mismatch", new Forbidden());
         }
         const identity = yield* requestAuthentication(auth);
-        const principal = yield* identity.current(new Headers(request.headers));
-        if (principal === null) return yield* Effect.fail(new Unauthorized());
+        const headers = new Headers(request.headers);
+        const principal = yield* identity.current(headers);
+        if (principal === null)
+          return yield* Effect.andThen(recordNoSession(headers), Effect.fail(new Unauthorized()));
+        yield* recordSessionCredential(principal);
         const operation = {
           area: group.identifier,
           operation: endpoint.identifier,
