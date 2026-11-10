@@ -25,7 +25,6 @@ import {
   readWriteAppFiles,
   revokeClientGrants,
   TargetRefusal,
-  targetRefusal,
 } from "../support/mcp-connections.ts";
 import { holdTools, untilHeld } from "../support/held-call.ts";
 import { Target } from "../support/platform.ts";
@@ -552,13 +551,20 @@ return { first, second };`,
           }),
         )(result.structuredContent);
         expect(execution.value.first).toBe("granted");
-        // The connection does not allow the replacement, so the call is refused for that and
-        // never runs with it.
+        // The pinned account is no longer linked. Report setup recovery, not an organization
+        // permission failure, and never run with or name the replacement.
         expect(
           yield* Schema.decodeUnknownEffect(Schema.fromJsonString(TargetRefusal))(
             execution.value.second.refused,
           ),
-        ).toEqual(targetRefusal(app.id, replacement));
+        ).toMatchObject({
+          code: "ConnectionAccountUnlinked",
+          status: 409,
+          message: `This connection runs as account ${granted}, which you no longer have linked; relink it, or ask an operator to reset the connection.`,
+          recovery: { action: "Relink the account, or ask an operator to reset the connection." },
+          retryable: false,
+        });
+        expect(execution.value.second.refused).not.toContain(replacement);
       }).pipe(Effect.provide(McpClient.layer)),
     ),
   );

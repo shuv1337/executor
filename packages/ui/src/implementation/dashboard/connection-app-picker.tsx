@@ -33,6 +33,7 @@ export interface Choice {
   /** Underlying accounts, used to apply one account across many apps at once. */
   readonly accounts: readonly AccountId[];
   readonly provider: ProviderId;
+  readonly linked: boolean;
 }
 
 /** Everything an app offers a connection, computed once per inventory rather than per render. */
@@ -65,6 +66,7 @@ export function appChoices(
     .map((account): Choice => ({
       target: { kind: "account", id: account.id, label: account.label || "Unnamed account" },
       description: linked.has(account.id) ? "Linked to this app" : "Links when saved",
+      linked: linked.has(account.id),
       accounts: [account.id],
       provider: account.provider,
     }));
@@ -110,6 +112,17 @@ export function selectionIssue(choices: AppChoices, selection: ConnectionApp): s
   return undefined;
 }
 
+/** Saving can repair a selection whose accounts are still usable but no longer linked. */
+export const selectionUnlinked = (choices: AppChoices, selection: ConnectionApp) =>
+  choices.needsAccount &&
+  selection.targets.length > 0 &&
+  !selection.targets.some((target) =>
+    choices.options.some(
+      (option) =>
+        option.linked && connectionTargetKey(option.target) === connectionTargetKey(target),
+    ),
+  );
+
 /** One dense row per app. Controls appear only once the app is included. */
 export function ConnectionAppRow({
   choices,
@@ -132,6 +145,10 @@ export function ConnectionAppRow({
   const id = useId();
   const { app } = choices;
   const issue = selection === undefined ? undefined : selectionIssue(choices, selection);
+  // Saved accounts can still be available to choose after their app link was removed.
+  // Saving relinks them, so this is a status/recovery hint, not a validation blocker.
+  const unlinked = selection !== undefined && selectionUnlinked(choices, selection);
+  const status = issue ?? (unlinked ? "Needs account — save to relink" : undefined);
   const only = choices.options.length === 1 ? choices.options[0] : undefined;
   const setTools = (tools: ConnectionTools) => {
     if (selection !== undefined) onChange({ ...selection, tools });
@@ -161,14 +178,16 @@ export function ConnectionAppRow({
             </span>
             <span
               className={`block truncate text-xs ${
-                issue === undefined ? "text-muted-foreground" : "text-amber-600 dark:text-amber-400"
+                status === undefined
+                  ? "text-muted-foreground"
+                  : "text-amber-600 dark:text-amber-400"
               }`}
             >
               {renderConnectAccount !== undefined &&
               choices.needsAccount &&
               choices.options.length === 0
                 ? "No connected accounts"
-                : (issue ??
+                : (status ??
                   (!choices.needsAccount
                     ? "No account needed"
                     : choices.options.length === 0

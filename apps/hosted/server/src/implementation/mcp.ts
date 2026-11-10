@@ -6,7 +6,7 @@ import {
 } from "../contracts/product-analytics.ts";
 import { McpSchema } from "effect/ai";
 import { authorizeApp, authorizeSavedTool, authorizeTool } from "./authorization.ts";
-import { callerLinkedAccounts, linkedAccounts } from "./app-accounts.ts";
+import { callerLinkedAccounts, linkedAccounts, requireConnectionAccounts } from "./app-accounts.ts";
 import { GrantForbidden, untargetedLinkRefusal } from "@executor-js/mcp-auth";
 import {
   permittedAppIds,
@@ -189,13 +189,15 @@ export const hostedMcpBackend = Effect.gen(function* () {
       )
         ? yield* discoveryAccounts
         : [];
-      return linkedRequirements(
+      const accounts = linkedRequirements(
         requirements.accounts,
         "user",
         linked
           .filter((account) => account.app === app.id)
           .map((link) => ({ requirement: link.requirement, account: link })),
       );
+      yield* requireConnectionAccounts(app.id, accounts);
+      return accounts;
     });
   const backend = {
     eventDefinitions: (input) =>
@@ -245,6 +247,8 @@ export const hostedMcpBackend = Effect.gen(function* () {
           OrganizationForbidden: () => Effect.fail(new ElicitationFailed({ reason: "forbidden" })),
           AppNotFound: () => Effect.fail(new ElicitationFailed({ reason: "forbidden" })),
           AccountRequired: () => Effect.fail(new ElicitationFailed({ reason: "forbidden" })),
+          ConnectionAccountUnlinked: () =>
+            Effect.fail(new ElicitationFailed({ reason: "forbidden" })),
           AppNotDeployed: () => Effect.fail(new ElicitationFailed({ reason: "forbidden" })),
           VersionNotFound: () => Effect.fail(new ElicitationFailed({ reason: "forbidden" })),
           StorageError: () => Effect.fail(new ElicitationFailed({ reason: "transport" })),

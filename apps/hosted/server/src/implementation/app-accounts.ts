@@ -7,6 +7,8 @@
  */
 import {
   AccountId,
+  CurrentCaller,
+  type LinkedAccounts,
   AccountNotFound,
   AppId,
   StorageError,
@@ -22,12 +24,12 @@ import {
   type Executor,
   type WebhookSourceConfig,
 } from "@executor-js/sdk/core";
-import { permitsAccounts, permittedTargets } from "@executor-js/authorization";
+import { permitsAccounts, permitsApp, permittedTargets } from "@executor-js/authorization";
 import { Effect, Schema } from "effect";
 import type { SqlClient } from "effect/sql";
 import { CurrentUserId } from "../contracts/auth.ts";
 import { CurrentAuthorization } from "../contracts/authorization.ts";
-import { RequirementMismatch } from "../contracts/app-accounts.ts";
+import { ConnectionAccountUnlinked, RequirementMismatch } from "../contracts/app-accounts.ts";
 import { OrganizationForbidden } from "../contracts/organization.ts";
 import {
   AppAccountReads,
@@ -165,6 +167,29 @@ const callerRequirements = (version: AppVersion, links?: CallerLinks) =>
   });
 
 /**
+ * A connection pinned only to accounts cannot run with zero matching user links, even for
+ * many(). Check before resolving plain requirements too, and before MCP's accountless shortcut.
+ * Only name IDs in the caller's own connection policy, never look up another person's account.
+ */
+export const requireConnectionAccounts = (app: AppId, linked: LinkedAccounts) =>
+  Effect.gen(function* () {
+    const policy = yield* CurrentAuthorization;
+    const caller = yield* CurrentCaller;
+    if (caller?.provenance?.connectionId === undefined || !permitsApp(policy, app)) return;
+    const targets = permittedTargets(policy.tools, app);
+    if (targets === undefined || targets.app || Object.keys(linked).length === 0) return;
+    const accounts = [...targets.accounts];
+    const first = accounts[0];
+    if (
+      first !== undefined &&
+      !Object.values(linked).some((requirement) =>
+        requirement.accounts.some((account) => targets.accounts.has(account.id)),
+      )
+    )
+      return yield* new ConnectionAccountUnlinked({ app, accounts: [first, ...accounts.slice(1)] });
+  });
+
+/**
  * The accounts an operation the caller starts runs with, for every requirement of the version,
  * resolved by the shared rules: app requirements from the app links, user requirements from the
  * caller's user links; the newest of a plain requirement, every one of a many() one. The caller's
@@ -172,10 +197,12 @@ const callerRequirements = (version: AppVersion, links?: CallerLinks) =>
  */
 export const versionAccounts = (version: AppVersion, links?: CallerLinks) =>
   Effect.gen(function* () {
+    const requirements = yield* callerRequirements(version, links);
+    yield* requireConnectionAccounts(version.app, requirements.userLinks);
     const resolved = yield* resolveLinkedAccounts({
       app: version.app,
       version: version.version,
-      ...(yield* callerRequirements(version, links)),
+      ...requirements,
     });
     const policy = yield* CurrentAuthorization;
     if (!permitsAccounts(policy, version.app, userAccountIds(resolved)))
