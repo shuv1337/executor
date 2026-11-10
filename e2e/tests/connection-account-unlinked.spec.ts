@@ -137,7 +137,7 @@ export default defineApp({ user: { accounts: { service: service${cardinality ===
             authorization: `Bearer ${Redacted.value(key.key)}`,
             "x-executor-caller-connection": connection.id,
           };
-          const message = `This connection runs as account ${pinned}, which you no longer have linked; relink it, or ask an operator to reset the connection.`;
+          const message = `This connection runs as account ${pinned}, which is no longer linked to this app for you. Relink it, or edit the connection to run as another of your accounts.`;
           const checkMissing = (stage: string) =>
             Effect.gen(function* () {
               for (const suffix of ["", "/index", "/who"]) {
@@ -158,6 +158,11 @@ export default defineApp({ user: { accounts: { service: service${cardinality ===
                   app: app.id,
                   accounts: [pinned],
                   message,
+                  recovery: {
+                    action: "Relink the account, or edit the connection to run as another account.",
+                    instructions:
+                      "Only the connection's owner can fix this; organization admins cannot edit another member's connection. Open the connection under Connect and save it to relink the account it runs as, or choose another of your accounts for this app. Relinking the account on the app's Accounts tab also works. For a single-account app, relinking replaces your current link. Linking a different account does not change which account the connection runs as. Do not change organization roles or bypass account access.",
+                  },
                 });
               }
               const called = yield* api.request(

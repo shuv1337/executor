@@ -560,8 +560,10 @@ return { first, second };`,
         ).toMatchObject({
           code: "ConnectionAccountUnlinked",
           status: 409,
-          message: `This connection runs as account ${granted}, which you no longer have linked; relink it, or ask an operator to reset the connection.`,
-          recovery: { action: "Relink the account, or ask an operator to reset the connection." },
+          message: `This connection runs as account ${granted}, which is no longer linked to this app for you. Relink it, or edit the connection to run as another of your accounts.`,
+          recovery: {
+            action: "Relink the account, or edit the connection to run as another account.",
+          },
           retryable: false,
         });
         expect(execution.value.second.refused).not.toContain(replacement);
