@@ -148,7 +148,32 @@ export function ConnectionAppRow({
   // Saved accounts can still be available to choose after their app link was removed.
   // Saving relinks them, so this is a status/recovery hint, not a validation blocker.
   const unlinked = selection !== undefined && selectionUnlinked(choices, selection);
-  const status = issue ?? (unlinked ? "Needs account — save to relink" : undefined);
+  const replaced = unlinked
+    ? choices.options.filter(
+        (option) =>
+          option.linked &&
+          Object.values(app.requirements.accounts).some(
+            (requirement) =>
+              requirement.scope === "user" &&
+              requirement.cardinality === "one" &&
+              requirement.provider === option.provider,
+          ) &&
+          selection.targets.some((target) =>
+            choices.options.some(
+              (chosen) =>
+                chosen.provider === option.provider &&
+                connectionTargetKey(chosen.target) === connectionTargetKey(target),
+            ),
+          ),
+      )
+    : [];
+  const status =
+    issue ??
+    (unlinked
+      ? replaced.length > 0
+        ? `Needs account — saving replaces ${replaced.map((option) => connectionTargetLabel(option.target)).join(", ")}`
+        : "Needs account — save to relink"
+      : undefined);
   const only = choices.options.length === 1 ? choices.options[0] : undefined;
   const setTools = (tools: ConnectionTools) => {
     if (selection !== undefined) onChange({ ...selection, tools });
@@ -177,6 +202,7 @@ export function ConnectionAppRow({
               {app.name}
             </span>
             <span
+              title={status}
               className={`block truncate text-xs ${
                 status === undefined
                   ? "text-muted-foreground"

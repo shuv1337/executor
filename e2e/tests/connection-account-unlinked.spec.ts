@@ -239,11 +239,36 @@ export default defineApp({ user: { accounts: { service: service${cardinality ===
           });
           expect(general.status, JSON.stringify(general.body)).toBe(200);
           expect(general.body).toEqual([other]);
+          const relinkStatus =
+            cardinality === "one"
+              ? "Needs account — saving replaces Other private label"
+              : "Needs account — save to relink";
+          yield* browser.use("Reopen the connection with another linked account", (page) =>
+            page.reload(),
+          );
+          yield* browser.use("Explain the effect of relinking before saving", (page) =>
+            page.getByText(relinkStatus, { exact: true }).waitFor(),
+          );
+          yield* browser.checkpoint("Relinking with another account already linked");
           // Real app authorization still wins, even with the pinned link missing.
           yield* share("private");
           const forbidden = yield* api.request(session, "GET", `${path}/tools`, undefined, scoped);
           expect(forbidden.status, JSON.stringify(forbidden.body)).toBe(403);
           expect(forbidden.body).toMatchObject({ _tag: "OrganizationForbidden" });
+          yield* share("everyone");
+          yield* browser.use("Save with the relinking consequence disclosed", (page) =>
+            page.getByRole("button", { name: "Save changes", exact: true }).click(),
+          );
+          yield* browser.use("Relinking status clears after saving", (page) =>
+            page.getByText(relinkStatus, { exact: true }).waitFor({ state: "hidden" }),
+          );
+          expect(yield* linkedAccountIds(actors.member, path)).toEqual(
+            cardinality === "one" ? [pinned] : [other, pinned],
+          );
+          expect(
+            (yield* run("Pinned connection recovers with another account present", call))
+              .structuredContent,
+          ).toMatchObject({ execution: { ok: true, value: [pinned] } });
         }).pipe(Effect.provide(McpClient.layer)),
       ),
     );
