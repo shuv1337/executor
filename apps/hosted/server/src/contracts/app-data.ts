@@ -1,3 +1,4 @@
+import { ConnectionAccountUnlinked } from "./app-accounts.ts";
 import { withLegacyKeys } from "@executor-js/utils/legacy-keys";
 import { RequiredAction } from "./authorization.ts";
 /** Authored app operations, scoped to an explicit hosted organization and configured app. */
@@ -18,6 +19,7 @@ const payload = Schema.Struct({
   input: Json,
 }).pipe(withLegacyKeys({ version: "deployment" }));
 const errors = [
+  ConnectionAccountUnlinked,
   ...appDataErrors,
   OrganizationForbidden,
   AuthenticationUnavailable,

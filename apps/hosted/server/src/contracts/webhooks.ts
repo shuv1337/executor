@@ -1,3 +1,4 @@
+import { ConnectionAccountUnlinked } from "./app-accounts.ts";
 import { RequiredAction } from "./authorization.ts";
 /** Organization-authorized management of ordinary app webhook subscriptions. */
 import { Schema } from "effect";
@@ -24,7 +25,7 @@ const app = { organization: OrganizationReference, app: AppId };
 const target = { ...app, subscription: WebhookId };
 const source = { ...app, account: AccountId };
 const path = "/api/organizations/:organization/apps/:app";
-const errors = [...WebhookErrors, OrganizationForbidden] as const;
+const errors = [...WebhookErrors, ConnectionAccountUnlinked, OrganizationForbidden] as const;
 /**
  * Subscriptions and webhook sources run as their actor. Reads and changes of one's own need app
  * use; changing someone else's needs app management. Creating one runs it as the caller. Every

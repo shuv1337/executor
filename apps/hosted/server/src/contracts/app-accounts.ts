@@ -31,6 +31,26 @@ import {
   RequireOrganization,
 } from "./organization.ts";
 
+/** A connection's own pinned accounts are no longer among the caller's usable app links. */
+export const ConnectionAccountUnlinked = UserFacingError.define({
+  tag: "ConnectionAccountUnlinked",
+  status: 409,
+  fields: { app: AppId, accounts: Schema.NonEmptyArray(AccountId) },
+  presentation: ({ accounts }) => ({
+    title: "This connection needs an account",
+    description:
+      accounts.length === 1
+        ? `This connection runs as account ${accounts[0]}, which is no longer linked to this app for you. Relink it, or edit the connection to run as another of your accounts.`
+        : `This connection runs as accounts ${accounts.join(", ")}, none of which are still linked to this app for you. Relink one, or edit the connection to run as another of your accounts.`,
+    recovery: {
+      action: "Relink the account, or edit the connection to run as another account.",
+      instructions:
+        "Only the connection's owner can fix this; organization admins cannot edit another member's connection. Open the connection under Connect and save it to relink the account it runs as, or choose another of your accounts for this app. Relinking the account on the app's Accounts tab also works. For a single-account app, relinking replaces your current link. Linking a different account does not change which account the connection runs as. Do not change organization roles or bypass account access.",
+    },
+  }),
+});
+export type ConnectionAccountUnlinked = typeof ConnectionAccountUnlinked.Type;
+
 const mismatch = {
   requirement: {
     title: "This app has no such account requirement here",

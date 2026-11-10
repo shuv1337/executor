@@ -6947,6 +6947,28 @@ export const scenarios = plan({
       local: na("Local connections are covered by the local scoped connection scenario."),
     },
   },
+  connectionAccountUnlinkedMany: {
+    fixtures: "actors",
+    file: "connection-account-unlinked.spec.ts",
+    title:
+      "Pinned many-account connections report unlinked accounts and recover without changing organization access",
+    targets: {
+      "self-host": scheduled,
+      cloud: scheduled,
+      local: na("Hosted member accounts and authorization."),
+    },
+  },
+  connectionAccountUnlinkedPlain: {
+    fixtures: "actors",
+    file: "connection-account-unlinked.spec.ts",
+    title:
+      "Pinned plain-account connections report unlinked accounts and recover without changing organization access",
+    targets: {
+      "self-host": scheduled,
+      cloud: scheduled,
+      local: na("Hosted member accounts and authorization."),
+    },
+  },
   scopedConnectionAccounts: {
     fixtures: "actors",
     file: "mcp-connections.spec.ts",
@@ -6961,7 +6983,7 @@ export const scenarios = plan({
     fixtures: "actors",
     file: "mcp-connections.spec.ts",
     title:
-      "a scoped connection refuses a call that runs with an account linked in place of the granted one during an execution, as the grant not allowing that account",
+      "a scoped connection refuses a call after its pinned account is replaced during an execution, as an unlinked connection account",
     targets: {
       "self-host": scheduled,
       cloud: scheduled,

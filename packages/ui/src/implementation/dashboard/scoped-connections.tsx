@@ -80,6 +80,7 @@ import {
   accountOption,
   initialSelection,
   selectionIssue,
+  selectionUnlinked,
   type AppChoices,
 } from "./connection-app-picker.tsx";
 import { useIncrementalList } from "./incremental-list.tsx";
@@ -535,7 +536,12 @@ function ConnectionForm<E, EL extends E, ES extends E, ER extends E>({
   );
   const input = connectionInput(draft);
   const creating = stored === undefined;
-  const dirty = creating || JSON.stringify(input) !== JSON.stringify(connectionInput(initial));
+  const relinking = draft.apps.some((selection) => {
+    const choice = choices.get(selection.id);
+    return choice !== undefined && selectionUnlinked(choice, selection);
+  });
+  const dirty =
+    creating || relinking || JSON.stringify(input) !== JSON.stringify(connectionInput(initial));
   const valid = input !== undefined && draft.apps.length > 0 && blocked === 0;
   const setSelection = (id: AppId, next: ConnectionApp | undefined) =>
     setDraft((previous) => ({
@@ -773,6 +779,8 @@ function ConnectionForm<E, EL extends E, ES extends E, ER extends E>({
               </button>
             ) : creating ? (
               `${plural(draft.apps.length, "app")} turned on`
+            ) : relinking ? (
+              "Save to relink this connection's accounts"
             ) : (
               "Unsaved changes"
             )}

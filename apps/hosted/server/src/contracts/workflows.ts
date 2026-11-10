@@ -1,3 +1,4 @@
+import { ConnectionAccountUnlinked } from "./app-accounts.ts";
 /** Organization authorization surrounds app-scoped workflow lifecycle operations. */
 import { withLegacyKeys } from "@executor-js/utils/legacy-keys";
 import { Schema } from "effect";
@@ -21,8 +22,12 @@ import {
 } from "./organization.ts";
 const app = { organization: OrganizationReference, app: AppId };
 const run = { ...app, run: WorkflowRunId };
-const errors = [...WorkflowErrors, OrganizationForbidden] as const;
-const definitionErrors = [...WorkflowDefinitionErrors, OrganizationForbidden] as const;
+const errors = [...WorkflowErrors, ConnectionAccountUnlinked, OrganizationForbidden] as const;
+const definitionErrors = [
+  ...WorkflowDefinitionErrors,
+  ConnectionAccountUnlinked,
+  OrganizationForbidden,
+] as const;
 const path = "/api/organizations/:organization/apps/:app";
 /**
  * Members who can use the app read definitions and start runs with their accounts. Runs belong to

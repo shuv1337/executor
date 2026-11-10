@@ -1,3 +1,4 @@
+import { ConnectionAccountUnlinked } from "./app-accounts.ts";
 import { withLegacyKeys } from "@executor-js/utils/legacy-keys";
 import { RequiredAction } from "./authorization.ts";
 /** Account-dependent discovery and execution within a configured app. */
@@ -54,6 +55,7 @@ import {
 
 const params = { organization: OrganizationReference, app: AppId };
 const discoveryErrors = [
+  ConnectionAccountUnlinked,
   StorageError,
   CredentialsError,
   AppNotFound,

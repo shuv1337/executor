@@ -1,3 +1,4 @@
+import { ConnectionAccountUnlinked } from "./app-accounts.ts";
 /** Organization-aware schedule management, with browser-only human review. */
 import { Context, Effect, Schema } from "effect";
 import { HttpApiEndpoint, HttpApiGroup, OpenApi } from "effect/http-api";
@@ -42,7 +43,12 @@ const organization = { organization: OrganizationReference };
 const app = { ...organization, app: AppId };
 const copy = { ...app, name: Schema.NonEmptyString, copy: ScheduleId };
 const prefix = "/api/organizations/:organization";
-const errors = [...ScheduleErrors, OrganizationForbidden, Forbidden] as const;
+const errors = [
+  ...ScheduleErrors,
+  ConnectionAccountUnlinked,
+  OrganizationForbidden,
+  Forbidden,
+] as const;
 /** How a by-name route picks between the app schedule and the caller's copy; agents read it. */
 const scopeRule =
   "scope \"app\" is the app declaration's one schedule, which runs without a caller with the app's linked accounts; scope \"user\" is the caller's own copy of a user declaration. Without scope, the schedule saved under the name decides; with none saved, the app's declaration; otherwise user. When both the app schedule and the caller's copy are saved under the name, the call fails with ScheduleScopeRequired: retry with scope.";

@@ -1,5 +1,6 @@
 import { withLegacyKeys } from "@executor-js/utils/legacy-keys";
 import { RequiredAction } from "./authorization.ts";
+import { ConnectionAccountUnlinked } from "./app-accounts.ts";
 /** Organization-scoped skill reads expose only the skill directory, never general app source. */
 import { Schema } from "effect";
 import { HttpApiEndpoint, HttpApiGroup } from "effect/http-api";
@@ -16,6 +17,7 @@ import {
 } from "@executor-js/sdk/core";
 import { OrganizationReference, RequireOrganization } from "./organization.ts";
 
+const errors = [...AppSkillErrors, ConnectionAccountUnlinked] as const;
 const app = { organization: OrganizationReference, app: AppId };
 const version = { version: SkillSelection.version, revision: SkillSelection.revision };
 const prefix = "/api/organizations/:organization/apps/:app/skills";
@@ -26,7 +28,7 @@ export const HostedSkills = HttpApiGroup.make("skills")
       params: app,
       query: Schema.Struct(version).pipe(withLegacyKeys({ version: "deployment" })),
       success: AppSkillBundle,
-      error: AppSkillErrors,
+      error: errors,
     }).annotate(RequiredAction, "discover"),
   )
   .add(
@@ -34,7 +36,7 @@ export const HostedSkills = HttpApiGroup.make("skills")
       params: app,
       query: Schema.Struct(version).pipe(withLegacyKeys({ version: "deployment" })),
       success: AppSkillCatalog,
-      error: AppSkillErrors,
+      error: errors,
     }).annotate(RequiredAction, "discover"),
   )
   .add(
@@ -44,7 +46,7 @@ export const HostedSkills = HttpApiGroup.make("skills")
         withLegacyKeys({ version: "deployment" }),
       ),
       success: AppSkillDocument,
-      error: [...AppSkillErrors, AppSkillNotFound],
+      error: [...errors, AppSkillNotFound],
     }).annotate(RequiredAction, "discover"),
   )
   .middleware(RequireOrganization);
