@@ -129,6 +129,15 @@ export const makeToolSearch = (options: {
           definitionDigests.set(definition, computed);
         return computed;
       });
+      // shareListing interns each distinct $defs object. Thousands of tools can use the same
+      // one, so replace its positions with digests once, preserving names and insertion order.
+      const digestedDefinitions = new Map<
+        JsonObject,
+        {
+          readonly named: Record<string, string>;
+          readonly positions: ReadonlyArray<number>;
+        }
+      >();
       const derived: Array<SearchToolRow> = [];
       for (const [index, tool] of listing.items.entries()) {
         const kept: StoredTool = stored.tools[index] ?? tool;
@@ -137,14 +146,22 @@ export const makeToolSearch = (options: {
         const digested = (schema: JsonObject | undefined) =>
           Effect.gen(function* () {
             if (schema === undefined) return null;
-            // Entries, not assignment, so a definition named `__proto__` stays an own entry.
-            const named: Array<[string, string]> = [];
-            for (const [name, at] of Object.entries(objectOf(schema.$defs)))
-              if (typeof at === "number") {
-                positions.add(at);
-                named.push([name, yield* definitionDigest(at)]);
-              }
-            return { ...schema, $defs: Object.fromEntries(named) };
+            const definitions = objectOf(schema.$defs);
+            let found = digestedDefinitions.get(definitions);
+            if (found === undefined) {
+              // Entries, not assignment, so a definition named `__proto__` stays an own entry.
+              const named: Array<[string, string]> = [];
+              const used: number[] = [];
+              for (const [name, at] of Object.entries(definitions))
+                if (typeof at === "number") {
+                  used.push(at);
+                  named.push([name, yield* definitionDigest(at)]);
+                }
+              found = { named: Object.fromEntries(named), positions: used };
+              digestedDefinitions.set(definitions, found);
+            }
+            for (const at of found.positions) positions.add(at);
+            return { ...schema, $defs: found.named };
           });
         const shared = new Set(kept.shared ?? []);
         const input = shared.has("inputSchema") ? yield* digested(kept.inputSchema) : null;
