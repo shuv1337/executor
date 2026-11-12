@@ -10,6 +10,8 @@ import { Target } from "../support/platform.ts";
 import { connectLocalAccount } from "../support/app-accounts.ts";
 import { scenarios } from "../test-plan.ts";
 import { appsManifest } from "../support/apps-release.ts";
+import { pairLocalOperator } from "../support/mcp-consent.ts";
+import { ConnectionView, consentTo, revokeClientGrants } from "../support/mcp-connections.ts";
 
 /** UTF-8 bytes of JSON one search page holds at most. */
 const pageBytes = 25_000;
@@ -74,6 +76,7 @@ const Page = Schema.Struct({
   next: Schema.NullOr(
     Schema.Struct({
       namespace: Schema.optional(Schema.String),
+      query: Schema.optional(Schema.String),
       limit: Schema.optional(Schema.Number),
       offset: Schema.Number,
     }),
@@ -98,6 +101,212 @@ const Executed = <A, I>(value: Schema.Codec<A, I>) =>
   });
 
 layer(TestLive, { excludeTestServices: true })("MCP search concise", (it) => {
+  it.effect(scenarios.mcpSearchDottedPaths.title, (context) =>
+    withCase(
+      context,
+      Effect.gen(function* () {
+        const target = yield* Target,
+          api = yield* Api,
+          mcp = yield* McpClient;
+        const operator = yield* pairLocalOperator;
+        const headers = { authorization: `Bearer ${Redacted.value(target.apiKey)}` };
+        const deployed = yield* operator.send(
+          "POST",
+          "/v1/apps/deploy",
+          {
+            owner: "local",
+            name: `Dotted search ${randomUUID().slice(0, 8)}`,
+            files: [
+              {
+                path: "index.ts",
+                content: `
+import { defineApp, object, query, router } from "apps";
+const list = () => query({ description: "List tenants and their history.", input: object({}) }, async () => []);
+export default defineApp({}, async () => ({ tools: router({
+  tenants: router({ list: list(), history: list(), listAll: list() }),
+  graph: router(Object.fromEntries(Array.from({ length: 6 }, (_, n) => ["list" + n, list()]))),
+}) }));
+`,
+              },
+              appsManifest,
+            ],
+          },
+          headers,
+        );
+        expect(deployed.status, JSON.stringify(deployed.body)).toBe(200);
+        const { app } = yield* body(
+          Schema.Struct({ app: Schema.Struct({ id: Schema.String, slug: Schema.String }) }),
+          deployed,
+        );
+        yield* Effect.addFinalizer(() =>
+          operator.send("DELETE", `/v1/apps/${app.id}`, undefined, headers).pipe(Effect.orDie),
+        );
+        const client = yield* mcp.connect(target.apiKey, "dotted-search");
+        const search =
+          (connection: typeof client) =>
+          (input: { namespace?: string; query?: string; limit?: number; offset?: number }) =>
+            connection
+              .use(`Search ${JSON.stringify(input)}`, (client, signal) =>
+                client.callTool({ name: "search", arguments: input }, undefined, { signal }),
+              )
+              .pipe(
+                Effect.flatMap((result) =>
+                  Schema.decodeUnknownEffect(Page)(result.structuredContent),
+                ),
+              );
+        const full = search(client);
+        const root = `tools[${JSON.stringify(app.slug)}]`;
+        const exactPath = `${root}.tenants.list`;
+        const tenantPaths = ["list", "history", "listAll"]
+          .map((name) => `${root}.tenants.${name}`)
+          .sort();
+        const allPaths = [
+          ...tenantPaths,
+          ...Array.from({ length: 6 }, (_, n) => `${root}.graph.list${n}`),
+        ].sort();
+
+        // Both public discovery entry points resolve the relative path, despite noisy list tools.
+        for (const namespace of [app.slug, root]) {
+          for (const query of ["tenants.list", `${app.slug}.tenants.list`, exactPath]) {
+            const page = yield* full({ namespace, query, limit: 5 });
+            expect(page.items.map((item) => item.path)).toEqual([exactPath]);
+            expect(page.remaining).toBe(0);
+            expect(page.next).toBeNull();
+            const exhausted = yield* full({ namespace, query, offset: 1, limit: 5 });
+            expect(exhausted.items).toEqual([]);
+            expect(exhausted.remaining).toBe(0);
+            expect(exhausted.next).toBeNull();
+          }
+        }
+        const executed = yield* client
+          .use("Relative dotted search inside execute", (client, signal) =>
+            client.callTool(
+              {
+                name: "execute",
+                arguments: {
+                  code: `return await tools.search({ namespace: ${JSON.stringify(app.slug)}, query: "tenants.list", limit: 5 });`,
+                },
+              },
+              undefined,
+              { signal },
+            ),
+          )
+          .pipe(
+            Effect.flatMap((result) =>
+              Schema.decodeUnknownEffect(Executed(Page))(result.structuredContent),
+            ),
+          );
+        expect(executed.execution.value.items.map((item) => item.path)).toEqual([exactPath]);
+        expect(executed.execution.value.remaining).toBe(0);
+        expect(executed.execution.value.next).toBeNull();
+
+        // Bare words and prose still rank every match, even when a leaf has that exact name.
+        // An absent dotted path also falls back to that same ranked, paginated search.
+        for (const [namespace, query, expected] of [
+          [`${app.slug}.tenants`, "list", tenantPaths],
+          [`${app.slug}.tenants`, "history", tenantPaths],
+          [app.slug, "tenants list", allPaths],
+          [app.slug, "missing.list", allPaths],
+          [app.slug, "tenants..list", allPaths],
+        ] as const) {
+          const first = yield* full({ namespace, query, limit: 1 });
+          expect(first.items).toHaveLength(1);
+          expect(expected).toContain(first.items[0]?.path);
+          expect(first.remaining).toBe(expected.length - 1);
+          expect(first.next).toEqual({ namespace, query, limit: 1, offset: 1 });
+          const rest = yield* full({ namespace, query, limit: 100, offset: 1 });
+          expect([...first.items, ...rest.items].map((item) => item.path).sort()).toEqual(expected);
+          expect(rest.remaining).toBe(0);
+          expect(rest.next).toBeNull();
+        }
+        // Neither a full path nor a relative candidate can escape the nested router's `below`.
+        for (const query of ["tenants.list", `${app.slug}.tenants.list`, exactPath]) {
+          const page = yield* full({ namespace: `${app.slug}.graph`, query, limit: 100 });
+          expect(page.items.map((item) => item.path).sort()).toEqual(
+            allPaths.filter((path) => path.startsWith(`${root}.graph.`)),
+          );
+          expect(page.remaining).toBe(0);
+          expect(page.next).toBeNull();
+        }
+
+        // An identifier-only app slug can name both a full path and a relative router.
+        // Distinct tools at both paths make reversing the candidate order observable.
+        const precedenceName = `precedence${randomUUID().slice(0, 8)}`;
+        const precedenceDeployed = yield* operator.send(
+          "POST",
+          "/v1/apps/deploy",
+          {
+            owner: "local",
+            name: precedenceName,
+            files: [
+              {
+                path: "index.ts",
+                content: `
+import { defineApp, object, query, router } from "apps";
+const tenants = () => router({ list: query({ input: object({}) }, async () => []) });
+export default defineApp({}, async () => ({ tools: router({
+  tenants: tenants(),
+  ${precedenceName}: router({ tenants: tenants() }),
+}) }));
+`,
+              },
+              appsManifest,
+            ],
+          },
+          headers,
+        );
+        expect(precedenceDeployed.status, JSON.stringify(precedenceDeployed.body)).toBe(200);
+        const { app: precedenceApp } = yield* body(
+          Schema.Struct({ app: Schema.Struct({ id: Schema.String, slug: Schema.String }) }),
+          precedenceDeployed,
+        );
+        yield* Effect.addFinalizer(() =>
+          operator
+            .send("DELETE", `/v1/apps/${precedenceApp.id}`, undefined, headers)
+            .pipe(Effect.orDie),
+        );
+        expect(precedenceApp.slug).toBe(precedenceName);
+        const precedenceRoot = `tools.${precedenceApp.slug}`;
+        for (const path of ["tenants.list", `${precedenceApp.slug}.tenants.list`]) {
+          const query = `${precedenceApp.slug}.${path}`;
+          const page = yield* full({ namespace: precedenceApp.slug, query });
+          expect(page.items.map((item) => item.path)).toEqual([`${precedenceRoot}.${path}`]);
+          expect(page.remaining).toBe(0);
+          expect(page.next).toBeNull();
+        }
+
+        const clients: string[] = [];
+        yield* revokeClientGrants(operator, () => clients);
+        const created = yield* api.request(operator, "POST", "/dashboard/api/mcp/connections", {
+          id: randomUUID(),
+          name: "Only tenant history",
+          apps: [
+            {
+              app: app.id,
+              runsAs: [{ kind: "app" }],
+              tools: { kind: "selected", names: ["tenants.history"] },
+            },
+          ],
+        });
+        expect(created.status, JSON.stringify(created.body)).toBe(200);
+        const connection = yield* body(ConnectionView, created);
+        const consent = yield* consentTo(operator, connection.url);
+        clients.push(consent.clientId);
+        expect(consent.status).toBe(200);
+        const scoped = search(
+          yield* mcp.connect(yield* consent.tokens, "dotted-search-scoped", {
+            connection: connection.id,
+          }),
+        );
+        for (const query of ["tenants.list", `${app.slug}.tenants.list`, exactPath]) {
+          const page = yield* scoped({ namespace: app.slug, query, limit: 5 });
+          expect(page.items.map((item) => item.path)).toEqual([`${root}.tenants.history`]);
+          expect(page.remaining).toBe(0);
+          expect(page.next).toBeNull();
+        }
+      }).pipe(Effect.provide(McpClient.layer)),
+    ),
+  );
   it.effect(scenarios.mcpSearchConcise.title, (context) =>
     withCase(
       context,

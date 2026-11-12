@@ -23,6 +23,7 @@ import {
   type ToolRouter,
   type ToolSearchItem,
   type ToolSearchListing,
+  type ToolSearchPage,
   type ToolSearchScope,
   type ToolSearchTarget,
 } from "@executor-js/sdk/core";
@@ -472,7 +473,8 @@ type Found = { readonly target: SearchTarget; readonly path: string };
 /**
  * Ranked tools for one search. The backend ranks the rows of every target the namespace reaches,
  * so no listing is loaded to search. A query that is a tool's exact path, or its tool expression,
- * returns only that tool; a query without words lists every tool in target and name order.
+ * returns only that tool. Dotted paths may also be relative to an explicit namespace;
+ * a query without words lists every tool in target and name order.
  */
 const rank = <E extends Error>(
   searchable: Searchable<E>,
@@ -509,26 +511,31 @@ const rank = <E extends Error>(
         ...(below === undefined ? {} : { below }),
       }));
     const query = (input.query ?? "").trim();
-    const path = canonical(query);
-    // The target an exact path names a tool of: the one with the longest path it lies below.
-    const named = targets
-      .filter(({ target }) => path.startsWith(`${target.path}.`))
-      .reduce<SearchTarget | undefined>(
-        (best, { target }) =>
-          best === undefined || target.path.length > best.path.length ? target : best,
-        undefined,
-      );
-    const name = named === undefined ? undefined : toolName(path.slice(named.path.length + 1));
-    const exact = !Schema.is(ToolName)(name)
-      ? undefined
-      : yield* search({
-          targets: searched((target) => [
-            { readOnly: false, names: target === named ? [name] : [] },
-          ]),
-          query: "",
-          offset: 0,
-          limit: 1,
-        });
+    // Full paths and tool expressions take precedence. Only dotted identifiers get a relative
+    // candidate: a leaf word or prose must keep the backend's ranked-list behavior.
+    const paths = [canonical(query)];
+    if (namespace !== "" && /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/.test(query))
+      paths.push(`${namespace}.${query}`);
+    let exact: ToolSearchPage | undefined;
+    for (const path of paths) {
+      // The target an exact path names a tool of: the one with the longest path it lies below.
+      const named = targets
+        .filter(({ target }) => path.startsWith(`${target.path}.`))
+        .reduce<SearchTarget | undefined>(
+          (best, { target }) =>
+            best === undefined || target.path.length > best.path.length ? target : best,
+          undefined,
+        );
+      const name = named === undefined ? undefined : toolName(path.slice(named.path.length + 1));
+      if (!Schema.is(ToolName)(name)) continue;
+      exact = yield* search({
+        targets: searched((target) => [{ readOnly: false, names: target === named ? [name] : [] }]),
+        query: "",
+        offset: 0,
+        limit: 1,
+      });
+      if (exact.items.length > 0) break;
+    }
     const ranked =
       exact !== undefined && exact.items.length > 0
         ? { items: offset === 0 ? exact.items : [], remaining: 0, missing: exact.missing }
