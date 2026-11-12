@@ -34,25 +34,36 @@ export function references(value: JsonValue, found = new Set<string>()): Set<str
  */
 export const bundler = (definitions: Readonly<Record<string, JsonObject>>) => {
   const direct = new Map<string, ReadonlySet<string>>();
+  // Operations often reach the same graph. Walk it once per ordered set of roots, and share
+  // the resulting $defs so catalog validation and encoding also visit it only once. This cache
+  // belongs to this bundler's immutable definitions, never to another revision or account.
+  const closures = new Map<string, JsonObject | null>();
   return (schema: JsonObject): JsonObject => {
-    const reached = new Map<string, JsonObject>();
     const pending = [...references(schema)];
-    for (let name = pending.pop(); name !== undefined; name = pending.pop()) {
-      const definition = Object.hasOwn(definitions, name) ? definitions[name] : undefined;
-      if (definition === undefined || reached.has(name)) continue;
-      reached.set(name, definition);
-      let names = direct.get(name);
-      if (names === undefined) direct.set(name, (names = references(definition)));
-      pending.push(...names);
+    if (pending.length === 0) return schema;
+    const key = JSON.stringify(pending);
+    let bundled = closures.get(key);
+    if (bundled === undefined) {
+      const reached = new Map<string, JsonObject>();
+      for (let name = pending.pop(); name !== undefined; name = pending.pop()) {
+        const definition = Object.hasOwn(definitions, name) ? definitions[name] : undefined;
+        if (definition === undefined || reached.has(name)) continue;
+        reached.set(name, definition);
+        let names = direct.get(name);
+        if (names === undefined) direct.set(name, (names = references(definition)));
+        pending.push(...names);
+      }
+      bundled = reached.size === 0 ? null : Object.fromEntries(reached);
+      closures.set(key, bundled);
     }
-    if (reached.size === 0) return schema;
+    if (bundled === null) return schema;
     const own = schema.$defs;
     return {
       ...schema,
-      $defs: {
-        ...Object.fromEntries(reached),
-        ...(own !== null && typeof own === "object" && !Array.isArray(own) ? own : {}),
-      },
+      $defs:
+        own !== null && typeof own === "object" && !Array.isArray(own)
+          ? { ...bundled, ...own }
+          : bundled,
     };
   };
 };
