@@ -67,6 +67,9 @@ jobs:
       - name: Security scenarios
         run: |
           bun run e2e:self-host -- --test-name 'application_type|fetch without a User-Agent names Executor|cannot create an all-apps connection|cannot widen a connection or mint|fails to load fails only its own reads'
+      # Run the large cold catalog alone, not beside the functional scenarios' servers.
+      - name: Cold MCP discovery
+        run: bun run e2e:self-host --test-name 'Cold MCP discovery serves 8549'
       - name: MCP search scenarios
         run: |
           bun run e2e:local --test-name 'MCP search resolves namespace-relative dotted paths|A broad MCP tool search returns concise pages'
