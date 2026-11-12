@@ -101,6 +101,31 @@ layer(HostedLive, { excludeTestServices: true })("Cold OpenAPI discovery", (it) 
           concurrency: "unbounded",
         });
         yield* search("warm", "Updated");
+        // Faster discovery must not omit the shared cyclic schemas. Read through the public
+        // tool endpoint only after the cold searches, so this cannot prewarm their catalog.
+        const described = yield* body(
+          Schema.Struct({
+            description: Schema.String,
+            inputSchema: Schema.Record(Schema.String, Schema.Json),
+            outputSchema: Schema.Struct({
+              anyOf: Schema.Array(Schema.Struct({ $ref: Schema.String })),
+              $defs: Schema.Record(Schema.String, Schema.Json),
+            }),
+          }),
+          yield* api.request(actors.owner, "GET", `${path}/tools/records.getRecord8548`),
+        );
+        expect(described.description).toBe("Updated record 8548");
+        expect(described.inputSchema).toMatchObject({
+          properties: { query: { properties: { id: { type: "string" } } } },
+        });
+        expect(described.outputSchema.anyOf).toEqual([{ $ref: "#/$defs/Record0" }]);
+        expect(Object.keys(described.outputSchema.$defs)).toHaveLength(601);
+        expect(described.outputSchema.$defs.Record0).toMatchObject({
+          properties: { parent: { $ref: "#/$defs/Root" }, value: { type: "string" } },
+        });
+        expect(described.outputSchema.$defs.Root).toMatchObject({
+          properties: { record599: { $ref: "#/$defs/Record599" } },
+        });
         // Walk public search pages, not the management index, so no prewarm can hide the cold path.
         const paged = yield* client.use("Walk the updated catalog", (client, signal) =>
           client.callTool(
