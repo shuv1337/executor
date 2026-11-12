@@ -1050,6 +1050,16 @@ export const scenarios = plan({
       local: na("Hosted version API scenario"),
     },
   },
+  mcpSearchDottedPaths: {
+    file: "mcp-search-concise.spec.ts",
+    title:
+      "MCP search resolves namespace-relative dotted paths without changing ranked queries or scope",
+    targets: {
+      local: scheduled,
+      "self-host": na("Shared MCP search; covered on local"),
+      cloud: na("Shared MCP search; covered on local"),
+    },
+  },
   mcpSearchConcise: {
     file: "mcp-search-concise.spec.ts",
     title:
