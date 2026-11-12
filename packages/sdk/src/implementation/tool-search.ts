@@ -201,7 +201,9 @@ export const makeToolSearch = (options: {
     Effect.gen(function* () {
       let shared = projections.get(listing);
       if (shared === undefined) {
-        shared = yield* Effect.cached(rows(listing));
+        shared = yield* Effect.cached(
+          rows(listing).pipe(Effect.withSpan("sdk.tools.search.project")),
+        );
         projections.set(listing, shared);
       }
       return yield* shared;
@@ -241,19 +243,21 @@ export const makeToolSearch = (options: {
             ]),
           ].join("\n"),
         );
-        yield* store.write(
-          {
-            listing: id,
-            owner: state.app.owner,
-            app: state.app.id,
-            version: state.version.id,
-            target: yield* stateTarget(state),
-            at,
-            digest: digested,
-            routers: listing.routers,
-          },
-          content,
-        );
+        yield* store
+          .write(
+            {
+              listing: id,
+              owner: state.app.owner,
+              app: state.app.id,
+              version: state.version.id,
+              target: yield* stateTarget(state),
+              at,
+              digest: digested,
+              routers: listing.routers,
+            },
+            content,
+          )
+          .pipe(Effect.withSpan("sdk.tools.search.persist"));
       }).pipe(
         Effect.withSpan("sdk.tools.search.write", {
           attributes: { "executor.app.id": state.app.id, "executor.tools": listing.items.length },
