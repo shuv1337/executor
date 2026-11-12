@@ -229,6 +229,52 @@ export default defineApp({}, async () => ({ tools: router({
           expect(page.next).toBeNull();
         }
 
+        // An identifier-only app slug can name both a full path and a relative router.
+        // Distinct tools at both paths make reversing the candidate order observable.
+        const precedenceName = `precedence${randomUUID().slice(0, 8)}`;
+        const precedenceDeployed = yield* operator.send(
+          "POST",
+          "/v1/apps/deploy",
+          {
+            owner: "local",
+            name: precedenceName,
+            files: [
+              {
+                path: "index.ts",
+                content: `
+import { defineApp, object, query, router } from "apps";
+const tenants = () => router({ list: query({ input: object({}) }, async () => []) });
+export default defineApp({}, async () => ({ tools: router({
+  tenants: tenants(),
+  ${precedenceName}: router({ tenants: tenants() }),
+}) }));
+`,
+              },
+              appsManifest,
+            ],
+          },
+          headers,
+        );
+        expect(precedenceDeployed.status, JSON.stringify(precedenceDeployed.body)).toBe(200);
+        const { app: precedenceApp } = yield* body(
+          Schema.Struct({ app: Schema.Struct({ id: Schema.String, slug: Schema.String }) }),
+          precedenceDeployed,
+        );
+        yield* Effect.addFinalizer(() =>
+          operator
+            .send("DELETE", `/v1/apps/${precedenceApp.id}`, undefined, headers)
+            .pipe(Effect.orDie),
+        );
+        expect(precedenceApp.slug).toBe(precedenceName);
+        const precedenceRoot = `tools.${precedenceApp.slug}`;
+        for (const path of ["tenants.list", `${precedenceApp.slug}.tenants.list`]) {
+          const query = `${precedenceApp.slug}.${path}`;
+          const page = yield* full({ namespace: precedenceApp.slug, query });
+          expect(page.items.map((item) => item.path)).toEqual([`${precedenceRoot}.${path}`]);
+          expect(page.remaining).toBe(0);
+          expect(page.next).toBeNull();
+        }
+
         const clients: string[] = [];
         yield* revokeClientGrants(operator, () => clients);
         const created = yield* api.request(operator, "POST", "/dashboard/api/mcp/connections", {
