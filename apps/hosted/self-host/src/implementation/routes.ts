@@ -58,6 +58,7 @@ import { selfHostApi } from "./api.ts";
 import { selfHostMcp } from "../mcp.ts";
 import { SelfHostAuth } from "../auth.ts";
 import { selfHostAnalytics } from "./product-analytics.ts";
+import { selfHostFeedbackWebhook } from "./feedback-webhook.ts";
 
 import type { SourceTextFile as SourceFile } from "@executor-js/sdk/core";
 import type { selfHostExecutorServices } from "./executor-services.ts";
@@ -74,11 +75,16 @@ export const selfHostRouteMap = <DashboardE, DashboardR>(options: {
     const { skills, egress, executorServices, dashboard } = options;
     const auth = yield* SelfHostAuth.pipe(Effect.provide(executorServices));
     const analytics = yield* selfHostAnalytics;
-    /** Requests and background schedules record through this instance's sink unless it opted out. */
+    const webhook = yield* selfHostFeedbackWebhook(auth.origin);
+    const feedbackSink = analytics?.product ?? (yield* ProductAnalytics);
+    /** The operator's feedback receiver remains available when usage analytics are off. */
     const observed = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-      analytics === undefined
-        ? effect
-        : effect.pipe(Effect.provideService(ProductAnalytics, analytics.product));
+      effect.pipe(
+        Effect.provideService(
+          ProductAnalytics,
+          webhook === undefined ? feedbackSink : { ...feedbackSink, submitFeedback: webhook },
+        ),
+      );
     const scheduler = yield* Effect.gen(function* () {
       const executor = yield* Effect.flatten(HostedExecutor);
       const authorize = yield* ScheduledAuthority;

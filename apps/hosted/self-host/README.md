@@ -161,6 +161,37 @@ organization, and leaves it unset otherwise. Releases before the one that added
 the record refuse every sign-in once a database holds a second organization, so
 do not roll back below it after one exists.
 
+### Operator feedback receiver
+
+Set `EXECUTOR_FEEDBACK_WEBHOOK_URL` to send explicit `feedback.submit` submissions
+from the API and Executor app to your own HTTP(S) receiver. Optionally set
+`EXECUTOR_FEEDBACK_WEBHOOK_SECRET` for an `Authorization: Bearer` header. Keep both
+in your host's secret store; credential-bearing webhook URLs are secrets too.
+Use HTTPS except for a trusted local receiver. URLs with embedded username/password
+credentials are refused; query-string tokens are supported.
+
+The receiver gets a JSON POST containing `message`, `submittedAt` (ISO 8601),
+`organization: { id }`, `user: { id, email? }`, `caller` (available authenticated
+source/client/app attribution), and `instanceOrigin`. Unlike anonymous analytics,
+this intentionally identifies the sender to the instance operator. Never include
+credentials in feedback. `title` ("Executor feedback") and `body` (the first 1,500
+message characters plus the sender) also support notification webhook services
+without a separate adapter. An app's managed API key may identify its owner, not
+the outer agent; unavailable agent attribution is not inferred from message text.
+
+Only a 2xx response within 10 seconds returns `accepted`. Redirects, connection
+failures, timeouts and rejection return `FeedbackUnavailable`, without disclosing
+the receiver URL or response. Delivery is not retried automatically; after an
+ambiguous timeout a caller retry may duplicate feedback. `Idempotency-Key` is a
+unique per-delivery ID, not a deduplication key across separate caller submissions.
+
+The webhook takes precedence over feedback analytics and works even with
+`DO_NOT_TRACK=1`, `EXECUTOR_DISABLE_ANALYTICS=1`, or no analytics destination.
+Other usage analytics are unchanged. With the URL unset or empty, existing
+analytics feedback behavior is unchanged, including `FeedbackDisabled` when
+analytics are unavailable. Submissions are not stored in the product database:
+there is no feedback table, so durable retention belongs to the receiver for now.
+
 ### Trace sampling
 
 Recording every span made Motel the busiest process under load, so the product
