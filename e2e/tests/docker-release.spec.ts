@@ -42,6 +42,117 @@ const pinnedWorkerd = Effect.gen(function* () {
   return `workerd ${manifest.devDependencies.workerd.replace(/^\d+\.(\d{4})(\d{2})(\d{2})\.\d+$/, "$1-$2-$3")}`;
 });
 
+/** Exercise the product Worker, not Bun: workerd supports manual redirects but not error mode. */
+it.live("released image delivers operator feedback with analytics disabled", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const processes = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const image = yield* Config.String("EXECUTOR_E2E_DOCKER_IMAGE");
+      const id = `executor-feedback-${randomBytes(8).toString("hex")}`;
+      const run = (args: readonly string[]) =>
+        processes.string(ChildProcess.make("docker", args, { stderr: "inherit" }));
+      yield* Effect.acquireRelease(run(["volume", "create", id]), () =>
+        run(["volume", "rm", id]).pipe(Effect.orDie),
+      );
+      yield* Effect.acquireRelease(
+        run([
+          "run",
+          "--detach",
+          "--network",
+          "none",
+          "--name",
+          id,
+          "--volume",
+          `${id}:/app/data`,
+          "--env",
+          "BETTER_AUTH_URL=http://localhost:4400",
+          "--env",
+          "DO_NOT_TRACK=1",
+          "--env",
+          "EXECUTOR_FEEDBACK_WEBHOOK_URL=http://127.0.0.1:4567/feedback",
+          "--env",
+          "EXECUTOR_FEEDBACK_WEBHOOK_SECRET=synthetic-native-feedback",
+          image,
+        ]),
+        () => run(["rm", "--force", "--volumes", id]).pipe(Effect.orDie),
+      );
+      // The receiver and HTTP driver share only this container's network namespace.
+      // No host ports, extra Docker networks or external services are used.
+      const result = yield* run([
+        "run",
+        "--rm",
+        "--network",
+        `container:${id}`,
+        "node:24.22.1-bookworm-slim",
+        "node",
+        "--input-type=module",
+        "-e",
+        `
+import assert from "node:assert/strict";
+import { createServer } from "node:http";
+import { setTimeout } from "node:timers/promises";
+const received = [];
+let status = 204;
+const receiver = createServer(async (request, response) => {
+  let text = "";
+  for await (const chunk of request) text += chunk;
+  received.push({ authorization: request.headers.authorization, payload: JSON.parse(text) });
+  response.writeHead(status, { location: "/feedback" });
+  response.end();
+});
+await new Promise(resolve => receiver.listen(4567, "127.0.0.1", resolve));
+try {
+  const origin = "http://localhost:4400";
+  const request = (path, data, cookie) => fetch(origin + path, {
+    method: data === undefined ? "GET" : "POST",
+    headers: { origin, "content-type": "application/json", ...(cookie ? { cookie } : {}) },
+    ...(data === undefined ? {} : { body: JSON.stringify(data) })
+  });
+  let healthy = false;
+  for (let attempt = 0; attempt < 200; attempt++) {
+    try { if ((await request("/health")).ok) { healthy = true; break; } } catch {}
+    await setTimeout(250);
+  }
+  assert.ok(healthy, "native product did not become healthy");
+  const setup = await request("/api/auth/self-host/setup", {
+    name: "Feedback Owner", email: "feedback@example.test",
+    password: "Synthetic-feedback-password-123!", organizationName: "Feedback lab"
+  });
+  assert.equal(setup.status, 200);
+  const cookie = setup.headers.getSetCookie().map(part => part.split(";")[0]).join("; ");
+  const organizations = await request("/api/auth/organization/list", undefined, cookie);
+  const [organization] = await organizations.json();
+  const path = "/api/organizations/" + organization.id + "/feedback";
+  const accepted = await request(path, { message: "Native feedback" }, cookie);
+  assert.equal(accepted.status, 200);
+  assert.deepEqual(await accepted.json(), { status: "accepted" });
+  assert.equal(received.length, 1);
+  assert.equal(received[0].authorization, "Bearer synthetic-native-feedback");
+  assert.equal(received[0].payload.user.email, "feedback@example.test");
+  assert.equal(received[0].payload.organization.id, organization.id);
+  assert.equal(received[0].payload.message, "Native feedback");
+  assert.equal(received[0].payload.instanceOrigin, origin);
+  for (const failure of [302, 503]) {
+    status = failure;
+    const rejected = await request(path, { message: "Native receiver failure" }, cookie);
+    assert.equal(rejected.status, 503);
+    assert.equal((await rejected.json())._tag, "FeedbackUnavailable");
+  }
+  assert.equal(received.length, 3, "redirect was followed or delivery retried");
+  console.log("Native feedback: accepted, attributed, redirects and failures refused");
+} finally {
+  receiver.closeAllConnections();
+  await new Promise(resolve => receiver.close(resolve));
+}
+        `,
+      ]);
+      expect(result).toContain(
+        "Native feedback: accepted, attributed, redirects and failures refused",
+      );
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
 for (const mode of ["explicit", "local", "railway"] as const)
   it.live(`released image keeps login and encrypted credentials across restart (${mode})`, () =>
     Effect.scoped(

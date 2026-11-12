@@ -1,7 +1,7 @@
 # Send feedback
 
-Executor's team reads feedback from agents and the people they work for. Send
-it with the Executor app's `feedback.submit` tool. Find its path with
+Executor's team reads feedback from agents and the people they work for. A
+self-host operator may configure their own receiver instead. Send feedback with the Executor app's `feedback.submit` tool. Find its path with
 `tools.search` and its signature with `tools.search.describe`. Hosted Executor
 also needs the organization from `context.get`.
 If the tool reports that feedback is disabled on this instance, skip it.

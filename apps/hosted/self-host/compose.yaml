@@ -17,6 +17,9 @@ services:
       SSO_CLIENT_SECRET: ${SSO_CLIENT_SECRET:-}
       SSO_ALLOWED_DOMAINS: ${SSO_ALLOWED_DOMAINS:-}
       EXECUTOR_ENCRYPTION_KEY:
+      # Optional operator-owned feedback receiver, independent of anonymous analytics.
+      EXECUTOR_FEEDBACK_WEBHOOK_URL:
+      EXECUTOR_FEEDBACK_WEBHOOK_SECRET:
       # Optional client-IP assertion, accepted only from the configured proxy peers.
       EXECUTOR_TRUSTED_PROXY_HEADER:
       EXECUTOR_TRUSTED_PROXIES:

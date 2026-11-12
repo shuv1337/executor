@@ -3218,6 +3218,30 @@ export const scenarios = plan({
       local: na("Local feedback has no organization; the local analytics scenario covers it."),
     },
   },
+  feedbackWebhook: {
+    fixtures: "actors",
+    file: "feedback-webhook.spec.ts",
+    title: "self-host feedback webhook awaits acceptance and preserves analytics fallback",
+    managementApps: ["owner"],
+    targets: {
+      "self-host": scheduled,
+      cloud: na("Operator feedback webhooks are self-host only."),
+      local: na("Operator feedback webhooks are self-host only."),
+    },
+  },
+  feedbackWebhookOptOut: {
+    fixtures: "actors",
+    file: "feedback-webhook.spec.ts",
+    title:
+      "self-host feedback webhook works with analytics disabled and surfaces receiver failures",
+    managementApps: ["owner"],
+    serverEnvironment: { DO_NOT_TRACK: "1" },
+    targets: {
+      "self-host": scheduled,
+      cloud: na("Operator feedback webhooks are self-host only."),
+      local: na("Operator feedback webhooks are self-host only."),
+    },
+  },
   selfHostAnalytics: {
     fixtures: "actors",
     file: "instance-analytics.spec.ts",
