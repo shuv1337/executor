@@ -129,6 +129,15 @@ export const makeToolSearch = (options: {
           definitionDigests.set(definition, computed);
         return computed;
       });
+      // shareListing interns each distinct $defs object. Thousands of tools can use the same
+      // one, so replace its positions with digests once, preserving names and insertion order.
+      const digestedDefinitions = new Map<
+        JsonObject,
+        {
+          readonly named: Record<string, string>;
+          readonly positions: ReadonlyArray<number>;
+        }
+      >();
       const derived: Array<SearchToolRow> = [];
       for (const [index, tool] of listing.items.entries()) {
         const kept: StoredTool = stored.tools[index] ?? tool;
@@ -137,14 +146,22 @@ export const makeToolSearch = (options: {
         const digested = (schema: JsonObject | undefined) =>
           Effect.gen(function* () {
             if (schema === undefined) return null;
-            // Entries, not assignment, so a definition named `__proto__` stays an own entry.
-            const named: Array<[string, string]> = [];
-            for (const [name, at] of Object.entries(objectOf(schema.$defs)))
-              if (typeof at === "number") {
-                positions.add(at);
-                named.push([name, yield* definitionDigest(at)]);
-              }
-            return { ...schema, $defs: Object.fromEntries(named) };
+            const definitions = objectOf(schema.$defs);
+            let found = digestedDefinitions.get(definitions);
+            if (found === undefined) {
+              // Entries, not assignment, so a definition named `__proto__` stays an own entry.
+              const named: Array<[string, string]> = [];
+              const used: number[] = [];
+              for (const [name, at] of Object.entries(definitions))
+                if (typeof at === "number") {
+                  used.push(at);
+                  named.push([name, yield* definitionDigest(at)]);
+                }
+              found = { named: Object.fromEntries(named), positions: used };
+              digestedDefinitions.set(definitions, found);
+            }
+            for (const at of found.positions) positions.add(at);
+            return { ...schema, $defs: found.named };
           });
         const shared = new Set(kept.shared ?? []);
         const input = shared.has("inputSchema") ? yield* digested(kept.inputSchema) : null;
@@ -172,6 +189,25 @@ export const makeToolSearch = (options: {
       }
       return { tools: derived, definitions: stored.definitions };
     });
+  /**
+   * Cold readers share the evaluated listing with its background writer. Derive its rows once,
+   * not once per waiter: expanding and hashing shared schema definitions dominates large
+   * catalogs. The cached effect shares in-flight work and stops it only when every reader leaves;
+   * the weak key releases the projection with the immutable listing. Writes and target checks
+   * remain per caller, so a later write still repairs missing or superseded rows.
+   */
+  const projections = new WeakMap<ToolListing, ReturnType<typeof rows>>();
+  const projected = (listing: ToolListing) =>
+    Effect.gen(function* () {
+      let shared = projections.get(listing);
+      if (shared === undefined) {
+        shared = yield* Effect.cached(
+          rows(listing).pipe(Effect.withSpan("sdk.tools.search.project")),
+        );
+        projections.set(listing, shared);
+      }
+      return yield* shared;
+    });
   return {
     /** The kept rows of the state's listing, if any. */
     listing: (state: InvocationSnapshot, listing: ToolSearchListing) =>
@@ -194,7 +230,7 @@ export const makeToolSearch = (options: {
      */
     write: (state: InvocationSnapshot, id: ToolSearchListing, listing: ToolListing, at: number) =>
       Effect.gen(function* () {
-        const content = yield* rows(listing);
+        const content = yield* projected(listing);
         const digested = yield* digest(
           [
             JSON.stringify(listing.routers),
@@ -207,19 +243,21 @@ export const makeToolSearch = (options: {
             ]),
           ].join("\n"),
         );
-        yield* store.write(
-          {
-            listing: id,
-            owner: state.app.owner,
-            app: state.app.id,
-            version: state.version.id,
-            target: yield* stateTarget(state),
-            at,
-            digest: digested,
-            routers: listing.routers,
-          },
-          content,
-        );
+        yield* store
+          .write(
+            {
+              listing: id,
+              owner: state.app.owner,
+              app: state.app.id,
+              version: state.version.id,
+              target: yield* stateTarget(state),
+              at,
+              digest: digested,
+              routers: listing.routers,
+            },
+            content,
+          )
+          .pipe(Effect.withSpan("sdk.tools.search.persist"));
       }).pipe(
         Effect.withSpan("sdk.tools.search.write", {
           attributes: { "executor.app.id": state.app.id, "executor.tools": listing.items.length },

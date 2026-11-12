@@ -604,7 +604,9 @@ export const liveOpenapiRouter = (options: OpenapiSourceOptions): RouterDeclarat
   // is released before the parts are written.
   const serialize = (context: CacheLoadContext) =>
     Effect.gen(function* () {
-      const { revision, meta, compiled } = yield* compile(context);
+      const { revision, meta, compiled } = yield* compile(context).pipe(
+        Effect.withSpan("app.openapi.compile"),
+      );
       // oxlint-disable-next-line executor/authored-code-through-adapter -- scheduler yield
       yield* Effect.promise(yieldToRuntime);
       const summaries = paginate(compiled.operations.map(summaryOf));
@@ -664,7 +666,9 @@ export const liveOpenapiRouter = (options: OpenapiSourceOptions): RouterDeclarat
     });
   const refresh = (context: CacheLoadContext) =>
     Effect.gen(function* () {
-      const { manifest, batches, retained, retainedBytes } = yield* serialize(context);
+      const { manifest, batches, retained, retainedBytes } = yield* serialize(context).pipe(
+        Effect.withSpan("app.openapi.serialize"),
+      );
       // Revision keys are immutable and independent. Await every write before
       // publishing the manifest, without serializing their network round trips.
       yield* Effect.forEach(
@@ -1015,17 +1019,21 @@ export const liveOpenapiRouter = (options: OpenapiSourceOptions): RouterDeclarat
     list: () =>
       withRevision((manifest) =>
         Effect.gen(function* () {
-          const all = yield* operationsFor(manifest);
+          const all = yield* operationsFor(manifest).pipe(
+            Effect.withSpan("app.openapi.operations"),
+          );
           if (all === undefined) return undefined;
-          const definitions = yield* definitionsFor(manifest, all);
+          const definitions = yield* definitionsFor(manifest, all).pipe(
+            Effect.withSpan("app.openapi.definitions"),
+          );
           if (definitions === undefined) return undefined;
           const bundle = bundler(definitions);
           const request = createRequest(options);
-          return {
+          return yield* Effect.sync(() => ({
             value: all
               .filter((op) => request.available(op, options.account))
               .map((operation) => describe(operation, bundle)),
-          };
+          })).pipe(Effect.withSpan("app.openapi.schemas"));
         }),
       ),
     summaries: () =>

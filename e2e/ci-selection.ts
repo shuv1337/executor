@@ -62,7 +62,7 @@ class SelectionFailed extends Schema.TaggedError<SelectionFailed>()("SelectionFa
 const claude = "Claude Code connects";
 const inventoryLoad = "concurrent owners and admins save every account";
 const catalogScale =
-  "MCP execute over 7,000 tools|MCP execute pays for a slow app|MCP execute remembers a stalled|MCP execute serves a search from rows past|MCP execute reports an app whose aged";
+  "Cold MCP discovery serves 8549|MCP execute over 7,000 tools|MCP execute pays for a slow app|MCP execute remembers a stalled|MCP execute serves a search from rows past|MCP execute reports an app whose aged";
 
 /**
  * Each output feeds one `--test-name` in checks.yml. Full runs use these patterns unchanged.

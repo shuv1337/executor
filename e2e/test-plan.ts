@@ -6245,6 +6245,16 @@ export const scenarios = plan({
       local: na("The module counts are read from Cloud's delivered traces."),
     },
   },
+  coldOpenapiDiscovery: {
+    fixtures: "actors",
+    file: "cold-openapi-discovery.spec.ts",
+    title: "Cold MCP discovery serves 8549 generated OpenAPI tools after activation",
+    targets: {
+      "self-host": scheduled,
+      cloud: na("Exercises the shared listing and OpenAPI runtime on an isolated self-host."),
+      local: na("Uses the shared SDK through the hosted API."),
+    },
+  },
   largeOpenapiApp: {
     fixtures: "actors",
     file: "large-openapi-app.spec.ts",

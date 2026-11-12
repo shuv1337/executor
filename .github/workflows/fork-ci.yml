@@ -67,6 +67,24 @@ jobs:
       - name: Security scenarios
         run: |
           bun run e2e:self-host -- --test-name 'application_type|fetch without a User-Agent names Executor|cannot create an all-apps connection|cannot widen a connection or mint|fails to load fails only its own reads'
+      # Run the large cold catalog alone, not beside the functional scenarios' servers.
+      - name: Cold MCP discovery
+        run: bun run e2e:self-host --test-name 'Cold MCP discovery serves 8549'
+      - name: Cold discovery phase timings
+        if: always()
+        run: |
+          node --input-type=module <<'JS'
+          import { globSync, readFileSync } from "node:fs";
+          for (const file of globSync(".local/e2e/**/telemetry.json")) {
+            for (const trace of JSON.parse(readFileSync(file, "utf8"))) {
+              const spans = (trace.data ?? []).map(row => row.span).filter(span =>
+                /app\.|sdk\.tools|mcp\.|MCP|build.*load|runtime/.test(span.operationName));
+              console.log(JSON.stringify({file, id: trace.id, spans: spans.map(s => ({
+                phase: s.operationName, ms: s.durationMs, start: s.startTime
+              }))}));
+            }
+          }
+          JS
       - name: MCP search scenarios
         run: |
           bun run e2e:local --test-name 'MCP search resolves namespace-relative dotted paths|A broad MCP tool search returns concise pages'
