@@ -172,6 +172,23 @@ export const makeToolSearch = (options: {
       }
       return { tools: derived, definitions: stored.definitions };
     });
+  /**
+   * Cold readers share the evaluated listing with its background writer. Derive its rows once,
+   * not once per waiter: expanding and hashing shared schema definitions dominates large
+   * catalogs. The cached effect shares in-flight work and stops it only when every reader leaves;
+   * the weak key releases the projection with the immutable listing. Writes and target checks
+   * remain per caller, so a later write still repairs missing or superseded rows.
+   */
+  const projections = new WeakMap<ToolListing, ReturnType<typeof rows>>();
+  const projected = (listing: ToolListing) =>
+    Effect.gen(function* () {
+      let shared = projections.get(listing);
+      if (shared === undefined) {
+        shared = yield* Effect.cached(rows(listing));
+        projections.set(listing, shared);
+      }
+      return yield* shared;
+    });
   return {
     /** The kept rows of the state's listing, if any. */
     listing: (state: InvocationSnapshot, listing: ToolSearchListing) =>
@@ -194,7 +211,7 @@ export const makeToolSearch = (options: {
      */
     write: (state: InvocationSnapshot, id: ToolSearchListing, listing: ToolListing, at: number) =>
       Effect.gen(function* () {
-        const content = yield* rows(listing);
+        const content = yield* projected(listing);
         const digested = yield* digest(
           [
             JSON.stringify(listing.routers),
