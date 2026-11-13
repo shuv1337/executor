@@ -206,18 +206,23 @@ const prepare = (state: DurableObjectState, env: Environment) =>
     }).pipe(Effect.provideContext(common));
   });
 
+/** Media types of bodies that stay open until the client leaves: live app queries, MCP and NDJSON. */
+const openEnded = new Set(["text/event-stream", "application/x-ndjson"]);
+
 /**
  * workerd never cancels a Durable Object's response body when the client leaves; the request
- * signal is the only notice. Cancel the body then, so a streamed response, such as a live app
- * query, stops its work and releases its connections instead of running until a restart. The
- * handler gets a request without that signal, so a client that leaves never interrupts its writes.
+ * signal is the only notice. Cancel an open-ended body then, so a live app query stops its work
+ * and releases its connections instead of running until a restart. Every other body ends on its
+ * own and keeps its length, which the host's compression reads. The handler gets a request
+ * without that signal, so a client that leaves never interrupts its writes.
  */
 const endsWithClient = async (
   request: Request,
   handle: (request: Request) => Promise<Response>,
 ): Promise<Response> => {
   const response = await handle(new Request(request, { signal: null }));
-  if (response.body === null) return response;
+  const media = response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase();
+  if (response.body === null || media === undefined || !openEnded.has(media)) return response;
   const relay = new TransformStream<Uint8Array, Uint8Array>();
   response.body.pipeTo(relay.writable, { signal: request.signal }).catch(() => undefined);
   return new Response(relay.readable, response);

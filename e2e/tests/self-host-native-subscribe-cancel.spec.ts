@@ -93,7 +93,10 @@ const subscribe = (origin: string, host: string, cookie: string, version: string
   driver(
     "open an app subscription",
     () =>
-      new Promise<ClientRequest>((resolve, reject) => {
+      new Promise<{
+        readonly request: ClientRequest;
+        readonly headers: IncomingMessage["headers"];
+      }>((resolve, reject) => {
         const body = JSON.stringify({ version, name: "latest", input: {} });
         const outgoing = request(
           {
@@ -119,7 +122,8 @@ const subscribe = (origin: string, host: string, cookie: string, version: string
             let text = "";
             response.on("data", (chunk: Buffer) => {
               text += chunk.toString("utf8");
-              if (text.includes('"type":"snapshot"')) resolve(outgoing);
+              if (text.includes('"type":"snapshot"'))
+                resolve({ request: outgoing, headers: response.headers });
             });
             response.on("error", () => {});
             response.on("end", () => reject(new Error("subscribe ended before a snapshot")));
@@ -347,7 +351,7 @@ it.live(
         const live = yield* appsConnections;
 
         // The browser goes away.
-        for (const outgoing of open) outgoing.destroy();
+        for (const { request: outgoing } of open) outgoing.destroy();
         const cancelledAt = Date.now();
         // The product notices within a heartbeat or two.
         yield* Effect.sleep("12 seconds");
@@ -380,6 +384,11 @@ it.live(
         );
 
         const evidence = {
+          subscribeHeaders: {
+            contentType: open[0]?.headers["content-type"],
+            contentLength: open[0]?.headers["content-length"],
+            transferEncoding: open[0]?.headers["transfer-encoding"],
+          },
           idle,
           live,
           connectionsAfterCancel,
@@ -390,6 +399,10 @@ it.live(
           heartbeatsAfterCancel: heartbeats.afterCancel,
         };
         yield* Effect.log(`subscribe-cancel evidence ${JSON.stringify(evidence)}`);
+        // The product cancels only open-ended bodies, so the stream must name its media type.
+        expect
+          .soft(open[0]?.headers["content-type"]?.split(";")[0], "subscribe media type")
+          .toBe("text/event-stream");
         expect
           .soft(live - idle, "notification connections while subscribed")
           .toBeLessThanOrEqual(1);
