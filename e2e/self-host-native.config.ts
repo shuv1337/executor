@@ -4,6 +4,7 @@ export default defineConfig({
     include: [
       "e2e/tests/self-host-native-auth.spec.ts",
       "e2e/tests/self-host-native-telemetry.spec.ts",
+      "e2e/tests/self-host-native-subscribe-cancel.spec.ts",
     ],
     testTimeout: 60_000,
   },
