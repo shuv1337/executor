@@ -271,7 +271,7 @@ const packageRuntime = Effect.gen(function* () {
   // host names on each command line: the product reaches `apps` over HTTP and capnweb, and the apps
   // Worker calls back to the product's SelfOrigin and WorkflowCallbacks entrypoints.
   const productWorker = (bindings: { readonly apps: string }) => `(name="product",worker=(
-   compatibilityDate="2026-09-01",compatibilityFlags=["nodejs_compat","no_brotli_content_encoding"],
+   compatibilityDate="2026-09-01",compatibilityFlags=["nodejs_compat","no_brotli_content_encoding","enable_request_signal"],
    modules=[(name="product.mjs",esModule=embed "@@RUNTIME@@/product.mjs"),(name="executor:pglite.wasm",wasm=embed "@@RUNTIME@@/pglite.wasm"),(name="executor:initdb.wasm",wasm=embed "@@RUNTIME@@/initdb.wasm"),(name="executor:pglite.data",data=embed "@@RUNTIME@@/pglite.data")],
    bindings=[(name="PRODUCT",durableObjectNamespace="ExecutorProduct"),(name="NATIVE",service="native"),(name="LEGACY_DATABASE",service="legacy-data"),(name="BLOBS",service="builds"),(name="DASHBOARD",service="dashboard"),(name="PUBLIC_FETCH",service="public"),(name="PRIVATE_FETCH",service="internet"),(name="MOTEL",service="motel"),(name="SELF",service=(name="product",entrypoint="SelfOrigin")),(name="APPS",service=${bindings.apps}),(name="UNSAFE_EVAL",unsafeEval=void)],
    durableObjectNamespaces=[(className="ExecutorProduct",uniqueKey="executor-product",enableSql=true,preventEviction=true)],durableObjectStorage=(localDisk="product-data")

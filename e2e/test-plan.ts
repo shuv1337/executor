@@ -148,6 +148,20 @@ export const scenarios = plan({
       cloud: na("Cloud exports to Axiom, not a bundled collector."),
     },
   },
+  selfHostNativeSubscribeCancel: {
+    file: "self-host-native-subscribe-cancel.spec.ts",
+    title:
+      "Native self-host frees cancelled app subscriptions and shares one notification connection per app",
+    targets: {
+      "self-host": {
+        status: "not-run",
+        reason:
+          "Runs against the separately prepared Go/workerd runtime through e2e/self-host-native.config.ts; the ordinary self-host runner uses Bun.",
+      },
+      local: na("Local does not run the separate product and apps workerd processes."),
+      cloud: na("Cloud runs apps on Cloudflare, not the native self-host apps process."),
+    },
+  },
   selfHostNativeTelemetryLifecycle: {
     file: "self-host-native-telemetry.spec.ts",
     title: "Native self-host restarts its telemetry collector and stops it with the product",

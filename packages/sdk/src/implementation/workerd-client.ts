@@ -1,6 +1,6 @@
 /** Portable app protocol. Runtime adapters own processes, sockets and storage bindings. */
 import { RpcTarget, type RpcStub } from "capnweb";
-import { Cause, Effect, Redacted, Schema, Stream } from "effect";
+import { Cause, Effect, RcMap, Redacted, Schema, Stream } from "effect";
 import { HttpServerRequest, HttpServerResponse } from "effect/http";
 import {
   DeclaredRequirements,
@@ -225,6 +225,12 @@ export const connectedWorkerdApps = (blobs: BlobStorage, transport: WorkerdTrans
   Effect.gen(function* () {
     const provideBlobs = Effect.provideService(BlobStore, blobs);
     const rpc = transport.rpc;
+    // Every live query of an app shares one notification connection, closed when the last one
+    // ends. A late subscriber still sees the latest revision.
+    const notifications = yield* RcMap.make({
+      lookup: (app: string) =>
+        Stream.broadcast(transport.changes(app), { capacity: 1, strategy: "sliding", replay: 1 }),
+    });
     const runtime = yield* appRuntime({
       name: "runtime.workerd",
       loadBuild: (build) =>
@@ -310,7 +316,7 @@ export const connectedWorkerdApps = (blobs: BlobStorage, transport: WorkerdTrans
           return { build, requirements, ...(record.ui === undefined ? {} : { ui: record.ui }) };
         }),
       asset: ({ build, path }) => workerBuildAsset(build, path).pipe(provideBlobs),
-      changes: transport.changes,
+      changes: (app) => Stream.unwrap(RcMap.get(notifications, app)),
     });
     return {
       runtime: runtimeAdapter(runtime),

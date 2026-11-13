@@ -209,6 +209,7 @@ export const nativeSelfHost = (environment: Readonly<Record<string, string>>) =>
     return {
       origin,
       collectorSocket,
+      dataDirectory,
       motelDirectory,
       pid: child.pid,
       exitCode: child.exitCode,

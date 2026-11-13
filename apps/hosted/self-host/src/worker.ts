@@ -207,6 +207,23 @@ const prepare = (state: DurableObjectState, env: Environment) =>
   });
 
 /**
+ * workerd never cancels a Durable Object's response body when the client leaves; the request
+ * signal is the only notice. Cancel the body then, so a streamed response, such as a live app
+ * query, stops its work and releases its connections instead of running until a restart. The
+ * handler gets a request without that signal, so a client that leaves never interrupts its writes.
+ */
+const endsWithClient = async (
+  request: Request,
+  handle: (request: Request) => Promise<Response>,
+): Promise<Response> => {
+  const response = await handle(new Request(request, { signal: null }));
+  if (response.body === null) return response;
+  const relay = new TransformStream<Uint8Array, Uint8Array>();
+  response.body.pipeTo(relay.writable, { signal: request.signal }).catch(() => undefined);
+  return new Response(relay.readable, response);
+};
+
+/**
  * The product store has its own disk service, namespace and migration journal.
  *
  * Opening it runs schema migrations and data steps, which can take longer on a large install than
@@ -268,7 +285,7 @@ export class ExecutorProduct extends DurableObject<Environment> implements Produ
   }
   /** Dispatch the existing authenticated product routes. */
   async fetch(request: Request): Promise<Response> {
-    return (await this.#product()).fetch(request);
+    return endsWithClient(request, (await this.#product()).fetch);
   }
   /** Private workflow callbacks are reached only through the named service entrypoint. */
   async workflow(request: Request): Promise<Response> {
