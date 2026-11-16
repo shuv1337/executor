@@ -32,6 +32,10 @@ jobs:
       - run: bun install --frozen-lockfile
       # format, lint (deny warnings), typecheck and the repo's structural checks
       - run: bun run check
+      - name: Self-host SDK distribution policy and deploy gate
+        run: |
+          bun run apps:build
+          bun run e2e:apps-published --testNamePattern 'self-host (gate|private publication)|private fork publish policy'
       # Self-contained e2e suites (no cloud, browser or Docker). ci-selection and
       # export-public are left out: they assume upstream's main-branch CI layout.
       - name: tests
