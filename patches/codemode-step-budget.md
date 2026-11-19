@@ -35,7 +35,7 @@ times less than the runaway. Counted programs: a 100,000-iteration `for` loop is
 filtering and mapping 10,000 records 177,000, the `mcp-execute-concurrency` reporter program
 about 400,000 and its 1,001 x 300 loop reference about 1.5 million.
 
-## Native calls
+## Native calls and operators
 
 A native method can do far more work than the step that calls it: `s.split("")` on a 1 MB string
 is one step, but returns a million-element array that codemode then copies. Before native calls
@@ -45,50 +45,98 @@ host (tools, program functions, promise and generator methods, `tools.search`) c
 steps and are not charged. Every other call is charged with `StepBudget.charge`:
 
 - before it runs, for its input: the receiver of a method and the string arguments of a method;
-  every argument of a global function (`JSON`, `Object`, `Array`, `Math` and the like). This stops
-  a call whose input is already too large before it starts.
-- after it returns, for its result.
+  every argument of a global function (`JSON`, `Object`, `Array`, `Math` and the like), except
+  `Object.assign`'s target, which it only writes, and `Object.hasOwn` and `Array.isArray`, which
+  read one key or the type. This stops a call whose input is already too large before it starts.
+- after it returns, for its result, but only when the result is new. A result the program
+  already holds is not charged: the method's own receiver (`Map.set`), one of its arguments
+  (`Object.assign`), or an element or accumulator (`Map.get`, `at`, `pop`, `shift`, `find`,
+  `findLast`, `reduce`). `sort`, `reverse` and `fill` return their array and are charged for it
+  again, for the pass. Before this, `g.get(k)` was charged for the whole group each time, and
+  grouping 50,000 rows into 10 or 50 groups stopped at the budget in under a second.
 - spread arguments, array spread and object spread, and the arguments and result of `new`, at the
-  same rate.
+  same rate. Spread and `new Set` or `new Map` take a string one character at a time, so there a
+  string costs one step per 2 characters.
+
+Operators and patterns that read a whole value are charged too:
+
+- Binary operators other than `===` and `!==`, and unary `+`, `-` and `~`, walk their operands to
+  reject interpreter references before coercing them. The walk is charged as it goes, one step
+  per 2 values visited, so it stops partway once the budget is spent. Primitives skip it.
+- `in` reads one own key, so it only checks that its right-hand object is data and does not walk
+  it. Before this, `id in index` walked the whole index on each check, and merging 20,000 records
+  into a 20,000-record index ran to its wall time. It no longer throws when the object holds a
+  function somewhere inside; it still does when the object itself is one.
+- Comparing two strings is charged one step per 256 characters it may read: equal lengths for
+  equality, the shorter length for `<`, `<=`, `>` and `>=`.
+- A template interpolating an array or object is charged for copying and joining it.
+- Rest patterns: an object rest is charged for the object, an array rest one step per element it
+  takes. `for...in` is charged for its key list.
 
 Data costs one step per 2 array elements, object keys or `Map` and `Set` entries, and one per 256
-string characters. An array of records or arrays counts each element as wide as its first one, up
-to 32, because copying a result walks every field. Other values (numbers, functions, class
-instances) cost nothing. Two kinds of method are charged less, so loops that call them stay
-linear: methods whose work is bounded by their result (`slice`, `substring`, `at`, `push`, `pop`,
-`concat` and similar) charge only their result, and `indexOf`, `includes` and `lastIndexOf` charge
-one step per 4,096 elements or characters they can scan from their start position. A method that
-returns its own receiver, such as `Map.set`, is not charged again for it.
+string characters. An array of records or arrays counts each element as wide as the widest of up
+to 8 evenly spaced elements, up to 64, because copying a result walks every field. Other values
+(numbers, functions, class instances) cost nothing. Some methods are charged differently:
+methods whose work is bounded by their result (`slice`, `substring`, `at`, `push`, `pop`,
+`concat` and similar) charge only their result, so loops that call them stay linear; `indexOf`,
+`includes` and `lastIndexOf` charge one step per 512 elements or characters they can scan from
+their start position; `normalize` and `localeCompare` charge 8 times their receiver.
 
 One native call still runs to its end before its result is charged; codemode cannot interrupt it.
 Its input is charged before it runs, so the largest single call a program can make is bounded by
-data it already paid to build, and the next step after an overrun stops the program.
+data it already paid to build, and the next step after an overrun stops the program. A regular
+expression is the exception: its input is small, but a backtracking pattern such as `/^(a+)+$/`
+on a 25-character string can take tens of milliseconds per match, and a loop of 1,000 such
+matches runs to the wall time (44 s in Node, inside its 60 s). Codemode has no backtracking limit
+to set, and refusing nested quantifiers would refuse ordinary patterns, so this is not charged.
 
-Charging adds about 4% to a loop that makes three native calls per iteration (100,000 iterations of
-`Math.max`, `slice` and `push`: medians of 2,083-2,098 ms against 2,003-2,004 ms without native
-charging, Node 24, 7 runs each).
+Hot loops got faster, as primitives now skip the operand walk. Medians of 7 runs in Node 24
+(base is `main`'s patch, previous is the first native-charging version):
+
+| Loop (100,000-300,000 iterations)         | base ms | previous ms | now ms |
+| ----------------------------------------- | ------: | ----------: | -----: |
+| `s += i % 7`                              |   1,392 |       1,356 |  1,271 |
+| comparisons and `in`                      |     887 |         881 |    784 |
+| `push`, `Math.max` and `slice` every turn |   1,711 |       1,714 |  1,757 |
 
 The rates were measured with each workload looped under the default 5,000,000-step budget until it
-stopped (CPU seconds in Node 24 and Bun; wall seconds of one request in workerd, where it was the
-only work):
+stopped, on one host (wall seconds of one program; in workerd, one request with nothing else
+running). Most setups build a million-element array with `Array.from` and a mapper, a million
+callback calls; callbacks cost about twice a loop step in workerd, so that setup alone takes up
+to 7 s there.
 
-| Workload                            | Node s | Bun s | workerd s |
-| ----------------------------------- | -----: | ----: | --------: |
-| pure interpreter loop               |   2.35 |  1.02 |      8.52 |
-| `split("")` of 1 MB (review PoC)    |   2.05 |  3.83 |      1.07 |
-| `JSON.stringify` 20k records + scan |   4.87 |  1.24 |      2.79 |
-| `JSON.parse` of 1.3 MB              |   3.73 |  1.34 |      1.53 |
-| `join` of 1M elements               |   1.89 |  3.17 |      0.87 |
-| `Object.keys` of 100k keys          |   3.15 |  2.27 |      2.89 |
-| spread of 1M elements               |   0.77 |  0.82 |      4.93 |
-| `replaceAll` on 1 MB                |   5.40 |  3.62 |      9.43 |
+| Workload                                         | Node 24 s | Bun s | workerd s |
+| ------------------------------------------------ | --------: | ----: | --------: |
+| pure interpreter loop                            |      1.68 |  0.78 |      8.53 |
+| `split("")` of 1 MB (round 0 PoC)                |      1.23 |  2.80 |      0.98 |
+| `JSON.stringify` 20k records + `includes`        |      2.74 |  0.90 |      2.30 |
+| `JSON.parse` of 1.3 MB                           |      1.77 |  0.98 |      1.84 |
+| `join` of 1M elements                            |      5.61 |  4.18 |     11.61 |
+| `Object.keys` of 100k keys                       |      1.71 |  1.30 |      2.64 |
+| spread of 1M elements                            |      5.15 |  2.68 |     14.87 |
+| `replaceAll` on 1 MB                             |      3.92 |  3.30 |      8.03 |
+| `JSON.stringify` of `[0, ...20k 200-key records]` |      6.76 |  3.73 |      6.08 |
+| `includes` on 1M strings                         |      7.16 |  5.95 |     15.17 |
+| `normalize` of 1M characters                     |      1.19 |  2.80 |      1.24 |
+| `"zz" in` a 200k-key object                      |      2.56 |  1.25 |      8.68 |
+| `a == "x"` on 1M elements                        |      6.02 |  4.76 |     11.96 |
+| `"" + a` on 1M elements                          |      5.96 |  4.60 |     11.84 |
+| template of 1M elements                          |      5.25 |  3.42 |     11.18 |
+| `===` of two 4 MB strings                        |      0.05 |  0.05 |      0.05 |
+| `<` of two 4 MB strings                          |      0.04 |  0.07 |      0.07 |
+| `[x, ...r] = ` 1M elements                       |      4.92 |  2.66 |     13.16 |
+| `{k0, ...r} = ` 100k keys                        |      4.07 |  1.28 |      4.24 |
+| `for...in` 200k keys, then `break`               |      1.91 |  0.86 |      4.34 |
+| `new Set` of a 1M-character string               |      0.59 |  0.35 |      5.47 |
 
-Native costs differ by engine, so no one rate matches all three, but every workload stops within
-about 10 s on each runtime. In workerd, where the budget is about 9 s of interpreted work, each
-native-heavy loop stops at or before the interpreted one. Ordinary programs fit: filtering and
-mapping 20,000 records needs under 2,000,000 steps, grouping 50,000 records under 5,000,000, and a
-comparator `sort` of 50,000 objects passes. A comparator `sort` of 100,000 objects needs about
-20,000,000 steps, as every comparison is interpreted, so the default stops it; self-host and local
-raise the budget with `EXECUTOR_MCP_MAX_STEPS`.
+Every workload stops within about 7.5 s in Node and Bun and about 15 s in workerd, where the
+interpreted loop alone takes 8.5 s; the ones above 8.5 s spend most of it building their input
+with callbacks. Ordinary programs fit, with the steps they are charged: grouping 50,000 rows with
+`Map.get` 1.48 million whatever the number of groups; merging 20,000 records with `in` 0.85
+million (with `Object.hasOwn` 0.63 million); filtering and mapping 20,000 records 0.49 million;
+splitting and matching 20,000 log lines 0.48 million; and a comparator `sort` of 50,000 objects
+3.9 million (17 s in workerd, where every comparison is a callback). A comparator `sort` of
+100,000 objects needs about 20,000,000 steps, so the default stops it; self-host and local raise
+the budget with `EXECUTOR_MCP_MAX_STEPS`.
 
 Remove the hunks when a codemode release has a step or CPU budget.

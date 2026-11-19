@@ -528,12 +528,14 @@ export const McpLimits = Schema.Struct({
   maxToolCalls: Schema.Int.check(Schema.isGreaterThan(0)),
   /**
    * Interpreter steps one program may spend: one per statement or expression evaluated, plus steps
-   * for native calls in proportion to the data they read and return (about one per two array
-   * elements or object keys and one per 256 string characters). Waiting on tool calls and approvals
-   * spends nothing. This limits the work a program does on the server's own thread, which
-   * `timeoutMs` alone does not; one native call still runs to its end before it is charged. The
-   * default stops a comparator `sort` of about 100,000 objects, which takes about 20 million steps;
-   * self-host and local raise it with `EXECUTOR_MCP_MAX_STEPS`.
+   * for native calls, and for operators that walk or coerce a whole value, in proportion to the data
+   * they read, copy and return (about one per two array elements or object keys and one per 256
+   * string characters). A value a call returns that the program already holds, such as the group
+   * `Map.get` returns, is not charged. Waiting on tool calls and approvals spends nothing. This
+   * limits the work a program does on the server's own thread, which `timeoutMs` alone does not;
+   * one native call, or one backtracking regular expression match, still runs to its end before it
+   * is charged. The default stops a comparator `sort` of about 100,000 objects, which takes about 20
+   * million steps; self-host and local raise it with `EXECUTOR_MCP_MAX_STEPS`.
    */
   maxSteps: Schema.Int.check(Schema.isGreaterThan(0)),
 });

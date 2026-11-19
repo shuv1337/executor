@@ -1232,7 +1232,7 @@ export const scenarios = plan({
     fixtures: "actors",
     file: "mcp-execute-step-budget.spec.ts",
     title:
-      "Hosted MCP execute stops a program that only computes, in the interpreter or through native calls, at its step budget with TimeoutExceeded, while other callers stay fast and ordinary programs complete",
+      "Hosted MCP execute stops a program that only computes, in the interpreter, through native calls or through operators, at its step budget with TimeoutExceeded, while other callers stay fast and ordinary programs, including grouping and `in` lookups, complete",
     targets: {
       "self-host": scheduled,
       cloud: na("Shared execute path and CodeMode patch; covered on self-host"),

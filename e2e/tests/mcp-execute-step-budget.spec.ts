@@ -5,7 +5,10 @@
  * gave up. The step budget stops such a program with `TimeoutExceeded` long before its wall time,
  * whatever its own `catch` does, while other requests keep answering and an ordinary program that
  * calls tools and loops still completes. Native calls are charged for the data they read and
- * return, so a loop of large `split` calls, one step each, stops in seconds too.
+ * return, so a loop of large `split` calls, one step each, stops in seconds too, and so are
+ * operators that walk or coerce a whole value. A value a call returns that the program already
+ * holds, such as a group `Map.get` returns, is not charged, so grouping many rows into few groups
+ * completes.
  */
 import { expect, layer } from "@effect/vitest";
 import { Duration, Effect, Fiber, Schema } from "effect";
@@ -97,6 +100,40 @@ const s = "x".repeat(1000000);
 let n = 0;
 for (let i = 0; i < 100000; i++) { n += s.split("").length }
 return n;`;
+
+/**
+ * The review's proof that operators escaped the budget: comparing a million-element array to a
+ * string coerces the whole array each time, in one step. Uncharged, it ran to the wall clock.
+ */
+const operatorRunaway = `
+const a = Array.from({ length: 1000000 }, (_, i) => i);
+let n = 0;
+for (let i = 0; i < 100000; i++) { if (a == "x") n++ }
+return n;`;
+
+/**
+ * The review's realistic operator proof: merging 20,000 records into an index of 20,000 by checking
+ * `id in index`. `in` walked the whole index on every check and this ran to the 120 s wall
+ * clock; it reads one key now.
+ */
+const dedupeWithIn = `
+const a = Array.from({ length: 20000 }, (_, i) => ({ id: 'r' + i, name: 'n' + i, tags: ['x', 'y'] }));
+const b = Array.from({ length: 20000 }, (_, i) => ({ id: 'r' + i * 2, name: 'm' + i, tags: ['z'] }));
+const byId = {};
+for (const r of a) byId[r.id] = r;
+let added = 0;
+for (const r of b) { if (!(r.id in byId)) { byId[r.id] = r; added++ } }
+return added;`;
+
+/**
+ * Groups 50,000 rows into a few groups with `Map.get`, which returns a group of thousands of rows
+ * every time. Charging that group as if copied stopped it in under a second.
+ */
+const groupBy = (groups: number) => `
+const rows = Array.from({ length: 50000 }, (_, i) => ({ k: 'k' + (i % ${groups}), v: i }));
+const g = new Map();
+for (const r of rows) { const a = g.get(r.k) ?? []; a.push(r.v); g.set(r.k, a) }
+return g.size;`;
 
 /** Filters and maps 10,000 records, as programs do with a large tool result. */
 const recordsTransform = `
@@ -196,6 +233,30 @@ layer(HostedLive, { excludeTestServices: true })("Hosted MCP execute step budget
           });
           expect(native.ms).toBeLessThan(20_000);
 
+          // So does a loop of operators that coerce a whole array.
+          const operator = yield* execute(runner, "operator-runaway", operatorRunaway);
+          expect(operator.execution).toMatchObject({
+            ok: false,
+            error: {
+              kind: "TimeoutExceeded",
+              message: expect.stringContaining(
+                `Execution exceeded its compute budget of ${defaultMaxSteps} interpreter steps`,
+              ),
+            },
+          });
+          expect(operator.ms).toBeLessThan(20_000);
+
+          // Checking membership with `in` against a large index stays fast and inside it.
+          const dedupe = yield* execute(runner, "dedupe-with-in", dedupeWithIn);
+          expect(dedupe.execution).toMatchObject({ ok: true, value: 10000 });
+          expect(dedupe.ms).toBeLessThan(20_000);
+
+          // Grouping 50,000 rows into 10 or 50 groups completes.
+          const grouped10 = yield* execute(runner, "group-by-10", groupBy(10));
+          expect(grouped10.execution).toMatchObject({ ok: true, value: 10 });
+          const grouped50 = yield* execute(runner, "group-by-50", groupBy(50));
+          expect(grouped50.execution).toMatchObject({ ok: true, value: 50 });
+
           // Transforming 10,000 records with native calls stays well inside it.
           const records = yield* execute(runner, "records-transform", recordsTransform);
           expect(records.execution).toMatchObject({ ok: true, value: { kept: 5000, json: true } });
@@ -212,6 +273,10 @@ layer(HostedLive, { excludeTestServices: true })("Hosted MCP execute step budget
           yield* evidence.measure("heavy-but-fine-ms", fine.ms);
           yield* evidence.measure("native-runaway-ms", native.ms);
           yield* evidence.measure("records-transform-ms", records.ms);
+          yield* evidence.measure("operator-runaway-ms", operator.ms);
+          yield* evidence.measure("dedupe-with-in-ms", dedupe.ms);
+          yield* evidence.measure("group-by-10-ms", grouped10.ms);
+          yield* evidence.measure("group-by-50-ms", grouped50.ms);
         }).pipe(Effect.provide(McpClient.layer)),
       ),
     { timeout: 180_000 },
