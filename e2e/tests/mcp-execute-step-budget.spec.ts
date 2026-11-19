@@ -10,8 +10,9 @@
  * holds, such as a group `Map.get` returns, is not charged, so grouping many rows into few groups
  * completes. Storing a value walks it once to reject cycles; that walk is charged, and a value
  * holding no objects is not walked again, so attaching one shared value to every row completes.
- * Joining strings with `+` is charged by the length of the result, so a loop that joins a
- * megabyte string stops in seconds.
+ * Storing the value a property already holds skips that walk, so grouping row objects with
+ * `g[k] = g[k] || []` completes. Joining strings with `+` or a template is charged by the length
+ * of the result, so a loop that joins a megabyte string stops in seconds.
  */
 import { expect, layer } from "@effect/vitest";
 import { Duration, Effect, Fiber, Schema } from "effect";
@@ -169,6 +170,32 @@ let n = 0;
 for (let i = 0; i < 1000000; i++) { const t = s + i; n += t.charCodeAt(500000) }
 return n;`;
 
+/**
+ * Groups 50,000 row objects into 10 groups by storing each group back into itself before the push.
+ * The store walked the whole group, every row in it, on every row, and stopped at the budget.
+ */
+const groupRowsOrPush = `
+const rows = Array.from({ length: 50000 }, (_, i) => ({ k: 'k' + (i % 10), v: i, name: 'n' + i }));
+const g = {};
+for (const r of rows) { g[r.k] = g[r.k] || []; g[r.k].push(r) }
+return Object.keys(g).length;`;
+
+/** The same grouping in the `reduce` form. */
+const groupRowsReduce = `
+const rows = Array.from({ length: 50000 }, (_, i) => ({ k: 'k' + (i % 10), v: i, name: 'n' + i }));
+const g = rows.reduce((acc, r) => { (acc[r.k] = acc[r.k] || []).push(r); return acc }, {});
+return Object.keys(g).length;`;
+
+/**
+ * The review's proof that templates escaped the budget: interpolating a megabyte string is one
+ * step, and reading the result copies the megabyte. Uncharged, it ran to the wall clock.
+ */
+const templateRunaway = `
+const s = "x".repeat(1000000);
+let n = 0;
+for (let i = 0; i < 1000000; i++) { const t = \`\${s}\${i}\`; n += t.charCodeAt(500000) }
+return n;`;
+
 /** Filters and maps 10,000 records, as programs do with a large tool result. */
 const recordsTransform = `
 const records = Array.from({ length: 10000 }, (_, i) => ({ id: 'r' + i, price: i % 100, tags: ['a', 'b'] }));
@@ -299,6 +326,27 @@ layer(HostedLive, { excludeTestServices: true })("Hosted MCP execute step budget
           expect(shared.execution).toMatchObject({ ok: true, value: 20000 });
           expect(shared.ms).toBeLessThan(20_000);
 
+          // Grouping row objects by storing each group back into itself completes, in both forms.
+          const groupedRows = yield* execute(runner, "group-rows-or-push", groupRowsOrPush);
+          expect(groupedRows.execution).toMatchObject({ ok: true, value: 10 });
+          expect(groupedRows.ms).toBeLessThan(20_000);
+          const reducedRows = yield* execute(runner, "group-rows-reduce", groupRowsReduce);
+          expect(reducedRows.execution).toMatchObject({ ok: true, value: 10 });
+          expect(reducedRows.ms).toBeLessThan(20_000);
+
+          // A loop that interpolates a megabyte string stops at the budget, in seconds.
+          const template = yield* execute(runner, "template-runaway", templateRunaway);
+          expect(template.execution).toMatchObject({
+            ok: false,
+            error: {
+              kind: "TimeoutExceeded",
+              message: expect.stringContaining(
+                `Execution exceeded its compute budget of ${defaultMaxSteps} interpreter steps`,
+              ),
+            },
+          });
+          expect(template.ms).toBeLessThan(20_000);
+
           // A loop that joins a megabyte string stops at the budget, in seconds.
           const concat = yield* execute(runner, "concat-runaway", concatRunaway);
           expect(concat.execution).toMatchObject({
@@ -335,6 +383,9 @@ layer(HostedLive, { excludeTestServices: true })("Hosted MCP execute step budget
           yield* evidence.measure("group-by-object-ms", groupedObject.ms);
           yield* evidence.measure("shared-meta-ms", shared.ms);
           yield* evidence.measure("concat-runaway-ms", concat.ms);
+          yield* evidence.measure("group-rows-or-push-ms", groupedRows.ms);
+          yield* evidence.measure("group-rows-reduce-ms", reducedRows.ms);
+          yield* evidence.measure("template-runaway-ms", template.ms);
         }).pipe(Effect.provide(McpClient.layer)),
       ),
     { timeout: 180_000 },

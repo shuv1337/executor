@@ -899,7 +899,7 @@ index bd1bc708017c1a30b0c81d37639b55ff12a2e3bc..0ef22693f3e8bbed507161502b837c59
      private invokeConsole;
      private evaluateCallArguments;
 diff --git a/dist/interpreter/runtime.js b/dist/interpreter/runtime.js
-index 8c1b549d3da8c2287e330e63d7370cd3838e57df..cb19bd882a1e3847531b19847867e1159bccb5cd 100644
+index 8c1b549d3da8c2287e330e63d7370cd3838e57df..bc213c7be488a22deac6d42fe4b1f630647bb577 100644
 --- a/dist/interpreter/runtime.js
 +++ b/dist/interpreter/runtime.js
 @@ -1,11 +1,11 @@
@@ -1496,7 +1496,7 @@ index 8c1b549d3da8c2287e330e63d7370cd3838e57df..cb19bd882a1e3847531b19847867e115
                      const cursor = yield* self.syncIterator(spread, element);
                      if (cursor === undefined)
                          throw new InterpreterRuntimeError("Array spread requires a synchronous iterable.", element).as("TypeError");
-@@ -2036,6 +2237,9 @@ export class Interpreter {
+@@ -2036,9 +2237,14 @@ export class Interpreter {
                  output += rawValue.cooked;
                  if (index < expressions.length) {
                      const raw = yield* self.evaluateExpression(asNode(expressions[index], "expressions"));
@@ -1506,21 +1506,29 @@ index 8c1b549d3da8c2287e330e63d7370cd3838e57df..cb19bd882a1e3847531b19847867e115
                      output += coerceToString(boundedData(raw, "Template interpolation"));
                  }
              }
-@@ -2312,7 +2516,7 @@ export class Interpreter {
++            // Like string `+`: the result is a rope that the next read copies whole.
++            self.budget.charge(output.length / CONCAT_CHARS_PER_STEP, node);
+             return output;
+         });
+     }
+@@ -2312,7 +2518,9 @@ export class Interpreter {
              if (typeof key !== "number" || parseArrayIndex(key) === undefined) {
                  throw new InterpreterRuntimeError("Array assignment index must be a valid array index.", node, "InvalidDataValue");
              }
 -            rejectCircularInsertion(target, next, "Array assignment result", node);
-+            rejectCircularInsertion(target, next, "Array assignment result", node, undefined, this.meterWalk(node));
++            // Storing the value a slot already holds cannot change the graph, so it skips the walk.
++            if (!(Object.hasOwn(target, key) && target[key] === next))
++                rejectCircularInsertion(target, next, "Array assignment result", node, undefined, this.meterWalk(node));
              target[key] = next;
              return;
          }
-@@ -2337,7 +2541,7 @@ export class Interpreter {
+@@ -2337,7 +2545,8 @@ export class Interpreter {
              return;
          }
          const target = reference.target;
 -        rejectCircularInsertion(target, next, "Object assignment result", node);
-+        rejectCircularInsertion(target, next, "Object assignment result", node, undefined, this.meterWalk(node));
++        if (!(Object.hasOwn(target, key) && target[key] === next))
++            rejectCircularInsertion(target, next, "Object assignment result", node, undefined, this.meterWalk(node));
          Reflect.set(target, key, next);
      }
      toPropertyKey(value, node) {

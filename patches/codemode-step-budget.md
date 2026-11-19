@@ -69,8 +69,8 @@ Operators and patterns that read a whole value are charged too:
   function somewhere inside; it still does when the object itself is one.
 - Comparing two strings is charged one step per 256 characters it may read: equal lengths for
   equality, the shorter length for `<`, `<=`, `>` and `>=`.
-- `+` that yields a string is charged one step per 4,096 characters of its result, and so is
-  `+=`. The engine joins strings as a rope, so the join itself is cheap, but the next read of the
+- `+` that yields a string is charged one step per 4,096 characters of its result, and so are
+  `+=` and a template literal. The engine joins strings as a rope, so the join itself is cheap, but the next read of the
   result copies all of it: `t = s + i` on a 1 MB `s` followed by `t.charCodeAt(…)` copied 1 MB per
   step and ran to the wall time; it now stops in about 1.5 s. The rate is per 4,096 rather than
   256 because building output with `out += line` is charged its whole length on every append,
@@ -82,7 +82,10 @@ Operators and patterns that read a whole value are charged too:
   values to reject interpreter references. Both walks are charged as they go, one step per 2
   values visited. The store walk also remembers, in a `WeakSet`, every object it finds holding no
   objects, and stops there next time; storing an object into one removes it, and every store into
-  existing data runs this walk first, so the walk still finds every cycle. Before this, attaching
+  existing data runs this walk first, so the walk still finds every cycle. The one store that
+  skips it is a property or index assignment of the value the slot already holds, which cannot
+  change the graph: `g[k] = g[k] || []` followed by `g[k].push(row)` walked the whole group, every
+  row in it, on every row, and grouping 50,000 row objects stopped at the budget in about 2 s. Before this, attaching
   one shared `meta` of 50,000 columns to each of 20,000 rows walked all the columns on each store,
   uncharged, and ran for minutes; it now takes 0.3 s. Grouping 50,000 rows into an object with
   `a = g[k] || []; a.push(v); g[k] = a` walked each group on each store; it now takes 0.7 s.
@@ -117,6 +120,9 @@ These still run work the budget does not see, and are left for a follow-up:
   A loop of each of these with a million-element array runs to its 30 s wall time.
   `console.table` and `Object.is` walk too, but are already stopped by the charge for their
   arguments.
+- A shared value made of many small records is walked in full on every store, because only
+  objects holding no objects are remembered: attaching a 1,000-record `meta` to each of 20,000
+  rows stops at the budget in about 2 s.
 - Not a hole, but worth knowing: grouping with `g[k] = (g[k] || []).concat([v])` copies the group
   on every row and is charged for it, so 50,000 rows in 10 groups stop at the budget in under a
   second. `push` into the group instead.
