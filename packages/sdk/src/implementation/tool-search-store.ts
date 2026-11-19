@@ -87,6 +87,38 @@ const Ranked = Schema.Struct({
   definitions: Schema.Array(Schema.Tuple([Schema.String, Schema.Int, Json])),
 });
 export type RankedPage = typeof Ranked.Type;
+/**
+ * Every item a search ranks, in rank order, as a page names it: its first row, the target it is
+ * at and every target it merges. `stamp` names the digest of each target's listing it ranked.
+ */
+const Ordered = Schema.Struct({
+  total: Schema.Int,
+  missing: Schema.Array(Schema.Int),
+  stamp: Schema.String,
+  ranked: Schema.Array(Schema.Tuple([Schema.String, Schema.Int, Schema.Array(Schema.Int)])),
+});
+type Ordered = typeof Ordered.Type;
+/** The rows of a page of a kept order, read with the stamp of the listings they belong to. */
+const Shown = Schema.Struct({
+  stamp: Schema.String,
+  items: Schema.Array(
+    Schema.Struct({
+      id: Schema.String,
+      listing: Schema.String,
+      tool: StoredTool,
+      router: Schema.NullOr(ToolRouter),
+    }),
+  ),
+  definitions: Ranked.fields.definitions,
+});
+
+/**
+ * Searches whose order is kept for their later pages. A page past the first reads its rows by the
+ * kept order instead of ranking every row the targets hold again, so paging through a catalog of
+ * n tools costs one ranking and n rows, not one ranking per page. The order is used only while
+ * every listing it ranked still has the digest it had, so a page never mixes two rankings.
+ */
+const keptOrders = 8;
 
 /**
  * Rows per insert statement: nine parameters each stays well inside Postgres's bound. A batch
@@ -108,6 +140,8 @@ export const supersededRetentionMillis = 60 * 60_000;
 const BM25 = { k1: 1.2, b: 0.75 } as const;
 
 export const makeToolSearchStore = (sql: SqlClient.SqlClient) => {
+  /** Kept orders by search, least recently used first; see `keptOrders`. */
+  const orders = new Map<string, Ordered>();
   const failed = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
     effect.pipe(Effect.mapError(() => new StorageError()));
   /** A tool is in a scope when it is read-only under a read-only scope or the scope names it. */
@@ -368,9 +402,12 @@ export const makeToolSearchStore = (sql: SqlClient.SqlClient) => {
      * their rows matches, the item is at their first permitted target, lists every other
      * permitted target with that tool, and ranks by the best matching row.
      *
-     * Ranking and reading the page's tools, definitions and routers are one statement, so they
-     * read one snapshot: a page never holds a row the scopes did not rank, even while another
-     * evaluation replaces the listing's rows. `missing` names targets whose listing has no rows.
+     * The first page ranks and reads the page's tools, definitions and routers in one statement,
+     * so they read one snapshot: a page never holds a row the scopes did not rank, even while
+     * another evaluation replaces the listing's rows. A later page reads its rows by the order the
+     * search kept (see `keptOrders`) and checks, in the same statement, that every listing still
+     * has the digest it was ranked with; a listing written since is ranked again.
+     * `missing` names targets whose listing has no rows.
      */
     page: (input: {
       readonly targets: ReadonlyArray<RankedTarget>;
@@ -408,12 +445,12 @@ export const makeToolSearchStore = (sql: SqlClient.SqlClient) => {
                       + ${BM25.b}::float8 * hits.length / stats.avgdl)))::float8 as score
                 from hits join df using (term) cross join stats
                 group by hits.ordinal, hits.id, hits.name, hits.signature)`;
-        const [page] =
-          yield* sql`with t(ordinal, listing, app, target, labels, length) as (values ${values}),
+        const listed = sql`t(ordinal, listing, app, target, labels, length) as (values ${values}),
           present as (
-            select t.ordinal from t
+            select t.ordinal, l.digest from t
             join executor_tool_search_listings l
-              on l.listing = t.listing and l.app = t.app and l.target = t.target),
+              on l.listing = t.listing and l.app = t.app and l.target = t.target)`;
+        const merged = sql`${listed},
           scope as materialized (
             select t.ordinal, t.app, s.id, s.name, s.signature, string_to_array(s.terms, ' ') as own,
               string_to_array(t.labels, ' ') as labels, s.length + t.length as length
@@ -434,7 +471,24 @@ export const makeToolSearchStore = (sql: SqlClient.SqlClient) => {
             join scope
               on scope.app = best.app and scope.name = best.name
                 and scope.signature = best.signature
-            group by best.app, best.name, best.signature, best.score),
+            group by best.app, best.name, best.signature, best.score)`;
+        const missing = sql`coalesce((select json_agg(t.ordinal order by t.ordinal) from t
+              where not exists (select 1 from present where present.ordinal = t.ordinal)),
+              '[]'::json)`;
+        const stamp = sql`coalesce((select json_agg(json_build_array(ordinal, digest)
+              order by ordinal) from present), '[]'::json)::text`;
+        /** A page's tool's router and the definitions its tools name, from `shown`. */
+        const router = sql`(select router from json_array_elements(shown.routers) as r(router)
+                  where router->>'path' = shown.tool->>'router' limit 1)`;
+        const definitions = sql`coalesce((select json_agg(json_build_array(d.listing, d.position, d.definition))
+              from executor_tool_search_definitions d
+              where d.id in (
+                select shown.listing || ':' || p.position
+                from shown, json_array_elements_text(shown.definitions) as p(position))),
+              '[]'::json)`;
+        /** Rank and read one page in one statement. */
+        const ranked = () =>
+          sql`with ${merged},
           page as (
             select id, target, ordinals,
               row_number() over (order by score desc, target, name collate "C") as rank
@@ -447,25 +501,93 @@ export const makeToolSearchStore = (sql: SqlClient.SqlClient) => {
             from page
             join executor_tool_search s on s.id = page.id
             join executor_tool_search_listings l on l.listing = s.listing)
-          select (select count(*) from merged)::int as total,
-            coalesce((select json_agg(t.ordinal order by t.ordinal) from t
-              where not exists (select 1 from present where present.ordinal = t.ordinal)),
-              '[]'::json) as missing,
+          select (select count(*) from merged)::int as total, ${missing} as missing,
             coalesce((select json_agg(json_build_object(
                 'target', shown.target, 'ordinals', to_json(shown.ordinals),
-                'listing', shown.listing, 'tool', shown.tool,
-                'router', (select router from json_array_elements(shown.routers) as r(router)
-                  where router->>'path' = shown.tool->>'router' limit 1))
+                'listing', shown.listing, 'tool', shown.tool, 'router', ${router})
               order by shown.rank) from shown), '[]'::json) as items,
-            coalesce((select json_agg(json_build_array(d.listing, d.position, d.definition))
-              from executor_tool_search_definitions d
-              where d.id in (
-                select shown.listing || ':' || p.position
-                from shown, json_array_elements_text(shown.definitions) as p(position))),
-              '[]'::json) as definitions`.pipe(
+            ${definitions} as definitions`.pipe(
             Effect.flatMap(Schema.decodeUnknownEffect(Schema.Array(Ranked))),
+            Effect.map(([page]) => page ?? { total: 0, missing: [], items: [], definitions: [] }),
           );
-        return page ?? { total: 0, missing: [], items: [], definitions: [] };
+        /** A page of a kept order, or nothing when a listing it ranked has changed since. */
+        const kept = (order: Ordered) =>
+          Effect.gen(function* () {
+            const slice = order.ranked.slice(input.offset, input.offset + input.limit);
+            const [shown] = yield* sql`with ${listed},
+              shown as (
+                select s.id, s.listing, s.tool, s.definitions, l.routers
+                from executor_tool_search s
+                join executor_tool_search_listings l on l.listing = s.listing
+                where s.id in (select value from json_array_elements_text(
+                  ${JSON.stringify(slice.map(([id]) => id))}::json)))
+              select ${stamp} as stamp,
+                coalesce((select json_agg(json_build_object('id', shown.id,
+                    'listing', shown.listing, 'tool', shown.tool, 'router', ${router}))
+                  from shown), '[]'::json) as items,
+                ${definitions} as definitions`.pipe(
+              Effect.flatMap(Schema.decodeUnknownEffect(Schema.Array(Shown))),
+            );
+            if (shown === undefined || shown.stamp !== order.stamp) return undefined;
+            const rows = new Map(shown.items.map((item) => [item.id, item]));
+            const items: Array<RankedPage["items"][number]> = [];
+            for (const [id, target, ordinals] of slice) {
+              const row = rows.get(id);
+              if (row === undefined) return undefined;
+              items.push({
+                target,
+                ordinals,
+                listing: row.listing,
+                tool: row.tool,
+                router: row.router,
+              });
+            }
+            return {
+              total: order.total,
+              missing: order.missing,
+              items,
+              definitions: shown.definitions,
+            } satisfies RankedPage;
+          });
+        // The first page, which most searches end at, ranks and reads in one statement.
+        if (input.offset === 0) {
+          yield* Effect.annotateCurrentSpan("executor.search.order", "ranked");
+          return yield* ranked();
+        }
+        const key = JSON.stringify([input.targets, input.terms]);
+        const remembered = orders.get(key);
+        if (remembered !== undefined) {
+          const page = yield* kept(remembered);
+          if (page !== undefined) {
+            orders.delete(key);
+            orders.set(key, remembered);
+            yield* Effect.annotateCurrentSpan("executor.search.order", "kept");
+            return page;
+          }
+          orders.delete(key);
+        }
+        const [order] = yield* sql`with ${merged}
+          select (select count(*) from merged)::int as total, ${missing} as missing,
+            ${stamp} as stamp,
+            coalesce((select json_agg(json_build_array(id, target, ordinals)
+              order by score desc, target, name collate "C") from merged), '[]'::json) as ranked`.pipe(
+          Effect.flatMap(Schema.decodeUnknownEffect(Schema.Array(Ordered))),
+        );
+        if (order !== undefined) {
+          const page = yield* kept(order);
+          if (page !== undefined) {
+            orders.set(key, order);
+            for (const old of orders.keys()) {
+              if (orders.size <= keptOrders) break;
+              orders.delete(old);
+            }
+            yield* Effect.annotateCurrentSpan("executor.search.order", "ordered");
+            return page;
+          }
+        }
+        // A listing changed between ranking and reading: rank and read in one statement.
+        yield* Effect.annotateCurrentSpan("executor.search.order", "ranked");
+        return yield* ranked();
       }).pipe(failed),
   };
 };
