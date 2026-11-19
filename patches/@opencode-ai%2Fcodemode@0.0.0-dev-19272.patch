@@ -1,5 +1,5 @@
 diff --git a/dist/codemode.d.ts b/dist/codemode.d.ts
-index 7e9424e..47295db 100644
+index 7e9424edcc57ed3c533ac1a55da8f6f0b6a1c8a4..847f79c154eb8a5d1a4f629f932b74ec31eb4fd5 100644
 --- a/dist/codemode.d.ts
 +++ b/dist/codemode.d.ts
 @@ -1,8 +1,8 @@
@@ -13,7 +13,28 @@ index 7e9424e..47295db 100644
  /** Signature-construction helpers for host-owned catalog instructions. */
  export { searchSignature, toolExpression } from "./tool-runtime.js";
  /** Resource budgets enforced independently during each CodeMode program execution. */
-@@ -37,6 +37,11 @@ export type ExecuteOptions<Provided extends Record<string, unknown> = {}> = {
+@@ -14,6 +14,12 @@ export type ExecutionLimits = {
+     readonly timeoutMs?: number;
+     /** Maximum number of tool calls admitted by the runtime. No default: absent means unlimited. */
+     readonly maxToolCalls?: number;
++    /**
++     * Maximum statements and expressions the interpreter evaluates, across every function and job of
++     * the program. Waiting on tool calls evaluates nothing. Past it the program fails with
++     * `TimeoutExceeded`, which its own catch cannot stop. No default: absent means unlimited.
++     */
++    readonly maxSteps?: number;
+     /**
+      * Maximum UTF-8 bytes retained from the result and logs. Warnings have a separate equal budget;
+      * truncation notices and host formatting are additional.
+@@ -23,6 +29,7 @@ export type ExecutionLimits = {
+ export type ResolvedExecutionLimits = {
+     readonly timeoutMs: number | undefined;
+     readonly maxToolCalls: number | undefined;
++    readonly maxSteps: number | undefined;
+     readonly maxOutputBytes: number | undefined;
+ };
+ /** Options for one CodeMode execution. */
+@@ -37,6 +44,11 @@ export type ExecuteOptions<Provided extends Record<string, unknown> = {}> = {
      onToolCallStart?: (call: ToolRuntime.ToolCallStarted) => Effect.Effect<void, never, Services<Provided>>;
      /** Observes each admitted tool call as it succeeds, fails, or is interrupted. */
      onToolCallEnd?: (call: ToolRuntime.ToolCallEnded) => Effect.Effect<void, never, Services<Provided>>;
@@ -25,7 +46,7 @@ index 7e9424e..47295db 100644
  };
  /** A JSON value that can cross the confined interpreter boundary. */
  export type DataValue = Schema.Json;
-@@ -58,6 +63,8 @@ export declare const Diagnostic: Schema.Struct<{
+@@ -58,6 +70,8 @@ export declare const Diagnostic: Schema.Struct<{
          readonly column: Schema.Number;
      }>>;
      readonly suggestions: Schema.optionalKey<Schema.$Array<Schema.String>>;
@@ -34,7 +55,7 @@ index 7e9424e..47295db 100644
  }>;
  /** A normalized program diagnostic safe to return across an agent tool boundary. */
  export type Diagnostic = typeof Diagnostic.Type;
-@@ -141,6 +148,8 @@ export type Result = typeof Result.Type;
+@@ -141,6 +155,8 @@ export type Result = typeof Result.Type;
  export type Runtime<R = never> = {
      readonly catalog: () => ReadonlyArray<ToolDescription>;
      readonly execute: (code: string) => Effect.Effect<Result, never, R>;
@@ -44,7 +65,7 @@ index 7e9424e..47295db 100644
  /** Executes one Effect-native CodeMode program without constructing a reusable runtime. */
  export declare const execute: <const Provided extends Record<string, unknown>>(options: ExecuteOptions<Provided>) => Effect.Effect<Result, never, Services<Provided>>;
 diff --git a/dist/codemode.js b/dist/codemode.js
-index e94b56b..8064157 100644
+index e94b56b920a396f6bae79fb51cd60bd07b83d591..4bcf465da622258b15b75e3de0520416791cd2c9 100644
 --- a/dist/codemode.js
 +++ b/dist/codemode.js
 @@ -23,6 +23,8 @@ export const Diagnostic = Schema.Struct({
@@ -56,7 +77,15 @@ index e94b56b..8064157 100644
  });
  const ToolCallSchema = Schema.Struct({ name: Schema.String });
  export const Success = Schema.Struct({
-@@ -65,6 +67,7 @@ export const make = (options = {}) => {
+@@ -51,6 +53,7 @@ const validateLimit = (name, value, minimum) => {
+ const resolveExecutionLimits = (limits) => ({
+     timeoutMs: validateLimit("timeoutMs", limits?.timeoutMs, 1),
+     maxToolCalls: validateLimit("maxToolCalls", limits?.maxToolCalls, 0),
++    maxSteps: validateLimit("maxSteps", limits?.maxSteps, 1),
+     maxOutputBytes: validateLimit("maxOutputBytes", limits?.maxOutputBytes, 0),
+ });
+ /** Executes one Effect-native CodeMode program without constructing a reusable runtime. */
+@@ -65,6 +68,7 @@ export const make = (options = {}) => {
      const prepared = ToolRuntime.prepare(tools);
      return {
          catalog: () => prepared.catalog,
@@ -66,7 +95,7 @@ index e94b56b..8064157 100644
      };
  };
 diff --git a/dist/interpreter/errors.js b/dist/interpreter/errors.js
-index 78e59e5..078dab7 100644
+index 78e59e5eb170dfcf427d136b52fb1682ff010d39..078dab75e4755260cb9229405e3cea42bfdf41cc 100644
 --- a/dist/interpreter/errors.js
 +++ b/dist/interpreter/errors.js
 @@ -22,7 +22,11 @@ export const normalizeError = (error) => {
@@ -100,7 +129,7 @@ index 78e59e5..078dab7 100644
  export const constructErrorValue = (name, args) => createErrorValue(name, args[0] === undefined ? "" : coerceToString(args[0]));
  export const constructAggregateErrorValue = (runner, args, node) => Effect.gen(function* () {
 diff --git a/dist/interpreter/execute.d.ts b/dist/interpreter/execute.d.ts
-index e17d584..aeb1771 100644
+index e17d5849420a0266e37bf14b7f0fc257ebce2818..aeb177171d6c924b02c4174edb767bc70aa232b4 100644
 --- a/dist/interpreter/execute.d.ts
 +++ b/dist/interpreter/execute.d.ts
 @@ -1,4 +1,4 @@
@@ -110,9 +139,18 @@ index e17d584..aeb1771 100644
 -export declare const executeWithLimits: <const Provided extends Record<string, unknown>>(options: ExecuteOptions<Provided>, limits: ResolvedExecutionLimits, searchIndex: ToolRuntime.DiscoveryPlan["searchIndex"]) => Effect.Effect<Result, never, Services<Provided>>;
 +export declare const executeWithLimits: <const Provided extends Record<string, unknown>>(options: ExecuteOptions<Provided>, limits: ResolvedExecutionLimits, searchIndex: ToolRuntime.DiscoveryPlan["searchIndexOnUse"]) => Effect.Effect<Result, never, Services<Provided>>;
 diff --git a/dist/interpreter/execute.js b/dist/interpreter/execute.js
-index 3d7f507..41edd0a 100644
+index 3d7f507ef37117b1d3ca12a3fa1d9754abca4031..82ffd78ab9661d809225c8e6326b142e225fd60d 100644
 --- a/dist/interpreter/execute.js
 +++ b/dist/interpreter/execute.js
+@@ -5,7 +5,7 @@ import { Cause, Effect, Scope } from "effect";
+ import { transpile } from "#transpile";
+ import { copyIn, copyOut, ToolRuntime } from "../tool-runtime.js";
+ import { normalizeError } from "./errors.js";
+-import { InterpreterRuntimeError, isRecord } from "./model.js";
++import { InterpreterRuntimeError, isRecord, StepBudget } from "./model.js";
+ import { PromiseRuntime } from "./promises.js";
+ import { Interpreter } from "./runtime.js";
+ export const executeWithLimits = (options, limits, searchIndex) => {
 @@ -21,7 +21,7 @@ export const executeWithLimits = (options, limits, searchIndex) => {
          const tools = ToolRuntime.make((options.tools ?? {}), limits.maxToolCalls, searchIndex, {
              onToolCallStart: options.onToolCallStart,
@@ -122,10 +160,11 @@ index 3d7f507..41edd0a 100644
          const logs = [];
          const logged = () => (logs.length > 0 ? { logs: [...logs] } : {});
          // Set only after copy-out so timeouts cannot report invalid values as completed.
-@@ -30,17 +30,21 @@ export const executeWithLimits = (options, limits, searchIndex) => {
+@@ -29,18 +29,22 @@ export const executeWithLimits = (options, limits, searchIndex) => {
+         const base = Effect.acquireUseRelease(Scope.make("parallel"), (scope) => Effect.gen(function* () {
              const program = parseProgram(options.code);
              const promises = new PromiseRuntime(scope);
-             const interpreter = new Interpreter(tools.execute, tools.search, tools.keys, promises, logs);
+-            const interpreter = new Interpreter(tools.execute, tools.search, tools.keys, promises, logs);
 -            const value = yield* interpreter.run(program);
 -            const result = copyOut(copyIn(value, "Execution result"), "nullify");
 -            returned = { value: result, promises };
@@ -137,6 +176,7 @@ index 3d7f507..41edd0a 100644
 -                ...logged(),
 -                toolCalls: tools.calls,
 -            };
++            const interpreter = new Interpreter(tools.execute, tools.search, tools.keys, promises, logs, new StepBudget(limits.maxSteps));
 +            // The program's main job holds the turn until its leftover jobs are interrupted.
 +            return yield* Effect.gen(function* () {
 +                yield* promises.turn.take;
@@ -156,7 +196,7 @@ index 3d7f507..41edd0a 100644
          const timeoutMs = limits.timeoutMs;
          const operation = timeoutMs === undefined
 diff --git a/dist/interpreter/methods.d.ts b/dist/interpreter/methods.d.ts
-index db276e3..d5b7dfc 100644
+index db276e322e6eb9108c09dff9b5218bc4e29df616..d5b7dfca9c0020d63c828d776e044061411ec2d1 100644
 --- a/dist/interpreter/methods.d.ts
 +++ b/dist/interpreter/methods.d.ts
 @@ -6,6 +6,8 @@ export type CallbackRunner<R> = {
@@ -168,8 +208,63 @@ index db276e3..d5b7dfc 100644
  };
  export type SupportedCallback = CodeModeFunction | CoercionFunction | UriFunction | PromiseCapabilityFunction | GlobalMethodReference | JsonMethodReference | IntrinsicReference | ErrorConstructorReference | GlobalNamespace | PromiseNamespace;
  export declare const isSupportedCallback: (value: unknown) => value is SupportedCallback;
+diff --git a/dist/interpreter/model.d.ts b/dist/interpreter/model.d.ts
+index ed2accf68c9f24fa26154e266617ef587340445a..6b0470af7409e5b43b0030e3010c12c6b5b6955c 100644
+--- a/dist/interpreter/model.d.ts
++++ b/dist/interpreter/model.d.ts
+@@ -136,6 +136,17 @@ export declare class InterpreterRuntimeError extends Error {
+     constructor(message: string, node?: AstNode, kind?: DiagnosticKind, suggestions?: ReadonlyArray<string> | undefined);
+     as(errorName: string): this;
+ }
++/** Thrown at every interpreter step after an execution spends its step budget. */
++export declare class StepBudgetExceeded extends InterpreterRuntimeError {
++    constructor(limit: number, node?: AstNode);
++}
++/** Counts the statements and expressions one execution evaluates; past its limit every step throws. */
++export declare class StepBudget {
++    readonly limit: number | undefined;
++    steps: number;
++    constructor(limit: number | undefined);
++    step(node?: AstNode): void;
++}
+ export declare const unsupportedSyntax: (kind: string, node: AstNode) => InterpreterRuntimeError;
+ export declare const isRecord: (value: unknown) => value is Record<string, unknown>;
+ export declare const asNode: (value: unknown, context: string) => AstNode;
+diff --git a/dist/interpreter/model.js b/dist/interpreter/model.js
+index d3a203d737409a4a51759206a156d90fed0ef918..37b7e94df0318d385fcf74a3f125f7f41eb586c0 100644
+--- a/dist/interpreter/model.js
++++ b/dist/interpreter/model.js
+@@ -141,6 +141,28 @@ export class InterpreterRuntimeError extends Error {
+         return this;
+     }
+ }
++/** Thrown at every interpreter step after an execution spends its step budget. */
++export class StepBudgetExceeded extends InterpreterRuntimeError {
++    constructor(limit, node) {
++        super(`Execution exceeded its compute budget of ${limit} interpreter steps and was stopped. Programs run in an interpreter many times slower than native code, so move heavy computation, such as parsing, diffing or rewriting large text or data, out of the program and pass it only the results.`, node, "TimeoutExceeded");
++    }
++}
++/**
++ * Counts the statements and expressions one execution evaluates, across all of its functions and
++ * jobs. Time spent waiting on tool calls evaluates nothing, so it is not counted. Once the limit is
++ * spent every further step throws, so a program's catch or finally cannot keep it running.
++ */
++export class StepBudget {
++    limit;
++    steps = 0;
++    constructor(limit) {
++        this.limit = limit;
++    }
++    step(node) {
++        if (this.limit !== undefined && ++this.steps > this.limit)
++            throw new StepBudgetExceeded(this.limit, node);
++    }
++}
+ export const unsupportedSyntax = (kind, node) => new InterpreterRuntimeError(`Syntax '${kind}' is not supported. ${supportedSyntaxMessage}`, node, "UnsupportedSyntax", [supportedSyntaxMessage]);
+ export const isRecord = (value) => typeof value === "object" && value !== null;
+ export const asNode = (value, context) => {
 diff --git a/dist/interpreter/promises.d.ts b/dist/interpreter/promises.d.ts
-index 3c4016c..51e2419 100644
+index 3c4016c3d1e0d7c2b2bf29382489e2957fe7cce2..51e241995cdbf2598a0283161b8db99dc8d0f6d2 100644
 --- a/dist/interpreter/promises.d.ts
 +++ b/dist/interpreter/promises.d.ts
 @@ -1,21 +1,44 @@
@@ -221,7 +316,7 @@ index 3c4016c..51e2419 100644
      interrupt(): Effect.Effect<Array<Diagnostic>>;
  }
 diff --git a/dist/interpreter/promises.js b/dist/interpreter/promises.js
-index 996f9a5..55843d5 100644
+index 996f9a5090879de5104b8ecb439ee15fecee6f40..55843d5d6d27b370a235d66e1a242ab274b03770 100644
 --- a/dist/interpreter/promises.js
 +++ b/dist/interpreter/promises.js
 @@ -5,9 +5,212 @@ import { applyCollectionCallback, isSupportedCallback } from "./methods.js";
@@ -594,15 +689,27 @@ index 996f9a5..55843d5 100644
      const box = {};
      const body = Effect.gen(function* () {
 diff --git a/dist/interpreter/runtime.d.ts b/dist/interpreter/runtime.d.ts
-index bd1bc70..3ad5894 100644
+index bd1bc708017c1a30b0c81d37639b55ff12a2e3bc..1bd8c078b0dd2399206284f42052b5efce50012e 100644
 --- a/dist/interpreter/runtime.d.ts
 +++ b/dist/interpreter/runtime.d.ts
-@@ -11,11 +11,12 @@ export declare class Interpreter<R> {
+@@ -1,6 +1,7 @@
+ import { Effect } from "effect";
+ import { type ProgramNode } from "./model.js";
+ import { PromiseRuntime } from "./promises.js";
++import { StepBudget } from "./model.js";
+ export declare class Interpreter<R> {
+     private scopes;
+     private readonly executeTool;
+@@ -8,14 +9,16 @@ export declare class Interpreter<R> {
+     private readonly toolKeys;
+     private readonly logs;
+     private readonly promises;
++    private readonly budget;
      private generatorState?;
      private generatorAsync;
      private readonly runner;
 -    constructor(executeTool: (path: ReadonlyArray<string>, args: Array<unknown>) => Effect.Effect<unknown, unknown, R>, invokeSearch: (args: Array<unknown>) => Effect.Effect<unknown, unknown, R>, toolKeys: (path: ReadonlyArray<string>) => ReadonlyArray<string>, promises: PromiseRuntime<R>, logs?: Array<string>);
-+    constructor(executeTool: (path: ReadonlyArray<string>, args: Array<unknown>) => Effect.Effect<unknown, unknown, R>, invokeSearch: (args: Array<unknown>) => Effect.Effect<unknown, unknown, R>, toolKeys: (path: ReadonlyArray<string>) => Effect.Effect<ReadonlyArray<string>, unknown, R>, promises: PromiseRuntime<R>, logs?: Array<string>);
++    constructor(executeTool: (path: ReadonlyArray<string>, args: Array<unknown>) => Effect.Effect<unknown, unknown, R>, invokeSearch: (args: Array<unknown>) => Effect.Effect<unknown, unknown, R>, toolKeys: (path: ReadonlyArray<string>) => Effect.Effect<ReadonlyArray<string>, unknown, R>, promises: PromiseRuntime<R>, logs?: Array<string>, budget?: StepBudget);
      run(program: ProgramNode): Effect.Effect<unknown, unknown, R>;
      private createToolCallPromise;
      private createPromise;
@@ -612,19 +719,40 @@ index bd1bc70..3ad5894 100644
      private evaluateBlock;
      private createFunction;
 diff --git a/dist/interpreter/runtime.js b/dist/interpreter/runtime.js
-index 8c1b549..3575409 100644
+index 8c1b549d3da8c2287e330e63d7370cd3838e57df..d225674fb6014a81d43a2b1e05cecbb1f4dee1e2 100644
 --- a/dist/interpreter/runtime.js
 +++ b/dist/interpreter/runtime.js
-@@ -154,6 +154,8 @@ export class Interpreter {
+@@ -1,6 +1,6 @@
+ import { Cause, Deferred, Effect, Exit } from "effect";
+ import { isBlockedMember, ToolReference, ToolRuntimeError } from "../tool-runtime.js";
+-import { AsyncIteratorSymbol, asNode, CodeModeFunction, CodeModeGenerator, CoercionFunction, ComputedValue, ErrorConstructorReference, GlobalMethodReference, GlobalNamespace, GeneratorMethodReference, GeneratorReturn, getArray, getBoolean, getNode, getOptionalNode, getString, IntrinsicReference, InterpreterRuntimeError, isRecord, IteratorSymbol, IteratorSymbols, JsonMethodReference, OptionalShortCircuit, PromiseCapabilityFunction, PromiseInstanceMethodReference, PromiseMethodReference, PromiseNamespace, ProgramThrow, SearchFunction, SymbolNamespace, unsupportedSyntax, UriFunction, } from "./model.js";
++import { AsyncIteratorSymbol, asNode, CodeModeFunction, CodeModeGenerator, CoercionFunction, ComputedValue, ErrorConstructorReference, GlobalMethodReference, GlobalNamespace, GeneratorMethodReference, GeneratorReturn, getArray, getBoolean, getNode, getOptionalNode, getString, IntrinsicReference, InterpreterRuntimeError, isRecord, IteratorSymbol, IteratorSymbols, JsonMethodReference, OptionalShortCircuit, PromiseCapabilityFunction, PromiseInstanceMethodReference, PromiseMethodReference, PromiseNamespace, ProgramThrow, SearchFunction, StepBudget, StepBudgetExceeded, SymbolNamespace, unsupportedSyntax, UriFunction, } from "./model.js";
+ import { caughtErrorValue, constructAggregateErrorValue, constructErrorValue } from "./errors.js";
+ import { arrayStatics, invokeArrayFrom, invokeGlobalMethod, invokeGroupBy, invokeIntrinsic, } from "./methods.js";
+ import { preserveConsumerError } from "./iterator.js";
+@@ -147,6 +147,7 @@ export class Interpreter {
+     toolKeys;
+     logs;
+     promises;
++    budget;
+     generatorState;
+     generatorAsync = false;
+     runner = {
+@@ -154,9 +155,12 @@ export class Interpreter {
          invokeCallable: (callable, args, node) => this.invokeCallable(callable, args, node),
          settlePromise: (promise) => this.settlePromise(promise),
          syncIterator: (value, node) => this.syncIterator(value, node),
 +        suspend: (wait) => this.promises.turn.suspend(wait),
 +        leave: (wait) => this.promises.turn.leave(wait),
      };
-     constructor(executeTool, invokeSearch, toolKeys, promises, logs = []) {
+-    constructor(executeTool, invokeSearch, toolKeys, promises, logs = []) {
++    constructor(executeTool, invokeSearch, toolKeys, promises, logs = [], budget = new StepBudget(undefined)) {
          const globalScope = new Map();
-@@ -223,21 +225,26 @@ export class Interpreter {
++        this.budget = budget;
+         this.scopes = new ScopeStack([globalScope]);
+         this.executeTool = executeTool;
+         this.invokeSearch = invokeSearch;
+@@ -223,22 +227,28 @@ export class Interpreter {
              return value;
          }).pipe(Effect.ensuring(Effect.sync(() => self.scopes.pop())));
      }
@@ -654,9 +782,11 @@ index 8c1b549..3575409 100644
 +        return this.promises.turn.suspend(Effect.yieldNow);
 +    }
      evaluateStatement(node) {
++        this.budget.step(node);
          switch (node.type) {
              case "ExpressionStatement":
-@@ -510,7 +517,7 @@ export class Interpreter {
+                 return Effect.as(this.evaluateExpression(getNode(node, "expression")), { kind: "none" });
+@@ -510,7 +520,7 @@ export class Interpreter {
              const close = () => iterator
                  ? self.closeIterator(iterator, node, awaiting)
                  : awaiting
@@ -665,7 +795,7 @@ index 8c1b549..3575409 100644
                      : (cursor?.close ?? Effect.void);
              let assignment;
              if (left.type !== "VariableDeclaration" &&
-@@ -656,7 +663,7 @@ export class Interpreter {
+@@ -656,7 +666,7 @@ export class Interpreter {
              const called = yield* Effect.exit(self.invokeCallable(iterator.next, [], node));
              if (!Exit.isSuccess(called)) {
                  if (awaiting)
@@ -674,7 +804,7 @@ index 8c1b549..3575409 100644
                  return yield* Effect.failCause(called.cause);
              }
              const captured = yield* Effect.exit(Effect.sync(() => {
-@@ -665,7 +672,7 @@ export class Interpreter {
+@@ -665,7 +675,7 @@ export class Interpreter {
              }));
              if (!Exit.isSuccess(captured)) {
                  if (awaiting)
@@ -683,7 +813,7 @@ index 8c1b549..3575409 100644
                  return yield* Effect.failCause(captured.cause);
              }
              return {
-@@ -681,7 +688,7 @@ export class Interpreter {
+@@ -681,7 +691,7 @@ export class Interpreter {
              ? new GeneratorMethodReference(iterator.iterator, "return")
              : iterator.iterator.return;
          if (close === undefined || close === null)
@@ -692,7 +822,7 @@ index 8c1b549..3575409 100644
          const self = this;
          return Effect.gen(function* () {
              const method = self.requireIteratorMethod(close, "Iterator return", node);
-@@ -692,13 +699,13 @@ export class Interpreter {
+@@ -692,13 +702,13 @@ export class Interpreter {
              const called = yield* Effect.exit(self.invokeCallable(method, [], node));
              if (!Exit.isSuccess(called)) {
                  if (awaiting)
@@ -708,7 +838,7 @@ index 8c1b549..3575409 100644
                  return yield* Effect.failCause(captured.cause);
              }
              if (awaiting)
-@@ -720,17 +727,18 @@ export class Interpreter {
+@@ -720,17 +730,18 @@ export class Interpreter {
              return value;
          throw new InterpreterRuntimeError(`${context} must be a function.`, node).as("TypeError");
      }
@@ -731,7 +861,7 @@ index 8c1b549..3575409 100644
      }
      evaluateForInStatement(node, labels) {
          const left = getNode(node, "left");
-@@ -743,7 +751,7 @@ export class Interpreter {
+@@ -743,7 +754,7 @@ export class Interpreter {
                  self.predeclarePattern(declared.pattern, declared.mutable, left);
              const right = yield* self.evaluateExpression(getNode(node, "right"));
              const body = getNode(node, "body");
@@ -740,7 +870,27 @@ index 8c1b549..3575409 100644
              if (keys === undefined) {
                  throw new InterpreterRuntimeError("for...in requires a plain object, array, or tools reference. Use for...of for arrays/strings/Maps/Sets, or Object.keys(value) for a key list.", node);
              }
-@@ -1592,7 +1600,7 @@ export class Interpreter {
+@@ -833,7 +844,10 @@ export class Interpreter {
+         const self = this;
+         const attempted = Effect.matchCauseEffect(this.evaluateStatement(body), {
+             onFailure: (cause) => {
+-                if (cause.reasons.some(Cause.isInterruptReason) || Cause.squash(cause) instanceof GeneratorReturn || !handler) {
++                if (cause.reasons.some(Cause.isInterruptReason) ||
++                    Cause.squash(cause) instanceof GeneratorReturn ||
++                    Cause.squash(cause) instanceof StepBudgetExceeded ||
++                    !handler) {
+                     return Effect.failCause(cause);
+                 }
+                 const caught = caughtErrorValue(Cause.squash(cause));
+@@ -1037,6 +1051,7 @@ export class Interpreter {
+         return undefined;
+     }
+     evaluateExpression(node) {
++        this.budget.step(node);
+         switch (node.type) {
+             case "Literal": {
+                 const regex = node.regex;
+@@ -1592,7 +1607,7 @@ export class Interpreter {
                  if (callable.namespace === "console")
                      return self.invokeConsole(callable.name, args, node);
                  if (callable.namespace === "Object" && args[0] instanceof ToolReference) {
@@ -749,7 +899,7 @@ index 8c1b549..3575409 100644
                  }
                  if (callable.namespace === "Object" && objectMethodsPreservingIdentity.has(callable.name)) {
                      if (callable.name === "fromEntries")
-@@ -1665,7 +1673,7 @@ export class Interpreter {
+@@ -1665,7 +1680,7 @@ export class Interpreter {
      }
      invokeObjectMethodOnTools(name, ref, node) {
          if (name === "keys") {
@@ -758,7 +908,16 @@ index 8c1b549..3575409 100644
          }
          throw new InterpreterRuntimeError(`Object.${name}(...) cannot read tool references: they are not plain data. Use Object.keys(tools) for names, or search({ query }) for signatures.`, node, "InvalidDataValue");
      }
-@@ -1730,7 +1738,7 @@ export class Interpreter {
+@@ -1701,7 +1716,7 @@ export class Interpreter {
+         });
+     }
+     invokeFunction(fn, args) {
+-        const invocation = new Interpreter(this.executeTool, this.invokeSearch, this.toolKeys, this.promises, this.logs);
++        const invocation = new Interpreter(this.executeTool, this.invokeSearch, this.toolKeys, this.promises, this.logs, this.budget);
+         invocation.scopes = new ScopeStack([...fn.capturedScopes, new Map()]);
+         const run = Effect.gen(function* () {
+             // Seed all parameters first so defaults cannot fall through to same-named outer bindings.
+@@ -1730,7 +1745,7 @@ export class Interpreter {
              return run;
          // The initial yield assigns the promise before the body can self-resolve.
          const box = {};
@@ -767,7 +926,7 @@ index 8c1b549..3575409 100644
              box.promise = promise;
              return promise;
          });
-@@ -1739,8 +1747,17 @@ export class Interpreter {
+@@ -1739,8 +1754,17 @@ export class Interpreter {
          const state = { started: false, completed: false, draining: false, pending: [], pendingIndex: 0 };
          invocation.generatorState = state;
          invocation.generatorAsync = asynchronous;
@@ -786,7 +945,7 @@ index 8c1b549..3575409 100644
              if (!asynchronous && state.active) {
                  return Effect.fail(new InterpreterRuntimeError("Generator is already running.", node).as("TypeError"));
              }
-@@ -1749,11 +1766,11 @@ export class Interpreter {
+@@ -1749,11 +1773,11 @@ export class Interpreter {
                  state.completed = true;
                  state.pending.push(request);
                  if (state.draining)
@@ -800,7 +959,7 @@ index 8c1b549..3575409 100644
              }
              if (state.completed) {
                  if (kind === "throw")
-@@ -1766,11 +1783,19 @@ export class Interpreter {
+@@ -1766,11 +1790,19 @@ export class Interpreter {
                      return Effect.fail(new ProgramThrow(value));
                  return Effect.succeed({ value, done: true });
              }
@@ -821,7 +980,7 @@ index 8c1b549..3575409 100644
              }
              if (!state.started) {
                  state.started = true;
-@@ -1789,10 +1814,10 @@ export class Interpreter {
+@@ -1789,10 +1821,10 @@ export class Interpreter {
                      yield* invocation.completeGeneratorRequests(state, asynchronous);
                      state.completed = true;
                  });
@@ -835,7 +994,7 @@ index 8c1b549..3575409 100644
          return generator;
      }
      completeGeneratorRequests(state, asynchronous) {
-@@ -1820,7 +1845,7 @@ export class Interpreter {
+@@ -1820,7 +1852,7 @@ export class Interpreter {
          if (next)
              return Effect.succeed(next);
          state.available = Deferred.makeUnsafe();
@@ -845,7 +1004,7 @@ index 8c1b549..3575409 100644
      dequeueGeneratorRequest(state) {
          const request = state.pending[state.pendingIndex];
 diff --git a/dist/namespace.d.ts b/dist/namespace.d.ts
-index e464076..220d157 100644
+index e4640762c1139d5a864f966035446f5d890040f0..220d15700f5e0f2d4dbee3f5500875ccbf3cb86d 100644
 --- a/dist/namespace.d.ts
 +++ b/dist/namespace.d.ts
 @@ -1,9 +1,21 @@
@@ -877,7 +1036,7 @@ index e464076..220d157 100644
 +/** Declares a namespace whose tools are loaded when a program first reaches it. */
 +export declare const lazy: <R = never>(options: LazyOptions<R>) => Namespace<R>;
 diff --git a/dist/namespace.js b/dist/namespace.js
-index 93db240..e0e44b0 100644
+index 93db2408fe35817f6d53add795822e91dadcedfd..e0e44b0e8c823133cc390d3a12d7b87873006236 100644
 --- a/dist/namespace.js
 +++ b/dist/namespace.js
 @@ -5,3 +5,10 @@ export const make = (options) => ({
@@ -892,7 +1051,7 @@ index 93db240..e0e44b0 100644
 +    load: options.load,
 +});
 diff --git a/dist/openapi/index.js b/dist/openapi/index.js
-index 1702476..2425925 100644
+index 1702476510e1019a2a2b6b7e14423c84a350e8c9..2425925a7bd394917d57f36b84e6f0fa29e5f79e 100644
 --- a/dist/openapi/index.js
 +++ b/dist/openapi/index.js
 @@ -1,4 +1,4 @@
@@ -902,7 +1061,7 @@ index 1702476..2425925 100644
  import { invoke } from "./runtime.js";
  import { componentDefinitions, hasDirectionalSchemas, inputSchema, isRecord, methods, nonEmptyString, operationInput, operationOutput, operationPath, operationSecurityRequirements, securityRequirements, securitySchemes, specServerUrl, validateBaseUrl, } from "./spec.js";
 diff --git a/dist/openapi/runtime.d.ts b/dist/openapi/runtime.d.ts
-index 86ae0c3..2da6eeb 100644
+index 86ae0c3d2183e89bc3d83c1548d860bc8d69c78b..2da6eeb1b50263f69bc593a4fe0eb0cc4cc3a1d3 100644
 --- a/dist/openapi/runtime.d.ts
 +++ b/dist/openapi/runtime.d.ts
 @@ -1,4 +1,4 @@
@@ -912,7 +1071,7 @@ index 86ae0c3..2da6eeb 100644
  import type { Plan } from "./types.js";
  export declare const invoke: (plan: Plan, input: unknown) => Effect.Effect<unknown, unknown, HttpClient.HttpClient>;
 diff --git a/dist/openapi/runtime.js b/dist/openapi/runtime.js
-index 0fa6088..4e2d042 100644
+index 0fa6088d164442dfc9c41fff6ab71357f7386317..4e2d042f4f2b20b800bd26cd270014eee6b8dac6 100644
 --- a/dist/openapi/runtime.js
 +++ b/dist/openapi/runtime.js
 @@ -1,5 +1,5 @@
@@ -923,7 +1082,7 @@ index 0fa6088..4e2d042 100644
  import { isRecord, own } from "./spec.js";
  const decodeJson = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Unknown));
 diff --git a/dist/openapi/types.d.ts b/dist/openapi/types.d.ts
-index 52d2cb7..80e1db3 100644
+index 52d2cb7dbb75f6998a9dd2a4ad4e8a780ba9ceb0..80e1db35c82b1434144608a797077030f2c386b1 100644
 --- a/dist/openapi/types.d.ts
 +++ b/dist/openapi/types.d.ts
 @@ -1,5 +1,5 @@
@@ -934,7 +1093,7 @@ index 52d2cb7..80e1db3 100644
  /** A parsed OpenAPI 3.x document. YAML must be parsed by the host. */
  export type Document = Record<string, unknown>;
 diff --git a/dist/openapi/types.js b/dist/openapi/types.js
-index bc386d2..483cc3f 100644
+index bc386d2cd78bffa1bd1f76bf98509183f61c57d1..483cc3fd953ab434bf0209462d9a88ddce404fb0 100644
 --- a/dist/openapi/types.js
 +++ b/dist/openapi/types.js
 @@ -1,2 +1,2 @@
@@ -942,7 +1101,7 @@ index bc386d2..483cc3f 100644
 -import { HttpClient } from "effect/unstable/http";
 +import { HttpClient } from "effect/http";
 diff --git a/dist/tool-error.d.ts b/dist/tool-error.d.ts
-index 1adc0b7..9489b77 100644
+index 1adc0b7af422b5ca0ffe5b79abc7a14ceccb7627..9489b77bae4a0833ee2ff82811a859b22621775f 100644
 --- a/dist/tool-error.d.ts
 +++ b/dist/tool-error.d.ts
 @@ -2,10 +2,11 @@ import { Schema } from "effect";
@@ -960,7 +1119,7 @@ index 1adc0b7..9489b77 100644
 +export declare const toolError: (message: string, cause?: unknown, properties?: Readonly<Record<string, string>>) => ToolError;
  export {};
 diff --git a/dist/tool-error.js b/dist/tool-error.js
-index 6a8d1d2..492ad48 100644
+index 6a8d1d2243d9fc43281a19793e296dfa1556ee0f..492ad4845a7cc5023ee9e23b2eb264ce78a1f279 100644
 --- a/dist/tool-error.js
 +++ b/dist/tool-error.js
 @@ -3,7 +3,16 @@ import { Schema } from "effect";
@@ -983,7 +1142,7 @@ index 6a8d1d2..492ad48 100644
 +    ...(properties === undefined ? {} : { properties }),
 +});
 diff --git a/dist/tool-runtime.d.ts b/dist/tool-runtime.d.ts
-index 7b04d8e..98c08f7 100644
+index 7b04d8e485966e56e673286c9ac9415ac5f60a7f..98c08f773aeb548386a0b6d48ff26c72445d543c 100644
 --- a/dist/tool-runtime.d.ts
 +++ b/dist/tool-runtime.d.ts
 @@ -4,7 +4,12 @@ export type Services<T> = ServicesOf<T, []>;
@@ -1047,7 +1206,7 @@ index 7b04d8e..98c08f7 100644
 +export declare const make: <R>(tools: Tools<R>, maxToolCalls: number | undefined, searchIndex: () => ReadonlyArray<SearchEntry>, hooks?: ToolCallHooks<R>, search?: Search<R>) => ToolRuntime<R>;
  export * as ToolRuntime from "./tool-runtime.js";
 diff --git a/dist/tool-runtime.js b/dist/tool-runtime.js
-index f649a9a..8ccc826 100644
+index f649a9a04eea271c852510a4deef6efa7b6252bc..8ccc826028e82460cfe2227170f6cfea1c05d75d 100644
 --- a/dist/tool-runtime.js
 +++ b/dist/tool-runtime.js
 @@ -1,5 +1,5 @@

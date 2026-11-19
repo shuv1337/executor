@@ -526,12 +526,22 @@ export class CatalogUnavailable extends Schema.TaggedError<CatalogUnavailable>()
 export const McpLimits = Schema.Struct({
   timeoutMs: Schema.Int.check(Schema.isGreaterThan(0)),
   maxToolCalls: Schema.Int.check(Schema.isGreaterThan(0)),
+  /**
+   * Statements and expressions one program may evaluate. Waiting on tool calls and approvals
+   * evaluates nothing, so this bounds the CPU a program spends in the interpreter on the server's
+   * own thread, which `timeoutMs` alone does not.
+   */
+  maxSteps: Schema.Int.check(Schema.isGreaterThan(0)),
 });
 export type McpLimits = typeof McpLimits.Type;
 /** Default interpreter budgets; each product may supply different limits. */
 export const defaultMcpLimits: McpLimits = {
   timeoutMs: 5 * 60_000,
   maxToolCalls: 100,
+  // About 9 s of interpreter time in workerd, which runs about 550,000 steps a second (Node runs
+  // about 2 million). Ordinary programs spend 0.1-0.5 s before their first call; the program that
+  // held production's thread for 203 s took about 110 million steps.
+  maxSteps: 5_000_000,
 };
 /** UTF-8 bytes of JSON one search page may hold; `next` continues past it. */
 export const searchPageBytes = 25_000;
