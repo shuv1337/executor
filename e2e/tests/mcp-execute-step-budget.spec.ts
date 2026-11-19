@@ -4,7 +4,8 @@
  * production one program spent 203 s in the interpreter and other requests slowed until clients
  * gave up. The step budget stops such a program with `TimeoutExceeded` long before its wall time,
  * whatever its own `catch` does, while other requests keep answering and an ordinary program that
- * calls tools and loops still completes.
+ * calls tools and loops still completes. Native calls are charged for the data they read and
+ * return, so a loop of large `split` calls, one step each, stops in seconds too.
  */
 import { expect, layer } from "@effect/vitest";
 import { Duration, Effect, Fiber, Schema } from "effect";
@@ -88,6 +89,22 @@ try {
 }`;
 
 /**
+ * The review's proof that native calls escaped the budget: each `split` is one step, but builds a
+ * million-element array. Uncharged, it ran 83 s and outlasted a 60 s wall-time budget.
+ */
+const nativeRunaway = `
+const s = "x".repeat(1000000);
+let n = 0;
+for (let i = 0; i < 100000; i++) { n += s.split("").length }
+return n;`;
+
+/** Filters and maps 10,000 records, as programs do with a large tool result. */
+const recordsTransform = `
+const records = Array.from({ length: 10000 }, (_, i) => ({ id: 'r' + i, price: i % 100, tags: ['a', 'b'] }));
+const cheap = records.filter((record) => record.price < 50).map((record) => ({ id: record.id, price: record.price * 2 }));
+return { kept: cheap.length, json: JSON.stringify(cheap).length > 0 };`;
+
+/**
  * Three tool calls with a 200,000-iteration loop between them: several times the interpreter work
  * of the programs agents send, which spend well under a second before their first call.
  */
@@ -166,6 +183,23 @@ layer(HostedLive, { excludeTestServices: true })("Hosted MCP execute step budget
             "success",
           ]);
 
+          // A loop of large native calls stops at the same budget, in seconds.
+          const native = yield* execute(runner, "native-runaway", nativeRunaway);
+          expect(native.execution).toMatchObject({
+            ok: false,
+            error: {
+              kind: "TimeoutExceeded",
+              message: expect.stringContaining(
+                `Execution exceeded its compute budget of ${defaultMaxSteps} interpreter steps`,
+              ),
+            },
+          });
+          expect(native.ms).toBeLessThan(20_000);
+
+          // Transforming 10,000 records with native calls stays well inside it.
+          const records = yield* execute(runner, "records-transform", recordsTransform);
+          expect(records.execution).toMatchObject({ ok: true, value: { kept: 5000, json: true } });
+
           yield* evidence.measure("runaway-ms", stopped.ms);
           yield* evidence.measure("ordinary-quiet-max-ms", slowestQuiet);
           yield* evidence.measure("ordinary-busy-max-ms", Math.max(...busy));
@@ -176,6 +210,8 @@ layer(HostedLive, { excludeTestServices: true })("Hosted MCP execute step budget
             busy,
           });
           yield* evidence.measure("heavy-but-fine-ms", fine.ms);
+          yield* evidence.measure("native-runaway-ms", native.ms);
+          yield* evidence.measure("records-transform-ms", records.ms);
         }).pipe(Effect.provide(McpClient.layer)),
       ),
     { timeout: 180_000 },
