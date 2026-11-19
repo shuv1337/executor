@@ -196,18 +196,78 @@ index 3d7f507ef37117b1d3ca12a3fa1d9754abca4031..82ffd78ab9661d809225c8e6326b142e
          const timeoutMs = limits.timeoutMs;
          const operation = timeoutMs === undefined
 diff --git a/dist/interpreter/methods.d.ts b/dist/interpreter/methods.d.ts
-index db276e322e6eb9108c09dff9b5218bc4e29df616..d5b7dfca9c0020d63c828d776e044061411ec2d1 100644
+index db276e322e6eb9108c09dff9b5218bc4e29df616..ec1067b6c1d80e8688dd006858d4924fb0769086 100644
 --- a/dist/interpreter/methods.d.ts
 +++ b/dist/interpreter/methods.d.ts
-@@ -6,6 +6,8 @@ export type CallbackRunner<R> = {
+@@ -5,12 +5,15 @@ import { type SyncIteratorRunner } from "./iterator.js";
+ export type CallbackRunner<R> = {
      readonly invokeFunction: (fn: CodeModeFunction, args: Array<unknown>) => Effect.Effect<unknown, unknown, R>;
      readonly invokeCallable: (callable: unknown, args: Array<unknown>, node: AstNode) => Effect.Effect<unknown, unknown, R>;
++    readonly meterWalk: (node: AstNode) => (visited: number) => void;
      readonly settlePromise: (promise: CodeModePromise) => Effect.Effect<unknown, unknown, never>;
 +    readonly suspend: <A, E>(wait: Effect.Effect<A, E>) => Effect.Effect<A, E>;
 +    readonly leave: <A, E>(wait: Effect.Effect<A, E>) => Effect.Effect<A, E>;
  };
  export type SupportedCallback = CodeModeFunction | CoercionFunction | UriFunction | PromiseCapabilityFunction | GlobalMethodReference | JsonMethodReference | IntrinsicReference | ErrorConstructorReference | GlobalNamespace | PromiseNamespace;
  export declare const isSupportedCallback: (value: unknown) => value is SupportedCallback;
+ export declare const invokeIntrinsic: <R>(runner: CallbackRunner<R>, ref: IntrinsicReference, args: Array<unknown>, node: AstNode) => Effect.Effect<unknown, unknown, R>;
+-export declare const invokeGlobalMethod: (ref: GlobalMethodReference, args: Array<unknown>, node: AstNode) => unknown;
++export declare const invokeGlobalMethod: (ref: GlobalMethodReference, args: Array<unknown>, node: AstNode, meter?: (visited: number) => void) => unknown;
+ export declare const arrayStatics: Set<string>;
+ export declare const invokeArrayFrom: <R>(runner: CallbackRunner<R> & SyncIteratorRunner<R>, args: Array<unknown>, node: AstNode) => Effect.Effect<unknown, unknown, R>;
+ export declare const invokeGroupBy: <R>(runner: CallbackRunner<R> & SyncIteratorRunner<R>, namespace: "Map" | "Object", args: Array<unknown>, node: AstNode) => Effect.Effect<unknown, unknown, R>;
+diff --git a/dist/interpreter/methods.js b/dist/interpreter/methods.js
+index 320c1cada40e573468be75551742898317b0bd5f..70a5cce54ec26ea422ff5ee20fcddb5d4ba602bb 100644
+--- a/dist/interpreter/methods.js
++++ b/dist/interpreter/methods.js
+@@ -92,11 +92,11 @@ const coerceNumericArgument = (runner, value, node) => {
+         throw new InterpreterRuntimeError("Cannot convert object to primitive value.", node).as("TypeError");
+     });
+ };
+-export const invokeGlobalMethod = (ref, args, node) => {
++export const invokeGlobalMethod = (ref, args, node, meter) => {
+     if (ref.namespace === "console")
+         throw new InterpreterRuntimeError(`console.${ref.name} is not available.`, node);
+     if (ref.namespace === "Object")
+-        return invokeObjectMethod(ref.name, args, node);
++        return invokeObjectMethod(ref.name, args, node, meter);
+     if (ref.namespace === "Math")
+         return invokeMathMethod(ref.name, args, node);
+     if (ref.namespace === "Array")
+@@ -810,13 +810,13 @@ const invokeArrayMethod = (runner, target, name, args, node) => {
+         case "push": {
+             // Validate all insertions before mutating to avoid partial cyclic updates.
+             for (const item of args)
+-                rejectCircularInsertion(target, item, "Array.push result", node);
++                rejectCircularInsertion(target, item, "Array.push result", node, undefined, runner.meterWalk(node));
+             target.push(...args);
+             return Effect.succeed(target.length);
+         }
+         case "unshift": {
+             for (const item of args)
+-                rejectCircularInsertion(target, item, "Array.unshift result", node);
++                rejectCircularInsertion(target, item, "Array.unshift result", node, undefined, runner.meterWalk(node));
+             target.unshift(...args);
+             return Effect.succeed(target.length);
+         }
+@@ -833,7 +833,7 @@ const invokeArrayMethod = (runner, target, name, args, node) => {
+             const deleteCount = optNumber(args[1], "delete count") ?? 0;
+             const inserted = args.slice(2);
+             for (const item of inserted)
+-                rejectCircularInsertion(target, item, "Array.splice result", node);
++                rejectCircularInsertion(target, item, "Array.splice result", node, undefined, runner.meterWalk(node));
+             return Effect.succeed(target.splice(start, deleteCount, ...inserted));
+         }
+         case "toSpliced": {
+@@ -851,7 +851,7 @@ const invokeArrayMethod = (runner, target, name, args, node) => {
+             return Effect.succeed(copied);
+         }
+         case "fill": {
+-            rejectCircularInsertion(target, args[0], "Array.fill result", node);
++            rejectCircularInsertion(target, args[0], "Array.fill result", node, undefined, runner.meterWalk(node));
+             return Effect.succeed(target.fill(args[0], optNumber(args[1], "start"), optNumber(args[2], "end")));
+         }
+         case "copyWithin":
 diff --git a/dist/interpreter/model.d.ts b/dist/interpreter/model.d.ts
 index ed2accf68c9f24fa26154e266617ef587340445a..852ea1d07aeb70be1730579dc561f636e9ae938f 100644
 --- a/dist/interpreter/model.d.ts
@@ -697,34 +757,50 @@ index 996f9a5090879de5104b8ecb439ee15fecee6f40..55843d5d6d27b370a235d66e1a242ab2
  const chainReaction = (runner, promises, source, onFulfilled, onRejected, method, node) => {
      const box = {};
      const body = Effect.gen(function* () {
+diff --git a/dist/interpreter/references.d.ts b/dist/interpreter/references.d.ts
+index 7b1492c21fbe95d6b995327ad7aec31ba345bf6b..a2ebe70b30121ff5e4b6ca60e0b6109ac317f633 100644
+--- a/dist/interpreter/references.d.ts
++++ b/dist/interpreter/references.d.ts
+@@ -2,5 +2,5 @@ import { type AstNode } from "./model.js";
+ export declare const isRuntimeReference: (value: unknown) => boolean;
+ export declare const containsRuntimeReference: (value: unknown) => boolean;
+ export declare const containsOpaqueReference: (value: unknown) => boolean;
+-export declare const rejectCircularInsertion: (container: object, value: unknown, label: string, node: AstNode, seen?: Set<object>) => void;
++export declare const rejectCircularInsertion: (container: object, value: unknown, label: string, node: AstNode, seen?: Set<object>, meter?: (visited: number) => void) => void;
+ export declare const typeofValue: (value: unknown) => string;
 diff --git a/dist/interpreter/references.js b/dist/interpreter/references.js
-index 314a7c3752745de0b8680531b64cf37bc584a812..a22d1c44e05cbb97427cf86a82d68ee79ea3a41d 100644
+index 314a7c3752745de0b8680531b64cf37bc584a812..a4bf237d4e716d3259b0f617695268cc47c5b289 100644
 --- a/dist/interpreter/references.js
 +++ b/dist/interpreter/references.js
-@@ -70,6 +70,42 @@ export const containsOpaqueReference = (value) => {
+@@ -70,23 +70,82 @@ export const containsOpaqueReference = (value) => {
      }
      return false;
  };
+-// Reject cycles before mutation so later boundary walks remain safe.
+-export const rejectCircularInsertion = (container, value, label, node, seen = new Set()) => {
 +// Like containsOpaqueReference, but reports every value it visits to `meter` in batches of
 +// METER_BATCH, so the caller can charge the walk and stop it partway. Primitives return at once.
 +const METER_BATCH = 1024;
 +export const containsOpaqueReferenceMetered = (value, meter) => {
 +    if (value === null || typeof value !== "object")
 +        return false;
-+    const pending = [[value].values()];
+     const pending = [[value].values()];
 +    const seen = new Set();
 +    let visited = 0;
-+    while (pending.length > 0) {
-+        const next = pending.at(-1).next();
-+        if (next.done) {
-+            pending.pop();
-+            continue;
-+        }
+     while (pending.length > 0) {
+         const next = pending.at(-1).next();
+         if (next.done) {
+             pending.pop();
+             continue;
+         }
 +        if (++visited === METER_BATCH) {
 +            meter(visited);
 +            visited = 0;
 +        }
-+        const current = next.value;
+         const current = next.value;
+-        if (current === container)
+-            throw new InterpreterRuntimeError(`${label} contains a circular value.`, node, "InvalidDataValue");
+-        if (current === null || typeof current !== "object" || isRuntimeReference(current) || seen.has(current))
 +        if (isCodeModeValue(current))
 +            continue;
 +        if (isRuntimeReference(current)) {
@@ -732,18 +808,58 @@ index 314a7c3752745de0b8680531b64cf37bc584a812..a22d1c44e05cbb97427cf86a82d68ee7
 +            return true;
 +        }
 +        if (current === null || typeof current !== "object" || seen.has(current))
-+            continue;
-+        seen.add(current);
-+        pending.push(childValues(current));
-+    }
+             continue;
+         seen.add(current);
+         pending.push(childValues(current));
+     }
 +    meter(visited);
 +    return false;
 +};
 +/** An interpreter reference that is not CodeMode data, such as a function or the tools root. */
 +export const isOpaqueReference = (value) => !isCodeModeValue(value) && isRuntimeReference(value);
- // Reject cycles before mutation so later boundary walks remain safe.
- export const rejectCircularInsertion = (container, value, label, node, seen = new Set()) => {
-     const pending = [[value].values()];
++// Reject cycles before mutation so later boundary walks remain safe.
++// Data objects whose own values are all primitives or interpreter references, so a cycle walk
++// that reaches one can stop there: the container it looks for is a data object and cannot be among
++// them. An object leaves the set when an object is inserted into it, and every insertion of a
++// value into existing program data runs rejectCircularInsertion first, so membership stays exact.
++const leafData = new WeakSet();
++// The walk visits each value once and reports visits to `meter` in batches of METER_BATCH, so the
++// caller can charge it and stop it partway; a leaf seen before costs one visit.
++export const rejectCircularInsertion = (container, value, label, node, seen = new Set(), meter) => {
++    if (value === null || typeof value !== "object")
++        return;
++    leafData.delete(container);
++    const pending = [{ children: [value].values(), owner: undefined, leaf: true }];
++    let visited = 0;
++    while (pending.length > 0) {
++        const frame = pending.at(-1);
++        const next = frame.children.next();
++        if (next.done) {
++            pending.pop();
++            if (frame.owner !== undefined && frame.leaf)
++                leafData.add(frame.owner);
++            continue;
++        }
++        if (meter !== undefined && ++visited === METER_BATCH) {
++            meter(visited);
++            visited = 0;
++        }
++        const current = next.value;
++        if (current === container)
++            throw new InterpreterRuntimeError(`${label} contains a circular value.`, node, "InvalidDataValue");
++        if (current === null || typeof current !== "object" || isRuntimeReference(current))
++            continue;
++        frame.leaf = false;
++        if (seen.has(current) || leafData.has(current))
++            continue;
++        seen.add(current);
++        pending.push({ children: childValues(current), owner: current, leaf: true });
++    }
++    if (meter !== undefined)
++        meter(visited);
+ };
+ export const typeofValue = (value) => {
+     if (value instanceof CodeModeFunction ||
 diff --git a/dist/interpreter/runtime.d.ts b/dist/interpreter/runtime.d.ts
 index bd1bc708017c1a30b0c81d37639b55ff12a2e3bc..0ef22693f3e8bbed507161502b837c59590d8675 100644
 --- a/dist/interpreter/runtime.d.ts
@@ -783,7 +899,7 @@ index bd1bc708017c1a30b0c81d37639b55ff12a2e3bc..0ef22693f3e8bbed507161502b837c59
      private invokeConsole;
      private evaluateCallArguments;
 diff --git a/dist/interpreter/runtime.js b/dist/interpreter/runtime.js
-index 8c1b549d3da8c2287e330e63d7370cd3838e57df..5502f4f042142565e2e1304a24a9c9b2c3d292d9 100644
+index 8c1b549d3da8c2287e330e63d7370cd3838e57df..cb19bd882a1e3847531b19847867e1159bccb5cd 100644
 --- a/dist/interpreter/runtime.js
 +++ b/dist/interpreter/runtime.js
 @@ -1,11 +1,11 @@
@@ -800,7 +916,7 @@ index 8c1b549d3da8c2287e330e63d7370cd3838e57df..5502f4f042142565e2e1304a24a9c9b2
  import { ScopeStack } from "./scope.js";
  import { arrayMethods, mapMethods, mapStatics, setMethods } from "../stdlib/collections.js";
  import { consoleMethods, formatConsoleMessage } from "../stdlib/console.js";
-@@ -140,6 +140,95 @@ const copyIteratorSymbols = (source, target, consumed) => {
+@@ -140,6 +140,96 @@ const copyIteratorSymbols = (source, target, consumed) => {
      }
  };
  const promiseResolutionNode = { type: "PromiseResolution" };
@@ -814,6 +930,7 @@ index 8c1b549d3da8c2287e330e63d7370cd3838e57df..5502f4f042142565e2e1304a24a9c9b2
 +const RECORD_WIDTH_LIMIT = 64;
 +const RECORD_WIDTH_SAMPLES = 8;
 +const SCAN_ITEMS_PER_STEP = 512;
++const CONCAT_CHARS_PER_STEP = 4096;
 +const isPlainData = (value) => {
 +    if (value === null || typeof value !== "object")
 +        return false;
@@ -896,7 +1013,7 @@ index 8c1b549d3da8c2287e330e63d7370cd3838e57df..5502f4f042142565e2e1304a24a9c9b2
  export class Interpreter {
      scopes;
      executeTool;
-@@ -147,6 +236,7 @@ export class Interpreter {
+@@ -147,6 +237,7 @@ export class Interpreter {
      toolKeys;
      logs;
      promises;
@@ -904,12 +1021,13 @@ index 8c1b549d3da8c2287e330e63d7370cd3838e57df..5502f4f042142565e2e1304a24a9c9b2
      generatorState;
      generatorAsync = false;
      runner = {
-@@ -154,9 +244,12 @@ export class Interpreter {
+@@ -154,9 +245,13 @@ export class Interpreter {
          invokeCallable: (callable, args, node) => this.invokeCallable(callable, args, node),
          settlePromise: (promise) => this.settlePromise(promise),
          syncIterator: (value, node) => this.syncIterator(value, node),
 +        suspend: (wait) => this.promises.turn.suspend(wait),
 +        leave: (wait) => this.promises.turn.leave(wait),
++        meterWalk: (node) => this.meterWalk(node),
      };
 -    constructor(executeTool, invokeSearch, toolKeys, promises, logs = []) {
 +    constructor(executeTool, invokeSearch, toolKeys, promises, logs = [], budget = new StepBudget(undefined)) {
@@ -918,7 +1036,7 @@ index 8c1b549d3da8c2287e330e63d7370cd3838e57df..5502f4f042142565e2e1304a24a9c9b2
          this.scopes = new ScopeStack([globalScope]);
          this.executeTool = executeTool;
          this.invokeSearch = invokeSearch;
-@@ -223,22 +316,28 @@ export class Interpreter {
+@@ -223,22 +318,28 @@ export class Interpreter {
              return value;
          }).pipe(Effect.ensuring(Effect.sync(() => self.scopes.pop())));
      }
@@ -952,7 +1070,25 @@ index 8c1b549d3da8c2287e330e63d7370cd3838e57df..5502f4f042142565e2e1304a24a9c9b2
          switch (node.type) {
              case "ExpressionStatement":
                  return Effect.as(this.evaluateExpression(getNode(node, "expression")), { kind: "none" });
-@@ -510,7 +609,7 @@ export class Interpreter {
+@@ -346,7 +447,7 @@ export class Interpreter {
+         const self = this;
+         return Effect.gen(function* () {
+             const discriminant = yield* self.evaluateExpression(getNode(node, "discriminant"));
+-            if (containsOpaqueReference(discriminant)) {
++            if (containsOpaqueReferenceMetered(discriminant, self.meterWalk(node))) {
+                 throw new InterpreterRuntimeError("Switch discriminants must be data values.", node, "InvalidDataValue");
+             }
+             self.scopes.push();
+@@ -362,7 +463,7 @@ export class Interpreter {
+                         continue;
+                     }
+                     const candidate = yield* self.evaluateExpression(test);
+-                    if (containsOpaqueReference(candidate)) {
++                    if (containsOpaqueReferenceMetered(candidate, self.meterWalk(test))) {
+                         throw new InterpreterRuntimeError("Switch case values must be data values.", test, "InvalidDataValue");
+                     }
+                     if (candidate === discriminant) {
+@@ -510,7 +611,7 @@ export class Interpreter {
              const close = () => iterator
                  ? self.closeIterator(iterator, node, awaiting)
                  : awaiting
@@ -961,7 +1097,7 @@ index 8c1b549d3da8c2287e330e63d7370cd3838e57df..5502f4f042142565e2e1304a24a9c9b2
                      : (cursor?.close ?? Effect.void);
              let assignment;
              if (left.type !== "VariableDeclaration" &&
-@@ -656,7 +755,7 @@ export class Interpreter {
+@@ -656,7 +757,7 @@ export class Interpreter {
              const called = yield* Effect.exit(self.invokeCallable(iterator.next, [], node));
              if (!Exit.isSuccess(called)) {
                  if (awaiting)
@@ -970,7 +1106,7 @@ index 8c1b549d3da8c2287e330e63d7370cd3838e57df..5502f4f042142565e2e1304a24a9c9b2
                  return yield* Effect.failCause(called.cause);
              }
              const captured = yield* Effect.exit(Effect.sync(() => {
-@@ -665,7 +764,7 @@ export class Interpreter {
+@@ -665,7 +766,7 @@ export class Interpreter {
              }));
              if (!Exit.isSuccess(captured)) {
                  if (awaiting)
@@ -979,7 +1115,7 @@ index 8c1b549d3da8c2287e330e63d7370cd3838e57df..5502f4f042142565e2e1304a24a9c9b2
                  return yield* Effect.failCause(captured.cause);
              }
              return {
-@@ -681,7 +780,7 @@ export class Interpreter {
+@@ -681,7 +782,7 @@ export class Interpreter {
              ? new GeneratorMethodReference(iterator.iterator, "return")
              : iterator.iterator.return;
          if (close === undefined || close === null)
@@ -988,7 +1124,7 @@ index 8c1b549d3da8c2287e330e63d7370cd3838e57df..5502f4f042142565e2e1304a24a9c9b2
          const self = this;
          return Effect.gen(function* () {
              const method = self.requireIteratorMethod(close, "Iterator return", node);
-@@ -692,13 +791,13 @@ export class Interpreter {
+@@ -692,13 +793,13 @@ export class Interpreter {
              const called = yield* Effect.exit(self.invokeCallable(method, [], node));
              if (!Exit.isSuccess(called)) {
                  if (awaiting)
@@ -1004,7 +1140,7 @@ index 8c1b549d3da8c2287e330e63d7370cd3838e57df..5502f4f042142565e2e1304a24a9c9b2
                  return yield* Effect.failCause(captured.cause);
              }
              if (awaiting)
-@@ -720,17 +819,18 @@ export class Interpreter {
+@@ -720,17 +821,18 @@ export class Interpreter {
              return value;
          throw new InterpreterRuntimeError(`${context} must be a function.`, node).as("TypeError");
      }
@@ -1027,7 +1163,7 @@ index 8c1b549d3da8c2287e330e63d7370cd3838e57df..5502f4f042142565e2e1304a24a9c9b2
      }
      evaluateForInStatement(node, labels) {
          const left = getNode(node, "left");
-@@ -743,7 +843,9 @@ export class Interpreter {
+@@ -743,7 +845,9 @@ export class Interpreter {
                  self.predeclarePattern(declared.pattern, declared.mutable, left);
              const right = yield* self.evaluateExpression(getNode(node, "right"));
              const body = getNode(node, "body");
@@ -1038,7 +1174,7 @@ index 8c1b549d3da8c2287e330e63d7370cd3838e57df..5502f4f042142565e2e1304a24a9c9b2
              if (keys === undefined) {
                  throw new InterpreterRuntimeError("for...in requires a plain object, array, or tools reference. Use for...of for arrays/strings/Maps/Sets, or Object.keys(value) for a key list.", node);
              }
-@@ -833,7 +935,10 @@ export class Interpreter {
+@@ -833,7 +937,10 @@ export class Interpreter {
          const self = this;
          const attempted = Effect.matchCauseEffect(this.evaluateStatement(body), {
              onFailure: (cause) => {
@@ -1050,7 +1186,7 @@ index 8c1b549d3da8c2287e330e63d7370cd3838e57df..5502f4f042142565e2e1304a24a9c9b2
                      return Effect.failCause(cause);
                  }
                  const caught = caughtErrorValue(Cause.squash(cause));
-@@ -897,6 +1002,7 @@ export class Interpreter {
+@@ -897,6 +1004,7 @@ export class Interpreter {
                  for (const propertyValue of getArray(pattern, "properties")) {
                      const property = asNode(propertyValue, "properties");
                      if (property.type === "RestElement") {
@@ -1058,7 +1194,7 @@ index 8c1b549d3da8c2287e330e63d7370cd3838e57df..5502f4f042142565e2e1304a24a9c9b2
                          const rest = Object.create(null);
                          for (const [key, item] of Object.entries(value)) {
                              if (!consumed.has(key) && !isBlockedMember(key))
-@@ -946,6 +1052,7 @@ export class Interpreter {
+@@ -946,6 +1054,7 @@ export class Interpreter {
                  for (const propertyValue of getArray(pattern, "properties")) {
                      const property = asNode(propertyValue, "properties");
                      if (property.type === "RestElement") {
@@ -1066,7 +1202,7 @@ index 8c1b549d3da8c2287e330e63d7370cd3838e57df..5502f4f042142565e2e1304a24a9c9b2
                          const rest = Object.create(null);
                          for (const [key, item] of Object.entries(source)) {
                              if (!consumed.has(key) && !isBlockedMember(key))
-@@ -998,6 +1105,8 @@ export class Interpreter {
+@@ -998,6 +1107,8 @@ export class Interpreter {
                      if (!step.done)
                          rest.push(step.value);
                      while (!done) {
@@ -1075,7 +1211,7 @@ index 8c1b549d3da8c2287e330e63d7370cd3838e57df..5502f4f042142565e2e1304a24a9c9b2
                          const next = yield* cursor.next;
                          done = next.done;
                          if (!done)
-@@ -1037,6 +1146,7 @@ export class Interpreter {
+@@ -1037,6 +1148,7 @@ export class Interpreter {
          return undefined;
      }
      evaluateExpression(node) {
@@ -1083,7 +1219,7 @@ index 8c1b549d3da8c2287e330e63d7370cd3838e57df..5502f4f042142565e2e1304a24a9c9b2
          switch (node.type) {
              case "Literal": {
                  const regex = node.regex;
-@@ -1114,7 +1224,11 @@ export class Interpreter {
+@@ -1114,7 +1226,11 @@ export class Interpreter {
          }
          // Array and Object construct identically with or without new, like JS.
          if (name === "Array") {
@@ -1096,7 +1232,7 @@ index 8c1b549d3da8c2287e330e63d7370cd3838e57df..5502f4f042142565e2e1304a24a9c9b2
          }
          if (name === "Object") {
              return Effect.map(this.evaluateCallArguments(argNodes), (args) => self.constructObject(args, node));
-@@ -1122,6 +1236,8 @@ export class Interpreter {
+@@ -1122,6 +1238,8 @@ export class Interpreter {
          if (valueConstructors.has(name)) {
              return Effect.gen(function* () {
                  const args = yield* self.evaluateCallArguments(argNodes);
@@ -1105,7 +1241,7 @@ index 8c1b549d3da8c2287e330e63d7370cd3838e57df..5502f4f042142565e2e1304a24a9c9b2
                  switch (name) {
                      case "Date":
                          return yield* self.constructDate(args, node);
-@@ -1333,12 +1449,22 @@ export class Interpreter {
+@@ -1333,12 +1451,22 @@ export class Interpreter {
              return boundedData(self.applyBinaryOperator(operator, lhs, rhs, node), "Binary expression result");
          });
      }
@@ -1133,16 +1269,26 @@ index 8c1b549d3da8c2287e330e63d7370cd3838e57df..5502f4f042142565e2e1304a24a9c9b2
              throw new InterpreterRuntimeError("Binary operators require data values.", node, "InvalidDataValue");
          }
          // Null-prototype data needs explicit primitive coercion; identity and `in` retain raw objects.
-@@ -1352,6 +1478,8 @@ export class Interpreter {
+@@ -1352,9 +1480,16 @@ export class Interpreter {
          const bothObjects = lhs !== null && typeof lhs === "object" && rhs !== null && typeof rhs === "object";
          const l = coerceOperand(lhs);
          const r = coerceOperand(rhs);
 +        if (!bothObjects)
 +            this.budget.charge(comparisonSteps(operator, l, r), node);
          switch (operator) {
-             case "+":
-                 return l + r;
-@@ -1429,7 +1557,7 @@ export class Interpreter {
+-            case "+":
+-                return l + r;
++            case "+": {
++                // Joining strings makes a rope; whatever reads it next flattens the whole result.
++                const sum = l + r;
++                if (typeof sum === "string")
++                    this.budget.charge(sum.length / CONCAT_CHARS_PER_STEP, node);
++                return sum;
++            }
+             case "-":
+                 return l - r;
+             case "*":
+@@ -1429,7 +1564,7 @@ export class Interpreter {
                  return !value;
              if (operator === "void")
                  return undefined;
@@ -1151,7 +1297,7 @@ index 8c1b549d3da8c2287e330e63d7370cd3838e57df..5502f4f042142565e2e1304a24a9c9b2
                  throw new InterpreterRuntimeError("Unary operators require data values.", node, "InvalidDataValue");
              }
              const operand = value instanceof CodeModeDate
-@@ -1561,8 +1689,54 @@ export class Interpreter {
+@@ -1561,8 +1696,54 @@ export class Interpreter {
              return yield* self.invokeCallable(callable, args, node, callee);
          });
      }
@@ -1207,7 +1353,7 @@ index 8c1b549d3da8c2287e330e63d7370cd3838e57df..5502f4f042142565e2e1304a24a9c9b2
          const self = this;
          return Effect.gen(function* () {
              if (callable instanceof ToolReference) {
-@@ -1592,7 +1766,7 @@ export class Interpreter {
+@@ -1592,12 +1773,12 @@ export class Interpreter {
                  if (callable.namespace === "console")
                      return self.invokeConsole(callable.name, args, node);
                  if (callable.namespace === "Object" && args[0] instanceof ToolReference) {
@@ -1216,7 +1362,13 @@ index 8c1b549d3da8c2287e330e63d7370cd3838e57df..5502f4f042142565e2e1304a24a9c9b2
                  }
                  if (callable.namespace === "Object" && objectMethodsPreservingIdentity.has(callable.name)) {
                      if (callable.name === "fromEntries")
-@@ -1665,7 +1839,7 @@ export class Interpreter {
+                         return yield* invokeObjectFromEntries(self.runner, args[0], node);
+-                    return invokeGlobalMethod(callable, args, node);
++                    return invokeGlobalMethod(callable, args, node, self.meterWalk(node));
+                 }
+                 if (callable.namespace === "Array" && callable.name === "from") {
+                     return yield* invokeArrayFrom(self.runner, args, node);
+@@ -1665,7 +1846,7 @@ export class Interpreter {
      }
      invokeObjectMethodOnTools(name, ref, node) {
          if (name === "keys") {
@@ -1225,7 +1377,7 @@ index 8c1b549d3da8c2287e330e63d7370cd3838e57df..5502f4f042142565e2e1304a24a9c9b2
          }
          throw new InterpreterRuntimeError(`Object.${name}(...) cannot read tool references: they are not plain data. Use Object.keys(tools) for names, or search({ query }) for signatures.`, node, "InvalidDataValue");
      }
-@@ -1683,6 +1857,7 @@ export class Interpreter {
+@@ -1683,6 +1864,7 @@ export class Interpreter {
                  const argNode = asNode(arg, `arguments[${index}]`);
                  if (argNode.type === "SpreadElement") {
                      const spread = yield* self.evaluateExpression(getNode(argNode, "argument"));
@@ -1233,7 +1385,7 @@ index 8c1b549d3da8c2287e330e63d7370cd3838e57df..5502f4f042142565e2e1304a24a9c9b2
                      const cursor = yield* self.syncIterator(spread, argNode);
                      if (cursor === undefined)
                          throw new InterpreterRuntimeError("Spread arguments require a synchronous iterable.", argNode).as("TypeError");
-@@ -1701,7 +1876,7 @@ export class Interpreter {
+@@ -1701,7 +1883,7 @@ export class Interpreter {
          });
      }
      invokeFunction(fn, args) {
@@ -1242,7 +1394,7 @@ index 8c1b549d3da8c2287e330e63d7370cd3838e57df..5502f4f042142565e2e1304a24a9c9b2
          invocation.scopes = new ScopeStack([...fn.capturedScopes, new Map()]);
          const run = Effect.gen(function* () {
              // Seed all parameters first so defaults cannot fall through to same-named outer bindings.
-@@ -1730,7 +1905,7 @@ export class Interpreter {
+@@ -1730,7 +1912,7 @@ export class Interpreter {
              return run;
          // The initial yield assigns the promise before the body can self-resolve.
          const box = {};
@@ -1251,7 +1403,7 @@ index 8c1b549d3da8c2287e330e63d7370cd3838e57df..5502f4f042142565e2e1304a24a9c9b2
              box.promise = promise;
              return promise;
          });
-@@ -1739,8 +1914,17 @@ export class Interpreter {
+@@ -1739,8 +1921,17 @@ export class Interpreter {
          const state = { started: false, completed: false, draining: false, pending: [], pendingIndex: 0 };
          invocation.generatorState = state;
          invocation.generatorAsync = asynchronous;
@@ -1270,7 +1422,7 @@ index 8c1b549d3da8c2287e330e63d7370cd3838e57df..5502f4f042142565e2e1304a24a9c9b2
              if (!asynchronous && state.active) {
                  return Effect.fail(new InterpreterRuntimeError("Generator is already running.", node).as("TypeError"));
              }
-@@ -1749,11 +1933,11 @@ export class Interpreter {
+@@ -1749,11 +1940,11 @@ export class Interpreter {
                  state.completed = true;
                  state.pending.push(request);
                  if (state.draining)
@@ -1284,7 +1436,7 @@ index 8c1b549d3da8c2287e330e63d7370cd3838e57df..5502f4f042142565e2e1304a24a9c9b2
              }
              if (state.completed) {
                  if (kind === "throw")
-@@ -1766,11 +1950,19 @@ export class Interpreter {
+@@ -1766,11 +1957,19 @@ export class Interpreter {
                      return Effect.fail(new ProgramThrow(value));
                  return Effect.succeed({ value, done: true });
              }
@@ -1305,7 +1457,7 @@ index 8c1b549d3da8c2287e330e63d7370cd3838e57df..5502f4f042142565e2e1304a24a9c9b2
              }
              if (!state.started) {
                  state.started = true;
-@@ -1789,10 +1981,10 @@ export class Interpreter {
+@@ -1789,10 +1988,10 @@ export class Interpreter {
                      yield* invocation.completeGeneratorRequests(state, asynchronous);
                      state.completed = true;
                  });
@@ -1319,7 +1471,7 @@ index 8c1b549d3da8c2287e330e63d7370cd3838e57df..5502f4f042142565e2e1304a24a9c9b2
          return generator;
      }
      completeGeneratorRequests(state, asynchronous) {
-@@ -1820,7 +2012,7 @@ export class Interpreter {
+@@ -1820,7 +2019,7 @@ export class Interpreter {
          if (next)
              return Effect.succeed(next);
          state.available = Deferred.makeUnsafe();
@@ -1328,7 +1480,7 @@ index 8c1b549d3da8c2287e330e63d7370cd3838e57df..5502f4f042142565e2e1304a24a9c9b2
      }
      dequeueGeneratorRequest(state) {
          const request = state.pending[state.pendingIndex];
-@@ -1952,6 +2144,7 @@ export class Interpreter {
+@@ -1952,6 +2151,7 @@ export class Interpreter {
                      if (typeof spread !== "object" || Array.isArray(spread) || isRuntimeReference(spread)) {
                          throw new InterpreterRuntimeError("Object spread requires a data object.", property, "InvalidDataValue");
                      }
@@ -1336,7 +1488,7 @@ index 8c1b549d3da8c2287e330e63d7370cd3838e57df..5502f4f042142565e2e1304a24a9c9b2
                      for (const [key, value] of Object.entries(spread)) {
                          if (isBlockedMember(key))
                              throw new InterpreterRuntimeError(`Property '${key}' is not available.`, property);
-@@ -2004,6 +2197,7 @@ export class Interpreter {
+@@ -2004,6 +2204,7 @@ export class Interpreter {
                  const element = asNode(elementValue, "elements");
                  if (element.type === "SpreadElement") {
                      const spread = yield* self.evaluateExpression(getNode(element, "argument"));
@@ -1344,7 +1496,7 @@ index 8c1b549d3da8c2287e330e63d7370cd3838e57df..5502f4f042142565e2e1304a24a9c9b2
                      const cursor = yield* self.syncIterator(spread, element);
                      if (cursor === undefined)
                          throw new InterpreterRuntimeError("Array spread requires a synchronous iterable.", element).as("TypeError");
-@@ -2036,6 +2230,9 @@ export class Interpreter {
+@@ -2036,6 +2237,9 @@ export class Interpreter {
                  output += rawValue.cooked;
                  if (index < expressions.length) {
                      const raw = yield* self.evaluateExpression(asNode(expressions[index], "expressions"));
@@ -1354,6 +1506,24 @@ index 8c1b549d3da8c2287e330e63d7370cd3838e57df..5502f4f042142565e2e1304a24a9c9b2
                      output += coerceToString(boundedData(raw, "Template interpolation"));
                  }
              }
+@@ -2312,7 +2516,7 @@ export class Interpreter {
+             if (typeof key !== "number" || parseArrayIndex(key) === undefined) {
+                 throw new InterpreterRuntimeError("Array assignment index must be a valid array index.", node, "InvalidDataValue");
+             }
+-            rejectCircularInsertion(target, next, "Array assignment result", node);
++            rejectCircularInsertion(target, next, "Array assignment result", node, undefined, this.meterWalk(node));
+             target[key] = next;
+             return;
+         }
+@@ -2337,7 +2541,7 @@ export class Interpreter {
+             return;
+         }
+         const target = reference.target;
+-        rejectCircularInsertion(target, next, "Object assignment result", node);
++        rejectCircularInsertion(target, next, "Object assignment result", node, undefined, this.meterWalk(node));
+         Reflect.set(target, key, next);
+     }
+     toPropertyKey(value, node) {
 diff --git a/dist/namespace.d.ts b/dist/namespace.d.ts
 index e4640762c1139d5a864f966035446f5d890040f0..220d15700f5e0f2d4dbee3f5500875ccbf3cb86d 100644
 --- a/dist/namespace.d.ts
@@ -1451,6 +1621,39 @@ index bc386d2cd78bffa1bd1f76bf98509183f61c57d1..483cc3fd953ab434bf0209462d9a88dd
  import { Effect } from "effect";
 -import { HttpClient } from "effect/unstable/http";
 +import { HttpClient } from "effect/http";
+diff --git a/dist/stdlib/object.d.ts b/dist/stdlib/object.d.ts
+index 5d8d15cd307e58e08f9b3757d31eee35501d72b7..7ce4a7e5491c6c0ce1f0d26ee49f82fe438fac06 100644
+--- a/dist/stdlib/object.d.ts
++++ b/dist/stdlib/object.d.ts
+@@ -3,5 +3,5 @@ import { type AstNode } from "../interpreter/model.js";
+ import { type SyncIteratorRunner } from "../interpreter/iterator.js";
+ export declare const objectMethodsPreservingIdentity: Set<string>;
+ export declare const objectStatics: Set<string>;
+-export declare const invokeObjectMethod: (name: string, args: Array<unknown>, node: AstNode) => unknown;
++export declare const invokeObjectMethod: (name: string, args: Array<unknown>, node: AstNode, meter?: (visited: number) => void) => unknown;
+ export declare const invokeObjectFromEntries: <R>(runner: SyncIteratorRunner<R>, source: unknown, node: AstNode) => Effect.Effect<Record<string, unknown>, unknown, R>;
+diff --git a/dist/stdlib/object.js b/dist/stdlib/object.js
+index fe2d225693f15eece4838b62a22fab7b43351da1..6e874045f38719d8032186938d55435388718814 100644
+--- a/dist/stdlib/object.js
++++ b/dist/stdlib/object.js
+@@ -7,7 +7,7 @@ import { boundedData, coerceToString } from "./value.js";
+ import { preserveConsumerError } from "../interpreter/iterator.js";
+ export const objectMethodsPreservingIdentity = new Set(["assign", "values", "entries", "fromEntries"]);
+ export const objectStatics = new Set(["keys", "values", "entries", "hasOwn", "is", "assign", "fromEntries", "groupBy"]);
+-export const invokeObjectMethod = (name, args, node) => {
++export const invokeObjectMethod = (name, args, node, meter) => {
+     const requireObject = () => {
+         const input = args[0];
+         if (Array.isArray(input))
+@@ -50,7 +50,7 @@ export const invokeObjectMethod = (name, args, node) => {
+             const guardedSet = (key, item) => {
+                 if (typeof key === "string" && isBlockedMember(key))
+                     throw new InterpreterRuntimeError(`Property '${key}' is not available.`, node);
+-                rejectCircularInsertion(out, item, "Object.assign result", node, seen);
++                rejectCircularInsertion(out, item, "Object.assign result", node, seen, meter);
+                 if (!Reflect.set(out, key, item))
+                     throw new InterpreterRuntimeError(`Object.assign could not assign property '${String(key)}'.`, node).as("TypeError");
+             };
 diff --git a/dist/tool-error.d.ts b/dist/tool-error.d.ts
 index 1adc0b7af422b5ca0ffe5b79abc7a14ceccb7627..9489b77bae4a0833ee2ff82811a859b22621775f 100644
 --- a/dist/tool-error.d.ts

@@ -8,7 +8,10 @@
  * return, so a loop of large `split` calls, one step each, stops in seconds too, and so are
  * operators that walk or coerce a whole value. A value a call returns that the program already
  * holds, such as a group `Map.get` returns, is not charged, so grouping many rows into few groups
- * completes.
+ * completes. Storing a value walks it once to reject cycles; that walk is charged, and a value
+ * holding no objects is not walked again, so attaching one shared value to every row completes.
+ * Joining strings with `+` is charged by the length of the result, so a loop that joins a
+ * megabyte string stops in seconds.
  */
 import { expect, layer } from "@effect/vitest";
 import { Duration, Effect, Fiber, Schema } from "effect";
@@ -135,6 +138,37 @@ const g = new Map();
 for (const r of rows) { const a = g.get(r.k) ?? []; a.push(r.v); g.set(r.k, a) }
 return g.size;`;
 
+/**
+ * The same grouping into an object, reassigning each group after the push. Storing a group walked
+ * it to reject cycles, thousands of rows every time, uncharged; the walk now stops at groups
+ * already known to hold no objects.
+ */
+const groupByObject = `
+const rows = Array.from({ length: 50000 }, (_, i) => ({ k: 'k' + (i % 10), v: i }));
+const g = {};
+for (const r of rows) { const a = g[r.k] || []; a.push(r.v); g[r.k] = a }
+return Object.keys(g).length;`;
+
+/**
+ * Attaches one shared value of 50,000 columns to each of 20,000 rows. Each store walked all
+ * 50,000 columns, uncharged, and ran for minutes.
+ */
+const sharedMeta = `
+const meta = { columns: Array.from({ length: 50000 }, (_, i) => 'c' + i) };
+const rows = Array.from({ length: 20000 }, (_, i) => ({ id: i }));
+for (const r of rows) { r.meta = meta }
+return rows.length;`;
+
+/**
+ * The review's proof that string `+` escaped the budget: joining a megabyte string to a number is
+ * one step, and reading the result copies the megabyte. Uncharged, it ran to the wall clock.
+ */
+const concatRunaway = `
+const s = "x".repeat(1000000);
+let n = 0;
+for (let i = 0; i < 1000000; i++) { const t = s + i; n += t.charCodeAt(500000) }
+return n;`;
+
 /** Filters and maps 10,000 records, as programs do with a large tool result. */
 const recordsTransform = `
 const records = Array.from({ length: 10000 }, (_, i) => ({ id: 'r' + i, price: i % 100, tags: ['a', 'b'] }));
@@ -257,6 +291,27 @@ layer(HostedLive, { excludeTestServices: true })("Hosted MCP execute step budget
           const grouped50 = yield* execute(runner, "group-by-50", groupBy(50));
           expect(grouped50.execution).toMatchObject({ ok: true, value: 50 });
 
+          // Grouping into an object and attaching a shared value to every row complete promptly.
+          const groupedObject = yield* execute(runner, "group-by-object", groupByObject);
+          expect(groupedObject.execution).toMatchObject({ ok: true, value: 10 });
+          expect(groupedObject.ms).toBeLessThan(20_000);
+          const shared = yield* execute(runner, "shared-meta", sharedMeta);
+          expect(shared.execution).toMatchObject({ ok: true, value: 20000 });
+          expect(shared.ms).toBeLessThan(20_000);
+
+          // A loop that joins a megabyte string stops at the budget, in seconds.
+          const concat = yield* execute(runner, "concat-runaway", concatRunaway);
+          expect(concat.execution).toMatchObject({
+            ok: false,
+            error: {
+              kind: "TimeoutExceeded",
+              message: expect.stringContaining(
+                `Execution exceeded its compute budget of ${defaultMaxSteps} interpreter steps`,
+              ),
+            },
+          });
+          expect(concat.ms).toBeLessThan(20_000);
+
           // Transforming 10,000 records with native calls stays well inside it.
           const records = yield* execute(runner, "records-transform", recordsTransform);
           expect(records.execution).toMatchObject({ ok: true, value: { kept: 5000, json: true } });
@@ -277,6 +332,9 @@ layer(HostedLive, { excludeTestServices: true })("Hosted MCP execute step budget
           yield* evidence.measure("dedupe-with-in-ms", dedupe.ms);
           yield* evidence.measure("group-by-10-ms", grouped10.ms);
           yield* evidence.measure("group-by-50-ms", grouped50.ms);
+          yield* evidence.measure("group-by-object-ms", groupedObject.ms);
+          yield* evidence.measure("shared-meta-ms", shared.ms);
+          yield* evidence.measure("concat-runaway-ms", concat.ms);
         }).pipe(Effect.provide(McpClient.layer)),
       ),
     { timeout: 180_000 },

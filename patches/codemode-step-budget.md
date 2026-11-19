@@ -69,6 +69,23 @@ Operators and patterns that read a whole value are charged too:
   function somewhere inside; it still does when the object itself is one.
 - Comparing two strings is charged one step per 256 characters it may read: equal lengths for
   equality, the shorter length for `<`, `<=`, `>` and `>=`.
+- `+` that yields a string is charged one step per 4,096 characters of its result, and so is
+  `+=`. The engine joins strings as a rope, so the join itself is cheap, but the next read of the
+  result copies all of it: `t = s + i` on a 1 MB `s` followed by `t.charCodeAt(…)` copied 1 MB per
+  step and ran to the wall time; it now stops in about 1.5 s. The rate is per 4,096 rather than
+  256 because building output with `out += line` is charged its whole length on every append,
+  which grows with the square of the line count: a 554 KB report of 5,000 lines costs 0.43
+  million steps, and about 18,000 lines (2.2 MB) spend the default budget. Collect lines in an
+  array and `join` them instead, which is charged once.
+- Storing a value walks it to reject cycles: assignment to a property or index, `push`,
+  `unshift`, `splice`, `fill` and `Object.assign`. `switch` walks its discriminant and case
+  values to reject interpreter references. Both walks are charged as they go, one step per 2
+  values visited. The store walk also remembers, in a `WeakSet`, every object it finds holding no
+  objects, and stops there next time; storing an object into one removes it, and every store into
+  existing data runs this walk first, so the walk still finds every cycle. Before this, attaching
+  one shared `meta` of 50,000 columns to each of 20,000 rows walked all the columns on each store,
+  uncharged, and ran for minutes; it now takes 0.3 s. Grouping 50,000 rows into an object with
+  `a = g[k] || []; a.push(v); g[k] = a` walked each group on each store; it now takes 0.7 s.
 - A template interpolating an array or object is charged for copying and joining it.
 - Rest patterns: an object rest is charged for the object, an array rest one step per element it
   takes. `for...in` is charged for its key list.
@@ -84,20 +101,37 @@ their start position; `normalize` and `localeCompare` charge 8 times their recei
 
 One native call still runs to its end before its result is charged; codemode cannot interrupt it.
 Its input is charged before it runs, so the largest single call a program can make is bounded by
-data it already paid to build, and the next step after an overrun stops the program. A regular
-expression is the exception: its input is small, but a backtracking pattern such as `/^(a+)+$/`
-on a 25-character string can take tens of milliseconds per match, and a loop of 1,000 such
-matches runs to the wall time (44 s in Node, inside its 60 s). Codemode has no backtracking limit
-to set, and refusing nested quantifiers would refuse ordinary patterns, so this is not charged.
+data it already paid to build, and the next step after an overrun stops the program.
 
-Hot loops got faster, as primitives now skip the operand walk. Medians of 7 runs in Node 24
-(base is `main`'s patch, previous is the first native-charging version):
+### Not charged yet
+
+These still run work the budget does not see, and are left for a follow-up:
+
+- A backtracking regular expression. Its input is small, but `/^(a+)+$/` on a 25-character string
+  can take tens of milliseconds per match, and a loop of 1,000 such matches runs to the wall time
+  (44 s in Node, inside its 60 s). Codemode has no backtracking limit to set, and refusing nested
+  quantifiers would refuse ordinary patterns.
+- Walks that reject interpreter references and are not metered: `++` and `--` on a value held in
+  a property (`o.x++` with `o.x` a million-element array walks it every time), the entries
+  `Object.fromEntries` reads, and the non-string arguments of string methods (`"a".padEnd(1, big)`).
+  A loop of each of these with a million-element array runs to its 30 s wall time.
+  `console.table` and `Object.is` walk too, but are already stopped by the charge for their
+  arguments.
+- Not a hole, but worth knowing: grouping with `g[k] = (g[k] || []).concat([v])` copies the group
+  on every row and is charged for it, so 50,000 rows in 10 groups stop at the budget in under a
+  second. `push` into the group instead.
+
+Hot loops cost about what they did on `main`; primitives skip the operand walk. Medians of 7 runs
+in Node 24 (base is `main`'s patch, previous is the version before store walks and string `+`
+were charged):
 
 | Loop (100,000-300,000 iterations)         | base ms | previous ms | now ms |
 | ----------------------------------------- | ------: | ----------: | -----: |
-| `s += i % 7`                              |   1,392 |       1,356 |  1,271 |
-| comparisons and `in`                      |     887 |         881 |    784 |
-| `push`, `Math.max` and `slice` every turn |   1,711 |       1,714 |  1,757 |
+| `s += i % 7`                              |   1,370 |       1,291 |  1,283 |
+| comparisons and `in`                      |     884 |         790 |    780 |
+| `push`, `Math.max` and `slice` every turn |   1,667 |       1,710 |  1,713 |
+| `o.x = {v: i, t: [i]}` and `a[0] = i`     |   1,109 |       1,134 |  1,129 |
+| `s = 'key-' + i + '-' + (i % 7)`          |     768 |         703 |    714 |
 
 The rates were measured with each workload looped under the default 5,000,000-step budget until it
 stopped, on one host (wall seconds of one program; in workerd, one request with nothing else
@@ -129,9 +163,12 @@ to 7 s there.
 | `for...in` 200k keys, then `break`               |      1.91 |  0.86 |      4.34 |
 | `new Set` of a 1M-character string               |      0.59 |  0.35 |      5.47 |
 
-Every workload stops within about 7.5 s in Node and Bun and about 15 s in workerd, where the
-interpreted loop alone takes 8.5 s; the ones above 8.5 s spend most of it building their input
-with callbacks. Ordinary programs fit, with the steps they are charged: grouping 50,000 rows with
+On a quiet host every workload above stops within about 7.5 s in Node and Bun and about 15 s in
+workerd, where the interpreted loop alone takes 8.5 s; the ones above 8.5 s spend most of it
+building their input with callbacks. Under load the same programs take longer: the reviewer, with
+other programs running, saw 8.3 to 9.6 s in Bun, and a loop that sorts a million-element array in
+place with a comparator, a callback per comparison, takes 10 to 16 s. These stop at the budget all
+the same; what they take is the steps per second the host gives them. Ordinary programs fit, with the steps they are charged: grouping 50,000 rows with
 `Map.get` 1.48 million whatever the number of groups; merging 20,000 records with `in` 0.85
 million (with `Object.hasOwn` 0.63 million); filtering and mapping 20,000 records 0.49 million;
 splitting and matching 20,000 log lines 0.48 million; and a comparator `sort` of 50,000 objects

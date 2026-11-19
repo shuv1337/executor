@@ -528,9 +528,10 @@ export const McpLimits = Schema.Struct({
   maxToolCalls: Schema.Int.check(Schema.isGreaterThan(0)),
   /**
    * Interpreter steps one program may spend: one per statement or expression evaluated, plus steps
-   * for native calls, and for operators that walk or coerce a whole value, in proportion to the data
-   * they read, copy and return (about one per two array elements or object keys and one per 256
-   * string characters). A value a call returns that the program already holds, such as the group
+   * for native calls, for operators that walk or coerce a whole value, and for storing a value (which
+   * walks it for cycles), in proportion to the data they read, copy and return (about one per two
+   * array elements or object keys and one per 256 string characters); `+` that yields a string costs
+   * one per 4,096 characters of the result. A value a call returns that the program already holds, such as the group
    * `Map.get` returns, is not charged. Waiting on tool calls and approvals spends nothing. This
    * limits the work a program does on the server's own thread, which `timeoutMs` alone does not;
    * one native call, or one backtracking regular expression match, still runs to its end before it
