@@ -469,12 +469,59 @@ layer(HostedLive, { excludeTestServices: true })("Caller identity", (it) => {
               .status,
           ).toBe(403);
         }
-        for (const invalid of ["browser", "native", "bogus"]) {
+        for (const invalid of ["browser", "native", "bogus", "AUTOMATIC", "Model", ""]) {
           const path = approvalPath(asked.requestId, withMode(page.searchParams, invalid));
           expect((yield* api.request(actors.owner, "GET", path)).status).toBe(400);
+          expect(
+            (yield* api.request(actors.owner, "POST", path, { response: { action: "accept" } }))
+              .status,
+          ).toBe(400);
+        }
+        for (const extra of ["automatic", "model"]) {
+          const repeated = new URLSearchParams(page.searchParams);
+          repeated.append("mode", extra);
+          const path = approvalPath(asked.requestId, repeated);
+          expect((yield* api.request(actors.owner, "GET", path)).status).toBe(400);
+          expect(
+            (yield* api.request(actors.owner, "POST", path, { response: { action: "accept" } }))
+              .status,
+          ).toBe(400);
         }
 
-        // 7. Model and browser foils owned by the same user cannot cross modes or grants.
+        // 7. A second automatic-mode grant of the same owner cannot reach the first grant's run (K1).
+        const secondConsent = yield* consentTo(actors.owner, plain, {
+          "x-executor-organization": actors.organization.id,
+          "x-executor-grant-settings": JSON.stringify({ mode: "automatic" }),
+        });
+        clients.push(secondConsent.clientId);
+        expect(secondConsent.status).toBe(200);
+        const secondToken = yield* secondConsent.tokens;
+        const secondAuto = mcpRunner(
+          yield* mcp.connect(secondToken, "caller-identity-automatic-second"),
+          app.slug,
+          "automatic",
+        );
+        const secondAsked = yield* Schema.decodeUnknownEffect(Pending)(
+          (yield* secondAuto.execute("second automatic client runs human() tool", "personal", {
+            note: "second grant",
+          })).structuredContent,
+        );
+        const secondPage = new URL(secondAsked.approvalUrl!);
+        expect(secondPage.searchParams.get("mode")).toBe("automatic");
+        const secondAutoOnFirst = approvalPath(asked.requestId, secondPage.searchParams);
+        const secondAutoGet = yield* api.request(actors.owner, "GET", secondAutoOnFirst);
+        expect(secondAutoGet.status).toBe(200);
+        expect(yield* body(ApprovalView, secondAutoGet)).toEqual({ status: "unavailable" });
+        const secondAutoPost = yield* api.request(actors.owner, "POST", secondAutoOnFirst, {
+          response: { action: "accept" },
+        });
+        expect(secondAutoPost.status).toBe(200);
+        expect(yield* body(ApprovalAck, secondAutoPost)).toEqual({ status: "unavailable" });
+        const firstStillPending = yield* api.request(actors.owner, "GET", ownLink);
+        expect(firstStillPending.status).toBe(200);
+        expect((yield* body(ApprovalView, firstStillPending)).status).toBe("pending");
+
+        // 8. Model and browser foils owned by the same user cannot cross modes or grants.
         const modelFoil = yield* mcpUser(actors.owner, "model-foil", app.slug, "model");
         const browserFoil = yield* mcpUser(actors.owner, "browser-foil", app.slug, "browser");
         const modelAsked = yield* Schema.decodeUnknownEffect(Pending)(
@@ -529,29 +576,37 @@ layer(HostedLive, { excludeTestServices: true })("Caller identity", (it) => {
           ).toBe(403);
         }
 
-        // 8. Automatic grant reference pointed at the browser foil's request and session.
+        // 9. Automatic grant reference pointed at the browser foil's request and session.
         const autoOnBrowserNoMode = new URLSearchParams({
           grant: page.searchParams.get("grant")!,
           sessionId: browserPage.searchParams.get("sessionId")!,
         });
+        const autoOnBrowserNoModePath = approvalPath(browserAsked.requestId, autoOnBrowserNoMode);
+        expect((yield* api.request(actors.owner, "GET", autoOnBrowserNoModePath)).status).toBe(403);
         expect(
-          (yield* api.request(
-            actors.owner,
-            "GET",
-            approvalPath(browserAsked.requestId, autoOnBrowserNoMode),
-          )).status,
+          (yield* api.request(actors.owner, "POST", autoOnBrowserNoModePath, {
+            response: { action: "accept" },
+          })).status,
         ).toBe(403);
         const autoOnBrowserWithAuto = new URLSearchParams(autoOnBrowserNoMode);
         autoOnBrowserWithAuto.set("mode", "automatic");
-        const crossGrantAuto = yield* api.request(
-          actors.owner,
-          "GET",
-          approvalPath(browserAsked.requestId, autoOnBrowserWithAuto),
+        const autoOnBrowserWithAutoPath = approvalPath(
+          browserAsked.requestId,
+          autoOnBrowserWithAuto,
         );
+        const crossGrantAuto = yield* api.request(actors.owner, "GET", autoOnBrowserWithAutoPath);
         expect(crossGrantAuto.status).toBe(200);
         expect(yield* body(ApprovalView, crossGrantAuto)).toEqual({ status: "unavailable" });
+        const crossGrantAutoPost = yield* api.request(
+          actors.owner,
+          "POST",
+          autoOnBrowserWithAutoPath,
+          { response: { action: "accept" } },
+        );
+        expect(crossGrantAutoPost.status).toBe(200);
+        expect(yield* body(ApprovalAck, crossGrantAutoPost)).toEqual({ status: "unavailable" });
 
-        // 9. Model and browser foils still approve and complete through their own links (K2, K3).
+        // 10. Model and browser foils still approve and complete through their own links (K2, K3).
         const modelOwnPath = approvalPath(modelAsked.requestId, modelPage.searchParams);
         expect((yield* api.request(actors.owner, "GET", modelOwnPath)).status).toBe(200);
         const modelAnswer = yield* api.request(actors.owner, "POST", modelOwnPath, {
@@ -590,7 +645,7 @@ layer(HostedLive, { excludeTestServices: true })("Caller identity", (it) => {
           subject: browserDone.caller.subject,
         });
 
-        // 10. Owner opens the automatic approval link in a real browser and clicks Approve.
+        // 11. Owner opens the automatic approval link in a real browser and clicks Approve.
         const browser = yield* Browser;
         yield* browser.login(actors.owner);
         yield* browser.use("owner opens the automatic approval link", (tab) =>
@@ -603,7 +658,7 @@ layer(HostedLive, { excludeTestServices: true })("Caller identity", (it) => {
           tab.getByText("You can return to your agent.").waitFor(),
         );
 
-        // 11. Automatic agent resumes and receives the human approval.
+        // 12. Automatic agent resumes and receives the human approval.
         const done = yield* auto.completed(
           Identity,
           yield* auto.resume("automatic agent collects", asked.requestId),
