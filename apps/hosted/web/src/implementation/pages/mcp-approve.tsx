@@ -16,7 +16,7 @@ export function McpApprovePage() {
   const address = Schema.decodeUnknownOption(Address)({
     requestId: location.pathname.split("/").at(-1),
     sessionId: query.get("sessionId"),
-    // Forward only what the link carries; a model-mode request is addressed by its mode.
+    // Forward only what the link carries; a caller-mode request is addressed by its mode.
     ...Object.fromEntries(
       (["grant", "grantId", "mode"] as const).flatMap((name) => {
         const value = query.get(name);

@@ -299,10 +299,10 @@ running tool continue without replay. An unavailable request may have expired,
 been consumed, or been lost on restart; do not rerun the source automatically.
 
 `human-approval` (`human()`) accepts only a person's answer: the browser approval
-page, the dashboard, or the client's own form in native mode. In model mode the
-agent's own `accept` is refused and the same request comes back with an
-`approvalUrl`; show it to the user, wait for them to approve there, then call
-`resume` again to collect the result. Declining needs no person.
+page, the dashboard, or the client's own form in native mode. In model or
+automatic mode the agent's own `accept` is refused and the same request comes
+back with an `approvalUrl`; show it to the user, wait for them to approve there,
+then call `resume` again to collect the result. Declining needs no person.
 
 ## Who called the tool
 
