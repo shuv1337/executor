@@ -7,6 +7,8 @@ on:
     branches: [v2]
   pull_request:
     branches: [v2]
+  # Run by hand: GitHub silently disables workflows on an inactive fork (Actions page banner), and only the repo owner can re-enable them.
+  workflow_dispatch:
 
 concurrency:
   group: fork-ci-${{ github.ref }}
