@@ -86,6 +86,11 @@ the staged version against the host version, `runtime.json` and the framework
 reference. It downloads the listed tarball, verifies registry integrity and
 compares every packaged file with this build. Missing versions, unavailable
 archives and different content stop deployment. It never publishes by default.
+The tarball and every redirect hop must stay on the registry's own origin, and
+the gate follows only the redirects the builder follows (301, 302, 303, 307 and
+308). A Verdaccio behind a proxy that advertises another host in `dist.tarball`
+fails this check; set its public URL (`url_prefix`) to the origin in
+`EXECUTOR_NPM_REGISTRY`.
 Do not continue after a failed gate. A healthy `/health` is not an SDK gate.
 
 After the gate passes, start the local installation:

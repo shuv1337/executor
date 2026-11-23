@@ -32,7 +32,13 @@ const args = process.argv.slice(2);
 const publish = args.includes("--publish");
 const packageIndex = args.indexOf("--package");
 const packageDirectory = packageIndex < 0 ? staged : args[packageIndex + 1];
+/** At most the builder's own hop limit (10), so the gate never passes a chain the builder refuses. */
 const redirectLimit = 5;
+/**
+ * The redirects the app builder follows (`patches/@cloudflare%2Fworker-bundler@0.2.4.patch`). It
+ * treats any other 3xx as a failed download, so the gate returns that answer as the archive too.
+ */
+const followedRedirects: ReadonlySet<number> = new Set([301, 302, 303, 307, 308]);
 
 /** The origin of an absolute URL, or `undefined` when the text is not one. */
 const originOf = (url: string) => {
@@ -54,14 +60,13 @@ const downloadFromRegistry = (url: string, origin: string) =>
         .get(target)
         .pipe(Effect.provideService(FetchHttpClient.RequestInit, { redirect: "manual" }));
       const location = response.headers.location;
-      if (response.status < 300 || response.status >= 400 || location === undefined)
-        return response;
+      if (!followedRedirects.has(response.status) || location === undefined) return response;
       yield* response.text;
       const parsed = Url.fromString(location, target);
       const next = Result.isSuccess(parsed) ? parsed.success : undefined;
       if (next === undefined || next.origin !== origin)
         return yield* new AppsReleaseMismatch({
-          message: `Builder SDK tarball on ${origin} redirects to ${next?.origin ?? location}, outside the builder registry's origin. The builder refuses that tarball, so deployment is refused.`,
+          message: `Builder SDK tarball on ${origin} redirects to ${next?.origin ?? location}, outside the builder registry's origin. The gate accepts only tarballs served on the registry's own origin, so deployment is refused. If the registry is Verdaccio behind a proxy, set its public URL (url_prefix) to EXECUTOR_NPM_REGISTRY's origin.`,
         });
       if (hop >= redirectLimit)
         return yield* new AppsReleaseMismatch({
@@ -166,7 +171,7 @@ NodeRuntime.runMain(
     const tarballOrigin = originOf(published.dist.tarball);
     if (registryOrigin === undefined || tarballOrigin !== registryOrigin)
       return yield* new AppsReleaseMismatch({
-        message: `Builder registry metadata at ${registryOrigin ?? registry} serves its SDK tarball at ${published.dist.tarball} (${tarballOrigin ?? "not an absolute URL"}), outside the builder registry's origin. The builder refuses that tarball, so deployment is refused.`,
+        message: `Builder registry metadata at ${registryOrigin ?? registry} serves its SDK tarball at ${published.dist.tarball} (${tarballOrigin ?? "not an absolute URL"}), outside the builder registry's origin. The builder refuses that tarball, so deployment is refused. If the registry is Verdaccio behind a proxy, set its public URL (url_prefix) to EXECUTOR_NPM_REGISTRY's origin.`,
       });
     const archive = yield* downloadFromRegistry(published.dist.tarball, registryOrigin);
     if (archive.status !== 200) {

@@ -1,5 +1,5 @@
 /** Host-owned lifecycle jobs. No browser session, secrets, or live request enters the queue. */
-import { StorageError } from "@executor-js/sdk/core";
+import { BuildStage, StorageError } from "@executor-js/sdk/core";
 import { Effect, Exit, Schedule, Schema } from "effect";
 import { SqlClient } from "effect/sql";
 import { traceFailure } from "@executor-js/telemetry/failed-span";
@@ -31,6 +31,8 @@ const Manager = Schema.Struct({ userId: Schema.String, name: Schema.String });
  */
 const FailureCause = Schema.Struct({
   tag: Schema.String,
+  /** The build step a failed build names, such as `dependencies`; a closed set, never text. */
+  stage: Schema.optional(BuildStage),
   package: Schema.optional(Schema.String),
   version: Schema.optional(Schema.String),
   registry: Schema.optional(Schema.String),
@@ -70,8 +72,8 @@ const causeOrigin = (value: unknown) => {
 };
 /**
  * Project a failure onto the fields that may reach a background log: its tagged name and, when an
- * error or its cause chain states them as typed fields, the package, version, registry origin and
- * HTTP status. An error that states none of them is named by its tag alone.
+ * error or its cause chain states them as typed fields, the build stage, package, version, registry
+ * origin and HTTP status. An error that states none of them is named by its tag alone.
  */
 const failureCause = (error: unknown): FailureCause => {
   let tag = "Unknown";
@@ -79,6 +81,7 @@ const failureCause = (error: unknown): FailureCause => {
   let version: string | undefined;
   let registry: string | undefined;
   let status: number | undefined;
+  let stage: typeof BuildStage.Type | undefined;
   let current: unknown = error;
   for (let depth = 0; depth < 4 && typeof current === "object" && current !== null; depth += 1) {
     const value = current as Record<string, unknown>;
@@ -86,6 +89,7 @@ const failureCause = (error: unknown): FailureCause => {
     packageName ??= causeName(value.dependency) ?? causeName(value.package);
     version ??= causeName(value.version);
     registry ??= causeOrigin(value.registry);
+    stage ??= Schema.is(BuildStage)(value.stage) ? value.stage : undefined;
     status ??=
       typeof value.status === "number" &&
       Number.isInteger(value.status) &&
@@ -97,6 +101,7 @@ const failureCause = (error: unknown): FailureCause => {
   }
   return {
     tag,
+    ...(stage === undefined ? {} : { stage }),
     ...(packageName === undefined ? {} : { package: packageName }),
     ...(version === undefined ? {} : { version }),
     ...(registry === undefined ? {} : { registry }),
