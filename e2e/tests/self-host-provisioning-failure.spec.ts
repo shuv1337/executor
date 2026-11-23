@@ -116,10 +116,17 @@ layer(TestLive, { excludeTestServices: true })("Self-host provisioning failure",
           if (failed === undefined || retried === undefined)
             return yield* Effect.die("Provisioning failure lines missing");
           expect(failed.fields["reason"]).toBe("dependency");
-          expect(failed.fields["cause"]).toMatchObject({ tag: "VersionBuildFailed" });
+          // The failed build's stage is a closed name, so the log can say which step broke.
+          expect(failed.fields["cause"]).toMatchObject({
+            tag: "VersionBuildFailed",
+            stage: "dependencies",
+          });
           expect(retried.fields["attempts"]).toBeGreaterThanOrEqual(1);
           expect(retried.fields["outcome"]).toBe("requeued");
-          expect(retried.fields["cause"]).toMatchObject({ tag: "VersionBuildFailed" });
+          expect(retried.fields["cause"]).toMatchObject({
+            tag: "VersionBuildFailed",
+            stage: "dependencies",
+          });
 
           // The registry's credentials, path and query stay out of both lines.
           for (const { line } of [...step, ...attempt])

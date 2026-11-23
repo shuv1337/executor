@@ -91,6 +91,8 @@ const registry = (
     readonly tarball?: string;
     /** The archive's own URL answers this redirect instead of an archive. */
     readonly redirect?: string;
+    /** The redirect's status; 302 when not given. */
+    readonly redirectStatus?: number;
   } = {},
 ) => {
   let requests = 0;
@@ -101,6 +103,8 @@ const registry = (
   let firstArchiveRequest: number | undefined;
   let cachedUntil = 0;
   const tarball = `/apps/-/apps-${version}.tgz`;
+  /** Where a same-origin redirect can send the archive request; it serves the origin's answer. */
+  const moved = `/apps/-/moved/apps-${version}.tgz`;
   const origin = (): Archive => {
     if (Array.isArray(archive)) return archive[Math.min(originRequests, archive.length - 1)]!;
     const { stored } = archive as { readonly stored: { afterMs: number; bytes: Uint8Array } };
@@ -127,7 +131,7 @@ const registry = (
     }
     if (url.pathname === tarball) {
       if (options.redirect !== undefined) {
-        response.writeHead(302, { location: options.redirect });
+        response.writeHead(options.redirectStatus ?? 302, { location: options.redirect });
         response.end();
         return;
       }
@@ -147,6 +151,12 @@ const registry = (
         if (options.cachedMs !== undefined && Date.now() >= cachedUntil)
           cachedUntil = Date.now() + options.cachedMs;
       }
+      response.writeHead(answer.status, { "content-type": "application/octet-stream" });
+      response.end(answer.bytes ?? "");
+      return;
+    }
+    if (url.pathname === moved) {
+      const answer = origin();
       response.writeHead(answer.status, { "content-type": "application/octet-stream" });
       response.end(answer.bytes ?? "");
       return;
@@ -278,6 +288,33 @@ layer(NodeServices.layer)("apps release check", (it) => {
       const pass = yield* check(same.url(), "", {}, true);
       expect(pass.exitCode, pass.log).toBe(0);
       expect(pass.log).toContain(`Builder registry serves matching apps@${version}`);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("self-host gate follows only the redirects the builder follows", () =>
+    Effect.gen(function* () {
+      const { version, local } = yield* archives;
+      const integrity = integrityOf(local);
+      // The builder follows 301, 302, 303, 307 and 308 and treats any other 3xx as a failed
+      // download, so a same-origin 300 or 304 carrying a Location must not pass the gate.
+      for (const [redirectStatus, succeeds] of [
+        [300, false],
+        [304, false],
+        [302, true],
+        [308, true],
+      ] as const) {
+        const npm = yield* registry(version, integrity, [{ status: 200, bytes: local }], {
+          redirect: `/apps/-/moved/apps-${version}.tgz`,
+          redirectStatus,
+        });
+        const run = yield* check(npm.url(), "", {}, true);
+        expect(run.exitCode, `${redirectStatus}: ${run.log}`).toBe(succeeds ? 0 : 1);
+        expect(run.log).toContain(
+          succeeds
+            ? `Builder registry serves matching apps@${version}`
+            : `Builder SDK tarball is unavailable (status ${redirectStatus})`,
+        );
+      }
     }).pipe(Effect.scoped),
   );
 
