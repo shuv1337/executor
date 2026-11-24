@@ -1262,6 +1262,17 @@ export const scenarios = plan({
       local: na("Hosted version API scenario"),
     },
   },
+  mcpSearchMissingApp: {
+    fixtures: "actors",
+    file: "mcp-search-missing-app.spec.ts",
+    title:
+      "MCP search explains an empty result for a namespace that names no app the caller can use, such as a removed one",
+    targets: {
+      "self-host": scheduled,
+      cloud: na("Shared search path; covered on self-host"),
+      local: na("Hosted version API scenario"),
+    },
+  },
   mcpGlobalSearchLoadsNoListings: {
     fixtures: "actors",
     file: "mcp-execute-lazy.spec.ts",
