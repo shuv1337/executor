@@ -229,6 +229,8 @@ const OAuthRow = Schema.Struct({
   connectionResource: Schema.NullOr(Schema.String),
   connectionPolicy: Schema.NullOr(Schema.String),
   connectionRevoked: Schema.NullOr(Schema.Boolean),
+  connectionCreatedAt: Schema.NullOr(Schema.Number),
+  connectionUpdatedAt: Schema.NullOr(Schema.Number),
   urlOrganizations: Schema.String,
   headerOrganizations: Schema.String,
 });
@@ -288,6 +290,8 @@ const loadOAuth = (
     mc.resource as "connectionResource",
     mc.policy as "connectionPolicy",
     mc.revoked as "connectionRevoked",
+    floor(extract(epoch from mc."createdAt") * 1000)::float8 as "connectionCreatedAt",
+    floor(extract(epoch from mc."updatedAt") * 1000)::float8 as "connectionUpdatedAt",
     ${matches(sql, url)} as "urlOrganizations",
     ${matches(sql, header)} as "headerOrganizations"
   from "oauthAccessToken" t
@@ -426,6 +430,18 @@ const oauthAccess = (
                   row.connectionPolicy,
                 ).pipe(Effect.mapError(() => unavailable)),
               );
+    const connectionRevision =
+      connection === undefined
+        ? undefined
+        : row.connectionCreatedAt === null ||
+            row.connectionUpdatedAt === null ||
+            row.connectionPolicy === null
+          ? yield* unavailable
+          : yield* mcpConnectionRevision(
+              row.connectionCreatedAt,
+              row.connectionUpdatedAt,
+              row.connectionPolicy,
+            ).pipe(Effect.mapError(() => unavailable));
     const requested = yield* requestedOrganization(
       request,
       header,
@@ -439,6 +455,7 @@ const oauthAccess = (
       email: row.userEmail ?? null,
       clientId: row.tokenClient,
       grant: { id: grantId, policy, target },
+      ...(connectionRevision === undefined ? {} : { connectionRevision }),
       access: { organization, owner: organizationOwner(organization), role },
       organizationSlug: row.organizationSlug,
     };
@@ -664,7 +681,15 @@ const ConnectionRow = Schema.Struct({
   revoked: Schema.NullOr(Schema.Boolean),
   policy: Schema.String,
   createdAt: Schema.Number,
+  updatedAt: Schema.Number,
 });
+
+/** Both the record generation and its stored policy enter the host-only cache identity. */
+export const mcpConnectionRevision = (generation: number, updatedAt: number, policy: string) =>
+  Effect.tryPromise({
+    try: () => defaultKeyHasher(JSON.stringify([generation, updatedAt, policy])),
+    catch: () => new AuthenticationUnavailable(),
+  });
 
 /**
  * The policy a PAT gets at a scoped connection's URL: the connection's own, read on every use. Only
@@ -681,7 +706,8 @@ export const patConnectionPolicy = (
 ) =>
   Effect.gen(function* () {
     const rows = yield* sql`select "userId", resource, revoked, policy::text as policy,
-        floor(extract(epoch from "createdAt") * 1000)::float8 as "createdAt"
+        floor(extract(epoch from "createdAt") * 1000)::float8 as "createdAt",
+        floor(extract(epoch from "updatedAt") * 1000)::float8 as "updatedAt"
       from "mcpConnection" where id = ${connection}`;
     const row = Schema.decodeUnknownOption(ConnectionRow)(rows[0]);
     if (
@@ -690,11 +716,18 @@ export const patConnectionPolicy = (
       row.value.userId !== userId ||
       row.value.resource !== organization
     )
-      return Option.none<{ readonly policy: GrantPolicy; readonly generation: number }>();
-    const generation = row.value.createdAt;
-    return Schema.decodeUnknownOption(Schema.fromJsonString(ConnectionPolicy))(
+      return Option.none();
+    const decoded = Schema.decodeUnknownOption(Schema.fromJsonString(ConnectionPolicy))(
       row.value.policy,
-    ).pipe(Option.map((policy) => ({ policy: connectionGrantPolicy(policy), generation })));
+    );
+    if (Option.isNone(decoded)) return Option.none();
+    const generation = row.value.createdAt;
+    const revision = yield* mcpConnectionRevision(
+      generation,
+      row.value.updatedAt,
+      row.value.policy,
+    );
+    return Option.some({ policy: connectionGrantPolicy(decoded.value), generation, revision });
   });
 
 /** MCP authority for an OAuth grant or a PAT, with live grant, connection and membership. */
@@ -718,6 +751,9 @@ export const mcpBearerAccess = (
         email: grant.email,
         clientId: grant.clientId,
         grant: grant.grant,
+        ...(grant.connectionRevision === undefined
+          ? {}
+          : { connectionRevision: grant.connectionRevision }),
         access: grant.access,
       });
     }
@@ -733,7 +769,7 @@ export const mcpBearerAccess = (
     // grant, which the URL's delivery check refuses and names the URL it serves.
     const scoped =
       request.connection === undefined
-        ? Option.none<{ readonly policy: GrantPolicy; readonly generation: number }>()
+        ? Option.none()
         : yield* patConnectionPolicy(
             sql,
             request.connection,
@@ -757,6 +793,7 @@ export const mcpBearerAccess = (
       userId: key.userId,
       email: key.email,
       clientId: `pat:${key.id}`,
+      ...(Option.isNone(scoped) ? {} : { connectionRevision: scoped.value.revision }),
       grant: {
         id: patGrantId({
           token: key.id,

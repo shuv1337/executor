@@ -16,7 +16,8 @@ import { Api, body, type Session } from "../support/api.ts";
 import { Browser } from "../support/browser.ts";
 import { appsManifest } from "../support/apps-release.ts";
 import { HostedLive, TestLive, withCase, withHostedCase } from "../support/case.ts";
-import { App, Organization } from "../support/contracts.ts";
+import { App, Organization, Resource } from "../support/contracts.ts";
+import { connectionsPath } from "../support/app-accounts.ts";
 import { Evidence } from "../support/evidence.ts";
 import { McpClient } from "../support/mcp-client.ts";
 import { McpOAuth } from "../support/mcp-oauth.ts";
@@ -100,17 +101,19 @@ const connectionProbe = Effect.gen(function* () {
     }),
     () =>
       Effect.callback<void>((resume) => {
+        server.closeAllConnections();
         server.close(() => resume(Effect.void));
       }),
   );
   return `http://127.0.0.1:${port}`;
 });
 
-const issueSkillKey = (actor: Session) =>
+const issueSkillKey = (actor: Session, organization?: string) =>
   Effect.gen(function* () {
     const api = yield* Api;
     const response = yield* api.request(actor, "POST", "/api/auth/api-key/create", {
       name: "MCP skills extension",
+      ...(organization === undefined ? {} : { metadata: { organization } }),
     });
     expect(response.status).toBe(200);
     const token = yield* body(Token, response);
@@ -127,6 +130,7 @@ const deploySkillApp = (
   organization: string,
   name: string,
   files: ReadonlyArray<{ path: string; content: string }>,
+  warm = true,
 ) =>
   Effect.gen(function* () {
     const api = yield* Api;
@@ -136,8 +140,10 @@ const deploySkillApp = (
     const app = yield* body(App, deployed);
     const path = `${prefix}/${app.id}`;
     yield* Effect.addFinalizer(() => api.request(owner, "DELETE", path).pipe(Effect.orDie));
-    const warmed = yield* api.request(owner, "GET", `${path}/skill-bundle`);
-    expect(warmed.status, JSON.stringify(warmed.body)).toBe(200);
+    if (warm) {
+      const warmed = yield* api.request(owner, "GET", `${path}/skill-bundle`);
+      expect(warmed.status, JSON.stringify(warmed.body)).toBe(200);
+    }
     return { app, path };
   });
 
@@ -189,24 +195,18 @@ layer(HostedLive, { excludeTestServices: true })("MCP Skills extension", (it) =>
       Effect.gen(function* () {
         const api = yield* Api,
           actors = yield* Actors,
-          clients = yield* McpSkillsClient;
+          clients = yield* McpSkillsClient,
+          target = yield* Target;
         const organization = actors.organization.id;
-        const prefix = `/api/organizations/${organization}/mcp-connections`;
+        const org = `/api/organizations/${organization}`;
+        const prefix = `${org}/mcp-connections`;
         const marker = randomUUID();
         const probe = yield* connectionProbe;
-        const { app: visible } = yield* deploySkillApp(
+        const { app: removed } = yield* deploySkillApp(
           actors.owner,
           organization,
-          "Connection skills",
-          loaderAppFiles(`
-await ctx.cache.read?.("scope-probe");
-const scope = await (await ctx.fetch(${JSON.stringify(probe)}, { signal: ctx.signal })).text();
-return [{
-  name: "allowed-guide", description: "Synthetic connection scope probe.",
-  files: [{ path: "SKILL.md", content: ${JSON.stringify(
-    skillMd("allowed-guide", "Synthetic connection scope probe.", ""),
-  )} + "Outbound scope: " + scope + "\\n" }],
-}];`),
+          "Removable skills",
+          skillAppFiles("removable-guide", marker),
         );
         const { app: hidden } = yield* deploySkillApp(
           actors.owner,
@@ -214,15 +214,122 @@ return [{
           "Unscoped skills",
           skillAppFiles("outside-guide", marker),
         );
-        const allowed = `skill://${visible.slug}/allowed-guide`;
+        const removedUri = `skill://${removed.slug}/removable-guide/SKILL.md`;
         const outside = `skill://${hidden.slug}/outside-guide`;
-        const created = yield* api.request(actors.owner, "POST", prefix, {
-          id: randomUUID(),
-          name: "Skills for one app",
-          apps: [{ app: visible.id, runsAs: [{ kind: "app" }], tools: { kind: "all" } }],
+        const entryFor = (app: string, runsAs: object = { kind: "app" }) => ({
+          app,
+          runsAs: [runsAs],
+          tools: { kind: "all" },
         });
-        expect(created.status, JSON.stringify(created.body)).toBe(200);
-        const connection = yield* body(ConnectionView, created);
+        const createConnection = (
+          name: string,
+          apps: readonly object[],
+          id: string = randomUUID(),
+        ) =>
+          Effect.gen(function* () {
+            const response = yield* api.request(actors.owner, "POST", prefix, {
+              id,
+              name,
+              apps,
+            });
+            expect(response.status, JSON.stringify(response.body)).toBe(200);
+            return yield* body(ConnectionView, response);
+          });
+        const other = yield* createConnection("Outside connection", [entryFor(hidden.id)]);
+        const origin = target.metadata.origin;
+        const token = yield* issueSkillKey(actors.owner, organization);
+        const { app: visible } = yield* deploySkillApp(
+          actors.owner,
+          organization,
+          "Connection skills",
+          [
+            {
+              path: "index.ts",
+              content: `import { defineApp, defineProvider, dynamicSkills, secrets, object, string } from "apps";
+const publisher = defineProvider({
+  name: "skill publisher",
+  hosts: [${JSON.stringify(new URL(origin).host)}],
+  auth: { token: secrets({ label: "Publisher token", fields: object({ token: string() }) }) },
+});
+export default defineApp({ user: { accounts: { publisher } } }, async (ctx) => ({
+  dynamicSkills: dynamicSkills({ list: async () => {
+const publisherView = await ctx.cache.get({
+  key: "visible-publisher-skills", schema: string(), freshFor: "24 hours",
+  load: async ({ fetch, signal }) => {
+    const read = async (uri, connection = "") => {
+      const method = "resources/read";
+      const response = await fetch(${JSON.stringify(`${origin}/mcp`)} + connection, {
+        method: "POST", signal,
+        headers: {
+          authorization: "Bearer " + ctx.user.accounts.publisher.fields.token,
+          accept: "application/json, text/event-stream",
+          "content-type": "application/json",
+          "mcp-protocol-version": "2026-07-28", "mcp-method": method, "mcp-name": uri,
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: { uri, _meta: {
+          "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+          "io.modelcontextprotocol/clientCapabilities": {},
+        } } }),
+      });
+      if (response.status === 403) return "forbidden";
+      if (!response.ok) throw new Error("Publisher MCP returned " + response.status);
+      const reply = await response.json();
+      if (reply.error?.code === -32602) return "excluded";
+      if (!reply.result?.contents?.[0]?.text) throw new Error("Publisher MCP returned no skill file");
+      return "visible";
+    };
+    const removable = await read(${JSON.stringify(removedUri)});
+    const outside = await read(${JSON.stringify(`${outside}/SKILL.md`)});
+    const conflicting = await read(${JSON.stringify(`${outside}/SKILL.md`)}, ${JSON.stringify(`?connection=${other.id}`)});
+    const thirdParty = await (await fetch(${JSON.stringify(probe)}, { signal })).text();
+    return "Removable: " + removable + "\\nOutside: " + outside +
+      "\\nOther connection: " + conflicting + "\\nThird party: " + thirdParty +
+      "\\nPublisher load: " + crypto.randomUUID();
+  },
+});
+return [{
+  name: "allowed-guide", description: "Publisher skills visible to this connection.",
+  files: [{ path: "SKILL.md", content: ${JSON.stringify(
+    skillMd("allowed-guide", "Publisher skills visible to this connection.", ""),
+  )} + publisherView + "\\n" }],
+}];
+} }),
+}));`,
+            },
+            appsManifest,
+          ],
+          false,
+        );
+        const pending = yield* api.request(
+          actors.owner,
+          "POST",
+          connectionsPath(`${org}/apps/${visible.id}`, "user", "publisher"),
+          {},
+        );
+        expect(pending.status).toBe(200);
+        const submitted = yield* api.request(
+          actors.owner,
+          "POST",
+          `${org}/connections/${(yield* body(Resource, pending)).id}/submit`,
+          { method: "token", label: "Skill publisher", fields: { token: Redacted.value(token) } },
+        );
+        expect(submitted.status).toBe(200);
+        const account = (yield* body(Resource, submitted)).id;
+        yield* Effect.addFinalizer(() =>
+          api.request(actors.owner, "DELETE", `${org}/accounts/${account}`).pipe(Effect.orDie),
+        );
+        const warmed = yield* api.request(
+          actors.owner,
+          "GET",
+          `${org}/apps/${visible.id}/skill-bundle`,
+        );
+        expect(warmed.status, JSON.stringify(warmed.body)).toBe(200);
+        const allowed = `skill://${visible.slug}/allowed-guide`;
+        const own = entryFor(visible.id, { kind: "account", id: account });
+        const connection = yield* createConnection("Publisher and removable skills", [
+          own,
+          entryFor(removed.id),
+        ]);
         const connectionPath = `${prefix}/${connection.id}`;
         const issued = yield* api.request(actors.owner, "POST", `${connectionPath}/keys`, {
           name: "Only one app",
@@ -239,7 +346,7 @@ return [{
           revision: "2026-07-28",
           connection: connection.id,
         } as const;
-        const full = yield* clients.connect(yield* issueSkillKey(actors.owner), "unscoped", {
+        const full = yield* clients.connect(token, "unscoped", {
           organization,
           revision: options.revision,
         });
@@ -255,35 +362,66 @@ return [{
         const broadFile = yield* full.use("Read the cached unscoped skill", (skills) =>
           skills.read(broadEntry),
         );
-        expect(broadFile.body).toContain("Outbound scope: unscoped");
-        for (const [name, secret] of [
-          ["connection-key", key],
-          ["connection-grant", grant],
-        ] as const) {
-          const scoped = yield* clients.connect(secret, name, options);
-          const listing = yield* scoped.use(`List skills for the ${name}`, (skills) =>
-            skills.list(),
-          );
-          expect(uris(listing.skills)).toEqual([allowedUri]);
-          const entry = yield* scoped.use(`Get the allowed skill for the ${name}`, (skills) =>
-            skills.get(allowedUri),
-          );
-          expect(entry.skill.uri).toBe(allowedUri);
-          // The listing's manifest must be built under the scoped outbound, not
-          // borrowed from the unscoped caller's kept catalog.
-          expect(listing.skills).toEqual([entry.skill]);
-          const file = yield* scoped.use(
-            `Read the scoped dynamic skill for the ${name}`,
-            (skills) => skills.read(entry.skill),
-          );
-          expect(file.body).toContain("Outbound scope: scoped");
-          yield* expectSkillRefused(scoped, outside);
-          yield* expectSkillRefused(scoped, "skill://executor/executor");
+        expect(broadFile.body).toContain("Removable: visible\nOutside: visible");
+        const scoped = yield* Effect.all([
+          clients.connect(key, "connection-key", options),
+          clients.connect(grant, "connection-grant", options),
+        ]);
+        const verify = (client: ConnectedSkills, narrowed: boolean) =>
+          Effect.gen(function* () {
+            const listed = yield* client.use("List scoped skills", (skills) => skills.list());
+            expect(uris(listed.skills).toSorted()).toEqual(
+              (narrowed ? [allowedUri] : [allowedUri, removedUri]).toSorted(),
+            );
+            const got = yield* client.use("Get the scoped publisher skill", (skills) =>
+              skills.get(allowedUri),
+            );
+            // Verify the kept listing and the current read are both from the caller's scope.
+            expect(listed.skills.find((skill) => skill.uri === allowedUri)).toEqual(got.skill);
+            const file = yield* client.use("Read the scoped publisher skill", (skills) =>
+              skills.read(got.skill),
+            );
+            expect(file.body).toContain(
+              `Removable: ${narrowed ? "excluded" : "visible"}\nOutside: excluded\nOther connection: forbidden\nThird party: unscoped`,
+            );
+            yield* expectSkillRefused(client, outside);
+            yield* expectSkillRefused(client, "skill://executor/executor");
+            return file.body;
+          });
+        for (const client of scoped) yield* verify(client, false);
+
+        const updated = yield* api.request(actors.owner, "PUT", connectionPath, {
+          name: connection.name,
+          apps: [own],
+        });
+        expect(updated.status, JSON.stringify(updated.body)).toBe(200);
+        expect((yield* body(ConnectionView, updated)).id).toBe(connection.id);
+        for (const client of scoped) yield* verify(client, true);
+        const scopedPat = yield* clients.connect(token, "scoped-publisher-pat", options);
+        const narrowedFile = yield* verify(scopedPat, true);
+
+        const anonymous = yield* api.session();
+        for (const bound of ["", "invalid!", randomUUID()]) {
+          const invalid = yield* api.request(anonymous, "GET", "/mcp/whoami", undefined, {
+            authorization: `Bearer ${Redacted.value(token)}`,
+            "x-executor-caller-connection": bound,
+          });
+          expect(invalid.status).toBe(403);
+          expect(invalid.body).toMatchObject({ error: { data: { code: "GrantForbidden" } } });
         }
+        const foreign = yield* api.request(anonymous, "GET", "/mcp/whoami", undefined, {
+          authorization: `Bearer ${Redacted.value(yield* issueSkillKey(actors.member, organization))}`,
+          "x-executor-caller-connection": connection.id,
+        });
+        expect(foreign.status).toBe(403);
 
         const revoked = yield* api.request(actors.owner, "POST", `${connectionPath}/revoke`);
         expect(revoked.status, JSON.stringify(revoked.body)).toBe(200);
-        const anonymous = yield* api.session();
+        const revokedHeader = yield* api.request(anonymous, "GET", "/mcp/whoami", undefined, {
+          authorization: `Bearer ${Redacted.value(token)}`,
+          "x-executor-caller-connection": connection.id,
+        });
+        expect(revokedHeader.status).toBe(403);
         for (const secret of [key, grant]) {
           for (const method of ["skills/list", "skills/get", "resources/read"]) {
             const response = yield* api.request(
@@ -307,6 +445,12 @@ return [{
             expect(response.status, `${method} after connection revocation`).toBe(401);
           }
         }
+
+        const recreated = yield* createConnection(connection.name, [own], connection.id);
+        expect(recreated.id).toBe(connection.id);
+        const recreatedClient = yield* clients.connect(token, "recreated-connection", options);
+        // Identical policy and connection ID must still load a new publisher entry.
+        expect(yield* verify(recreatedClient, true)).not.toBe(narrowedFile);
       }).pipe(Effect.provide(McpSkillsClient.layer)),
     ),
   );
@@ -325,6 +469,10 @@ return [{
         });
         expect(created.status, JSON.stringify(created.body)).toBe(200);
         const second = yield* body(Organization, created);
+        // Self-host does not remove organizations; the isolated server is discarded on cleanup.
+        yield* Effect.addFinalizer(() =>
+          api.request(actors.owner, "DELETE", `/api/organizations/${second.id}`).pipe(Effect.orDie),
+        );
         const firstMarker = randomUUID();
         const secondMarker = randomUUID();
         const name = "Identically named skills";
@@ -353,7 +501,8 @@ return [{
         expect(shared.status).toBe(200);
         const firstGuide = `skill://${first.app.slug}/first-guide`;
         const secondGuide = `skill://${other.app.slug}/second-guide`;
-        const owner = yield* clients.connect(yield* issueSkillKey(actors.owner), "other-org", {
+        const ownerKey = yield* issueSkillKey(actors.owner);
+        const owner = yield* clients.connect(ownerKey, "other-org", {
           revision: "2026-07-28",
           organizationSlug: second.slug,
         });
@@ -362,24 +511,41 @@ return [{
           (skills) => skills.list(),
         );
         expect(uris(otherListing.skills)).toContain(`${secondGuide}/SKILL.md`);
-        const member = yield* clients.connect(yield* issueSkillKey(actors.member), "first-org", {
+        const otherEntry = yield* owner.use("Get the second organization's skill", (skills) =>
+          skills.get(`${secondGuide}/SKILL.md`),
+        );
+        const otherFile = yield* owner.use("Read the second organization's skill", (skills) =>
+          skills.read(otherEntry.skill),
+        );
+        expect(otherFile.body).toContain(secondMarker);
+        const ownerFirst = yield* clients.connect(ownerKey, "owner-first-org", {
           revision: "2026-07-28",
           organizationSlug: actors.organization.slug,
         });
-        const listing = yield* member.use("List the member's organization by URL", (skills) =>
-          skills.list(),
+        const member = yield* clients.connect(
+          yield* issueSkillKey(actors.member),
+          "member-first-org",
+          {
+            revision: "2026-07-28",
+            organizationSlug: actors.organization.slug,
+          },
         );
-        expect(uris(listing.skills)).toContain(`${firstGuide}/SKILL.md`);
-        expect(uris(listing.skills)).not.toContain(`${secondGuide}/SKILL.md`);
-        const ownEntry = yield* member.use("Get the first organization's skill", (skills) =>
-          skills.get(`${firstGuide}/SKILL.md`),
-        );
-        const own = yield* member.use("Read the first organization's skill", (skills) =>
-          skills.read(ownEntry.skill),
-        );
-        expect(own.body).toContain(firstMarker);
-        expect(own.body).not.toContain(secondMarker);
-        yield* expectSkillRefused(member, secondGuide);
+        for (const client of [ownerFirst, member]) {
+          const listing = yield* client.use("List the first organization by URL", (skills) =>
+            skills.list(),
+          );
+          expect(uris(listing.skills)).toContain(`${firstGuide}/SKILL.md`);
+          expect(uris(listing.skills)).not.toContain(`${secondGuide}/SKILL.md`);
+          const ownEntry = yield* client.use("Get the first organization's skill", (skills) =>
+            skills.get(`${firstGuide}/SKILL.md`),
+          );
+          const own = yield* client.use("Read the first organization's skill", (skills) =>
+            skills.read(ownEntry.skill),
+          );
+          expect(own.body).toContain(firstMarker);
+          expect(own.body).not.toContain(secondMarker);
+          yield* expectSkillRefused(client, secondGuide);
+        }
       }).pipe(Effect.provide(McpSkillsClient.layer)),
     ),
   );

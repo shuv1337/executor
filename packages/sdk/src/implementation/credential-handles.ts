@@ -733,6 +733,8 @@ export interface CredentialOutbound {
    * host's own origin carry it; app code cannot choose a different one.
    */
   readonly callerConnection?: string;
+  /** Public host routes that serve the product even when there is no self service binding. */
+  readonly hostOrigins?: readonly string[];
   /** The host API revision the invocation's cache belongs to; see `hostApiDocument`. */
   readonly hostApi?: HostApiCheck;
 }
@@ -825,10 +827,18 @@ const scrubbed = (error: unknown, values: ReadonlyMap<string, string>) => {
 };
 
 /** Replace any connection id app code wrote with the one this Worker was loaded for. */
-const stampCaller = (headers: Headers, outbound: CredentialOutbound) => {
+const stampCaller = (
+  headers: Headers,
+  url: URL,
+  outbound: CredentialOutbound,
+  connection = outbound.callerConnection,
+) => {
   headers.delete(callerConnectionHeader);
-  if (outbound.callerConnection !== undefined)
-    headers.set(callerConnectionHeader, outbound.callerConnection);
+  if (
+    connection !== undefined &&
+    (url.origin === outbound.egress.selfOrigin || outbound.hostOrigins?.includes(url.origin))
+  )
+    headers.set(callerConnectionHeader, connection);
 };
 
 const forward = async (request: Request, outbound: CredentialOutbound): Promise<Response> => {
@@ -851,12 +861,16 @@ const forward = async (request: Request, outbound: CredentialOutbound): Promise<
   if (found.size === 0) {
     // The default User-Agent is already on `requestHeaders`. Stamp the connection this Worker
     // was loaded for onto that same copy: a scoped key still cannot widen by omitting User-Agent.
-    stampCaller(requestHeaders, outbound);
+    stampCaller(requestHeaders, url, outbound);
+    // A redirect on a scoped call must cross the outbound again, so a change of
+    // origin cannot carry the header out or skip binding it on the way back in.
+    const redirect = outbound.callerConnection === undefined ? request.redirect : "manual";
     const sent =
       body === undefined
-        ? new Request(request, { headers: requestHeaders })
+        ? new Request(request, { headers: requestHeaders, redirect })
         : new Request(request, {
             headers: requestHeaders,
+            redirect,
             body: body.complete ? body.text : body.stream,
             ...(body.complete ? {} : { duplex: "half" }),
           });
@@ -950,7 +964,7 @@ const forward = async (request: Request, outbound: CredentialOutbound): Promise<
     // A managed credential is the host's. Drop any connection id app code wrote, then attach the
     // one sealed for this invocation. Two managed credentials from different connections cannot
     // share a request.
-    stampCaller(headers, outbound);
+    let connection = outbound.callerConnection;
     if ([...opened.values()].some((sealed) => sealed.managed === true)) {
       const provider = [...opened.values()].find((sealed) => sealed.managed === true)?.provider;
       const mismatch = () =>
@@ -970,12 +984,12 @@ const forward = async (request: Request, outbound: CredentialOutbound): Promise<
       // one that dropped it, must not replace that bind.
       if (outbound.callerConnection !== undefined && sealedConnection !== outbound.callerConnection)
         return mismatch();
-      headers.delete(callerConnectionHeader);
-      const bound = outbound.callerConnection ?? sealedConnection;
-      if (bound !== undefined) headers.set(callerConnectionHeader, bound);
+      connection ??= sealedConnection;
     }
+    const destination = replaceAll(placed.success.href, encoded(anywhere, encodings.url));
+    stampCaller(headers, new URL(destination), outbound, connection);
     const response = await send(
-      new Request(replaceAll(placed.success.href, encoded(anywhere, encodings.url)), {
+      new Request(destination, {
         method: request.method,
         headers,
         body: text ?? (body?.complete === false ? body.stream : request.body),

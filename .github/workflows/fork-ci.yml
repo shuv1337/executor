@@ -103,6 +103,8 @@ jobs:
         run: |
           bun run e2e:self-host --test-name 'Skills extension|Self-host MCP (admits|never forgets) a' --workers 1
           bun run e2e:local --test-name 'Skills extension' --workers 1
+      - name: Member managed keys
+        run: bun run e2e:self-host --test-name "Executor app's managed key is recreated after an admin becomes a member|Executor installs each user" --workers 1
       # A failed default-app install names its tagged cause in the log, never the registry's URL.
       - name: Provisioning failure scenarios
         run: |

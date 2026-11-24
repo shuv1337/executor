@@ -28,6 +28,8 @@ export const McpAccess = Schema.Struct({
   clientId: Schema.NonEmptyString,
   access: OrganizationAccess,
   grant: Grant,
+  /** Host-only cache revision for the live connection checked with this credential. */
+  connectionRevision: Schema.optionalKey(Schema.String),
 });
 export type McpAccess = typeof McpAccess.Type;
 

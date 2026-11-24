@@ -18,6 +18,7 @@ import type { Query } from "./database.ts";
 import type { Declarations } from "./declarations.ts";
 import { readVersionSource } from "./version-source.ts";
 import { prepareAppSkills } from "./skill-source.ts";
+import { CurrentCallerConnectionRevision } from "../contracts/caller-connection.ts";
 
 /**
  * Runtime skill results. A catalog is reused when it has no live loader, or when its
@@ -90,6 +91,7 @@ export const makeSkills = (
         capabilities?.skills === true
           ? yield* Effect.gen(function* () {
               const state = yield* invocation(db, { ...input, version });
+              const callerConnectionRevision = yield* CurrentCallerConnectionRevision;
               const sources = capabilities.skillSources === true;
               const known = input.revision;
               const catalog = yield* declarations.read(
@@ -105,6 +107,9 @@ export const makeSkills = (
                       sources,
                       ...context,
                       ...boundCallerConnection(state.caller),
+                      ...(callerConnectionRevision === undefined
+                        ? {}
+                        : { callerConnectionRevision }),
                     })
                     .pipe(
                       // A service's rejection names the selected account, as in tool listing.

@@ -18,6 +18,7 @@ import {
   McpForbidden,
   McpUnauthorized,
   OrganizationId,
+  patConnectionPolicy,
   patGrantId,
   patGrantOf,
   recordAuthFailure,
@@ -33,7 +34,6 @@ import {
   type LegacyMcpPath,
   type ResourceOrigins,
 } from "@executor-js/mcp-auth";
-import { ConnectionPolicy, connectionGrantPolicy } from "@executor-js/mcp-auth/connections";
 import { ApprovalMode } from "@executor-js/mcp-auth/grants";
 import { APIError } from "better-auth/api";
 import { Clock, Effect, Option, Schema } from "effect";
@@ -268,13 +268,6 @@ export const legacyMcp = <E, R>(
       : response;
   });
 
-const ConnectionRow = Schema.Struct({
-  userId: Schema.String,
-  resource: Schema.NullOr(Schema.String),
-  policy: Schema.String,
-  revoked: Schema.Boolean,
-});
-
 /**
  * The access a request rewritten from a v1 toolkit URL has: the caller's own copy of the toolkit.
  * An OAuth grant must be the copy's own, which a grant made for the URL is; another is refused as
@@ -301,16 +294,13 @@ export const legacyToolkitAccess = (headers: Headers, access: McpAccess) =>
     });
     if (Option.isNone(copy)) return yield* refuse;
     const sql = yield* SqlClient.SqlClient;
-    const rows = yield* sql`
-      select "userId", resource, policy, revoked from "mcpConnection" where id = ${copy.value}`;
-    const row = (yield* Schema.decodeUnknownEffect(Schema.Array(ConnectionRow))(rows))[0];
-    if (
-      row === undefined ||
-      row.revoked ||
-      row.userId !== access.userId ||
-      row.resource !== access.access.organization
-    )
-      return yield* refuse;
+    const scope = yield* patConnectionPolicy(
+      sql,
+      copy.value,
+      access.userId,
+      access.access.organization,
+    );
+    if (Option.isNone(scope)) return yield* refuse;
     const target = access.grant.target;
     const pat = patGrantOf(access.grant.id);
     if (Option.isNone(pat)) {
@@ -323,11 +313,10 @@ export const legacyToolkitAccess = (headers: Headers, access: McpAccess) =>
     const mode = target.kind === "mcp" ? target.mode : "model";
     return McpAccess.make({
       ...access,
+      connectionRevision: scope.value.revision,
       grant: {
         id: patGrantId({ ...pat.value, connection: copy.value }),
-        policy: connectionGrantPolicy(
-          yield* Schema.decodeUnknownEffect(Schema.fromJsonString(ConnectionPolicy))(row.policy),
-        ),
+        policy: scope.value.policy,
         target: { kind: "mcp", mode, connection: copy.value },
       },
     });

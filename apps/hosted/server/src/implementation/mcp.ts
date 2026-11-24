@@ -37,6 +37,7 @@ import {
   EventNotFound,
   InvocationSelection,
   CurrentCaller,
+  CurrentCallerConnectionRevision,
   linkedRequirements,
   PrefetchHost,
   SearchablePrefetch,
@@ -82,6 +83,7 @@ export const hostedMcpBackend = Effect.gen(function* () {
   const database = yield* GroupDatabase;
   const user = yield* CurrentUserId;
   const verifiedCaller = yield* CurrentCaller;
+  const connectionRevision = yield* CurrentCallerConnectionRevision;
   const grant = yield* CurrentMcpGrant;
   const session = yield* CurrentMcpSession;
   const background = yield* HostedBackground;
@@ -110,6 +112,7 @@ export const hostedMcpBackend = Effect.gen(function* () {
     Context.add(GroupDatabase, database),
     Context.add(CurrentUserId, user),
     Context.add(CurrentCaller, verifiedCaller),
+    Context.add(CurrentCallerConnectionRevision, connectionRevision),
     Context.add(HostedBackground, background),
   );
   // Discovery reads are traced only; clients repeat them on every session and poll.

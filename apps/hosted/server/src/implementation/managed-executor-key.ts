@@ -36,7 +36,7 @@ const ManagedFields = Schema.Struct({ token: Schema.String });
  *
  * - the account is the one member setup recorded for this member (`executorKeyAccounts`), and is
  *   still this member's link of the Executor app;
- * - the member may hold a managed key today (owner or admin, verified where required);
+ * - the member may hold a managed key today (owner, admin or member, verified where required);
  * - the refused key has no row at all, so a disabled key stays refused. The bearer check deletes
  *   an expired key on its first refused use, after which it is renewed as a revoked one; the
  *   product mints these keys with no expiry, and nothing in the product sets one;

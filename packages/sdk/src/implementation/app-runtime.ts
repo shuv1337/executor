@@ -79,7 +79,16 @@ export const buildLoadSpan = "runtime.app.build.load";
 export const invocationBuildLoader = <R>(
   invocation: Pick<
     AppInvocation,
-    "app" | "build" | "database" | "sharedRuntime" | "command" | "accounts" | "run"
+    | "app"
+    | "build"
+    | "database"
+    | "sharedRuntime"
+    | "command"
+    | "accounts"
+    | "run"
+    | "hostApi"
+    | "callerConnection"
+    | "caller"
   >,
   read: Effect.Effect<LoadedWorkerBuild, RuntimeBuildUnavailable, R>,
 ): Effect.Effect<
@@ -171,6 +180,7 @@ export const appRuntime = (host: AppRuntimeHost) =>
         readonly observeRevision?: (revision: number) => void;
         /** The MCP connection this call arrived on, including when `caller` is not sent. */
         readonly callerConnection?: string;
+        readonly callerConnectionRevision?: string;
       } & HostContext,
       command: HostRequest,
       output: Schema.Decoder<A>,
@@ -201,6 +211,9 @@ export const appRuntime = (host: AppRuntimeHost) =>
             headers: Object.fromEntries(Object.entries(yield* traceHeaders)),
             ...(input.hostApi === undefined ? {} : { hostApi: input.hostApi }),
             ...(callerConnection === undefined ? {} : { callerConnection }),
+            ...(input.callerConnectionRevision === undefined
+              ? {}
+              : { callerConnectionRevision: input.callerConnectionRevision }),
             ...(input.approval === undefined ? {} : { approval: input.approval }),
             ...(input.caller === undefined ? {} : { caller: input.caller }),
             ...(input.approvedBy === undefined ? {} : { approvedBy: input.approvedBy }),

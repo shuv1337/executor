@@ -8,7 +8,11 @@ import {
   CurrentUserId,
   callerSpanAttributes,
 } from "../contracts/auth.ts";
-import { CurrentCaller } from "@executor-js/sdk/core";
+import {
+  callerConnectionHeader,
+  CurrentCaller,
+  CurrentCallerConnectionRevision,
+} from "@executor-js/sdk/core";
 import { mcpCaller } from "./caller.ts";
 import { recordAuthFailure } from "./auth-telemetry.ts";
 import {
@@ -17,6 +21,7 @@ import {
   unrecordedRefusal,
   GrantForbidden,
   McpWhoami,
+  ConnectionId,
   requestedMcpAddress,
   namedApprovalMode,
   mcpResource,
@@ -67,7 +72,6 @@ import { callerAccounts } from "./app-accounts.ts";
 import { resourceAuthorityForLinks } from "./resource-policy.ts";
 import { BearerHashes } from "./bearer-access.ts";
 import { hostedMcpBackend } from "./mcp.ts";
-import { patGrantOf } from "./mcp-oauth.ts";
 
 // A native MCP server retains its tool handlers. Authority is supplied only while
 // dispatching the HTTP request, never while registering those handlers.
@@ -207,20 +211,57 @@ export const requestedMcpOrganization = (url: URL): OrganizationReference | unde
 };
 
 /**
- * Why `access` cannot serve an MCP request at `address`, or undefined when it can. An OAuth grant
- * serves the approval mode and connection its record holds, whatever the URL names. A personal
- * access token takes its mode from the URL. The fork may narrow it to its owner's live connection;
- * without that authenticated narrowing, a connection URL is refused rather than served with full access.
+ * An explicit connection can only be served by credentials bound to that connection. Without
+ * an explicit connection, an OAuth grant may still carry its own narrower scope.
  */
-export const mcpAccessRefusal = (access: McpAccess, address: McpAddress) => {
-  const pat = patGrantOf(access.grant.id);
-  return (
-    grantRefusal(access.grant) ??
-    (Option.isSome(pat) && pat.value.connection === undefined
-      ? unrecordedRefusal(address)
-      : undefined)
-  );
+export const mcpAccessRefusal = (
+  access: McpAccess,
+  address: McpAddress,
+  callingConnection?: ConnectionId,
+) => {
+  const connection =
+    access.grant.target.kind === "mcp" ? access.grant.target.connection : undefined;
+  if (callingConnection !== undefined && connection !== callingConnection)
+    return { reason: "calling_connection" } as const;
+  if (address.connection !== undefined && address.connection !== connection)
+    return unrecordedRefusal(address);
+  return grantRefusal(access.grant);
 };
+
+const callingConnectionRefused = () =>
+  new GrantForbidden({ refusal: { reason: "calling_connection" } });
+
+/** A host-attached connection can narrow, never replace, the credential's own authority. */
+const authenticateMcpAddress = (
+  auth: McpAuthentication["Service"],
+  headers: Headers,
+  url: URL,
+  address: McpAddress,
+  organization: OrganizationReference | undefined,
+) =>
+  Effect.gen(function* () {
+    const header = headers.get(callerConnectionHeader);
+    const bound = header ?? undefined;
+    if (
+      bound !== undefined &&
+      (!Schema.is(ConnectionId)(bound) ||
+        (address.connection !== undefined && address.connection !== bound))
+    )
+      return yield* callingConnectionRefused();
+    const connection = Schema.is(ConnectionId)(bound) ? bound : undefined;
+    const access = yield* auth
+      .authenticate(headers, namedApprovalMode(url), organization, address.connection ?? connection)
+      .pipe(
+        Effect.mapError((error) =>
+          connection !== undefined && error._tag !== "AuthenticationUnavailable"
+            ? callingConnectionRefused()
+            : error,
+        ),
+      );
+    const refusal = mcpAccessRefusal(access, address, connection);
+    if (refusal !== undefined) return yield* new GrantForbidden({ refusal });
+    return access;
+  });
 
 /** A session belongs to a user/client/organization grant, never to a browser's active organization. */
 export const mcpSessionKey = ({ userId, clientId, access, grant }: McpAccess) =>
@@ -247,6 +288,7 @@ export const dispatchHostedMcp = <E, R>(
           Effect.provideService(CurrentPolicy, grantAuthorization(fresh.grant.policy)),
           Effect.provideService(CurrentUserId, fresh.userId),
           Effect.provideService(CurrentCaller, mcpCaller(fresh, authentication.issuer)),
+          Effect.provideService(CurrentCallerConnectionRevision, fresh.connectionRevision),
           Effect.provideService(CurrentMcpGrant, fresh.grant.id),
           Effect.provideService(CurrentMcpSession, session),
         );
@@ -276,11 +318,15 @@ export const dispatchHostedMcp = <E, R>(
     const caller = callerSpanAttributes(access.access.organization, access.userId);
     yield* Effect.annotateCurrentSpan(caller);
     // The recheck reads the mode this URL spells out, as the request's own authentication did.
-    const named = namedApprovalMode(new URL(request.url, authentication.origin));
     const current = Effect.annotateCurrentSpan(caller).pipe(
       Effect.andThen(
-        authentication
-          .authenticate(headers, named, access.access.organization, address.connection)
+        authenticateMcpAddress(
+          authentication,
+          headers,
+          new URL(request.url, authentication.origin),
+          address,
+          access.access.organization,
+        )
           // A recheck is for this organization and user from its start, so one refused or failed
           // before its statement answers still names them.
           .pipe(Effect.annotateSpans(caller)),
@@ -546,11 +592,12 @@ export const authenticatedMcp = <E, R>(
     const hashes = new Map<string, string>();
     // Only the mode the URL spells out: a credential without a grant record defaults on its own.
     const access = yield* Effect.result(
-      auth.authenticate(
+      authenticateMcpAddress(
+        auth,
         new Headers(request.headers),
-        namedApprovalMode(url),
+        url,
+        address,
         requestedMcpOrganization(url),
-        address.connection,
       ),
     ).pipe(Effect.provideService(BearerHashes, hashes));
     if (Result.isSuccess(access))

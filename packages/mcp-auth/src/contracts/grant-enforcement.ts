@@ -36,6 +36,8 @@ export const GrantRefusal = Schema.Union([
    * and cannot be limited to the connection the URL names.
    */
   Schema.Struct({ reason: Schema.Literal("connection"), connection: ConnectionId }),
+  /** A host-attached connection is invalid or the credential cannot honor it. */
+  Schema.Struct({ reason: Schema.Literal("calling_connection") }),
   /**
    * Its tools need browser approval, which its approval mode cannot ask for. Consent and
    * narrowing refuse this, so only a grant narrowed before narrowing did holds it.
@@ -173,6 +175,14 @@ const refusalPresentation = (refusal: GrantRefusal): ErrorPresentation =>
           action:
             "Use the MCP URL without the connection parameter, or sign the client in through OAuth and choose the connection, then retry.",
           instructions: `Personal access tokens and the local administrative key are not limited to a connection, so Executor refuses them at a connection URL instead of granting more than the connection allows. Remove the connection parameter to use the credential's full access, or connect the MCP client through OAuth and choose the connection on the sign-in page, then verify that tools are listed. ${notBypassed}`,
+        },
+      }),
+      calling_connection: () => ({
+        title: "Calling connection denied",
+        description: "The credential and request do not serve the calling MCP connection.",
+        recovery: {
+          action: "Use the credential's own connection and try again.",
+          instructions: `Check that the calling connection still exists and the credential serves it. ${notBypassed}`,
         },
       }),
       approval: ({ mode }) => ({

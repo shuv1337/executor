@@ -19,7 +19,13 @@ import {
   type AuthorizationPolicy,
   type ToolSelection,
 } from "@executor-js/authorization";
-import { AppId, callerConnectionHeader, CurrentCaller } from "@executor-js/sdk/core";
+import {
+  AppId,
+  callerConnectionHeader,
+  CurrentCaller,
+  CurrentCallerConnectionRevision,
+} from "@executor-js/sdk/core";
+import { mcpConnectionRevision } from "./bearer-access.ts";
 import {
   ConnectionId,
   connectionPermissions,
@@ -152,7 +158,8 @@ const scopedAuthority = (userId: string, organization: string, policy: Authoriza
   Effect.gen(function* () {
     const request = yield* HttpServerRequest.HttpServerRequest;
     const header = new Headers(request.headers).get(callerConnectionHeader);
-    if (header === null || header === "") return { policy, connectionId: undefined };
+    if (header === null || header === "")
+      return { policy, connectionId: undefined, connectionRevision: undefined };
     const id = yield* Schema.decodeUnknownEffect(ConnectionId)(header).pipe(
       Effect.mapError(() => new OrganizationForbidden()),
     );
@@ -164,6 +171,11 @@ const scopedAuthority = (userId: string, organization: string, policy: Authoriza
     return {
       policy: { ...policy, tools: narrowToConnection(policy.tools, found.policy) },
       connectionId: found.id,
+      connectionRevision: yield* mcpConnectionRevision(
+        Date.parse(found.createdAt),
+        Date.parse(found.updatedAt),
+        JSON.stringify(found.policy),
+      ),
     };
   });
 
@@ -213,6 +225,7 @@ export const withOrganizationRequest = <E, R>(
       return (yield* response(scope).pipe(
         Effect.tapCause(ErrorReporter.report),
         Effect.provideService(CurrentPolicy, scoped.policy),
+        Effect.provideService(CurrentCallerConnectionRevision, scoped.connectionRevision),
 
         Effect.provideService(CurrentOrganization, grant.access),
         Effect.provideService(CurrentOrganizationNamespace, scope),
@@ -289,6 +302,7 @@ export const withOrganizationRequest = <E, R>(
       Effect.provideService(CurrentToolCallCaller, { source: "dashboard" }),
       Effect.provideService(CurrentPrincipal, principal),
       Effect.provideService(CurrentPolicy, scoped.policy),
+      Effect.provideService(CurrentCallerConnectionRevision, scoped.connectionRevision),
     )).pipe(HttpServerResponse.setHeader("cache-control", "no-store"));
   });
 

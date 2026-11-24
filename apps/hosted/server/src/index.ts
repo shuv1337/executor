@@ -129,6 +129,8 @@ export {
   apiBearerAccess,
   describeMcpAccess,
   mcpBearerAccess,
+  mcpConnectionRevision,
+  patConnectionPolicy,
   type UnknownApiKeys,
 } from "./implementation/bearer-access.ts";
 export {

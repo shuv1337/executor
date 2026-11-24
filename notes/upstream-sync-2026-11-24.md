@@ -76,6 +76,29 @@ MCP URL accepts client-approvable tools automatically. Use `?elicitation_mode=mo
 model-mediated pause; automatic mode still pauses for a person when the tool requires one.
 This sync does not publish, merge the PR or deploy.
 
+## Review round 1
+
+- Hosted MCP authenticates the effective calling connection at ingress and on live rechecks.
+  Malformed, conflicting and unresolved host-attached constraints fail closed, rather than
+  falling back to the bearer credential's broader reach. The outbound strips this internal
+  header from third-party requests and attaches it only at the product's own origins.
+- Connection identity, generation, update time and live policy partition skill declaration and
+  app publisher caches. The revision travels only between the product and its runner, not in
+  an app-visible caller or app host protocol. Live narrowing and ID reuse cannot select an older
+  publisher namespace.
+- Self-host E2E warms a real publisher cache, checks loopback MCP access through a pinned PAT,
+  narrows the same connection, and verifies a fresh load after recreation under the same ID
+  and policy. One unpinned owner key crosses organization URLs with matching app slugs without
+  sharing skill data. The second organization's DELETE is attempted; self-host returns 404
+  because it does not expose that operation, so isolated server teardown owns the remaining data.
+- Fork CI now runs the member managed-key checks. Native coverage exercises the upstream stall
+  report through the fork's bounded stream cut and three-process teardown.
+- The inherited connection lifecycle test now checks the fork's discovery policy: a
+  full-access agent can manage connections but cannot discover agent-grant operations.
+  The separate anti-widening scenarios still require scoped operations to fail with 403.
+- Deferred from this round: `runtime.inspect` and `runtime.index` binding, detached skill catalog
+  loads, and any change to the PAT or connection key automatic approval default.
+
 Rat-stack references: `ratstack://skills/security-audit` (source-first trust boundary),
 `ratstack://lore/concurrent-work-needs-an-owner` (bounded client scopes), and
 `ratstack://skills/investigate-a-failure` (rebuild and verify failures at their source).

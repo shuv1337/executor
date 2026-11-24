@@ -172,6 +172,7 @@ export interface AppInvocation {
    * app bundle. Set beside `caller` so a build that does not receive `caller` still cannot widen.
    */
   readonly callerConnection?: string;
+  readonly callerConnectionRevision?: string;
   readonly approvedBy?: ApprovedBy;
   readonly replay?: typeof WorkflowReplay.Type;
   readonly deadline?: typeof InvocationDeadline.Type;
@@ -517,6 +518,15 @@ export const appWorker = (
 /** Whether a call runs in the app's data facet, under its data supervisor, rather than its Worker. */
 export const runsInFacet = (invocation: Pick<AppInvocation, "database" | "command">) =>
   invocation.database && dataOperations.has(invocation.command.operation);
+
+/** A scoped invocation cannot read publisher entries made with different authority. */
+const invocationCache = (invocation: AppInvocation) => {
+  const base = appCacheNamespace(invocation.build, invocation.hostApi);
+  const connection = invocation.callerConnection ?? invocation.caller?.provenance?.connectionId;
+  return connection === undefined
+    ? base
+    : `${base}:connection:${connection}:${invocation.callerConnectionRevision ?? ""}`;
+};
 
 /**
  * The accounts a bundle of this protocol reads. A bundle that reads sealed handles gets the
@@ -864,7 +874,7 @@ export const makeAppRunner = (host: AppRunnerHost) => {
             id,
             app: invocation.app,
             identity,
-            cacheNamespace: appCacheNamespace(invocation.build, invocation.hostApi),
+            cacheNamespace: invocationCache(invocation),
             ...(invocation.hostApi === undefined ? {} : { hostApi: invocation.hostApi }),
             ...(callerConnection === undefined ? {} : { callerConnection }),
             body,
@@ -1041,9 +1051,7 @@ export const makeAppRunner = (host: AppRunnerHost) => {
           (lanes: Semaphore.Semaphore): CacheTransport =>
           (command) =>
             lanes
-              .withPermits(1)(
-                data.cache(appCacheNamespace(invocation.build, invocation.hostApi), command),
-              )
+              .withPermits(1)(data.cache(invocationCache(invocation), command))
               .pipe(
                 Effect.flatMap(Schema.decodeUnknownEffect(CacheReply)),
                 Effect.mapError(() => new CacheError({ reason: "storage" })),

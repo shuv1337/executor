@@ -19,6 +19,7 @@ import { type RelayObjects, relayed, relayScript } from "../implementation/app-o
 import { appOutboundRoutes, type Sent } from "../implementation/app-outbound-routes.ts";
 import { cloudSentry, reportCloudFailure } from "../implementation/error-reporting.ts";
 import { platformObservability } from "./telemetry.ts";
+import { cloudResourceOrigins } from "./stage.ts";
 
 export const AppOutbound = Effect.gen(function* () {
   if (globalThis.__ALCHEMY_RUNTIME__) return yield* Cloudflare.Worker.ref("AppOutbound");
@@ -135,6 +136,12 @@ export const appCredentialOutbound = Effect.gen(function* () {
     ],
   });
   const environment = yield* Cloudflare.WorkerEnvironment;
+  const resourceOrigins = yield* cloudResourceOrigins.pipe(Effect.orDie);
+  const hostOrigins = [
+    ...resourceOrigins.api,
+    ...resourceOrigins.mcp,
+    ...(resourceOrigins.legacyMcp === undefined ? [] : [resourceOrigins.legacyMcp]),
+  ];
   // The runner and this Worker's outbound entrypoint share it; app code never receives it.
   const secret = yield* (yield* Random("AppCredentialKey")).text;
   const key = secret.pipe(Effect.flatMap((value) => credentialKey(Redacted.value(value))));
@@ -223,6 +230,7 @@ export const appCredentialOutbound = Effect.gen(function* () {
                 ? {}
                 : { callerConnection: props.value.callerConnection }),
               key: sealing,
+              hostOrigins,
               // Cloud's own origin is public, so it needs no exemption.
               egress: { refusePrivateAddresses: !privateFetch, selfOrigin: undefined },
               send: (request) =>

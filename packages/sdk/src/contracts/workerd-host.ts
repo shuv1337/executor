@@ -42,6 +42,8 @@ export const WorkerInvocation = Schema.Struct({
   caller: Schema.optionalKey(Caller),
   /** The MCP connection the call arrived on. The runner seals it; the app bundle never sees it. */
   callerConnection: Schema.optionalKey(Schema.String),
+  /** The caller's live scope for app cache isolation; internal runner RPC only. */
+  callerConnectionRevision: Schema.optionalKey(Schema.String),
   approvedBy: Schema.optionalKey(ApprovedBy),
   replay: Schema.optionalKey(WorkflowReplay),
   deadline: Schema.optionalKey(InvocationDeadline),

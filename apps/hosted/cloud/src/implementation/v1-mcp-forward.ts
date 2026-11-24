@@ -19,6 +19,7 @@ import {
   McpApprovalForbidden,
   McpForbidden,
   McpUnauthorized,
+  mcpConnectionRevision,
   OrganizationId,
   OrganizationRole,
   organizationOwner,
@@ -153,16 +154,22 @@ const verify = (secret: Redacted.Redacted<string>, token: string) =>
     return claims;
   });
 
+const storedConnectionFields = {
+  connectionUser: Schema.NullOr(Schema.String),
+  connectionResource: Schema.NullOr(Schema.String),
+  connectionPolicy: Schema.NullOr(Schema.String),
+  connectionRevoked: Schema.NullOr(Schema.Boolean),
+  connectionCreatedAt: Schema.NullOr(Schema.Number),
+  connectionUpdatedAt: Schema.NullOr(Schema.Number),
+};
+
 const Row = Schema.Struct({
   userId: Schema.NullOr(Schema.String),
   organization: Schema.NullOr(Schema.String),
   slug: Schema.NullOr(Schema.String),
   role: Schema.NullOr(Schema.String),
   toolkitConnection: Schema.NullOr(Schema.String),
-  connectionUser: Schema.NullOr(Schema.String),
-  connectionResource: Schema.NullOr(Schema.String),
-  connectionPolicy: Schema.NullOr(Schema.String),
-  connectionRevoked: Schema.NullOr(Schema.Boolean),
+  ...storedConnectionFields,
 });
 
 /** Everything one check reads, in one statement: the mapped user and organization and the rest. */
@@ -190,7 +197,9 @@ const load = (sql: SqlClient.SqlClient, claims: Claims) =>
       mc."userId" as "connectionUser",
       mc.resource as "connectionResource",
       mc.policy as "connectionPolicy",
-      mc.revoked as "connectionRevoked"
+      mc.revoked as "connectionRevoked",
+      floor(extract(epoch from mc."createdAt") * 1000)::float8 as "connectionCreatedAt",
+      floor(extract(epoch from mc."updatedAt") * 1000)::float8 as "connectionUpdatedAt"
     from (select 1) one
     left join "mcpConnection" mc on mc.id = (select v2_id from t)`.pipe(
     Effect.flatMap((rows) => Schema.decodeUnknownEffect(Row)(rows[0])),
@@ -203,6 +212,8 @@ interface StoredConnection {
   readonly resource: string | null;
   readonly policy: string | null;
   readonly revoked: boolean | null;
+  readonly createdAt: number | null;
+  readonly updatedAt: number | null;
 }
 
 /**
@@ -230,6 +241,7 @@ const grantedAccess = <E>(
     );
     const stored = input.connection;
     let policy: GrantPolicy = { kind: "all" };
+    let connectionRevision: string | undefined;
     if (stored !== undefined) {
       if (
         stored.revoked !== false ||
@@ -240,12 +252,20 @@ const grantedAccess = <E>(
       policy = connectionGrantPolicy(
         yield* Schema.decodeUnknownEffect(Schema.fromJsonString(ConnectionPolicy))(stored.policy),
       );
+      if (stored.createdAt === null || stored.updatedAt === null || stored.policy === null)
+        return yield* new AuthenticationUnavailable();
+      connectionRevision = yield* mcpConnectionRevision(
+        stored.createdAt,
+        stored.updatedAt,
+        stored.policy,
+      );
     }
     const connection = stored?.id;
     const address = input.address ?? connection;
     return McpAccess.make({
       userId: input.user,
       clientId: v1ForwardClient,
+      ...(connectionRevision === undefined ? {} : { connectionRevision }),
       grant: {
         id: grantId({ user: input.user, organization, mode: input.mode, connection }),
         policy,
@@ -335,6 +355,8 @@ export const v1ForwardAccess = (
                 resource: row.connectionResource,
                 policy: row.connectionPolicy,
                 revoked: row.connectionRevoked,
+                createdAt: row.connectionCreatedAt,
+                updatedAt: row.connectionUpdatedAt,
               },
         address: claims.connection,
       },
@@ -359,10 +381,7 @@ export const isV1ForwardGrant = (id: string) => id.startsWith(grantPrefix);
 
 const BrowserRow = Schema.Struct({
   role: Schema.NullOr(Schema.String),
-  connectionUser: Schema.NullOr(Schema.String),
-  connectionResource: Schema.NullOr(Schema.String),
-  connectionPolicy: Schema.NullOr(Schema.String),
-  connectionRevoked: Schema.NullOr(Schema.Boolean),
+  ...storedConnectionFields,
 });
 
 /**
@@ -392,7 +411,9 @@ export const v1ForwardBrowserAccess = (id: string, sessionUser: string | undefin
         mc."userId" as "connectionUser",
         mc.resource as "connectionResource",
         mc.policy as "connectionPolicy",
-        mc.revoked as "connectionRevoked"
+        mc.revoked as "connectionRevoked",
+        floor(extract(epoch from mc."createdAt") * 1000)::float8 as "connectionCreatedAt",
+        floor(extract(epoch from mc."updatedAt") * 1000)::float8 as "connectionUpdatedAt"
       from (select 1) one
       left join "mcpConnection" mc on mc.id = ${connection}`;
     const row = yield* Schema.decodeUnknownEffect(BrowserRow)(rows[0]);
@@ -411,6 +432,8 @@ export const v1ForwardBrowserAccess = (id: string, sessionUser: string | undefin
                 resource: row.connectionResource,
                 policy: row.connectionPolicy,
                 revoked: row.connectionRevoked,
+                createdAt: row.connectionCreatedAt,
+                updatedAt: row.connectionUpdatedAt,
               },
       },
       refuse,

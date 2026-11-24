@@ -1487,8 +1487,11 @@ export const grantOAuthPlugins = (settings: GrantOAuthOptions) => {
           runAuth(
             Effect.gen(function* () {
               const input = ctx.body;
-              yield* ownedConnection(ctx, input, input.id);
+              const current = yield* ownedConnection(ctx, input, input.id);
               // Connected agents read this record on their next request.
+              const updatedAt = new Date(
+                Math.max(yield* Clock.currentTimeMillis, current.updatedAt.getTime() + 1),
+              );
               const row = yield* authCall(() =>
                 ctx.context.adapter.update({
                   model: "mcpConnection",
@@ -1499,7 +1502,7 @@ export const grantOAuthPlugins = (settings: GrantOAuthOptions) => {
                   update: {
                     name: input.name,
                     policy: JSON.stringify(input.policy),
-                    updatedAt: new Date(),
+                    updatedAt,
                   },
                 }),
               );
