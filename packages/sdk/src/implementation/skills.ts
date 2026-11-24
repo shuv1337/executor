@@ -1,5 +1,5 @@
 import { storedApp, storedVersion } from "./apps.ts";
-import { snapshot as invocation } from "./tools.ts";
+import { boundCallerConnection, snapshot as invocation } from "./tools.ts";
 import { appProviderFailure } from "./provider-error.ts";
 import { AppSkills, ProviderError } from "apps/contracts";
 import { AppEvaluationFailed, evaluationFailure } from "../contracts/tools.ts";
@@ -18,6 +18,7 @@ import type { Query } from "./database.ts";
 import type { Declarations } from "./declarations.ts";
 import { readVersionSource } from "./version-source.ts";
 import { prepareAppSkills } from "./skill-source.ts";
+import { CurrentCallerConnectionRevision } from "../contracts/caller-connection.ts";
 
 /**
  * Runtime skill results. A catalog is reused when it has no live loader, or when its
@@ -90,6 +91,7 @@ export const makeSkills = (
         capabilities?.skills === true
           ? yield* Effect.gen(function* () {
               const state = yield* invocation(db, { ...input, version });
+              const callerConnectionRevision = yield* CurrentCallerConnectionRevision;
               const sources = capabilities.skillSources === true;
               const known = input.revision;
               const catalog = yield* declarations.read(
@@ -104,6 +106,7 @@ export const makeSkills = (
                       hostApi: declarations.hostApi(state.version),
                       sources,
                       ...context,
+                      ...boundCallerConnection(state.caller, callerConnectionRevision),
                     })
                     .pipe(
                       // A service's rejection names the selected account, as in tool listing.
@@ -166,10 +169,10 @@ export const makeSkills = (
       };
     });
   return {
-    bundle: (input: typeof AppSkillInputs.list.Type) =>
+    bundle: (input: typeof AppSkillInputs.list.Type, options?: CatalogReadOptions) =>
       Schema.decodeUnknownEffect(AppSkillInputs.list)(input).pipe(
         Effect.mapError(() => new RequestInvalid()),
-        Effect.flatMap(snapshot),
+        Effect.flatMap((input) => snapshot(input, options)),
         Effect.withSpan("sdk.skills.bundle"),
       ),
     list: (input: typeof AppSkillInputs.list.Type, options?: CatalogReadOptions) =>

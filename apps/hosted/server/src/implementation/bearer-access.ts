@@ -27,7 +27,11 @@ import {
   McpWhoami,
   type GrantTarget,
 } from "@executor-js/mcp-auth";
-import { ConnectionPolicy, connectionGrantPolicy } from "@executor-js/mcp-auth/connections";
+import {
+  ConnectionPolicy,
+  canonicalConnectionPolicy,
+  connectionGrantPolicy,
+} from "@executor-js/mcp-auth/connections";
 import { Clock, Context, Effect, Option, Redacted, Schema } from "effect";
 import { SqlClient } from "effect/sql";
 import { ApiKeyId, ApiKeyMetadata } from "../contracts/api-keys.ts";
@@ -229,6 +233,8 @@ const OAuthRow = Schema.Struct({
   connectionResource: Schema.NullOr(Schema.String),
   connectionPolicy: Schema.NullOr(Schema.String),
   connectionRevoked: Schema.NullOr(Schema.Boolean),
+  connectionCreatedAt: Schema.NullOr(Schema.Number),
+  connectionUpdatedAt: Schema.NullOr(Schema.Number),
   urlOrganizations: Schema.String,
   headerOrganizations: Schema.String,
 });
@@ -288,6 +294,8 @@ const loadOAuth = (
     mc.resource as "connectionResource",
     mc.policy as "connectionPolicy",
     mc.revoked as "connectionRevoked",
+    floor(extract(epoch from mc."createdAt") * 1000)::float8 as "connectionCreatedAt",
+    floor(extract(epoch from mc."updatedAt") * 1000)::float8 as "connectionUpdatedAt",
     ${matches(sql, url)} as "urlOrganizations",
     ${matches(sql, header)} as "headerOrganizations"
   from "oauthAccessToken" t
@@ -412,20 +420,32 @@ const oauthAccess = (
     yield* recordCaller(organization, row.subject);
     // A connection grant has no authority of its own; it reads the connection on every use.
     const connection = record.connection ?? undefined;
-    const policy =
+    const livePolicy =
       connection === undefined
-        ? yield* Schema.decodeUnknownEffect(Schema.fromJsonString(GrantPolicy))(
-            row.grantPolicy,
-          ).pipe(Effect.mapError(() => unauthorized("unknown")))
+        ? undefined
         : row.connectionId === null || row.connectionRevoked !== false
           ? yield* unauthorized("revoked")
           : row.connectionUser !== row.grantUser || row.connectionResource !== row.grantResource
             ? yield* unauthorized("wrong_resource")
-            : connectionGrantPolicy(
-                yield* Schema.decodeUnknownEffect(Schema.fromJsonString(ConnectionPolicy))(
-                  row.connectionPolicy,
-                ).pipe(Effect.mapError(() => unavailable)),
-              );
+            : yield* Schema.decodeUnknownEffect(Schema.fromJsonString(ConnectionPolicy))(
+                row.connectionPolicy,
+              ).pipe(Effect.mapError(() => unavailable));
+    const policy =
+      livePolicy === undefined
+        ? yield* Schema.decodeUnknownEffect(Schema.fromJsonString(GrantPolicy))(
+            row.grantPolicy,
+          ).pipe(Effect.mapError(() => unauthorized("unknown")))
+        : connectionGrantPolicy(livePolicy);
+    const connectionRevision =
+      livePolicy === undefined
+        ? undefined
+        : row.connectionCreatedAt === null || row.connectionUpdatedAt === null
+          ? yield* unavailable
+          : yield* mcpConnectionRevision(
+              row.connectionCreatedAt,
+              row.connectionUpdatedAt,
+              livePolicy,
+            ).pipe(Effect.mapError(() => unavailable));
     const requested = yield* requestedOrganization(
       request,
       header,
@@ -439,6 +459,7 @@ const oauthAccess = (
       email: row.userEmail ?? null,
       clientId: row.tokenClient,
       grant: { id: grantId, policy, target },
+      ...(connectionRevision === undefined ? {} : { connectionRevision }),
       access: { organization, owner: organizationOwner(organization), role },
       organizationSlug: row.organizationSlug,
     };
@@ -664,7 +685,20 @@ const ConnectionRow = Schema.Struct({
   revoked: Schema.NullOr(Schema.Boolean),
   policy: Schema.String,
   createdAt: Schema.Number,
+  updatedAt: Schema.Number,
 });
+
+/** Both the record generation and its stored policy enter the host-only cache identity. */
+export const mcpConnectionRevision = (
+  generation: number,
+  updatedAt: number,
+  policy: ConnectionPolicy,
+) =>
+  Effect.tryPromise({
+    try: () =>
+      defaultKeyHasher(JSON.stringify([generation, updatedAt, canonicalConnectionPolicy(policy)])),
+    catch: () => new AuthenticationUnavailable(),
+  });
 
 /**
  * The policy a PAT gets at a scoped connection's URL: the connection's own, read on every use. Only
@@ -681,7 +715,8 @@ export const patConnectionPolicy = (
 ) =>
   Effect.gen(function* () {
     const rows = yield* sql`select "userId", resource, revoked, policy::text as policy,
-        floor(extract(epoch from "createdAt") * 1000)::float8 as "createdAt"
+        floor(extract(epoch from "createdAt") * 1000)::float8 as "createdAt",
+        floor(extract(epoch from "updatedAt") * 1000)::float8 as "updatedAt"
       from "mcpConnection" where id = ${connection}`;
     const row = Schema.decodeUnknownOption(ConnectionRow)(rows[0]);
     if (
@@ -690,11 +725,14 @@ export const patConnectionPolicy = (
       row.value.userId !== userId ||
       row.value.resource !== organization
     )
-      return Option.none<{ readonly policy: GrantPolicy; readonly generation: number }>();
-    const generation = row.value.createdAt;
-    return Schema.decodeUnknownOption(Schema.fromJsonString(ConnectionPolicy))(
+      return Option.none();
+    const decoded = Schema.decodeUnknownOption(Schema.fromJsonString(ConnectionPolicy))(
       row.value.policy,
-    ).pipe(Option.map((policy) => ({ policy: connectionGrantPolicy(policy), generation })));
+    );
+    if (Option.isNone(decoded)) return Option.none();
+    const generation = row.value.createdAt;
+    const revision = yield* mcpConnectionRevision(generation, row.value.updatedAt, decoded.value);
+    return Option.some({ policy: connectionGrantPolicy(decoded.value), generation, revision });
   });
 
 /** MCP authority for an OAuth grant or a PAT, with live grant, connection and membership. */
@@ -718,6 +756,9 @@ export const mcpBearerAccess = (
         email: grant.email,
         clientId: grant.clientId,
         grant: grant.grant,
+        ...(grant.connectionRevision === undefined
+          ? {}
+          : { connectionRevision: grant.connectionRevision }),
         access: grant.access,
       });
     }
@@ -726,13 +767,14 @@ export const mcpBearerAccess = (
     if (key.connection !== undefined && request.connection !== key.connection)
       return yield* forbidden("connection_key", "wrong_resource");
 
-    const mode = request.mode ?? "model";
+    // A PAT without an explicit mode uses automatic at the plain URL.
+    const mode = request.mode ?? "automatic";
     // At a connection's URL a PAT runs with that connection's narrower policy, as its OAuth grants
     // do, when the connection is its user's own and stands. Otherwise the PAT keeps its unscoped
     // grant, which the URL's delivery check refuses and names the URL it serves.
     const scoped =
       request.connection === undefined
-        ? Option.none<{ readonly policy: GrantPolicy; readonly generation: number }>()
+        ? Option.none()
         : yield* patConnectionPolicy(
             sql,
             request.connection,
@@ -756,6 +798,7 @@ export const mcpBearerAccess = (
       userId: key.userId,
       email: key.email,
       clientId: `pat:${key.id}`,
+      ...(Option.isNone(scoped) ? {} : { connectionRevision: scoped.value.revision }),
       grant: {
         id: patGrantId({
           token: key.id,
@@ -828,10 +871,12 @@ export const apiBearerAccess = (
   origins: HostedOAuthOrigins,
   request: BearerRequest,
   unknownKeys?: UnknownApiKeys,
-) =>
-  Effect.gen(function* () {
+) => {
+  const token = bearer(request.headers);
+  // A refused API key says how to replace it; no sign-in would help.
+  const presentedKey = token !== undefined && isApiKey(token);
+  return Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
-    const token = bearer(request.headers);
     if (token === undefined) return yield* noBearer(request.headers);
     const access: Omit<ApiBearerAccess, "organizationSlug"> & {
       readonly organizationSlug: string | null;
@@ -869,9 +914,14 @@ export const apiBearerAccess = (
     return { ...access, organizationSlug } satisfies ApiBearerAccess;
   }).pipe(
     Effect.tapError(recordRefusal),
-    Effect.mapError(({ reason }) =>
+    Effect.mapError(({ reason, failure }) =>
       reason === "unauthorized"
-        ? new Unauthorized()
+        ? new Unauthorized(
+            presentedKey &&
+              (failure === "unknown" || failure === "revoked" || failure === "expired")
+              ? { credential: "apiKey" }
+              : {},
+          )
         : reason === "unavailable"
           ? new AuthenticationUnavailable()
           : reason === "connection_key"
@@ -879,3 +929,4 @@ export const apiBearerAccess = (
             : new OrganizationForbidden(),
     ),
   );
+};

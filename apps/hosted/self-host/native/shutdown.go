@@ -17,7 +17,6 @@ import (
 const (
 	drainGrace     = 10 * time.Second
 	workerdGrace   = 10 * time.Second
-	stallGrace     = 5 * time.Second
 	collectorGrace = 3 * time.Second
 	// Let cancelled handlers release their upstreams and flush a 503 before Close tears
 	// down their downstreams. A client that isn't reading cannot extend this wait.
@@ -224,6 +223,7 @@ type shutdownParts struct {
 	signals       <-chan os.Signal
 	serverError   <-chan error
 	stalled       <-chan error
+	stallReports  <-chan stallReport
 	endWatching   func()
 	endAnnouncing func()
 	endStreams    func()
@@ -263,6 +263,10 @@ func shutdown(parts shutdownParts, plan shutdownPlan) error {
 	case <-parts.productExited:
 		skipDrain = true
 	case reason = <-parts.stalled:
+		skipDrain = true
+		grace = stallGrace
+	case <-parts.stallReports:
+		reason = errWorkerdStalled
 		skipDrain = true
 		grace = stallGrace
 	}

@@ -16,4 +16,4 @@ export * from "./contracts/browser-tools.ts";
 export * from "./contracts/targets.ts";
 export * from "./contracts/storage.ts";
 export { mcpInteractionStore } from "./implementation/interaction-store.ts";
-export { mcpSessionStore } from "./implementation/session-store.ts";
+export { discardMcpSessions, mcpSessionStore } from "./implementation/session-store.ts";

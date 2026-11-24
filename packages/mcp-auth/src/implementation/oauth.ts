@@ -42,6 +42,7 @@ import {
   Connection,
   ConnectionName,
   ConnectionPolicy,
+  canonicalConnectionPolicy,
   connectionGrantPlaceholder,
   connectionGrantPolicy,
 } from "../contracts/connection.ts";
@@ -71,13 +72,6 @@ const ConnectionRecord = Schema.Struct({
   createdAt: Schema.Date,
   updatedAt: Schema.Date,
 });
-/** JSON with object keys sorted, so equal values compare equal whatever order they were built in. */
-const canonicalJson = (value: unknown): string =>
-  JSON.stringify(value, (_key, item: unknown) =>
-    item !== null && typeof item === "object" && !Array.isArray(item)
-      ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
-      : item,
-  );
 /** Server-only connection calls name the verified user and host resource explicitly. */
 const ConnectionOwner = { userId: Schema.NonEmptyString, resource: Schema.NonEmptyString };
 /** Verified credential identity plus the current persisted grant, independent of host ownership. */
@@ -638,10 +632,12 @@ export const grantOAuthPlugins = (settings: GrantOAuthOptions) => {
   /**
    * Grants that still hold a token Better Auth would accept: an unexpired, unrevoked access
    * token, or an unexpired, unrevoked refresh token that can mint one. Rotated refresh tokens are
-   * revoked and only replay their successor, so they never count. Tokens name the approving
-   * browser session while it exists and are refused once it expires. Signing out deletes it:
-   * Better Auth revokes its access tokens and detaches its `offline_access` refresh tokens,
-   * which then keep working.
+   * revoked and only replay their successor, so they never count. An access token naming the
+   * approving browser session is refused once that session expires. An `offline_access` refresh
+   * token outlives it: refreshing then issues tokens that name no session. A refresh token
+   * without `offline_access` ends with its session. Signing out deletes the session: Better Auth
+   * revokes its access tokens and its refresh tokens without `offline_access`, and detaches the
+   * rest, which keep working.
    */
   const usableGrants = (ctx: GenericEndpointContext, ids: readonly GrantId[]) =>
     Effect.gen(function* () {
@@ -650,6 +646,7 @@ export const grantOAuthPlugins = (settings: GrantOAuthOptions) => {
         Schema.Struct({
           referenceId: GrantId,
           sessionId: Schema.optionalKey(Schema.NullOr(Schema.String)),
+          scopes: Schema.optionalKey(Schema.NullOr(Schema.Array(Schema.String))),
         }),
       );
       const live = (model: "oauthAccessToken" | "oauthRefreshToken") =>
@@ -663,7 +660,13 @@ export const grantOAuthPlugins = (settings: GrantOAuthOptions) => {
             ],
           }),
         ).pipe(Effect.flatMap((rows) => parse(Live, rows)));
-      const tokens = [...(yield* live("oauthAccessToken")), ...(yield* live("oauthRefreshToken"))];
+      const accessTokens = yield* live("oauthAccessToken");
+      const refreshTokens = yield* live("oauthRefreshToken");
+      const offline = refreshTokens.filter((token) => token.scopes?.includes("offline_access"));
+      const tokens = [
+        ...accessTokens,
+        ...refreshTokens.filter((token) => !token.scopes?.includes("offline_access")),
+      ];
       const sessionIds = [
         ...new Set(tokens.flatMap((token) => (token.sessionId == null ? [] : [token.sessionId]))),
       ];
@@ -684,11 +687,12 @@ export const grantOAuthPlugins = (settings: GrantOAuthOptions) => {
               ),
             );
       const liveSessions = new Set(sessions.map((session) => session.id));
-      return new Set(
-        tokens.flatMap((token) =>
+      return new Set([
+        ...offline.map((token) => token.referenceId),
+        ...tokens.flatMap((token) =>
           token.sessionId == null || liveSessions.has(token.sessionId) ? [token.referenceId] : [],
         ),
-      );
+      ]);
     });
   /**
    * Why each grant is or is not idle since `since`. A grant receives tokens only by exchanging a
@@ -1433,7 +1437,8 @@ export const grantOAuthPlugins = (settings: GrantOAuthOptions) => {
               // The client chose this ID for one editor, so a retry returns the first result.
               if (existing !== undefined && !existing.revoked)
                 return existing.name === input.name &&
-                  canonicalJson(yield* connectionPolicy(existing)) === canonicalJson(input.policy)
+                  canonicalConnectionPolicy(yield* connectionPolicy(existing)) ===
+                    canonicalConnectionPolicy(input.policy)
                   ? yield* connectionView(existing)
                   : yield* Effect.fail(new APIError("CONFLICT"));
               if (existing !== undefined) return yield* reviveConnection(ctx, existing, input);
@@ -1477,8 +1482,11 @@ export const grantOAuthPlugins = (settings: GrantOAuthOptions) => {
           runAuth(
             Effect.gen(function* () {
               const input = ctx.body;
-              yield* ownedConnection(ctx, input, input.id);
+              const current = yield* ownedConnection(ctx, input, input.id);
               // Connected agents read this record on their next request.
+              const updatedAt = new Date(
+                Math.max(yield* Clock.currentTimeMillis, current.updatedAt.getTime() + 1),
+              );
               const row = yield* authCall(() =>
                 ctx.context.adapter.update({
                   model: "mcpConnection",
@@ -1489,7 +1497,7 @@ export const grantOAuthPlugins = (settings: GrantOAuthOptions) => {
                   update: {
                     name: input.name,
                     policy: JSON.stringify(input.policy),
-                    updatedAt: new Date(),
+                    updatedAt,
                   },
                 }),
               );

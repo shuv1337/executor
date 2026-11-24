@@ -37,6 +37,7 @@ import {
   EventNotFound,
   InvocationSelection,
   CurrentCaller,
+  CurrentCallerConnectionRevision,
   linkedRequirements,
   PrefetchHost,
   SearchablePrefetch,
@@ -59,8 +60,16 @@ import type { ToolCallCaller } from "../contracts/tool-call-log.ts";
 import { loggedToolCall, loggedToolResume, recordCallDetails } from "./tool-call-log.ts";
 import { patGrantOf } from "./mcp-oauth.ts";
 import { listTools, searchableKept, searchableTools, searchTools } from "./tools.ts";
+import { bundleAppSkills, listAppSkills, readAppSkill } from "./skills.ts";
 
-import { listAppSkills, readAppSkill } from "./skills.ts";
+/**
+ * The client that sent this request, as it describes itself. Protocol 2026-07-28 has no
+ * `initialize` and carries the client's info in every request's metadata; earlier versions give it
+ * once in `initialize`. The request context holds it either way. Self-reported, so attribution only.
+ */
+const requestClient = Effect.map(Effect.serviceOption(McpSchema.McpRequestContext), (request) =>
+  Option.flatMapNullishOr(request, (context) => context.clientInfo),
+);
 
 /**
  * Bind one request's verified membership and lazy SDK. The host must authenticate
@@ -74,6 +83,7 @@ export const hostedMcpBackend = Effect.gen(function* () {
   const database = yield* GroupDatabase;
   const user = yield* CurrentUserId;
   const verifiedCaller = yield* CurrentCaller;
+  const connectionRevision = yield* CurrentCallerConnectionRevision;
   const grant = yield* CurrentMcpGrant;
   const session = yield* CurrentMcpSession;
   const background = yield* HostedBackground;
@@ -102,6 +112,7 @@ export const hostedMcpBackend = Effect.gen(function* () {
     Context.add(GroupDatabase, database),
     Context.add(CurrentUserId, user),
     Context.add(CurrentCaller, verifiedCaller),
+    Context.add(CurrentCallerConnectionRevision, connectionRevision),
     Context.add(HostedBackground, background),
   );
   // Discovery reads are traced only; clients repeat them on every session and poll.
@@ -112,7 +123,7 @@ export const hostedMcpBackend = Effect.gen(function* () {
   ) =>
     Effect.gen(function* () {
       const current = yield* CurrentUsage;
-      const client = yield* Effect.serviceOption(McpSchema.McpServerClient);
+      const client = yield* requestClient;
       const properties = { area: "mcp", operation };
       return yield* (
         kind === "read"
@@ -122,9 +133,7 @@ export const hostedMcpBackend = Effect.gen(function* () {
         Effect.provideService(CurrentUsage, {
           ...current,
           source: "mcp",
-          ...(Option.isSome(client)
-            ? { client_name: client.value.clientInfo.name.slice(0, 100) }
-            : {}),
+          ...(Option.isSome(client) ? { client_name: client.value.name.slice(0, 100) } : {}),
         }),
         Effect.provideContext(context),
       );
@@ -389,6 +398,8 @@ export const hostedMcpBackend = Effect.gen(function* () {
       }).pipe((work) => observe("unsubscribeEvent", work)),
     listSkills: (input, options) =>
       observe("listSkills", grantRefusal(listAppSkills(input, options)), "read"),
+    bundleSkills: (input, options) =>
+      observe("bundleSkills", grantRefusal(bundleAppSkills(input, options)), "read"),
     readSkill: (input) => observe("readSkill", grantRefusal(readAppSkill(input)), "read"),
     authorizeElicitation: (input) =>
       Effect.gen(function* () {

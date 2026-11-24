@@ -985,6 +985,7 @@ const hostRuntimeFailures: ReadonlySet<RuntimeFailure> = new Set([
   "build",
   "unsupported",
   "managed",
+  "unloading",
 ]);
 const loadingInstructions =
   "This happened while Executor loaded the app's definition, before any tool ran. Do not change the app's accounts to work around it.";
@@ -1077,6 +1078,15 @@ const workerPresentation = (failure: RuntimeFailure | undefined) => {
     case "unsupported":
     case "managed":
       return { description, recovery: rebuild, retryable: false };
+    case "unloading":
+      return {
+        description: `${runtimeFailures.unloading}, so nothing was sent to the app.`,
+        recovery: retryOnce(
+          "report the failure with its reference.",
+          `Executor waited for the app's previous Worker to unload before loading it again, and it did not finish, so nothing was sent to the app. ${reportReference}`,
+        ),
+        retryable: true,
+      };
     default:
       return {
         description,
@@ -1435,9 +1445,10 @@ export const AppProviderFailed = UserFacingError.define({
       Schema.Struct({ id: AccountId, label: Schema.String, provider: Schema.String }),
     ),
     /**
-     * The service refused the account's credentials during a mutation, and Executor has since
-     * renewed them. The mutation was not repeated, because it may have made changes before the
-     * refusal; a later call uses the renewed credentials.
+     * The service refused the account's credentials during a call Executor does not repeat, and
+     * Executor has since renewed them. That is a call that may write, which may have made changes
+     * before the refusal, or a query only its tool declares reads, whose claim the app has not
+     * confirmed. A later call uses the renewed credentials.
      */
     credentialsRenewed: Schema.optional(Schema.Literal(true)),
     /**
@@ -1473,11 +1484,11 @@ export const AppProviderFailed = UserFacingError.define({
         case "unauthorized":
           if (credentialsRenewed === true)
             return {
-              title: "Access renewed; request not repeated",
-              description: `${service} rejected the credentials${target}${context}.${reported} Executor has renewed the account’s access, but did not repeat this call automatically.`,
+              title: "Access restored; call not repeated",
+              description: `${service} rejected the credentials${target}${context}.${reported} Access was restored. This call was not repeated; earlier steps may have changed data. Check the result and retry only if the user chooses.`,
               recovery: {
-                action: "The renewed access is used from now on.",
-                instructions: `Executor renewed the account’s access but did not repeat this call. Renewal does not establish whether an earlier part of the call changed data. ${instructions}`,
+                action: "Check the result and retry only if the user chooses.",
+                instructions: `Access was restored, but this call was not repeated, and earlier steps of it may have changed data. Check what it did before anything else, and retry only if the user chooses. ${instructions}`,
               },
               retryable: false,
             };

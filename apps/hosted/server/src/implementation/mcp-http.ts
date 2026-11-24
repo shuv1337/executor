@@ -8,7 +8,11 @@ import {
   CurrentUserId,
   callerSpanAttributes,
 } from "../contracts/auth.ts";
-import { CurrentCaller } from "@executor-js/sdk/core";
+import {
+  callerConnectionHeader,
+  CurrentCaller,
+  CurrentCallerConnectionRevision,
+} from "@executor-js/sdk/core";
 import { mcpCaller } from "./caller.ts";
 import { recordAuthFailure } from "./auth-telemetry.ts";
 import {
@@ -17,7 +21,9 @@ import {
   unrecordedRefusal,
   GrantForbidden,
   McpWhoami,
+  ConnectionId,
   requestedMcpAddress,
+  namedApprovalMode,
   mcpResource,
   mcpResourceMetadataUrl,
   requestResourceOrigin,
@@ -49,6 +55,7 @@ import {
   CurrentMcpSession,
   McpAuthentication,
   McpUnauthorized,
+  mcpCallerConnection,
   type McpAccess,
 } from "../contracts/mcp.ts";
 import { CurrentOrganization, OrganizationReference } from "../contracts/organization.ts";
@@ -101,6 +108,7 @@ const requestCaller = Effect.flatMap(RequestCaller, (caller) =>
 const RequestBackend = Context.Reference<McpBackend<RequestError>>("hosted/McpRequestBackend", {
   defaultValue: () => ({
     listSkills: unavailable,
+    bundleSkills: unavailable,
     readSkill: unavailable,
     listApps: unavailable,
     listAccounts: unavailable,
@@ -135,6 +143,8 @@ const RequestApprovalUrl = Context.Reference<
 const requestBackend: McpBackend<RequestError> = {
   listSkills: (input, options) =>
     Effect.flatMap(RequestBackend, (backend) => backend.listSkills(input, options)),
+  bundleSkills: (input, options) =>
+    Effect.flatMap(RequestBackend, (backend) => backend.bundleSkills(input, options)),
   readSkill: (input) => Effect.flatMap(RequestBackend, (backend) => backend.readSkill(input)),
   authorizeElicitation: (input) =>
     Effect.flatMap(RequestBackend, (backend) => backend.authorizeElicitation(input)),
@@ -203,20 +213,61 @@ export const requestedMcpOrganization = (url: URL): OrganizationReference | unde
 };
 
 /**
- * Why `access` cannot serve an MCP request at `address`, or undefined when it can. An OAuth grant
- * serves the approval mode and connection its record holds, whatever the URL names. A personal
- * access token takes its mode from the URL. The fork may narrow it to its owner's live connection;
- * without that authenticated narrowing, a connection URL is refused rather than served with full access.
+ * Ordinary OAuth serves its recorded consent, not the URL's suggested connection. PATs
+ * take their scope from the address. An attached connection must match verified authority.
  */
-export const mcpAccessRefusal = (access: McpAccess, address: McpAddress) => {
-  const pat = patGrantOf(access.grant.id);
-  return (
-    grantRefusal(access.grant) ??
-    (Option.isSome(pat) && pat.value.connection === undefined
-      ? unrecordedRefusal(address)
-      : undefined)
-  );
+export const mcpAccessRefusal = (
+  access: McpAccess,
+  address: McpAddress,
+  callingConnection?: ConnectionId,
+) => {
+  const connection =
+    access.grant.target.kind === "mcp" ? access.grant.target.connection : undefined;
+  if (callingConnection !== undefined && mcpCallerConnection(access) !== callingConnection)
+    return { reason: "calling_connection" } as const;
+  if (
+    address.connection !== undefined &&
+    address.connection !== connection &&
+    Option.isSome(patGrantOf(access.grant.id))
+  )
+    return unrecordedRefusal(address);
+  return grantRefusal(access.grant);
 };
+
+const callingConnectionRefused = () =>
+  new GrantForbidden({ refusal: { reason: "calling_connection" } });
+
+/** A host-attached connection can narrow, never replace, the credential's own authority. */
+const authenticateMcpAddress = (
+  auth: McpAuthentication["Service"],
+  headers: Headers,
+  url: URL,
+  address: McpAddress,
+  organization: OrganizationReference | undefined,
+) =>
+  Effect.gen(function* () {
+    const header = headers.get(callerConnectionHeader);
+    const bound = Schema.decodeUnknownOption(ConnectionId)(header);
+    const connection = Option.getOrUndefined(bound);
+    if (
+      header !== null &&
+      (connection === undefined ||
+        (address.connection !== undefined && address.connection !== connection))
+    )
+      return yield* callingConnectionRefused();
+    const access = yield* auth
+      .authenticate(headers, namedApprovalMode(url), organization, address.connection ?? connection)
+      .pipe(
+        Effect.mapError((error) =>
+          connection !== undefined && error._tag === "McpForbidden"
+            ? callingConnectionRefused()
+            : error,
+        ),
+      );
+    const refusal = mcpAccessRefusal(access, address, connection);
+    if (refusal !== undefined) return yield* new GrantForbidden({ refusal });
+    return access;
+  });
 
 /** A session belongs to a user/client/organization grant, never to a browser's active organization. */
 export const mcpSessionKey = ({ userId, clientId, access, grant }: McpAccess) =>
@@ -243,6 +294,7 @@ export const dispatchHostedMcp = <E, R>(
           Effect.provideService(CurrentPolicy, grantAuthorization(fresh.grant.policy)),
           Effect.provideService(CurrentUserId, fresh.userId),
           Effect.provideService(CurrentCaller, mcpCaller(fresh, authentication.issuer)),
+          Effect.provideService(CurrentCallerConnectionRevision, fresh.connectionRevision),
           Effect.provideService(CurrentMcpGrant, fresh.grant.id),
           Effect.provideService(CurrentMcpSession, session),
         );
@@ -271,10 +323,16 @@ export const dispatchHostedMcp = <E, R>(
     // organization and the users they affect counted.
     const caller = callerSpanAttributes(access.access.organization, access.userId);
     yield* Effect.annotateCurrentSpan(caller);
+    // The recheck reads the mode this URL spells out, as the request's own authentication did.
     const current = Effect.annotateCurrentSpan(caller).pipe(
       Effect.andThen(
-        authentication
-          .authenticate(headers, address.mode, access.access.organization, address.connection)
+        authenticateMcpAddress(
+          authentication,
+          headers,
+          new URL(request.url, authentication.origin),
+          address,
+          access.access.organization,
+        )
           // A recheck is for this organization and user from its start, so one refused or failed
           // before its statement answers still names them.
           .pipe(Effect.annotateSpans(caller)),
@@ -422,6 +480,8 @@ export const dispatchHostedMcp = <E, R>(
       ...backend,
       listSkills: (input, options) =>
         current.pipe(Effect.flatMap((fresh) => fresh.listSkills(input, options))),
+      bundleSkills: (input, options) =>
+        current.pipe(Effect.flatMap((fresh) => fresh.bundleSkills(input, options))),
       readSkill: (input) => current.pipe(Effect.flatMap((fresh) => fresh.readSkill(input))),
 
       authorizeElicitation: (input) =>
@@ -536,12 +596,14 @@ export const authenticatedMcp = <E, R>(
     if (address === undefined) return invalidAddress;
     // The request's tool calls recheck the same token; they reuse its hash (see BearerHashes).
     const hashes = new Map<string, string>();
+    // Only the mode the URL spells out: a credential without a grant record defaults on its own.
     const access = yield* Effect.result(
-      auth.authenticate(
+      authenticateMcpAddress(
+        auth,
         new Headers(request.headers),
-        address.mode,
+        url,
+        address,
         requestedMcpOrganization(url),
-        address.connection,
       ),
     ).pipe(Effect.provideService(BearerHashes, hashes));
     if (Result.isSuccess(access))

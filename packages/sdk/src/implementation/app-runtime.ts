@@ -79,7 +79,16 @@ export const buildLoadSpan = "runtime.app.build.load";
 export const invocationBuildLoader = <R>(
   invocation: Pick<
     AppInvocation,
-    "app" | "build" | "database" | "sharedRuntime" | "command" | "accounts" | "run"
+    | "app"
+    | "build"
+    | "database"
+    | "sharedRuntime"
+    | "command"
+    | "accounts"
+    | "run"
+    | "hostApi"
+    | "callerConnection"
+    | "caller"
   >,
   read: Effect.Effect<LoadedWorkerBuild, RuntimeBuildUnavailable, R>,
 ): Effect.Effect<
@@ -171,6 +180,7 @@ export const appRuntime = (host: AppRuntimeHost) =>
         readonly observeRevision?: (revision: number) => void;
         /** The MCP connection this call arrived on, including when `caller` is not sent. */
         readonly callerConnection?: string;
+        readonly callerConnectionRevision?: string;
       } & HostContext,
       command: HostRequest,
       output: Schema.Decoder<A>,
@@ -201,6 +211,9 @@ export const appRuntime = (host: AppRuntimeHost) =>
             headers: Object.fromEntries(Object.entries(yield* traceHeaders)),
             ...(input.hostApi === undefined ? {} : { hostApi: input.hostApi }),
             ...(callerConnection === undefined ? {} : { callerConnection }),
+            ...(input.callerConnectionRevision === undefined
+              ? {}
+              : { callerConnectionRevision: input.callerConnectionRevision }),
             ...(input.approval === undefined ? {} : { approval: input.approval }),
             ...(input.caller === undefined ? {} : { caller: input.caller }),
             ...(input.approvedBy === undefined ? {} : { approvedBy: input.approvedBy }),
@@ -246,8 +259,12 @@ export const appRuntime = (host: AppRuntimeHost) =>
               dispatch: Schema.optional(DispatchTiming),
               runner: Schema.optional(IsolateTiming),
               supervisor: Schema.optional(IsolateTiming),
+              resent: Schema.optional(Schema.Literal(true)),
             }),
           )(body).pipe(Effect.result);
+          // The call met its data supervisor resetting before it started and was sent again.
+          if (Result.isSuccess(collected) && collected.success.resent === true)
+            yield* Effect.annotateCurrentSpan("executor.runtime.resent", true);
           // Each isolate reports its own part on its own clock; see tool-call-overhead.ts.
           if (
             Result.isSuccess(collected) &&
@@ -380,9 +397,13 @@ export const appRuntime = (host: AppRuntimeHost) =>
       build: (input) => host.build(input).pipe(traced("build")),
       asset: host.asset,
       changes: host.changes,
-      skills: ({ sources, ...input }) =>
+      skills: ({ sources, callerConnection, ...input }) =>
         dispatch(
-          { ...input, database: false },
+          {
+            ...input,
+            database: false,
+            ...(callerConnection === undefined ? {} : { callerConnection }),
+          },
           skillsCommand(sources === true),
           SkillCatalogResponse,
           HostInspectError,

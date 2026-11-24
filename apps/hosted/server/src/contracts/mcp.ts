@@ -5,12 +5,12 @@ import {
   type McpWhoami,
   type ResourceOrigins,
 } from "@executor-js/mcp-auth";
-import type {
-  Connection,
+import {
+  type Connection,
   ConnectionId,
-  ConnectionIdTaken,
-  ConnectionNotFound,
-  ConnectionPolicy,
+  type ConnectionIdTaken,
+  type ConnectionNotFound,
+  type ConnectionPolicy,
 } from "@executor-js/mcp-auth/connections";
 import type { ConnectedAgent, ConnectedAgentNotFound } from "@executor-js/mcp-auth/agents";
 import { UserFacingError, type ErrorPresentation } from "@executor-js/utils/user-facing-error";
@@ -28,8 +28,17 @@ export const McpAccess = Schema.Struct({
   clientId: Schema.NonEmptyString,
   access: OrganizationAccess,
   grant: Grant,
+  /** A verified stored row ID when a legacy grant target carries a public alias instead. */
+  verifiedConnection: Schema.optionalKey(ConnectionId),
+  /** Host-only cache revision for the live connection checked with this credential. */
+  connectionRevision: Schema.optionalKey(Schema.String),
 });
 export type McpAccess = typeof McpAccess.Type;
+
+/** The connection to bind to nested requests, independent of its public address. */
+export const mcpCallerConnection = (access: McpAccess) =>
+  access.verifiedConnection ??
+  (access.grant.target.kind === "mcp" ? access.grant.target.connection : undefined);
 
 /**
  * The grant an MCP request authenticated with. Event subscriptions belong to it, so revoking the
@@ -217,6 +226,10 @@ export class McpAuthentication extends Context.Service<
     readonly resourceOrigins: ResourceOrigins;
     /** The authorization server's exact issuer identifier, which discovery names. */
     readonly issuer: string;
+    /**
+     * `mode` is the approval mode the MCP URL spells out (`namedApprovalMode`), undefined for a URL
+     * without one. Only a credential without a grant record reads it.
+     */
     readonly authenticate: (
       headers: Headers,
       mode?: ApprovalMode,

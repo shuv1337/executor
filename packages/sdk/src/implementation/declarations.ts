@@ -20,6 +20,7 @@ import {
 import type { HostApi, ResourceLifecycle } from "../contracts/executor.ts";
 import type { AppRequirements } from "../contracts/apps.ts";
 import { appCacheNamespace, type HostApiCheck } from "../contracts/host-api.ts";
+import { CurrentCallerConnectionRevision } from "../contracts/caller-connection.ts";
 import { type AccountId, type OwnerId, StorageError } from "../contracts/shared.ts";
 import type { makeOAuth } from "./oauth.ts";
 import { makeHandoff } from "./handoff.ts";
@@ -151,6 +152,13 @@ export const makeDeclarations = (options: {
             // A caller's evaluation and actorless work see different contexts: only one has `user`.
             state.scope,
             selections,
+            // Dynamic skill loaders can make host API reads under the caller's connection.
+            ...(command === "skills"
+              ? [
+                  state.caller?.provenance?.connectionId ?? null,
+                  (yield* CurrentCallerConnectionRevision) ?? null,
+                ]
+              : []),
           ]),
         ),
       );

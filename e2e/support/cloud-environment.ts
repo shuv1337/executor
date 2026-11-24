@@ -37,6 +37,7 @@ import { roleHost } from "./role-hosts.ts";
 import { freePort } from "./ports.ts";
 import { OperatorOAuthFixture, operatorOAuthFile, syntheticCloudGoogle } from "./operator-oauth.ts";
 import { reveal, secret } from "./failure-text.ts";
+import { cloudNotesFile, type CloudNotesSource } from "./cloud-release-notes.ts";
 
 /**
  * The operator settings for `fixture`: one test client, whose tokens go only to its own host, and
@@ -104,6 +105,19 @@ export const startCloudEnvironment = (input: {
    * scenarios that prove it.
    */
   readonly authRateLimit: boolean;
+  /**
+   * Organization removal's revocation budget, 5 minutes deployed. Only the Cloud of the scenarios
+   * that run it out sets it (`e2e:cloud --removal-revocation-budget`), so every other scenario's
+   * removals revoke under the deployed budget. Only `alchemy dev` honours it.
+   */
+  readonly removalRevocationBudgetMs?: number;
+  /**
+   * Build the dashboard with these notes instead of `cloudTestNotes` (`CloudNotesSource`): an empty
+   * file, as a deploy whose window has no notes writes, or notes the deploy's own script writes from
+   * commit messages. Only the Cloud of the scenarios that show them sets it
+   * (`e2e:cloud --release-notes <source>`).
+   */
+  readonly releaseNotes?: CloudNotesSource;
   /**
    * Which host serves the dashboard and sign-in: `app.` of the origin, or, with the rollback
    * switch (`CLOUD_BROWSER_ORIGIN=deployment`), the origin itself.
@@ -212,6 +226,7 @@ export const startCloudEnvironment = (input: {
       { mode: 0o600 },
     );
     yield* Effect.addFinalizer(() => fs.remove(oauthProxySecretFile).pipe(Effect.orDie));
+    const notes = yield* cloudNotesFile(input.releaseNotes, directory);
     const env = {
       PATH: [path.join(cloud, "node_modules/.bin"), process.env.PATH ?? ""].join(
         process.platform === "win32" ? ";" : ":",
@@ -237,6 +252,9 @@ export const startCloudEnvironment = (input: {
       OTEL_EXPORTER_OTLP_LOGS_ENDPOINT: `${collector}/v1/logs`,
       EXECUTOR_ENVIRONMENT: "test-local",
       TEST_STAGE_AUTH_RATE_LIMIT: String(input.authRateLimit),
+      ...(input.removalRevocationBudgetMs === undefined
+        ? {}
+        : { TEST_STAGE_REMOVAL_REVOCATION_BUDGET_MS: String(input.removalRevocationBudgetMs) }),
       VITE_POSTHOG_KEY: "synthetic-ingestion-key",
       VITE_POSTHOG_PATH: "/api/0123456789abcdef",
       VITE_POSTHOG_HOST: `http://127.0.0.1:${analyticsPort}`,
@@ -259,6 +277,9 @@ export const startCloudEnvironment = (input: {
       CLOUD_DEV_DATABASE_PASSWORD: databasePassword,
       CLOUD_DEV_EXTERNAL_DATABASE: "true",
       EXECUTOR_EMULATORS: JSON.stringify(reveal(fixture).services),
+      // The dashboard's notes input, as a deploy's build takes the notes it wrote: fixed notes, an
+      // empty file, or notes the deploy's script wrote (e2e/support/cloud-release-notes.ts).
+      EXECUTOR_CLOUD_RELEASE_NOTES: notes,
       // Fails only engine calls to steps the workflow engine calls scenario's app names.
       EXECUTOR_TEST_WORKFLOW_ENGINE_FAULTS: JSON.stringify(engineCallFaults),
       V1_MCP_FORWARD_SECRET: v1ForwardSecret,

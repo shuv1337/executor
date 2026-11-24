@@ -36,6 +36,14 @@ export const ConnectionPolicy = Schema.Struct({
   ),
 });
 export type ConnectionPolicy = typeof ConnectionPolicy.Type;
+
+/** The same stored policy compares and fingerprints alike, independent of JSON key order. */
+export const canonicalConnectionPolicy = (policy: ConnectionPolicy): string =>
+  JSON.stringify(policy, (_key, item: unknown) =>
+    item !== null && typeof item === "object" && !Array.isArray(item)
+      ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
+      : item,
+  );
 /** A live connection owned by the current user in one organization (or the local instance). */
 export const Connection = Schema.Struct({
   id: ConnectionId,

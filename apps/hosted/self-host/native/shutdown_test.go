@@ -724,6 +724,48 @@ func TestStopAfterWatchdogStallCutsStreamsAndUsesShortGrace(t *testing.T) {
 	}
 }
 
+func TestStallReportCutsStreamsAndStopsAllChildren(t *testing.T) {
+	f := newShutdownFixture(t)
+	product := f.child("stalled", "product")
+	apps := f.child("stubborn", "apps")
+	collector := f.child("quick", "collector")
+	reports := make(chan stallReport, 1)
+	f.parts.stallReports = reports
+	stream := f.request(http.MethodGet, "/stream")
+	result := f.start()
+	reports <- stallReport{rule: ruleBusy}
+	if _, err := io.ReadAll(stream.Body); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("stream was not cut: %v", err)
+	}
+	for _, child := range []*observedChild{product, apps} {
+		for event := await(t, child.events); event != "term"; event = await(t, child.events) {
+			if event != "request-ended" {
+				t.Fatalf("%s: got %q waiting for SIGTERM", child.name, event)
+			}
+		}
+	}
+	f.timers.timer(stallGrace) <- time.Now()
+	err := await(t, result)
+	if !errors.Is(err, errWorkerdStalled) {
+		t.Fatalf("expected workerd stall, got %v", err)
+	}
+	for _, child := range []*observedChild{product, apps} {
+		if !strings.Contains(err.Error(), child.name+" did not stop within "+stallGrace.String()+"; killed") {
+			t.Fatalf("%s did not use stall grace: %v", child.name, err)
+		}
+		await(t, child.exited)
+	}
+	if event := await(t, collector.events); event != "term" {
+		t.Fatalf("collector got %q, want SIGTERM", event)
+	}
+	await(t, collector.exited)
+	f.journalOrder(
+		[2]string{"edge:cut", "product:term"}, [2]string{"edge:cut", "apps:term"},
+		[2]string{"product:term", "bridge:close"}, [2]string{"apps:term", "bridge:close"},
+		[2]string{"bridge:close", "collector:term"},
+	)
+}
+
 type readerFunc func([]byte) (int, error)
 
 func (f readerFunc) Read(buf []byte) (int, error) { return f(buf) }

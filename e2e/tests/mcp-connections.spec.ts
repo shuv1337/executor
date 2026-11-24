@@ -107,7 +107,7 @@ layer(HostedLive, { excludeTestServices: true })("Scoped MCP connections", (it) 
         expect(connection.policy.apps).toEqual([
           { app: app.id, runsAs: [{ kind: "app" }], tools: { kind: "readOnly" } },
         ]);
-        // MCP grants cannot manage connections, including a full-access one: the API refuses MCP tokens.
+        // The fork lets a full-access agent manage connections, but not their agent grants.
         yield* browser.login(actors.owner);
         const full = yield* evidence.step(
           "Authorize the full-access URL for comparison",
@@ -126,18 +126,19 @@ layer(HostedLive, { excludeTestServices: true })("Scoped MCP connections", (it) 
             agentListed.execution.value,
           )).map((listedConnection) => listedConnection.id),
         ).toContain(connection.id);
-        const changeTools = ["create", "update", "revoke", "agents", "revokeAgent"].map(
+        const connectionTools = ["create", "update", "revoke", "agents", "revokeAgent"].map(
           (operation) => `tools.executor.mcpConnections.${operation}`,
         );
         const described = yield* fullRun(
-          "The agent has no tool that changes a connection",
-          `return await tools.search.describe({ paths: ${JSON.stringify(changeTools)} });`,
+          "The agent can discover connection management but not agent-grant operations",
+          `return await tools.search.describe({ paths: ${JSON.stringify(connectionTools)} });`,
         );
+        expect(described.execution.ok).toBe(true);
         expect(
           (yield* Schema.decodeUnknownEffect(
             Schema.Struct({ missing: Schema.Array(Schema.Struct({ path: Schema.String })) }),
           )(described.execution.value)).missing.map((item) => item.path),
-        ).toEqual(changeTools);
+        ).toEqual(connectionTools.slice(3));
         const grant = yield* evidence.step(
           "Authorize the connection's own URL through browser consent",
           oauth.authorizeConnection(connection.id),

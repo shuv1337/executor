@@ -91,14 +91,20 @@ jobs:
       # "App dependency registry" suite's only scenario is selected by the private-fetch prefix.
       - name: Security scenarios
         run: |
-          bun run e2e:self-host -- --test-name 'application_type|fetch without a User-Agent names Executor|cannot create an all-apps connection|cannot widen a connection or mint|fails to load fails only its own reads|with private fetch off, a build|App dependency registry|keeps renewing grants that hold a scope|own Google client still signs in gmail.modify'
+          bun run e2e:self-host -- --test-name 'application_type|fetch without a User-Agent names Executor|cannot create an all-apps connection|cannot widen a connection or mint|fails to load fails only its own reads|with private fetch off, a build|keeps renewing grants that hold a scope|own Google client still signs in gmail.modify'
       # A parked program outlives the request that started it: the entry must hold through idle
       # deadlines until its batch finishes, and a crash must report the program lost, not missing.
       - name: Parked MCP program scenarios
         run: |
           bun run e2e:self-host --test-name 'Self-host MCP (resumes all three|reports a crashed parked)|PAT MCP approvals bind|PAT MCP model-mode resume' --workers 1
       - name: Person-only approval scenarios
-        run: bun run e2e:self-host --test-name 'a tool that requires a person refuses the agent|owner of an automatic-mode grant approves' --workers 1
+        run: bun run e2e:self-host --test-name 'a tool that requires a person refuses the agent|owner of an automatic-mode grant approves|A plain-URL API key in automatic mode' --workers 1
+      - name: MCP Skills extension and client bounds
+        run: |
+          bun run e2e:self-host --test-name 'Skills extension|Self-host MCP (admits|never forgets) a' --workers 1
+          bun run e2e:local --test-name 'Skills extension' --workers 1
+      - name: Member managed keys
+        run: bun run e2e:self-host --test-name "Executor app's managed key is recreated after an admin becomes a member|Executor installs each user" --workers 1
       # A failed default-app install names its tagged cause in the log, never the registry's URL.
       - name: Provisioning failure scenarios
         run: |

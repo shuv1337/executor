@@ -49,6 +49,11 @@ type Loaded =
   | { readonly _tag: "missing" | "expired" | "invalid" }
   | { readonly _tag: "restored"; readonly session: unknown };
 
+/** Forget only protocol sessions for this caller when the host reclaims a client slot. */
+export const discardMcpSessions = (kv: McpMetadataStorage) => {
+  for (const [key] of kv.list({ prefix })) kv.delete(key);
+};
+
 /** One store per elicitation mode: a session belongs to the mode that opened it. */
 export const mcpSessionStore =
   (kv: McpMetadataStorage) =>

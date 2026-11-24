@@ -6,8 +6,11 @@ import { PagePending } from "@executor-js/hosted-web/page-pending";
 import { DashboardShell } from "@executor-js/hosted-web/shell";
 import { OrganizationBoundary, OrganizationContent } from "@executor-js/hosted-web/organization";
 import { NameAccountDialog } from "@executor-js/hosted-web/pages/name-account-dialog";
+import { Option } from "effect";
+import type { ReactNode } from "react";
 import { Navigation } from "../navigation.tsx";
 import { organizationCreationAtom } from "../../contracts/auth.ts";
+import { SelfHostUpdateBlock, useSelfHostUpdate } from "../update.tsx";
 
 /** The URL owns this tab's organization; all product pages inherit this boundary. */
 export const Route = createFileRoute("/org/$organizationSlug")({
@@ -20,16 +23,33 @@ function OrganizationLayout() {
   const creation = useAtomValue(organizationCreationAtom);
   return (
     <OrganizationBoundary slug={organizationSlug}>
-      <DashboardShell
-        allowCreateOrganization={AsyncResult.isSuccess(creation) && creation.value}
-        navigation={<Navigation />}
-      >
+      <SelfHostShell allowCreateOrganization={AsyncResult.isSuccess(creation) && creation.value}>
         <OrganizationContent pending={<PagePending />}>
           <Outlet />
           <NameAccountDialog />
         </OrganizationContent>
-      </DashboardShell>
+      </SelfHostShell>
     </OrganizationBoundary>
+  );
+}
+
+/** The shell, with the update block above the links once an owner's or admin's server has one. */
+function SelfHostShell({
+  children,
+  allowCreateOrganization,
+}: {
+  readonly children: ReactNode;
+  readonly allowCreateOrganization: boolean;
+}) {
+  const update = useSelfHostUpdate();
+  return (
+    <DashboardShell
+      allowCreateOrganization={allowCreateOrganization}
+      navigation={<Navigation />}
+      notice={Option.isSome(update) && <SelfHostUpdateBlock update={update.value} />}
+    >
+      {children}
+    </DashboardShell>
   );
 }
 

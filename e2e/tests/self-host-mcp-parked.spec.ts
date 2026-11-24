@@ -73,7 +73,9 @@ const fixture = Effect.gen(function* () {
     Effect.scoped(
       Effect.gen(function* () {
         const traceId = randomUUID().replaceAll("-", "");
-        const request = HttpClientRequest.post(`${target.metadata.origin}/mcp`).pipe(
+        const request = HttpClientRequest.post(
+          `${target.metadata.origin}/mcp?elicitation_mode=model`,
+        ).pipe(
           HttpClientRequest.setHeaders({
             accept: "application/json, text/event-stream",
             authorization: `Bearer ${reveal(token.key)}`,
