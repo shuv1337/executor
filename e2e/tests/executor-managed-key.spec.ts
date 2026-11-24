@@ -305,7 +305,7 @@ layer(HostedLive, { excludeTestServices: true })("Executor app's managed key", (
     ),
   );
 
-  it.effect(scenarios.executorManagedKeyIneligible.title, (context) =>
+  it.effect(scenarios.executorManagedKeyMemberRenewal.title, (context) =>
     withHostedCase(
       context,
       Effect.gen(function* () {
@@ -331,33 +331,20 @@ layer(HostedLive, { excludeTestServices: true })("Executor app's managed key", (
         );
         const member = members.members.find((entry) => entry.role === "admin");
         if (member === undefined) return yield* Effect.die("Admin fixture missing");
-        const setRole = (role: "admin" | "member") =>
-          api
-            .request(actors.owner, "POST", "/api/auth/organization/update-member-role", {
-              organizationId: organization,
-              memberId: member.id,
-              role,
-            })
-            .pipe(Effect.tap((response) => Effect.sync(() => expect(response.status).toBe(200))));
+        const downgraded = yield* api.request(
+          actors.owner,
+          "POST",
+          "/api/auth/organization/update-member-role",
+          { organizationId: organization, memberId: member.id, role: "member" },
+        );
+        expect(downgraded.status).toBe(200);
         const call = api.request(actors.admin, "POST", `${path}/tools/call`, {
           tool: "context.get",
           kind: "query",
           input: {},
         });
-        // A member may not hold a managed key, so losing the admin role means nothing is minted.
-        yield* setRole("member");
-        for (const attempt of ["first", "second"]) {
-          const refused = yield* call;
-          expect(refused.status, `${attempt}: ${JSON.stringify(refused.body)}`).toBe(502);
-          const failure = yield* Schema.decodeUnknownEffect(Refused)(refused.body);
-          expect(failure.account.id).toBe(account);
-          expect(failure.upstream.code).toBe("Unauthorized");
-          expect(failure.upstream.message).toBe(replaceKeySentence);
-          expect(yield* managedKeys(actors.admin, organization)).toEqual([]);
-        }
-        // The same member made admin again may hold it, and the next call restores it. A call that
-        // names no kind may write, so it is not repeated: it fails once, saying access was restored.
-        yield* setRole("admin");
+        // A regular member may still hold the key. A call that names no kind may write, so
+        // it is not repeated: it fails once, saying access was restored.
         const renewing = yield* api.request(actors.admin, "POST", `${path}/tools/call`, {
           tool: "context.get",
           input: {},
@@ -376,7 +363,7 @@ layer(HostedLive, { excludeTestServices: true })("Executor app's managed key", (
         expect(yield* managedKeys(actors.admin, organization)).toHaveLength(1);
         const restored = yield* call;
         expect(restored.status, JSON.stringify(restored.body)).toBe(200);
-        expect(yield* body(Identity, restored)).toEqual({ organization, role: "admin" });
+        expect(yield* body(Identity, restored)).toEqual({ organization, role: "member" });
         expect(yield* managedKeys(actors.admin, organization)).toHaveLength(1);
         expect(yield* apiKeyAccounts(actors.admin, organization)).toEqual([account]);
 

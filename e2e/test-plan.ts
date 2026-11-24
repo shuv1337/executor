@@ -8161,12 +8161,12 @@ export const scenarios = plan({
       local: na("Local uses its configured instance API key."),
     },
   },
-  executorManagedKeyIneligible: {
+  executorManagedKeyMemberRenewal: {
     fixtures: "actors",
     managementApps: ["admin"],
     file: "executor-managed-key.spec.ts",
     title:
-      "Executor app's managed key is not recreated for a member who may no longer hold one, and its refusal says how to replace it",
+      "Executor app's managed key is recreated after an admin becomes a member, but not after removal",
     targets: {
       "self-host": scheduled,
       cloud: managedCloud,
@@ -10902,6 +10902,16 @@ export const scenarios = plan({
       ),
     },
   },
+  personApprovalPlainKey: {
+    fixtures: "actors",
+    file: "caller-identity.spec.ts",
+    title: "A plain-URL API key in automatic mode still pauses for a signed-in person's approval",
+    targets: {
+      "self-host": scheduled,
+      cloud: na("This fork scenario verifies the self-host approval page."),
+      local: na("This scenario uses hosted memberships and personal API keys."),
+    },
+  },
   sharedRuntime: {
     fixtures: "actors",
     file: "shared-runtime.spec.ts",
@@ -12851,6 +12861,28 @@ export const scenarios = plan({
       "self-host": scheduled,
       cloud: managedCloud,
       local: na("Local has one operator; localMcpSkillsExtension covers its connections."),
+    },
+  },
+  mcpSkillsScopedCredentials: {
+    managementApps: ["owner"],
+    fixtures: "actors",
+    file: "mcp-skills-extension.spec.ts",
+    title:
+      "MCP Skills extension restricts connection keys and grants to their app, and refuses revoked connections",
+    targets: {
+      "self-host": scheduled,
+      cloud: na("This fork scenario verifies self-host connection keys."),
+      local: na("Local does not issue hosted connection keys."),
+    },
+  },
+  mcpSkillsOrganizationIsolation: {
+    fixtures: "actors",
+    file: "mcp-skills-extension.spec.ts",
+    title: "MCP Skills extension isolates self-host organizations with matching app slugs",
+    targets: {
+      "self-host": scheduled,
+      cloud: na("This fork scenario exercises the self-host root owner's organization creation."),
+      local: na("Local has no hosted organizations."),
     },
   },
   mcpSkillsExtensionExecutorEdits: {

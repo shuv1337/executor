@@ -373,6 +373,68 @@ layer(HostedLive, { excludeTestServices: true })("Caller identity", (it) => {
     ),
   );
 
+  it.effect(scenarios.personApprovalPlainKey.title, (context) =>
+    withHostedCase(
+      context,
+      Effect.gen(function* () {
+        const api = yield* Api,
+          actors = yield* Actors;
+        const { app } = yield* deployCallerApp;
+        // No explicit mode on the URL: a plain key now defaults to automatic.
+        const agent = yield* mcpUser(actors.member, "plain-key", app.slug);
+        const allowed = yield* agent.completed(
+          Identity,
+          yield* agent.execute("The plain key automatically accepts client approval", "reviewed", {
+            note: "automatic",
+          }),
+        );
+        expect(allowed.approvedBy).toMatchObject({ kind: "agent", method: "client" });
+        const asked = yield* Schema.decodeUnknownEffect(Pending)(
+          (yield* agent.execute("The plain key asks a person to approve", "personal", {
+            note: "person only",
+          })).structuredContent,
+        );
+        expect(asked.human).toBe(true);
+        if (asked.approvalUrl === undefined) return yield* Effect.die("No approval URL");
+        const page = new URL(asked.approvalUrl);
+        expect(page.searchParams.get("mode")).toBe("automatic");
+        expect([...page.searchParams.keys()].sort()).toEqual(["grant", "mode", "sessionId"]);
+        const refused = yield* Schema.decodeUnknownEffect(Pending)(
+          (yield* agent.resume("The key's own answer does not approve", asked.requestId))
+            .structuredContent,
+        );
+        expect(refused).toMatchObject({ requestId: asked.requestId, human: true });
+        const path = approvalPath(asked.requestId, page.searchParams);
+        expect(
+          (yield* api.request(yield* api.session(), "POST", path, {
+            response: { action: "accept" },
+          })).status,
+        ).toBe(401);
+        const browser = yield* Browser;
+        yield* browser.login(actors.member);
+        yield* browser.use("Open the plain key's approval page as its owner", (tab) =>
+          tab.goto(`${page.pathname}${page.search}`),
+        );
+        yield* browser.use("Approve as the signed-in person", (tab) =>
+          tab.getByRole("button", { name: "Approve", exact: true }).click(),
+        );
+        yield* browser.use("Wait for the approval confirmation", (tab) =>
+          tab.getByText("You can return to your agent.").waitFor(),
+        );
+        const done = yield* agent.completed(
+          Identity,
+          yield* agent.resume("The plain key collects the person's answer", asked.requestId),
+        );
+        expect(done.caller).toMatchObject({ kind: "agent", email: "member@example.test" });
+        expect(done.approvedBy).toMatchObject({
+          kind: "human",
+          method: "browser",
+          subject: done.caller.subject,
+        });
+      }).pipe(Effect.provide(McpClient.layer)),
+    ),
+  );
+
   it.effect(scenarios.personApprovalAutomatic.title, (context) =>
     withHostedCase(
       context,

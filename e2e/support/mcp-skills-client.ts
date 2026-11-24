@@ -25,6 +25,8 @@ const make = Effect.gen(function* () {
         readonly revision: SkillsRevision;
         /** X-Executor-Organization, for a hosted credential that is not bound to one. */
         readonly organization?: string;
+        /** Select the hosted organization by its MCP path instead of a header. */
+        readonly organizationSlug?: string;
         /** A scoped connection's ID, for its own `/mcp?connection=` URL. */
         readonly connection?: string;
       },
@@ -57,7 +59,12 @@ const make = Effect.gen(function* () {
           ),
           (client) => driver("close MCP skills client", () => client.close()).pipe(Effect.orDie),
         );
-        const endpoint = new URL(`${target.metadata.origin}/mcp`);
+        const endpoint = new URL(
+          options.organizationSlug === undefined
+            ? "/mcp"
+            : `/org/${encodeURIComponent(options.organizationSlug)}/mcp`,
+          target.metadata.origin,
+        );
         if (options.connection !== undefined)
           endpoint.searchParams.set("connection", options.connection);
         const transport = new StreamableHTTPClientTransport(endpoint, { fetch: observedFetch });

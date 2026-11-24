@@ -16,7 +16,7 @@ import { Api, body, type Session } from "../support/api.ts";
 import { Browser } from "../support/browser.ts";
 import { appsManifest } from "../support/apps-release.ts";
 import { HostedLive, TestLive, withCase, withHostedCase } from "../support/case.ts";
-import { App } from "../support/contracts.ts";
+import { App, Organization } from "../support/contracts.ts";
 import { Evidence } from "../support/evidence.ts";
 import { McpClient } from "../support/mcp-client.ts";
 import { McpOAuth } from "../support/mcp-oauth.ts";
@@ -80,6 +80,87 @@ return [{ name: "slow-guide", description: "Synthetic slow instructions.", files
 const sha256 = (bytes: Uint8Array) => `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
 const uris = (skills: ReadonlyArray<Skill>) => skills.map((skill) => skill.uri);
 
+/** Report only whether the runtime bound the request, never the connection ID or a credential. */
+const connectionProbe = Effect.gen(function* () {
+  const server = createServer((request, response) => {
+    response.end(
+      request.headers["x-executor-caller-connection"] === undefined ? "unscoped" : "scoped",
+    );
+  });
+  const port = yield* Effect.acquireRelease(
+    Effect.callback<number>((resume) => {
+      server.listen(0, "127.0.0.1", () => {
+        const address = server.address();
+        resume(
+          typeof address === "object" && address !== null
+            ? Effect.succeed(address.port)
+            : Effect.die("The connection probe needs a TCP listener"),
+        );
+      });
+    }),
+    () =>
+      Effect.callback<void>((resume) => {
+        server.close(() => resume(Effect.void));
+      }),
+  );
+  return `http://127.0.0.1:${port}`;
+});
+
+const issueSkillKey = (actor: Session) =>
+  Effect.gen(function* () {
+    const api = yield* Api;
+    const response = yield* api.request(actor, "POST", "/api/auth/api-key/create", {
+      name: "MCP skills extension",
+    });
+    expect(response.status).toBe(200);
+    const token = yield* body(Token, response);
+    yield* Effect.addFinalizer(() =>
+      api
+        .request(actor, "POST", "/api/auth/api-key/delete", { keyId: token.id })
+        .pipe(Effect.orDie),
+    );
+    return token.key;
+  });
+
+const deploySkillApp = (
+  owner: Session,
+  organization: string,
+  name: string,
+  files: ReadonlyArray<{ path: string; content: string }>,
+) =>
+  Effect.gen(function* () {
+    const api = yield* Api;
+    const prefix = `/api/organizations/${organization}/apps`;
+    const deployed = yield* api.request(owner, "POST", `${prefix}/deploy`, { name, files });
+    expect(deployed.status, JSON.stringify(deployed.body)).toBe(200);
+    const app = yield* body(App, deployed);
+    const path = `${prefix}/${app.id}`;
+    yield* Effect.addFinalizer(() => api.request(owner, "DELETE", path).pipe(Effect.orDie));
+    const warmed = yield* api.request(owner, "GET", `${path}/skill-bundle`);
+    expect(warmed.status, JSON.stringify(warmed.body)).toBe(200);
+    return { app, path };
+  });
+
+type ConnectedSkills = Effect.Success<ReturnType<(typeof McpSkillsClient.Service)["connect"]>>;
+
+const expectSkillRefused = (client: ConnectedSkills, base: string) =>
+  Effect.gen(function* () {
+    const uri = `${base}/SKILL.md`;
+    expect(
+      yield* client.refusal(`Get the excluded skill ${uri}`, (skills) => skills.get(uri)),
+    ).toBe(INVALID_PARAMS);
+    expect(
+      yield* client.refusal(`Read the excluded skill ${uri}`, (_, client) =>
+        client.readResource({ uri }),
+      ),
+    ).toBe(INVALID_PARAMS);
+    expect(
+      yield* client.refusal(`List the excluded directory ${base}`, (skills) =>
+        skills.readDirectory(base),
+      ),
+    ).toBe(INVALID_PARAMS);
+  });
+
 /** Read every file of each skill and check what the client verified against the entry. */
 const readEveryFile = (
   client: Effect.Success<ReturnType<(typeof McpSkillsClient.Service)["connect"]>>,
@@ -102,6 +183,207 @@ const readEveryFile = (
   );
 
 layer(HostedLive, { excludeTestServices: true })("MCP Skills extension", (it) => {
+  it.effect(scenarios.mcpSkillsScopedCredentials.title, (context) =>
+    withHostedCase(
+      context,
+      Effect.gen(function* () {
+        const api = yield* Api,
+          actors = yield* Actors,
+          clients = yield* McpSkillsClient;
+        const organization = actors.organization.id;
+        const prefix = `/api/organizations/${organization}/mcp-connections`;
+        const marker = randomUUID();
+        const probe = yield* connectionProbe;
+        const { app: visible } = yield* deploySkillApp(
+          actors.owner,
+          organization,
+          "Connection skills",
+          loaderAppFiles(`
+await ctx.cache.read?.("scope-probe");
+const scope = await (await ctx.fetch(${JSON.stringify(probe)}, { signal: ctx.signal })).text();
+return [{
+  name: "allowed-guide", description: "Synthetic connection scope probe.",
+  files: [{ path: "SKILL.md", content: ${JSON.stringify(
+    skillMd("allowed-guide", "Synthetic connection scope probe.", ""),
+  )} + "Outbound scope: " + scope + "\\n" }],
+}];`),
+        );
+        const { app: hidden } = yield* deploySkillApp(
+          actors.owner,
+          organization,
+          "Unscoped skills",
+          skillAppFiles("outside-guide", marker),
+        );
+        const allowed = `skill://${visible.slug}/allowed-guide`;
+        const outside = `skill://${hidden.slug}/outside-guide`;
+        const created = yield* api.request(actors.owner, "POST", prefix, {
+          id: randomUUID(),
+          name: "Skills for one app",
+          apps: [{ app: visible.id, runsAs: [{ kind: "app" }], tools: { kind: "all" } }],
+        });
+        expect(created.status, JSON.stringify(created.body)).toBe(200);
+        const connection = yield* body(ConnectionView, created);
+        const connectionPath = `${prefix}/${connection.id}`;
+        const issued = yield* api.request(actors.owner, "POST", `${connectionPath}/keys`, {
+          name: "Only one app",
+          expiresInSeconds: 3600,
+        });
+        expect(issued.status, JSON.stringify(issued.body)).toBe(200);
+        const { key } = yield* body(Token, issued);
+        const consent = yield* consentTo(actors.owner, connection.url);
+        expect(consent.status).toBe(200);
+        yield* revokeClientGrants(actors.owner, () => [consent.clientId]);
+        const grant = yield* consent.tokens;
+        const options = {
+          organization,
+          revision: "2026-07-28",
+          connection: connection.id,
+        } as const;
+        const full = yield* clients.connect(yield* issueSkillKey(actors.owner), "unscoped", {
+          organization,
+          revision: options.revision,
+        });
+        const listing = yield* full.use("Verify the excluded skills are present", (skills) =>
+          skills.list(),
+        );
+        expect(uris(listing.skills)).toEqual(
+          expect.arrayContaining([`${outside}/SKILL.md`, "skill://executor/executor/SKILL.md"]),
+        );
+        const allowedUri = `${allowed}/SKILL.md`;
+        const broadEntry = listing.skills.find((skill) => skill.uri === allowedUri);
+        if (broadEntry === undefined) return yield* Effect.die("The dynamic skill was not listed");
+        const broadFile = yield* full.use("Read the cached unscoped skill", (skills) =>
+          skills.read(broadEntry),
+        );
+        expect(broadFile.body).toContain("Outbound scope: unscoped");
+        for (const [name, secret] of [
+          ["connection-key", key],
+          ["connection-grant", grant],
+        ] as const) {
+          const scoped = yield* clients.connect(secret, name, options);
+          const listing = yield* scoped.use(`List skills for the ${name}`, (skills) =>
+            skills.list(),
+          );
+          expect(uris(listing.skills)).toEqual([allowedUri]);
+          const entry = yield* scoped.use(`Get the allowed skill for the ${name}`, (skills) =>
+            skills.get(allowedUri),
+          );
+          expect(entry.skill.uri).toBe(allowedUri);
+          // The listing's manifest must be built under the scoped outbound, not
+          // borrowed from the unscoped caller's kept catalog.
+          expect(listing.skills).toEqual([entry.skill]);
+          const file = yield* scoped.use(
+            `Read the scoped dynamic skill for the ${name}`,
+            (skills) => skills.read(entry.skill),
+          );
+          expect(file.body).toContain("Outbound scope: scoped");
+          yield* expectSkillRefused(scoped, outside);
+          yield* expectSkillRefused(scoped, "skill://executor/executor");
+        }
+
+        const revoked = yield* api.request(actors.owner, "POST", `${connectionPath}/revoke`);
+        expect(revoked.status, JSON.stringify(revoked.body)).toBe(200);
+        const anonymous = yield* api.session();
+        for (const secret of [key, grant]) {
+          for (const method of ["skills/list", "skills/get", "resources/read"]) {
+            const response = yield* api.request(
+              anonymous,
+              "POST",
+              `/mcp?connection=${encodeURIComponent(connection.id)}`,
+              {
+                jsonrpc: "2.0",
+                id: 1,
+                method,
+                params: method === "skills/list" ? {} : { uri: `${allowed}/SKILL.md` },
+              },
+              {
+                accept: "application/json, text/event-stream",
+                authorization: `Bearer ${Redacted.value(secret)}`,
+                "x-executor-organization": organization,
+                "mcp-protocol-version": options.revision,
+                "mcp-method": method,
+              },
+            );
+            expect(response.status, `${method} after connection revocation`).toBe(401);
+          }
+        }
+      }).pipe(Effect.provide(McpSkillsClient.layer)),
+    ),
+  );
+
+  it.effect(scenarios.mcpSkillsOrganizationIsolation.title, (context) =>
+    withHostedCase(
+      context,
+      Effect.gen(function* () {
+        const api = yield* Api,
+          actors = yield* Actors,
+          clients = yield* McpSkillsClient;
+        const created = yield* api.request(actors.owner, "POST", "/api/auth/organization/create", {
+          name: "Other skills organization",
+          slug: `other-skills-${randomUUID().slice(0, 8)}`,
+          keepCurrentActiveOrganization: true,
+        });
+        expect(created.status, JSON.stringify(created.body)).toBe(200);
+        const second = yield* body(Organization, created);
+        const firstMarker = randomUUID();
+        const secondMarker = randomUUID();
+        const name = "Identically named skills";
+        const first = yield* deploySkillApp(
+          actors.owner,
+          actors.organization.id,
+          name,
+          skillAppFiles("first-guide", firstMarker),
+        );
+        const other = yield* deploySkillApp(
+          actors.owner,
+          second.id,
+          name,
+          skillAppFiles("second-guide", secondMarker),
+        );
+        expect(first.app.slug).toBe(other.app.slug);
+        expect(first.app.id).not.toBe(other.app.id);
+        const access = yield* body(
+          Access,
+          yield* api.request(actors.owner, "GET", `${first.path}/access`),
+        );
+        const shared = yield* api.request(actors.owner, "PATCH", `${first.path}/access`, {
+          audience: { kind: "everyone" },
+          revision: access.revision,
+        });
+        expect(shared.status).toBe(200);
+        const firstGuide = `skill://${first.app.slug}/first-guide`;
+        const secondGuide = `skill://${other.app.slug}/second-guide`;
+        const owner = yield* clients.connect(yield* issueSkillKey(actors.owner), "other-org", {
+          revision: "2026-07-28",
+          organizationSlug: second.slug,
+        });
+        const otherListing = yield* owner.use(
+          "Warm and read the second organization's skill",
+          (skills) => skills.list(),
+        );
+        expect(uris(otherListing.skills)).toContain(`${secondGuide}/SKILL.md`);
+        const member = yield* clients.connect(yield* issueSkillKey(actors.member), "first-org", {
+          revision: "2026-07-28",
+          organizationSlug: actors.organization.slug,
+        });
+        const listing = yield* member.use("List the member's organization by URL", (skills) =>
+          skills.list(),
+        );
+        expect(uris(listing.skills)).toContain(`${firstGuide}/SKILL.md`);
+        expect(uris(listing.skills)).not.toContain(`${secondGuide}/SKILL.md`);
+        const ownEntry = yield* member.use("Get the first organization's skill", (skills) =>
+          skills.get(`${firstGuide}/SKILL.md`),
+        );
+        const own = yield* member.use("Read the first organization's skill", (skills) =>
+          skills.read(ownEntry.skill),
+        );
+        expect(own.body).toContain(firstMarker);
+        expect(own.body).not.toContain(secondMarker);
+        yield* expectSkillRefused(member, secondGuide);
+      }).pipe(Effect.provide(McpSkillsClient.layer)),
+    ),
+  );
+
   it.effect(scenarios.mcpSkillsExtension.title, (context) =>
     withHostedCase(
       context,

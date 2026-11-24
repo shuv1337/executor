@@ -1,5 +1,5 @@
 import { storedApp, storedVersion } from "./apps.ts";
-import { snapshot as invocation } from "./tools.ts";
+import { boundCallerConnection, snapshot as invocation } from "./tools.ts";
 import { appProviderFailure } from "./provider-error.ts";
 import { AppSkills, ProviderError } from "apps/contracts";
 import { AppEvaluationFailed, evaluationFailure } from "../contracts/tools.ts";
@@ -104,6 +104,7 @@ export const makeSkills = (
                       hostApi: declarations.hostApi(state.version),
                       sources,
                       ...context,
+                      ...boundCallerConnection(state.caller),
                     })
                     .pipe(
                       // A service's rejection names the selected account, as in tool listing.

@@ -455,6 +455,8 @@ export interface Runtime<Requirements = never> {
       /** Set for an app that reads the host API; see `HostApiCheck`. */
       readonly hostApi: HostApiCheck | undefined;
       readonly sources?: boolean;
+      /** Verified connection for the loader's outbound requests, not app-visible identity. */
+      readonly callerConnection?: string;
     } & HostContext,
   ) => Effect.Effect<SkillCatalog, RuntimeLoadError | typeof HostInspectError.Type, Requirements>;
   /** Describe the current tools, or only the named ones. Unknown names are omitted. */

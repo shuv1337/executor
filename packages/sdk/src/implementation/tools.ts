@@ -309,7 +309,7 @@ export const callerContext = (
  * The verified MCP connection, sent even when {@link callerContext} omits `caller`. The runner
  * seals it into the outbound; the app bundle never sees it.
  */
-const boundCallerConnection = (caller: Caller | undefined) => {
+export const boundCallerConnection = (caller: Caller | undefined) => {
   const connection = caller?.provenance?.connectionId;
   return connection === undefined ? {} : { callerConnection: connection };
 };

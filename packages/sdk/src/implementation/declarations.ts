@@ -151,6 +151,8 @@ export const makeDeclarations = (options: {
             // A caller's evaluation and actorless work see different contexts: only one has `user`.
             state.scope,
             selections,
+            // Dynamic skill loaders can make host API reads under the caller's connection.
+            ...(command === "skills" ? [state.caller?.provenance?.connectionId ?? null] : []),
           ]),
         ),
       );

@@ -384,9 +384,13 @@ export const appRuntime = (host: AppRuntimeHost) =>
       build: (input) => host.build(input).pipe(traced("build")),
       asset: host.asset,
       changes: host.changes,
-      skills: ({ sources, ...input }) =>
+      skills: ({ sources, callerConnection, ...input }) =>
         dispatch(
-          { ...input, database: false },
+          {
+            ...input,
+            database: false,
+            ...(callerConnection === undefined ? {} : { callerConnection }),
+          },
           skillsCommand(sources === true),
           SkillCatalogResponse,
           HostInspectError,
