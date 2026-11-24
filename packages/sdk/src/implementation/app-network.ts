@@ -16,19 +16,66 @@ import { RecordedMessage } from "@executor-js/utils/recorded-message";
 import { hostApiChangingCode } from "../contracts/host-api.ts";
 
 /**
+ * How the platform's network failed a send, matched from its rejection's message, which is never
+ * kept. Cloudflare and workerd reject with fixed texts: "Network connection lost." when a connection is
+ * refused, reset or closed, and "internal error; reference = …" when a DNS lookup, TLS
+ * handshake, connection or address policy fails.
+ */
+export const NetworkFailure = Schema.Literals([
+  "connection_lost",
+  "internal",
+  "subrequest_limit",
+  "other",
+]);
+export type NetworkFailure = typeof NetworkFailure.Type;
+
+/** A workerd error reference: an opaque ID the host logs beside the real cause. */
+const reference = /^internal error; reference = ([0-9a-z]{1,64})$/i;
+
+/** The fixed category of a send's rejection, and workerd's error reference when it gave one. */
+export const networkFailure = (
+  error: unknown,
+): { readonly failure: NetworkFailure; readonly reference?: string } => {
+  const message = error instanceof Error ? error.message : "";
+  if (/^network connection lost/i.test(message)) return { failure: "connection_lost" };
+  if (/^internal error/i.test(message)) {
+    const found = reference.exec(message)?.[1];
+    return found === undefined
+      ? { failure: "internal" }
+      : { failure: "internal", reference: found.toLowerCase() };
+  }
+  if (/too many subrequests/i.test(message)) return { failure: "subrequest_limit" };
+  return { failure: "other" };
+};
+
+/**
  * Executor's app network failed before the service answered an app's request. The request may have
  * reached the service: the connection can fail after the service received it. It names no host or
  * URL: the app knows which request it sent, and the message reaches telemetry when the app does not
- * catch the rejection.
+ * catch the rejection. `failure` says how the network failed, from a closed set, and `reference` is
+ * workerd's opaque error reference, which an operator can find in the host's logs.
  */
 export class NetworkUnreachable extends Schema.TaggedError<NetworkUnreachable>()(
   "NetworkUnreachable",
-  {},
+  {
+    failure: Schema.optional(NetworkFailure),
+    reference: Schema.optional(Schema.String.check(Schema.isPattern(/^[0-9a-z]{1,64}$/u))),
+  },
 ) {
   override get message() {
-    return "Executor's connection to the service failed before it answered. The request may have reached the service.";
+    const maybe = "The request may have reached the service.";
+    switch (this.failure) {
+      case "connection_lost":
+        return `Executor's connection to the service was lost before it answered: the connection was refused, reset or closed. ${maybe}`;
+      case "internal":
+        return `Executor's connection to the service failed before it answered: a DNS lookup, TLS handshake, connection or network address policy failed${this.reference === undefined ? "" : ` (workerd error reference ${this.reference})`}. ${maybe}`;
+      case "subrequest_limit":
+        return `Executor's connection to the service failed before it answered: the call reached its limit on outbound requests (subrequests). ${maybe}`;
+      default:
+        return `Executor's connection to the service failed before it answered. ${maybe}`;
+    }
   }
-  /** Fixed text: telemetry records the message itself. */
+  /** Fixed text and closed fields: telemetry records the message itself. */
   get [RecordedMessage]() {
     return this.message;
   }

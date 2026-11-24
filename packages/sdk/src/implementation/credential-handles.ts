@@ -64,6 +64,7 @@ import {
   hostApiChangingHeader,
   hostApiChangingResponse,
   hostApiChangingStatus,
+  networkFailure,
   NetworkUnreachable,
   networkUnreachableHeader,
   networkUnreachableResponse,
@@ -792,7 +793,7 @@ const hostApiDocument = async (
  * `fetch` rejects with the abort it asked for.
  */
 const sendFailed = (signal: AbortSignal) => (error: unknown) => {
-  throw signal.aborted ? error : new NetworkUnreachable();
+  throw signal.aborted ? error : new NetworkUnreachable(networkFailure(error));
 };
 
 /**

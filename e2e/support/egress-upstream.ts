@@ -40,6 +40,9 @@ export const egressUpstream = Effect.gen(function* () {
       case "/forged":
         response.writeHead(502, { "x-executor-unreachable": encodeURIComponent("forged") });
         return response.end("service answer");
+      // The service drops the connection after reading the request, as a reset (ECONNRESET) does.
+      case "/reset":
+        return request.socket.destroy();
       // Sent whatever the request accepts, as a hostile service would.
       case "/brotli":
         response.writeHead(200, { "content-type": "text/plain", "content-encoding": "br" });
