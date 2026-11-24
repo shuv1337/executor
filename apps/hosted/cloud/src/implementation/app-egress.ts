@@ -6,6 +6,7 @@
  */
 import { Schema } from "effect";
 import { RecordedMessage } from "@executor-js/utils/recorded-message";
+import { NetworkFailure, networkFailure } from "@executor-js/sdk/workerd";
 
 /**
  * Executor's app network failed to send an app's request, or the outbound itself failed. The
@@ -17,7 +18,7 @@ import { RecordedMessage } from "@executor-js/utils/recorded-message";
 export class AppEgressFailed extends Schema.TaggedError<AppEgressFailed>()("AppEgressFailed", {
   stage: Schema.Literals(["send", "outbound"]),
   /** A known failure of the platform's network, matched from the rejection's message. */
-  failure: Schema.Literals(["connection_lost", "internal", "subrequest_limit", "other"]),
+  failure: NetworkFailure,
 }) {
   override get message() {
     return this.stage === "send"
@@ -30,17 +31,6 @@ export class AppEgressFailed extends Schema.TaggedError<AppEgressFailed>()("AppE
   }
 }
 
-/** The fixed category of a rejection. Its message is matched, never kept. */
-export const egressFailure = (stage: AppEgressFailed["stage"], error: unknown) => {
-  const message = error instanceof Error ? error.message : "";
-  return new AppEgressFailed({
-    stage,
-    failure: /^network connection lost/i.test(message)
-      ? "connection_lost"
-      : /^internal error/i.test(message)
-        ? "internal"
-        : /too many subrequests/i.test(message)
-          ? "subrequest_limit"
-          : "other",
-  });
-};
+/** The fixed category of a rejection, shared with the app's own `NetworkUnreachable`. */
+export const egressFailure = (stage: AppEgressFailed["stage"], error: unknown) =>
+  new AppEgressFailed({ stage, failure: networkFailure(error).failure });

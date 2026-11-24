@@ -214,8 +214,9 @@ layer(HostedLive, { excludeTestServices: true })("App egress failures", (it) => 
 
         // A send that fails before any answer rejects the app's fetch: never a status. The
         // message cannot claim the request was not sent: the connection may fail after it was.
+        // workerd reports a refused connection as a lost one, and the message says so.
         const networkMessage =
-          "Executor's connection to the service failed before it answered. The request may have reached the service.";
+          "Executor's connection to the service was lost before it answered: the connection was refused, reset or closed. The request may have reached the service.";
         const rejected = { source: "app", errorName: "TypeError", message: networkMessage };
         const fetches: Record<string, unknown> = {};
         const fetchedTraces: Array<string> = [];
@@ -247,6 +248,14 @@ layer(HostedLive, { excludeTestServices: true })("App egress failures", (it) => 
             message: `Transport error (GET ${upstream.closedOrigin}/) (caused by TypeError: ${networkMessage})`,
           });
         }
+        // A service that resets the connection after the request arrived (ECONNRESET) is a lost
+        // connection too. The message names the failure, never the host.
+        const reset = yield* failed(
+          ToolFailed,
+          yield* fetching("global", { url: `${upstream.origin}/reset` }),
+        );
+        unsentTraces.push(yield* latestTrace);
+        expect(reset.failure).toEqual(rejected);
         // The isolates still answer with the service's own responses afterwards.
         expect(
           yield* answered(yield* facet("tampered", { url: `${upstream.origin}/fail` })),
