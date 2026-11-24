@@ -192,8 +192,8 @@ layer(HostedLive, { excludeTestServices: true })("Caller identity", (it) => {
           actors = yield* Actors;
         const organization = actors.organization.id;
         const { app, path } = yield* deployCallerApp;
-        const alice = yield* mcpUser(actors.member, "alice", app.slug),
-          bob = yield* mcpUser(actors.admin, "bob", app.slug);
+        const alice = yield* mcpUser(actors.member, "alice", app.slug, "model"),
+          bob = yield* mcpUser(actors.admin, "bob", app.slug, "model");
 
         // Concurrent calls from two users each reach the app as that user's own agent.
         const whoami = (user: typeof alice, step: string) =>

@@ -15,27 +15,43 @@ import {
   McpLimits,
   defaultMcpLimits,
   callerMcpStorage,
+  discardMcpSessions,
   mcpInteractionStore,
   mcpSessionStore,
 } from "@executor-js/mcp";
 import { PgliteClient } from "@effect/sql-pglite";
-import { Clock, Config, Effect, Exit, RcMap, Schema, Scope } from "effect";
+import {
+  Clock,
+  Config,
+  Context,
+  Deferred,
+  Duration,
+  Effect,
+  Exit,
+  Fiber,
+  Schedule,
+  Schema,
+  Scope,
+} from "effect";
+import { McpSchema } from "effect/ai";
 import { HttpServerResponse } from "effect/http";
+import { mcpClientLimits } from "./contracts/config.ts";
 import { SelfHostMcpStorage } from "./contracts/mcp-storage.ts";
 
 /**
- * Protocol sessions a handler keeps in each elicitation mode, by last use, forgetting only sessions
- * that own no work. A handler stays while its caller keeps calling, and the transport has no session
- * DELETE, so each client that opened a session for one call, or left without ending its session,
- * kept about 0.7 KB until restart.
+ * Protocol sessions one client's handler keeps in each elicitation mode, by last use, forgetting
+ * only sessions that own no work. A handler stays while its caller keeps calling, and the transport
+ * has no session DELETE, so each client that opened a session for one call, or left without ending
+ * its session, kept about 0.7 KB until restart.
  */
 const maxSessions = 256;
+/** Every client that could make room owns work: a request in flight or a paused program. */
+class McpClientsFull extends Schema.TaggedError<McpClientsFull>()("McpClientsFull", {}) {}
 
 /** Own protocol sessions in the server scope; the returned handler receives SDK/auth per request. */
 export const selfHostMcp = Effect.gen(function* () {
   const storage = yield* SelfHostMcpStorage;
   const clock = yield* Clock.Clock;
-  const hostScope = yield* Effect.scope;
   const idleMillis = yield* Config.schema(
     Schema.Int.check(Schema.isGreaterThan(0)),
     "EXECUTOR_MCP_SESSION_IDLE_MS",
@@ -50,60 +66,131 @@ export const selfHostMcp = Effect.gen(function* () {
       Config.withDefault(defaultMcpLimits.maxSteps),
     ),
   });
-  const sessions = yield* RcMap.make({
-    // Each session keeps what its callers' last tool calls read (CallStateCache).
-    lookup: (key: string) => {
-      const records = callerMcpStorage(storage, key);
-      return Effect.map(
-        makeHostedMcp(
-          undefined,
-          limits,
-          mcpSessionStore(records),
-          mcpInteractionStore(records, () => clock.currentTimeMillisUnsafe()),
-          maxSessions,
-        ),
-        (handler) => ({
-          ...handler,
-          holding: false,
-          calls: new Map<string, CallState>(),
-        }),
-      );
-    },
-    idleTimeToLive: idleMillis,
-    capacity: 256,
-  });
-  /**
-   * Acquire before the HTTP request releases its reference. A parked program owns a reference,
-   * not a timer racing the idle deadline. Once the last program ends, normal idle eviction resumes.
-   */
-  const hold = (
-    key: string,
-    handler: Effect.Success<ReturnType<typeof makeHostedMcp>> & { holding: boolean },
-  ) =>
-    Effect.gen(function* () {
-      if (handler.holding || handler.programs() === 0) return;
-      const scope = yield* Scope.make();
-      yield* RcMap.get(sessions, key).pipe(
-        Effect.provideService(Scope.Scope, scope),
-        Effect.onError(() => Scope.close(scope, Exit.void)),
-        // This request already holds the key, so retaining it cannot exceed capacity.
-        Effect.orDie,
-      );
-      handler.holding = true;
-      yield* Effect.gen(function* () {
-        while (handler.programs() > 0) yield* Effect.sleep("1 second");
-      }).pipe(
-        Effect.ensuring(
+  const bound = yield* mcpClientLimits;
+  // Each client keeps what its callers' last tool calls read (CallStateCache).
+  const build = (key: string) => {
+    const records = callerMcpStorage(storage, key);
+    return Effect.map(
+      makeHostedMcp(
+        undefined,
+        limits,
+        mcpSessionStore(records),
+        mcpInteractionStore(records, () => clock.currentTimeMillisUnsafe()),
+        maxSessions,
+      ),
+      (handler) => ({ ...handler, calls: new Map<string, CallState>() }),
+    );
+  };
+  type Handler = Effect.Success<ReturnType<typeof build>>;
+  // A handler outlives the request that opened it, so it is built in the server's context.
+  const context =
+    yield* Effect.context<Exclude<Effect.Services<ReturnType<typeof build>>, Scope.Scope>>();
+  const server = yield* Effect.scope;
+
+  interface Client {
+    readonly user: string;
+    readonly scope: Scope.Closeable;
+    readonly ready: Deferred.Deferred<Handler>;
+    handler: Handler | undefined;
+    /** Requests in flight, each until its response has been sent, its event stream included. */
+    requests: number;
+    idleSince: number;
+  }
+  /** One client per `mcpSessionKey`, least recently used first. */
+  const clients = new Map<string, Client>();
+  const ownsWork = (client: Client) =>
+    client.requests > 0 || client.handler === undefined || client.handler.programs() > 0;
+  const forget = (key: string, client: Client) => {
+    clients.delete(key);
+    Scope.close(client.scope, Exit.void).pipe(Effect.runForkWith(context), Fiber.runIn(server));
+  };
+  /** Forget the least recently used client, of `user` when named, that owns no work. */
+  const forgetIdle = (user?: string) => {
+    for (const [key, client] of clients) {
+      if ((user === undefined || client.user === user) && !ownsWork(client)) {
+        // Capacity eviction requires reinitialization. Idle expiry and a restart only
+        // discard the in-memory handler, so those cases can still restore the session.
+        try {
+          discardMcpSessions(callerMcpStorage(storage, key));
+        } catch {
+          Effect.logWarning("Could not discard MCP sessions on client eviction").pipe(
+            Effect.runForkWith(context),
+            Fiber.runIn(server),
+          );
+        }
+        forget(key, client);
+        return true;
+      }
+    }
+    return false;
+  };
+  /** Room for one more client of `user`, in the same synchronous step that will take it. */
+  const makeRoom = (user: string) => {
+    let held = 0;
+    for (const client of clients.values()) if (client.user === user) held++;
+    if (held >= bound.perUser) return forgetIdle(user);
+    return clients.size < bound.total || forgetIdle();
+  };
+  const open = (key: string, user: string) => {
+    const client: Client = {
+      user,
+      scope: Scope.forkUnsafe(server),
+      ready: Deferred.makeUnsafe(),
+      handler: undefined,
+      requests: 0,
+      idleSince: clock.currentTimeMillisUnsafe(),
+    };
+    clients.set(key, client);
+    build(key)
+      .pipe(
+        Effect.runForkWith(Context.add(context, Scope.Scope, client.scope)),
+        Fiber.runIn(client.scope),
+      )
+      .addObserver((exit) => {
+        if (Exit.isSuccess(exit)) client.handler = exit.value;
+        else if (clients.get(key) === client) forget(key, client);
+        Deferred.doneUnsafe(client.ready, exit);
+      });
+    return client;
+  };
+  /** The handler of `user`'s client `key`, held by the request's scope and moved to most recent. */
+  const handlerFor = (key: string, user: string) =>
+    Effect.uninterruptibleMask((restore) =>
+      Effect.suspend(() => {
+        let client = clients.get(key);
+        if (client === undefined) {
+          if (!makeRoom(user)) return Effect.fail(new McpClientsFull());
+          client = open(key, user);
+        } else {
+          clients.delete(key);
+          clients.set(key, client);
+        }
+        const held = client;
+        held.requests++;
+        return Effect.addFinalizer(() =>
           Effect.sync(() => {
-            handler.holding = false;
-          }).pipe(Effect.andThen(Scope.close(scope, Exit.void))),
-        ),
-        Effect.forkIn(hostScope),
-      );
-    }).pipe(Effect.uninterruptible);
+            held.requests--;
+            held.idleSince = clock.currentTimeMillisUnsafe();
+            // Used until its response ended, so a long event stream does not leave it first in line.
+            if (clients.get(key) === held) {
+              clients.delete(key);
+              clients.set(key, held);
+            }
+          }),
+        ).pipe(Effect.andThen(restore(Deferred.await(held.ready))));
+      }),
+    );
+  yield* Effect.sync(() => {
+    const now = clock.currentTimeMillisUnsafe();
+    for (const [key, client] of clients)
+      if (!ownsWork(client) && now - client.idleSince >= idleMillis) forget(key, client);
+  }).pipe(
+    Effect.repeat(Schedule.spaced(Duration.millis(Math.min(60_000, idleMillis)))),
+    Effect.forkScoped,
+  );
   const http = authenticatedMcp((access, address) =>
     Effect.gen(function* () {
-      const handler = yield* RcMap.get(sessions, mcpSessionKey(access));
+      const handler = yield* handlerFor(mcpSessionKey(access), access.userId);
       // PGlite runs in-process, so reads issued together cost no extra connection. A tool call's
       // statements run together under the client's lock, its reads in one snapshot, as in Cloud.
       // Not read-only: a statement another caller handed to PGlite just before the lock can still
@@ -114,27 +201,34 @@ export const selfHostMcp = Effect.gen(function* () {
           PgliteClient.pipelined(leaves, { outside, begin: "ISOLATION LEVEL REPEATABLE READ" }),
         ),
         Effect.provideService(CallStateCache, handler.calls),
-        Effect.ensuring(hold(mcpSessionKey(access), handler)),
       );
     }).pipe(
-      Effect.catchTag("ExceededCapacityError", () =>
+      // A client that owns work is never forgotten to admit another, so this one waits its turn.
+      Effect.catchTag("McpClientsFull", () =>
         Effect.succeed(
-          // An active request is never evicted to admit a new session.
-          // Native clients can retry after another scope expires.
-          HttpServerResponse.empty({ status: 503 }),
+          HttpServerResponse.jsonUnsafe(
+            {
+              jsonrpc: "2.0",
+              id: null,
+              error: {
+                code: McpSchema.RESOURCE_EXHAUSTED_ERROR_CODE,
+                message:
+                  "Too many MCP clients in use: every client this server keeps for you, or for everyone, is running a request or holds a paused program. Retry when one of them finishes.",
+              },
+            },
+            { status: 503, headers: { "retry-after": "1" } },
+          ),
         ),
       ),
     ),
   );
   const approvals = browserMcpRequest((access, address, issuer) =>
     Effect.gen(function* () {
-      const host = yield* RcMap.get(sessions, mcpSessionKey(access));
-      return yield* hostedMcpApproval(host.approvals, access, address, issuer).pipe(
-        Effect.ensuring(hold(mcpSessionKey(access), host)),
-      );
+      const host = yield* handlerFor(mcpSessionKey(access), access.userId);
+      return yield* hostedMcpApproval(host.approvals, access, address, issuer);
     }).pipe(
-      Effect.catchTag("ExceededCapacityError", () =>
-        Effect.succeed(HttpServerResponse.empty({ status: 503 })),
+      Effect.catchTag("McpClientsFull", () =>
+        Effect.succeed(HttpServerResponse.empty({ status: 503, headers: { "retry-after": "1" } })),
       ),
     ),
   );

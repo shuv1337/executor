@@ -627,6 +627,10 @@ func serve(mode string) error {
 		appWorkerIdle = strconv.Itoa(number)
 	}
 	config = substitute(config, []byte("@@APP_WORKER_IDLE_SECONDS@@"), []byte(appWorkerIdle))
+	stall, err := readStallSettings(values)
+	if err != nil {
+		return err
+	}
 	config = substitute(config, []byte("@@MEMORY_PRESSURE_MB@@"), []byte(strconv.FormatUint(memoryPressureMiB("/sys/fs/cgroup/memory.max"), 10)))
 	config = substitute(config, []byte("@@SELF_ORIGIN@@"), []byte(strconv.Quote(values["BETTER_AUTH_URL"])))
 	// App builds install packages from this registry; empty selects the public registry.
@@ -832,6 +836,9 @@ func serve(mode string) error {
 	} else {
 		proxy = productProxy(socketPath, workerdIdleTimeout, proxies...)
 	}
+	life := &lifeSigns{}
+	transport := proxy.Transport.(*http.Transport)
+	proxy.Transport = lifeTransport{RoundTripper: transport, life: life}
 	proxy.ModifyResponse = edge.response
 	opened := make(chan struct{})
 	public := &http.Server{
@@ -849,7 +856,7 @@ func serve(mode string) error {
 	var watchers sync.WaitGroup
 	stalled := make(chan error, 1)
 	if interval, failures, enabled := watchdogSettings(); enabled {
-		probe := healthProbe(watchCtx, socketPath, min(interval, 5*time.Second), false)
+		probe := watchdogHealthProbe(watchCtx, socketPath, min(interval, 5*time.Second), false)
 		watchers.Go(func() {
 			watchdog(probe, interval, failures, time.After, watchCtx.Done(), func() {
 				reportProductStall(os.Stderr, stalled, failures, interval)
@@ -860,7 +867,7 @@ func serve(mode string) error {
 	// even a refusal. After a run of silent probes it restarts that process alone, then re-arms
 	// once the new process answers.
 	if interval, failures, enabled := appWatchdogSettings(); apps != nil && enabled {
-		probe := healthProbe(watchCtx, appsSocket, min(interval, 5*time.Second), true)
+		probe := watchdogHealthProbe(watchCtx, appsSocket, min(interval, 5*time.Second), true)
 		watchers.Go(func() {
 			for {
 				stalled := false
@@ -876,16 +883,29 @@ func serve(mode string) error {
 			}
 		})
 	}
+	// The stall check arms on the product's first ready answer.
+	ready := make(chan struct{})
+	stallReports := make(chan stallReport)
+	if stall.seconds > 0 {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		pid := command.Process.Pid
+		watchers.Go(func() {
+			watchStalls(stall, ready, ticker.C, func() (threadSample, error) { return readThread(pid) }, healthProbe(socketPath, stallProbeTimeout), life, busyCPU("/sys/fs/cgroup/cpu.max"), os.Stderr, stallReports, watchCtx.Done())
+		})
+	}
 	announceCtx, stopAnnouncing := context.WithCancel(context.Background())
 	watchers.Go(func() {
-		announceReady(announceCtx, socketPath, values["BETTER_AUTH_URL"], startupProgressInterval, time.Second, os.Stderr, opened)
+		if announceReady(announceCtx, socketPath, values["BETTER_AUTH_URL"], startupProgressInterval, time.Second, os.Stderr, opened) {
+			close(ready)
+		}
 	})
 	parts := shutdownParts{
-		signals: signals, serverError: serverError, stalled: stalled,
+		signals: signals, serverError: serverError, stalled: stalled, stallReports: stallReports,
 		endWatching: endWatching, endAnnouncing: stopAnnouncing, joinWatching: watchers.Wait,
 		endStreams: func() { close(edge.ending) },
 		public:     public, listener: publicListener, edge: edge,
-		closeIdle: proxy.Transport.(*http.Transport).CloseIdleConnections, closeBridge: closeBridge,
+		closeIdle: transport.CloseIdleConnections, closeBridge: closeBridge,
 		product: product, productExited: product.exited, collector: telemetryCollector,
 	}
 	if apps != nil {
@@ -906,8 +926,8 @@ const startupProgressInterval = 15 * time.Second
 // would otherwise initialize only once the first visitor or health probe arrived. It asks the
 // product's /health until one answers 200, waiting retry after the first failure and doubling up
 // to 30 seconds, and logs every progress interval while it waits. It closes opened when the
-// product first answers, ready or not, and returns once the product is ready or ctx is cancelled.
-func announceReady(ctx context.Context, socket, origin string, progress, retry time.Duration, log io.Writer, opened chan<- struct{}) {
+// product first answers, ready or not, and returns true once ready or false if ctx is cancelled.
+func announceReady(ctx context.Context, socket, origin string, progress, retry time.Duration, log io.Writer, opened chan<- struct{}) bool {
 	started := time.Now()
 	fmt.Fprintln(log, "Executor is starting. The first start initializes the database, which can take a minute or more on slower hardware.")
 	// A fresh connection each time: a pooled one could reach workerd as it closes it.
@@ -943,14 +963,14 @@ func announceReady(ctx context.Context, socket, origin string, progress, retry t
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return false
 		case <-ticker.C:
 			fmt.Fprintf(log, "Executor is still starting (%s)\n", time.Since(started).Round(time.Second))
 		case ok := <-answer:
 			answer = nil
 			if ok {
 				fmt.Fprintf(log, "Executor is ready at %s (started in %s)\n", origin, time.Since(started).Round(time.Second))
-				return
+				return true
 			}
 			again = time.After(retry)
 			retry = min(retry*2, 30*time.Second)
@@ -1093,7 +1113,8 @@ func productProxyFor(socket string, upstreamIdleTimeout time.Duration, addressOf
 			request.Out.Close = request.In.ContentLength != 0
 			address := addressOf(request.In)
 			request.Out.Header.Set("x-executor-client-ip", address)
-
+			// Only the host's own stall check may ask for an untraced /health.
+			request.Out.Header.Del(hostProbeHeader)
 		},
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -1158,9 +1179,9 @@ func appWatchdogSettings() (time.Duration, int, bool) {
 	return time.Duration(seconds * float64(time.Second)), failures, true
 }
 
-// healthProbe bypasses the public proxy and asks the child's socket for /health.
+// watchdogHealthProbe bypasses the public proxy and asks the child's socket for /health.
 // For the apps process any response shows that its JavaScript thread is free, even a refusal.
-func healthProbe(ctx context.Context, socket string, timeout time.Duration, anyAnswer bool) func() bool {
+func watchdogHealthProbe(ctx context.Context, socket string, timeout time.Duration, anyAnswer bool) func() bool {
 	client := http.Client{
 		Timeout: timeout,
 		Transport: &http.Transport{
@@ -1176,6 +1197,7 @@ func healthProbe(ctx context.Context, socket string, timeout time.Duration, anyA
 	}
 	return func() bool {
 		request, _ := http.NewRequestWithContext(ctx, http.MethodGet, address, nil)
+		request.Header.Set(hostProbeHeader, "1")
 		response, err := client.Do(request)
 		if err != nil {
 			return false

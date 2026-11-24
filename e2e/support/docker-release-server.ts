@@ -8,17 +8,21 @@ import { driver } from "./platform.ts";
 import { containerNpmRegistry } from "./npm-registry.ts";
 import { fullTracing } from "./trace-sampling.ts";
 
-/** Start the image under test, set up its owner and organization; removed when the scope closes. */
-/**
- * A fresh released image with an owner. `environment` adds server settings; `restart` sets the
- * container's restart policy, as an operator's compose file does; `docker` adds `docker run`
- * arguments, such as a mounted file or a host name.
- */
-export const releasedServerWith = (options: {
+/** Settings for `releasedServerWith`. */
+export interface ReleasedServerOptions {
+  /** More environment for the container. */
   readonly environment?: Readonly<Record<string, string>>;
+  /** The container's restart policy, as in an operator's compose file. */
   readonly restart?: "unless-stopped";
+  /** More `docker run` arguments, such as a mounted file or a host name. */
   readonly docker?: readonly string[];
-}) =>
+}
+
+/**
+ * Start the image under test with `options`, set up its owner and organization; removed when the
+ * scope closes.
+ */
+export const releasedServerWith = (options: ReleasedServerOptions = {}) =>
   Effect.gen(function* () {
     const processes = yield* ChildProcessSpawner.ChildProcessSpawner;
     const image = yield* Config.String("EXECUTOR_E2E_DOCKER_IMAGE");
@@ -74,6 +78,7 @@ export const releasedServerWith = (options: {
       ),
       () => run(["rm", "--force", "--volumes", id]).pipe(Effect.orDie),
     );
+    // The image logs to stderr. Read it with stdout: an unread pipe fills and `docker logs` waits.
     yield* Effect.addFinalizer((exit) =>
       Exit.isFailure(exit)
         ? processes
@@ -137,6 +142,12 @@ export const releasedServerWith = (options: {
       json(Schema.Struct({ id: Schema.String }), `${prefix}/apps/deploy`, { name, files });
     /** Run a shell script in the container as the user the server runs as. */
     const exec = (script: string) => run(["exec", "--user", "executor", id, "sh", "-c", script]);
+    /** Run a shell script in the container as root. */
+    const execRoot = (script: string) => run(["exec", "--user", "root", id, "sh", "-c", script]);
+    /** The container's log so far; the image logs to stderr. */
+    const logs = processes.string(ChildProcess.make("docker", ["logs", id], { stderr: "pipe" }), {
+      includeStderr: true,
+    });
     // Stops every engine in the process; the product's state and the engines' storage remain.
     const restart = run(["restart", id]).pipe(Effect.andThen(ready));
     // Stops the process for a while before starting it again, so durable deadlines pass while
@@ -147,29 +158,37 @@ export const releasedServerWith = (options: {
         Effect.andThen(run(["start", id])),
         Effect.andThen(ready),
       );
-    /** The container's log and how often Docker has restarted it. */
-    const logs = processes
-      .string(ChildProcess.make("sh", ["-c", `docker logs ${id} 2>&1`], { extendEnv: true }))
-      .pipe(Effect.orElseSucceed(() => ""));
+    /** How often Docker has restarted the container. */
     const restartCount = run(["inspect", "--format", "{{.RestartCount}}", id]).pipe(
       Effect.map((text) => Number(text.trim())),
     );
     return {
-      json,
+      /** The container's name. */
+      id,
+      /** Run `docker` with these arguments. */
+      docker: run,
+      /** Answers once `/health` is 200. */
+      ready,
       request,
+      json,
       prefix,
       deploy,
       exec,
+      execRoot,
+      logs,
+      restartCount,
       restart,
       restartAfter,
       encryptionKey,
-      logs,
-      restartCount,
+      /** The image's public port on 127.0.0.1, and the origin its pages are served at. */
       port,
       origin,
+      /** The owner's session, as a `cookie` header. */
       session: cookie,
+      /** The owner's organization's ID. */
       organization: organization.id,
     };
   });
 
-export const releasedServer = releasedServerWith({});
+/** Start the image under test with its defaults; see `releasedServerWith`. */
+export const releasedServer = releasedServerWith();

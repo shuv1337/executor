@@ -726,7 +726,8 @@ export const mcpBearerAccess = (
     if (key.connection !== undefined && request.connection !== key.connection)
       return yield* forbidden("connection_key", "wrong_resource");
 
-    const mode = request.mode ?? "model";
+    // A PAT without an explicit mode uses automatic at the plain URL.
+    const mode = request.mode ?? "automatic";
     // At a connection's URL a PAT runs with that connection's narrower policy, as its OAuth grants
     // do, when the connection is its user's own and stands. Otherwise the PAT keeps its unscoped
     // grant, which the URL's delivery check refuses and names the URL it serves.
@@ -828,10 +829,12 @@ export const apiBearerAccess = (
   origins: HostedOAuthOrigins,
   request: BearerRequest,
   unknownKeys?: UnknownApiKeys,
-) =>
-  Effect.gen(function* () {
+) => {
+  const token = bearer(request.headers);
+  // A refused API key says how to replace it; no sign-in would help.
+  const presentedKey = token !== undefined && isApiKey(token);
+  return Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
-    const token = bearer(request.headers);
     if (token === undefined) return yield* noBearer(request.headers);
     const access: Omit<ApiBearerAccess, "organizationSlug"> & {
       readonly organizationSlug: string | null;
@@ -869,9 +872,14 @@ export const apiBearerAccess = (
     return { ...access, organizationSlug } satisfies ApiBearerAccess;
   }).pipe(
     Effect.tapError(recordRefusal),
-    Effect.mapError(({ reason }) =>
+    Effect.mapError(({ reason, failure }) =>
       reason === "unauthorized"
-        ? new Unauthorized()
+        ? new Unauthorized(
+            presentedKey &&
+              (failure === "unknown" || failure === "revoked" || failure === "expired")
+              ? { credential: "apiKey" }
+              : {},
+          )
         : reason === "unavailable"
           ? new AuthenticationUnavailable()
           : reason === "connection_key"
@@ -879,3 +887,4 @@ export const apiBearerAccess = (
             : new OrganizationForbidden(),
     ),
   );
+};

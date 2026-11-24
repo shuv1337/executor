@@ -838,7 +838,7 @@ func TestProductProbeReportsOnlyOK(t *testing.T) {
 	})}
 	go server.Serve(listener)
 	defer server.Close()
-	probe := healthProbe(context.Background(), socket, time.Second, false)
+	probe := watchdogHealthProbe(context.Background(), socket, time.Second, false)
 	if !probe() {
 		t.Fatal("a 200 from /health is an answer")
 	}

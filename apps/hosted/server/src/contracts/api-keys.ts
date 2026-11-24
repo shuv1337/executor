@@ -1,6 +1,23 @@
 import { Schema } from "effect";
 import { ConnectionId } from "@executor-js/mcp-auth/connections";
 import { OrganizationId } from "./organization.ts";
+/**
+ * Names the key member setup creates for the Executor app, on the Tokens page, so its owner knows
+ * where it came from. The name marks nothing: a token created before the name was reserved may
+ * bear it. New tokens cannot take it, so it does not mislead.
+ */
+export const managedKeyName = "Executor app (created automatically)";
+/**
+ * The Executor app's own key: the product marks it in the key's metadata when it mints it, which
+ * no token created on the Tokens page can carry. Keys minted before the mark existed carry none
+ * and read as ordinary tokens.
+ */
+export const isManagedKey = (key: {
+  readonly metadata?:
+    | { readonly organization?: string | undefined; readonly executorApp?: true | undefined }
+    | null
+    | undefined;
+}) => key.metadata?.executorApp === true && key.metadata.organization !== undefined;
 /** Public identifier, never the bearer credential. */
 export const ApiKeyId = Schema.NonEmptyString.pipe(Schema.brand("ApiKeyId"));
 /**
@@ -12,6 +29,8 @@ export const ApiKeyId = Schema.NonEmptyString.pipe(Schema.brand("ApiKeyId"));
 export const ApiKeyMetadata = Schema.Struct({
   organization: Schema.optional(OrganizationId),
   connection: Schema.optional(ConnectionId),
+  /** Set only on a key the product minted for the Executor app; servers before it ignore it. */
+  executorApp: Schema.optional(Schema.Literal(true)),
 });
 export type ApiKeyMetadata = typeof ApiKeyMetadata.Type;
 /** Native Better Auth key metadata; secret hashes are excluded. */

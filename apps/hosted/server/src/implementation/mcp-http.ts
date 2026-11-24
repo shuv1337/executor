@@ -18,6 +18,7 @@ import {
   GrantForbidden,
   McpWhoami,
   requestedMcpAddress,
+  namedApprovalMode,
   mcpResource,
   mcpResourceMetadataUrl,
   requestResourceOrigin,
@@ -101,6 +102,7 @@ const requestCaller = Effect.flatMap(RequestCaller, (caller) =>
 const RequestBackend = Context.Reference<McpBackend<RequestError>>("hosted/McpRequestBackend", {
   defaultValue: () => ({
     listSkills: unavailable,
+    bundleSkills: unavailable,
     readSkill: unavailable,
     listApps: unavailable,
     listAccounts: unavailable,
@@ -135,6 +137,8 @@ const RequestApprovalUrl = Context.Reference<
 const requestBackend: McpBackend<RequestError> = {
   listSkills: (input, options) =>
     Effect.flatMap(RequestBackend, (backend) => backend.listSkills(input, options)),
+  bundleSkills: (input, options) =>
+    Effect.flatMap(RequestBackend, (backend) => backend.bundleSkills(input, options)),
   readSkill: (input) => Effect.flatMap(RequestBackend, (backend) => backend.readSkill(input)),
   authorizeElicitation: (input) =>
     Effect.flatMap(RequestBackend, (backend) => backend.authorizeElicitation(input)),
@@ -271,10 +275,12 @@ export const dispatchHostedMcp = <E, R>(
     // organization and the users they affect counted.
     const caller = callerSpanAttributes(access.access.organization, access.userId);
     yield* Effect.annotateCurrentSpan(caller);
+    // The recheck reads the mode this URL spells out, as the request's own authentication did.
+    const named = namedApprovalMode(new URL(request.url, authentication.origin));
     const current = Effect.annotateCurrentSpan(caller).pipe(
       Effect.andThen(
         authentication
-          .authenticate(headers, address.mode, access.access.organization, address.connection)
+          .authenticate(headers, named, access.access.organization, address.connection)
           // A recheck is for this organization and user from its start, so one refused or failed
           // before its statement answers still names them.
           .pipe(Effect.annotateSpans(caller)),
@@ -422,6 +428,8 @@ export const dispatchHostedMcp = <E, R>(
       ...backend,
       listSkills: (input, options) =>
         current.pipe(Effect.flatMap((fresh) => fresh.listSkills(input, options))),
+      bundleSkills: (input, options) =>
+        current.pipe(Effect.flatMap((fresh) => fresh.bundleSkills(input, options))),
       readSkill: (input) => current.pipe(Effect.flatMap((fresh) => fresh.readSkill(input))),
 
       authorizeElicitation: (input) =>
@@ -536,10 +544,11 @@ export const authenticatedMcp = <E, R>(
     if (address === undefined) return invalidAddress;
     // The request's tool calls recheck the same token; they reuse its hash (see BearerHashes).
     const hashes = new Map<string, string>();
+    // Only the mode the URL spells out: a credential without a grant record defaults on its own.
     const access = yield* Effect.result(
       auth.authenticate(
         new Headers(request.headers),
-        address.mode,
+        namedApprovalMode(url),
         requestedMcpOrganization(url),
         address.connection,
       ),

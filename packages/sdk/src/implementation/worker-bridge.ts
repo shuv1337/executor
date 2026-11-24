@@ -1,6 +1,7 @@
 import { retireMethod } from "@executor-js/app-data/worker-bundle";
 import type { SourceFile } from "../contracts/version.ts";
 import { asciiJson } from "./ascii-json.ts";
+import { outboundGroupHeader } from "./app-network.ts";
 
 /**
  * The text files a server entry retains as `ctx.files`. `ui/` is the browser app: the host serves
@@ -100,7 +101,7 @@ const collect = () => { const gc = globalThis.gc; if (typeof gc !== "function" |
  * anything unexpected while reading it sends the original on unchanged.
  */
 export const appRpcBridge = (module: string, load: "module" | "call" = "module") => `
-${networkImport}
+import { outboundGroup } from "./${appNetworkModuleName}";
 ${
   load === "module"
     ? `import app from ${JSON.stringify(`./${module}`)};`
@@ -139,12 +140,15 @@ class Invocation extends RpcTarget {
     this.#stubs = [delivery, execution, management];
     // The app runs once the runner asks for its result, after this start has returned: starting is
     // the runner's own time and never overlaps the app's.
+    // A call the host names a group for runs in \`outboundGroup\`, so each request it sends names it.
+    const { [${JSON.stringify(outboundGroupHeader)}]: group, ...forwarded } = headers;
     this.#dispatch = () => {
       const clock = bridge.clock;
       const started = clock?.();
-      return bridge.fetch(new Request("https://app.internal/dispatch", {
-        method: "POST", headers: { ...headers, "content-type": "application/json" }, body, signal: this.#controller.signal
-      }), { ELICITATION: delivery, WORKFLOW: execution, WORKFLOW_CONTROLS: management, CACHE: this.#cache?.cache }).then(response => response.json()).then(value => ({ ok: true, value: dispatched(clock, started, value) }), error => ({ ok: false, error })).finally(() => this.#release());
+      const send = () => bridge.fetch(new Request("https://app.internal/dispatch", {
+        method: "POST", headers: { ...forwarded, "content-type": "application/json" }, body, signal: this.#controller.signal
+      }), { ELICITATION: delivery, WORKFLOW: execution, WORKFLOW_CONTROLS: management, CACHE: this.#cache?.cache });
+      return (typeof group === "string" ? outboundGroup.run(group, send) : send()).then(response => response.json()).then(value => ({ ok: true, value: dispatched(clock, started, value) }), error => ({ ok: false, error })).finally(() => this.#release());
     };
   }
   #release() { for (const stub of this.#stubs) stub?.[Symbol.dispose](); this.#stubs = []; }
@@ -181,8 +185,11 @@ export class ExecutorAppData extends DurableObject {
   #caches = new Map();
   fetch(request) { return bridge.fetch(request, { STORAGE: this.#storage }); }
   async invoke(id, body, headers, elicitation, workflows, cache) {
-    const session = cache == null ? undefined : bridge.cacheSession?.(cache);
-    if (session) this.#caches.set(id, session);
+    // The runtime disposes a stub passed to a call when the call returns, and a stale read's
+    // refresh outlives the call: keep a duplicate until the call's session is over.
+    const callback = cache == null || bridge.cacheSession == null ? null : cache.dup();
+    const session = callback == null ? undefined : bridge.cacheSession(callback);
+    if (session) this.#caches.set(id, { session, callback });
     const controller = new AbortController();
     this.#calls.set(id, controller);
     try {
@@ -194,6 +201,7 @@ export class ExecutorAppData extends DurableObject {
       return dispatched(clock, started, await response.json());
     } finally { this.#calls.delete(id); }
   }
-  async finish(id) { try { await this.#caches.get(id)?.drain(); } finally { this.#caches.delete(id); collect(); } }
-  async cancel(id) { this.#calls.get(id)?.abort(); await this.#caches.get(id)?.cancel(); this.#caches.delete(id); collect(); }
+  async finish(id) { const entry = this.#caches.get(id); try { await entry?.session.drain(); } finally { this.#release(id, entry); } }
+  async cancel(id) { this.#calls.get(id)?.abort(); const entry = this.#caches.get(id); try { await entry?.session.cancel(); } finally { this.#release(id, entry); } }
+  #release(id, entry) { entry?.callback[Symbol.dispose](); this.#caches.delete(id); collect(); }
 }`;

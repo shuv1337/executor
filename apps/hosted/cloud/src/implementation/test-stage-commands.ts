@@ -1,6 +1,18 @@
 /** Deploy isolated previews with explicit database, retention and background policies. */
 import { createHash } from "node:crypto";
-import { Clock, Config, Console, Effect, FileSystem, Option, Path, Result, Schema } from "effect";
+import {
+  Clock,
+  Config,
+  Console,
+  Duration,
+  Effect,
+  FileSystem,
+  Option,
+  Path,
+  Result,
+  Schema,
+  Stream,
+} from "effect";
 import { Argument, Command, Flag } from "effect/cli";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import { testStagePrefix } from "../infrastructure/stage.ts";
@@ -18,9 +30,11 @@ import {
 import { ReleaseRefusal, releaseRefusalReport } from "../contracts/release-guard.ts";
 import { withStageAdmin } from "./test-stage-inventory.ts";
 import { discoverTestStages } from "./test-stage-discovery.ts";
+import { accountLimits, accountUsage, capacityCheck } from "./test-stage-capacity.ts";
 import { findOrphanBranches } from "./test-stage-orphans.ts";
 import { branchGone, branchOutcomeMessage, removeStageBranch } from "./test-stage-branch.ts";
 import { awaitStageRollout } from "./test-stage-rollout.ts";
+import { isDeployOutcomeLine, retrySignature } from "./test-stage-deploy-retry.ts";
 import {
   destroyUnreadableStage,
   inventoryCount,
@@ -57,6 +71,57 @@ const runChild = (command: ChildProcess.Command) =>
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const code = Number(yield* spawner.exitCode(command));
     if (code !== 0) return yield* failure(`The child command exited with status ${code}.`);
+  });
+/**
+ * Run a child, passing its output through as it comes, and return its exit status with the lines
+ * of Alchemy's outcome (its failed resources and summary) that a retry is decided on.
+ */
+const runChildReading = (command: ChildProcess.Command) =>
+  Effect.gen(function* () {
+    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+    const child = yield* spawner.spawn(command);
+    const pass = <E>(stream: Stream.Stream<Uint8Array, E>, to: NodeJS.WriteStream) =>
+      stream.pipe(
+        Stream.tap((chunk) => Effect.sync(() => to.write(chunk))),
+        Stream.decodeText(),
+        Stream.splitLines,
+        Stream.filter(isDeployOutcomeLine),
+        Stream.runCollect,
+      );
+    const [out, err, code] = yield* Effect.all(
+      [pass(child.stdout, process.stdout), pass(child.stderr, process.stderr), child.exitCode],
+      { concurrency: "unbounded" },
+    );
+    return { code: Number(code), lines: [...out, ...err] };
+  }).pipe(Effect.scoped);
+/**
+ * Deploy a stage this run created. A deploy that fails only with one of `retrySignatures` runs
+ * once more, after a short wait for the Hyperdrive origin. Any other failure, a release guard's
+ * refusal and a second failure stop it as before, with every attempt's output in the log.
+ */
+const deployNewStage = (command: ChildProcess.Command, report: string) =>
+  Effect.gen(function* () {
+    const stopped = (code: number) =>
+      Effect.gen(function* () {
+        const refusal = yield* releaseRefusal(report);
+        return yield* Option.isSome(refusal)
+          ? refusal.value
+          : failure(`The child command exited with status ${code}.`);
+      });
+    const first = yield* runChildReading(command);
+    if (first.code === 0) return;
+    const signature = retrySignature(first.lines);
+    if (signature === undefined || Option.isSome(yield* releaseRefusal(report)))
+      return yield* stopped(first.code);
+    const wait = yield* Config.Duration("TEST_STAGE_DEPLOY_RETRY_WAIT").pipe(
+      Config.withDefault(Duration.seconds(60)),
+    );
+    yield* Console.log(
+      `Retrying the deploy once (${signature.name}): its first attempt failed only because ${signature.description}; waiting ${Duration.format(wait)} first.`,
+    );
+    yield* Effect.sleep(wait);
+    const second = yield* runChildReading(command);
+    if (second.code !== 0) return yield* stopped(second.code);
   });
 /** A release guard's refusal recorded by the Alchemy process, if it stopped the deploy. */
 const releaseRefusal = (report: string) =>
@@ -235,6 +300,11 @@ const operation = (name: "deploy" | "plan") =>
       telemetry: Flag.Literals("telemetry", ["export", "off"]).pipe(Flag.withDefault("off")),
       noInput: Flag.Boolean("no-input").pipe(Flag.withDefault(false)),
       yes: Flag.Boolean("yes").pipe(Flag.withDefault(false)),
+      // `deploy` only: refuse, rather than evict, a deploy that would replace another test stage.
+      // `plan` has no such flag, as before.
+      ...(name === "deploy"
+        ? { noEvict: Flag.Boolean("no-evict").pipe(Flag.withDefault(false)) }
+        : {}),
     },
     (input) =>
       withStageAdmin((admin) =>
@@ -266,27 +336,61 @@ const operation = (name: "deploy" | "plan") =>
           // A new stage replaces the oldest ones beyond the limit, before it creates resources.
           // An eviction that fails does not stop this deploy, whose author did not cause it, but
           // it is reported where they look: the log, a run annotation and the job summary.
+          const evictions =
+            existing === undefined ? stagesToEvict(yield* admin.list, input.slug) : [];
+          // With `--no-evict`, the same list at the same instant refuses the deploy instead, before
+          // it reserves, builds, deploys or destroys anything.
+          if ("noEvict" in input && input.noEvict === true && evictions.length > 0)
+            return yield* failure(
+              `Deploying ${input.slug} would evict ${evictions.length} test stage${evictions.length === 1 ? "" : "s"} to stay within ${testStageLimit}: ${evictions.map((stage) => `${stage.slug} (${oneLine(stage.owner)})`).join(", ")}. --no-evict refuses it, so nothing was reserved, deployed or destroyed. Destroy test stages you own, then deploy again.`,
+            );
+          // A new stage adds Workers and Durable Object classes, both account quotas. One past a
+          // configured quota is refused here rather than failing part way through Alchemy's apply;
+          // past only Cloudflare's documented figure, it warns and goes on. The stages it evicts are
+          // counted as freed, and checked again below with only the evictions that succeeded.
+          const usage = existing === undefined ? yield* accountUsage : undefined;
+          const limits = yield* accountLimits;
+          const capacity =
+            usage === undefined
+              ? undefined
+              : capacityCheck(
+                  usage,
+                  limits,
+                  input.slug,
+                  evictions.map((stage) => stage.slug),
+                );
+          if (capacity?.refusal !== undefined) return yield* failure(capacity.refusal);
+          if (capacity?.warning !== undefined) yield* Console.error(capacity.warning);
+          const evicted: string[] = [];
           if (existing === undefined)
-            for (const stage of stagesToEvict(yield* admin.list, input.slug)) {
+            for (const stage of evictions) {
               yield* Console.log(
                 `${name === "deploy" ? "Evicting" : "Deploying will evict"} the oldest test stage, ${stage.slug} (${oneLine(stage.owner)}), to stay within ${testStageLimit}.`,
               );
               if (name !== "deploy") continue;
-              const evicted = yield* destroy(stage.slug, {
+              const outcome = yield* destroy(stage.slug, {
                 automatic: false,
                 expectedOwner: Option.none(),
                 byName: false,
               }).pipe(Effect.result);
-              if (Result.isSuccess(evicted)) yield* Console.log(`Evicted ${stage.slug}.`);
-              else
+              if (Result.isSuccess(outcome)) {
+                evicted.push(stage.slug);
+                yield* Console.log(`Evicted ${stage.slug}.`);
+              } else
                 yield* reportEvictionFailure(
                   stage,
-                  Schema.is(TestStageFailed)(evicted.failure)
-                    ? evicted.failure.message
+                  Schema.is(TestStageFailed)(outcome.failure)
+                    ? outcome.failure.message
                     : "its teardown failed",
                   (yield* admin.list).length + 1,
                 );
             }
+          if (name === "deploy" && usage !== undefined && evicted.length < evictions.length) {
+            const again = capacityCheck(usage, limits, input.slug, evicted, true);
+            if (again.refusal !== undefined) return yield* failure(again.refusal);
+            if (again.warning !== undefined && capacity?.warning === undefined)
+              yield* Console.error(again.warning);
+          }
           const lease =
             name === "deploy"
               ? yield* admin.reserve(metadata)
@@ -333,7 +437,7 @@ const operation = (name: "deploy" | "plan") =>
               yield* (yield* FileSystem.FileSystem).makeTempDirectoryScoped(),
               "release-refusal.json",
             );
-            yield* runChild(
+            const alchemy = (output: "inherit" | "pipe") =>
               ChildProcess.make(
                 "alchemy",
                 [name, ...(input.noInput ? ["--no-input"] : []), ...(input.yes ? ["--yes"] : [])],
@@ -341,18 +445,24 @@ const operation = (name: "deploy" | "plan") =>
                   env: { ...env, ...apps, [releaseRefusalReport]: report },
                   extendEnv: true,
                   stdin: "inherit",
-                  stdout: "inherit",
-                  stderr: "inherit",
+                  stdout: output,
+                  stderr: output,
                 },
-              ),
-            ).pipe(
-              Effect.catchTag("TestStageFailed", (failed) =>
-                Effect.gen(function* () {
-                  const refusal = yield* releaseRefusal(report);
-                  return yield* Option.isSome(refusal) ? refusal.value : failed;
-                }),
-              ),
-            );
+              );
+            // Only a stage this run created is retried; a redeploy and a plan run as before. Its
+            // output is read only when it is not a terminal, where Alchemy is non-interactive
+            // already (CI), so reading it changes nothing Alchemy shows or asks.
+            if (name === "deploy" && existing === undefined && process.stdout.isTTY !== true)
+              yield* deployNewStage(alchemy("pipe"), report);
+            else
+              yield* runChild(alchemy("inherit")).pipe(
+                Effect.catchTag("TestStageFailed", (failed) =>
+                  Effect.gen(function* () {
+                    const refusal = yield* releaseRefusal(report);
+                    return yield* Option.isSome(refusal) ? refusal.value : failed;
+                  }),
+                ),
+              );
           }).pipe(Effect.scoped, Effect.timeout(testStageDeployMilliseconds));
           if (name === "deploy") {
             const domain = yield* Config.String("TEST_STAGE_DOMAIN").pipe(
