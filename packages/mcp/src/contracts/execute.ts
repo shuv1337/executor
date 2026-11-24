@@ -456,6 +456,11 @@ export const SearchResult = Schema.Struct({
       offset: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
     }),
   ),
+  /**
+   * On a first page, why the app the search names is missing: its namespace, or a query that is a
+   * tool path, names no app the caller can use, such as one that was removed. Absent otherwise.
+   */
+  notice: Schema.optionalKey(Schema.String),
 });
 /** Exact paths, as search returns them, whose full detail the caller wants. */
 export const DescribeInput = Schema.Struct({

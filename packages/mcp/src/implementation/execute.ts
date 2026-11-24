@@ -596,6 +596,8 @@ const searchPage = <E extends Error>(
   lost: Lost,
   search: McpBackend<E>["searchTools"],
   input: typeof SearchInput.Type,
+  /** The slug of every app the caller can use, whether or not its tools loaded. */
+  slugs: ReadonlySet<string>,
 ) =>
   Effect.gen(function* () {
     const offset = input.offset ?? 0;
@@ -636,13 +638,32 @@ const searchPage = <E extends Error>(
         jsonBytes(item) + 1 + added.reduce((sum, space) => sum + jsonBytes(space) + 1, 0),
     );
     const remaining = ranked.remaining + ranked.items.length - page.length;
+    const notice = offset === 0 ? missingAppNotice(input, slugs) : undefined;
     return {
       items: page.map(({ item }) => item),
       namespaces: page.flatMap(({ added }) => added),
       remaining,
       next: remaining > 0 ? { ...input, offset: offset + page.length } : null,
+      ...(notice === undefined ? {} : { notice }),
     };
   });
+
+/**
+ * The app a search names, by its namespace or by a query that is a tool path, when the caller can
+ * use no app by that slug. Executor keeps no record of an app after it is removed and lists only
+ * apps the caller can use, so it cannot say whether the app was removed, renamed or unshared: the
+ * notice says so and how to find out. An app the caller can use gets no notice; `unavailableApps`
+ * explains one whose tools did not load, such as one whose account needs reconnecting.
+ */
+const missingAppNotice = (input: typeof SearchInput.Type, slugs: ReadonlySet<string>) => {
+  const namespace = input.namespace === undefined ? "" : canonical(input.namespace);
+  const query = canonical(input.query ?? "");
+  const named =
+    namespace !== "" ? namespace : /^[\w$-]+(?:\.[A-Za-z_$][\w$]*)+$/.test(query) ? query : "";
+  const slug = named.split(".")[0] ?? "";
+  if (!Schema.is(AppSlug)(slug) || slugs.has(slug)) return undefined;
+  return `No app '${slug}' is available to you. Executor keeps no record of removed apps, so it cannot tell whether this app was removed, renamed or is no longer shared with you. Search without a namespace to find the apps you can use; if you need this one back, ask whoever manages your organization's apps whether it still exists and is shared with you.`;
+};
 
 /**
  * One page of CodeMode's global `search()`, ranked as `tools.search` ranks, in the shape CodeMode's
@@ -1514,6 +1535,7 @@ function catalog(
       described,
       searchable,
       lost,
+      slugs,
       unavailableApps,
       unknownTool: (error: CodeMode.Diagnostic) => unknownTool(error, loadedFrom, slugs),
       /**
@@ -1820,7 +1842,15 @@ function runProgram(
         input: SearchInput,
         output: SearchResult,
         execute: (input) =>
-          real(searchPage(prepared.searchable, prepared.lost, tools.searchTools, input)),
+          real(
+            searchPage(
+              prepared.searchable,
+              prepared.lost,
+              tools.searchTools,
+              input,
+              prepared.slugs,
+            ),
+          ),
       });
       const describe = Tool.make({
         description:
@@ -2156,7 +2186,13 @@ const readCatalog = <A>(
 /** The search tool: one ranked page of the caller's catalog, as tools.search returns it. */
 export const searchCatalog = (backend: McpBackend<Error>, input: typeof SearchInput.Type) =>
   readCatalog(backend, (discovered) =>
-    searchPage(discovered.searchable, discovered.lost, backend.searchTools, input),
+    searchPage(
+      discovered.searchable,
+      discovered.lost,
+      backend.searchTools,
+      input,
+      discovered.slugs,
+    ),
   ).pipe(
     Effect.map(({ value, discovered }) => ({
       ...value,
