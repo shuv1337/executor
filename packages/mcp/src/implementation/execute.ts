@@ -638,7 +638,7 @@ const searchPage = <E extends Error>(
         jsonBytes(item) + 1 + added.reduce((sum, space) => sum + jsonBytes(space) + 1, 0),
     );
     const remaining = ranked.remaining + ranked.items.length - page.length;
-    const notice = offset === 0 ? missingAppNotice(input, slugs) : undefined;
+    const notice = offset === 0 ? missingAppNotice(input, slugs, page.length === 0) : undefined;
     return {
       items: page.map(({ item }) => item),
       namespaces: page.flatMap(({ added }) => added),
@@ -654,12 +654,28 @@ const searchPage = <E extends Error>(
  * apps the caller can use, so it cannot say whether the app was removed, renamed or unshared: the
  * notice says so and how to find out. An app the caller can use gets no notice; `unavailableApps`
  * explains one whose tools did not load, such as one whose account needs reconnecting.
+ *
+ * A dotted query is often prose ("node.js", "e.g"), so a query names an app only when it is
+ * written as a tool expression (`tools.app.tool`), when its second segment is an operation kind
+ * (`app.queries.tool`), or when the page found nothing.
  */
-const missingAppNotice = (input: typeof SearchInput.Type, slugs: ReadonlySet<string>) => {
+const missingAppNotice = (
+  input: typeof SearchInput.Type,
+  slugs: ReadonlySet<string>,
+  empty: boolean,
+) => {
   const namespace = input.namespace === undefined ? "" : canonical(input.namespace);
-  const query = canonical(input.query ?? "");
-  const named =
-    namespace !== "" ? namespace : /^[\w$-]+(?:\.[A-Za-z_$][\w$]*)+$/.test(query) ? query : "";
+  const written = (input.query ?? "").trim();
+  const query = canonical(written);
+  const segments = query.split(".");
+  const toolPath =
+    /^[\w$-]+(?:\.[A-Za-z_$][\w$]*)+$/.test(query) &&
+    (empty ||
+      written.startsWith("tools.") ||
+      written.startsWith("tools[") ||
+      segments[1] === "queries" ||
+      segments[1] === "mutations");
+  const named = namespace !== "" ? namespace : toolPath ? query : "";
   const slug = named.split(".")[0] ?? "";
   if (!Schema.is(AppSlug)(slug) || slugs.has(slug)) return undefined;
   return `No app '${slug}' is available to you. Executor keeps no record of removed apps, so it cannot tell whether this app was removed, renamed or is no longer shared with you. Search without a namespace to find the apps you can use; if you need this one back, ask whoever manages your organization's apps whether it still exists and is shared with you.`;

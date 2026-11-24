@@ -21,6 +21,13 @@ export default defineApp({}, async () => ({ tools: router({
     async (_ctx, { text }) => ({ text })),
 }) }));`;
 
+// Kept for the whole run, so dotted prose queries have real matches.
+const proseSource = `import { defineApp, query, object, router } from "apps";
+export default defineApp({}, async () => ({ tools: router({
+  build: query({ input: object({}), description: "Check a node.js and socket.io build for the prose fixture" },
+    async () => ({ ok: true })),
+}) }));`;
+
 const Searched = Schema.Struct({
   items: Schema.Array(Schema.Struct({ path: Schema.String })),
   notice: Schema.optional(Schema.String),
@@ -64,6 +71,15 @@ layer(HostedLive, { excludeTestServices: true })("MCP search missing app", (it) 
         });
         expect(deployed.status).toBe(200);
         const app = yield* body(App, deployed);
+        const prose = yield* api.request(actors.owner, "POST", `${prefix}/apps/deploy`, {
+          name: `Prose app ${randomUUID().slice(0, 8)}`,
+          files: [{ path: "index.ts", content: proseSource }, appsManifest],
+        });
+        expect(prose.status).toBe(200);
+        const proseApp = yield* body(App, prose);
+        yield* Effect.addFinalizer(() =>
+          api.request(actors.owner, "DELETE", `${prefix}/apps/${proseApp.id}`).pipe(Effect.orDie),
+        );
         const client = yield* mcp.connect(key.key, "search-missing-app", {
           organization: actors.organization.id,
         });
@@ -98,14 +114,23 @@ layer(HostedLive, { excludeTestServices: true })("MCP search missing app", (it) 
         });
         expect(below.notice).toContain(`No app '${app.slug}' is available to you.`);
 
-        // A query that is one of its tool paths gets the same notice beside any ranked matches.
-        const byPath = yield* search("Search a removed app's tool path", {
-          query: `${app.slug}.echo`,
-        });
-        expect(byPath.notice).toContain(`No app '${app.slug}' is available to you.`);
-        // A query that is no tool path gets no notice.
-        const prose = yield* search("Search prose", { query: "echo text" });
-        expect(prose.notice).toBeUndefined();
+        // A query written as one of its tool paths gets the same notice beside any ranked matches:
+        // as a tool expression, or with an operation-kind segment.
+        for (const query of [
+          `tools[${JSON.stringify(app.slug)}].echo`,
+          `${app.slug}.queries.list_threads`,
+        ]) {
+          const byPath = yield* search(`Search a removed app's tool path ${query}`, { query });
+          expect(byPath.notice, query).toContain(`No app '${app.slug}' is available to you.`);
+        }
+        // Dotted prose that matches tools gets no notice, though its first word is no app's slug.
+        for (const query of ["node.js", "socket.io"]) {
+          const dotted = yield* search(`Search dotted prose ${query}`, { query });
+          expect(dotted.items.map((item) => item.path).join(" "), query).toContain(proseApp.slug);
+          expect(dotted.notice, query).toBeUndefined();
+        }
+        const words = yield* search("Search prose", { query: "echo text" });
+        expect(words.notice).toBeUndefined();
 
         // A program's tools.search returns the same notice.
         const executed = yield* client.use("Program search of a removed app", (client, signal) =>
