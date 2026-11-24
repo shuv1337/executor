@@ -2,7 +2,7 @@
 import * as Cloudflare from "alchemy/Cloudflare";
 import { AlchemyContext } from "alchemy/AlchemyContext";
 import { Random } from "alchemy";
-import { Cause, Effect, Redacted, Schema } from "effect";
+import { Cause, Effect, Option, Redacted, Schema } from "effect";
 import { HttpServerRequest, HttpServerResponse } from "effect/http";
 import { recordRoute } from "@executor-js/telemetry";
 import type { Fetcher } from "@cloudflare/workers-types";
@@ -19,7 +19,7 @@ import { type RelayObjects, relayed, relayScript } from "../implementation/app-o
 import { appOutboundRoutes, type Sent } from "../implementation/app-outbound-routes.ts";
 import { cloudSentry, reportCloudFailure } from "../implementation/error-reporting.ts";
 import { platformObservability } from "./telemetry.ts";
-import { cloudResourceOrigins } from "./stage.ts";
+import { cloudHosts } from "./stage.ts";
 
 export const AppOutbound = Effect.gen(function* () {
   if (globalThis.__ALCHEMY_RUNTIME__) return yield* Cloudflare.Worker.ref("AppOutbound");
@@ -136,11 +136,13 @@ export const appCredentialOutbound = Effect.gen(function* () {
     ],
   });
   const environment = yield* Cloudflare.WorkerEnvironment;
-  const resourceOrigins = yield* cloudResourceOrigins.pipe(Effect.orDie);
+  const { resourceOrigins, roles } = yield* cloudHosts.pipe(Effect.orDie);
   const hostOrigins = [
     ...resourceOrigins.api,
     ...resourceOrigins.mcp,
     ...(resourceOrigins.legacyMcp === undefined ? [] : [resourceOrigins.legacyMcp]),
+    // The app role serves the dashboard API even when browser pages run on deployment.
+    ...(Option.isSome(roles) ? [roles.value.origins.app] : []),
   ];
   // The runner and this Worker's outbound entrypoint share it; app code never receives it.
   const secret = yield* (yield* Random("AppCredentialKey")).text;

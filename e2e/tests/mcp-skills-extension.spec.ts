@@ -21,10 +21,16 @@ import { connectionsPath } from "../support/app-accounts.ts";
 import { Evidence } from "../support/evidence.ts";
 import { McpClient } from "../support/mcp-client.ts";
 import { McpOAuth } from "../support/mcp-oauth.ts";
-import { ConnectionView, consentTo, revokeClientGrants } from "../support/mcp-connections.ts";
+import {
+  ConnectionView,
+  Execution,
+  consentTo,
+  revokeClientGrants,
+} from "../support/mcp-connections.ts";
 import { pairLocalOperator } from "../support/mcp-consent.ts";
 import { McpSkillsClient } from "../support/mcp-skills-client.ts";
 import { Target } from "../support/platform.ts";
+import { rawRequest } from "../support/role-hosts.ts";
 
 const Token = Schema.Struct({ key: Schema.RedactedFromValue(Schema.String), id: Schema.String });
 const Access = Schema.Struct({
@@ -245,15 +251,14 @@ layer(HostedLive, { excludeTestServices: true })("MCP Skills extension", (it) =>
           [
             {
               path: "index.ts",
-              content: `import { defineApp, defineProvider, dynamicSkills, secrets, object, string } from "apps";
+              content: `import { defineApp, defineProvider, dynamicSkills, query, router, secrets, object, string } from "apps";
 const publisher = defineProvider({
   name: "skill publisher",
   hosts: [${JSON.stringify(new URL(origin).host)}],
   auth: { token: secrets({ label: "Publisher token", fields: object({ token: string() }) }) },
 });
-export default defineApp({ user: { accounts: { publisher } } }, async (ctx) => ({
-  dynamicSkills: dynamicSkills({ list: async () => {
-const publisherView = await ctx.cache.get({
+export default defineApp({ user: { accounts: { publisher } } }, async (ctx) => {
+const publisherView = () => ctx.cache.get({
   key: "visible-publisher-skills", schema: string(), freshFor: "24 hours",
   load: async ({ fetch, signal }) => {
     const read = async (uri, connection = "") => {
@@ -287,14 +292,18 @@ const publisherView = await ctx.cache.get({
       "\\nPublisher load: " + crypto.randomUUID();
   },
 });
+return {
+  tools: router({ publisherView: query({ input: object({}) }, publisherView) }),
+  dynamicSkills: dynamicSkills({ list: async () => {
 return [{
   name: "allowed-guide", description: "Publisher skills visible to this connection.",
   files: [{ path: "SKILL.md", content: ${JSON.stringify(
     skillMd("allowed-guide", "Publisher skills visible to this connection.", ""),
-  )} + publisherView + "\\n" }],
+  )} + await publisherView() + "\\n" }],
 }];
 } }),
-}));`,
+};
+});`,
             },
             appsManifest,
           ],
@@ -388,7 +397,28 @@ return [{
             yield* expectSkillRefused(client, "skill://executor/executor");
             return file.body;
           });
-        for (const client of scoped) yield* verify(client, false);
+        const callPublisher = (client: ConnectedSkills) =>
+          Effect.gen(function* () {
+            const result = yield* client.use("Call the publisher cache tool", (_, mcp) =>
+              mcp.callTool({
+                name: "execute",
+                arguments: {
+                  code: `return await tools[${JSON.stringify(visible.slug)}].publisherView({})`,
+                },
+              }),
+            );
+            const answered = yield* Schema.decodeUnknownEffect(Execution)(result.structuredContent);
+            expect(answered.execution.ok).toBe(true);
+            return yield* Schema.decodeUnknownEffect(Schema.String)(answered.execution.value);
+          });
+        const checkSharedCache = (client: ConnectedSkills, narrowed: boolean) =>
+          Effect.gen(function* () {
+            const cached = yield* callPublisher(client);
+            expect(cached).toContain(`Removable: ${narrowed ? "excluded" : "visible"}`);
+            expect(yield* verify(client, narrowed)).toContain(cached);
+            return cached;
+          });
+        for (const client of scoped) yield* checkSharedCache(client, false);
 
         const updated = yield* api.request(actors.owner, "PUT", connectionPath, {
           name: connection.name,
@@ -396,11 +426,31 @@ return [{
         });
         expect(updated.status, JSON.stringify(updated.body)).toBe(200);
         expect((yield* body(ConnectionView, updated)).id).toBe(connection.id);
-        for (const client of scoped) yield* verify(client, true);
+        for (const client of scoped) yield* checkSharedCache(client, true);
         const scopedPat = yield* clients.connect(token, "scoped-publisher-pat", options);
-        const narrowedFile = yield* verify(scopedPat, true);
+        const narrowedCache = yield* checkSharedCache(scopedPat, true);
 
         const anonymous = yield* api.session();
+        const publisherPath = `${org}/apps/${visible.id}/tools/call`;
+        const publisherInput = { tool: "publisherView", kind: "query", input: {} };
+        const publisherHeaders = { authorization: `Bearer ${Redacted.value(token)}` };
+        const apiCached = yield* api.request(anonymous, "POST", publisherPath, publisherInput, {
+          ...publisherHeaders,
+          "x-executor-caller-connection": connection.id,
+        });
+        expect(apiCached.status).toBe(200);
+        expect(apiCached.body).toBe(narrowedCache);
+        const emptyApiBinding = yield* api.request(
+          anonymous,
+          "POST",
+          publisherPath,
+          publisherInput,
+          {
+            ...publisherHeaders,
+            "x-executor-caller-connection": "",
+          },
+        );
+        expect(emptyApiBinding.status).toBe(403);
         for (const bound of ["", "invalid!", randomUUID()]) {
           const invalid = yield* api.request(anonymous, "GET", "/mcp/whoami", undefined, {
             authorization: `Bearer ${Redacted.value(token)}`,
@@ -422,6 +472,18 @@ return [{
           "x-executor-caller-connection": connection.id,
         });
         expect(revokedHeader.status).toBe(403);
+        for (const secret of [undefined, key, grant]) {
+          const challenge = yield* rawRequest(`${origin}/mcp/whoami`, {
+            headers: {
+              "x-executor-caller-connection": connection.id,
+              ...(secret === undefined
+                ? {}
+                : { authorization: `Bearer ${Redacted.value(secret)}` }),
+            },
+          });
+          expect(challenge.status).toBe(401);
+          expect(challenge.challenge).toContain("/.well-known/oauth-protected-resource/mcp");
+        }
         for (const secret of [key, grant]) {
           for (const method of ["skills/list", "skills/get", "resources/read"]) {
             const response = yield* api.request(
@@ -450,7 +512,7 @@ return [{
         expect(recreated.id).toBe(connection.id);
         const recreatedClient = yield* clients.connect(token, "recreated-connection", options);
         // Identical policy and connection ID must still load a new publisher entry.
-        expect(yield* verify(recreatedClient, true)).not.toBe(narrowedFile);
+        expect(yield* checkSharedCache(recreatedClient, true)).not.toBe(narrowedCache);
       }).pipe(Effect.provide(McpSkillsClient.layer)),
     ),
   );
@@ -469,10 +531,7 @@ return [{
         });
         expect(created.status, JSON.stringify(created.body)).toBe(200);
         const second = yield* body(Organization, created);
-        // Self-host does not remove organizations; the isolated server is discarded on cleanup.
-        yield* Effect.addFinalizer(() =>
-          api.request(actors.owner, "DELETE", `/api/organizations/${second.id}`).pipe(Effect.orDie),
-        );
+        // This self-host-only scenario relies on isolated server teardown for the organization.
         const firstMarker = randomUUID();
         const secondMarker = randomUUID();
         const name = "Identically named skills";

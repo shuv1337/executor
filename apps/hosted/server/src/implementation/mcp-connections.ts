@@ -81,7 +81,7 @@ const callingConnection = (auth: { readonly connections: McpConnectionStore }) =
   Effect.gen(function* () {
     const request = yield* HttpServerRequest.HttpServerRequest;
     const header = new Headers(request.headers).get(callerConnectionHeader);
-    if (header === null || header === "") return undefined;
+    if (header === null) return undefined;
     const id = yield* Schema.decodeUnknownEffect(ConnectionId)(header).pipe(
       Effect.mapError(() => new OrganizationForbidden()),
     );

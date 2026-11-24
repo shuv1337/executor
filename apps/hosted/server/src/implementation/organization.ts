@@ -158,8 +158,7 @@ const scopedAuthority = (userId: string, organization: string, policy: Authoriza
   Effect.gen(function* () {
     const request = yield* HttpServerRequest.HttpServerRequest;
     const header = new Headers(request.headers).get(callerConnectionHeader);
-    if (header === null || header === "")
-      return { policy, connectionId: undefined, connectionRevision: undefined };
+    if (header === null) return { policy, connectionId: undefined, connectionRevision: undefined };
     const id = yield* Schema.decodeUnknownEffect(ConnectionId)(header).pipe(
       Effect.mapError(() => new OrganizationForbidden()),
     );
@@ -174,7 +173,7 @@ const scopedAuthority = (userId: string, organization: string, policy: Authoriza
       connectionRevision: yield* mcpConnectionRevision(
         Date.parse(found.createdAt),
         Date.parse(found.updatedAt),
-        JSON.stringify(found.policy),
+        found.policy,
       ),
     };
   });

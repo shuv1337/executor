@@ -5,24 +5,25 @@
  */
 import type { ApprovedBy, Caller } from "apps/contracts";
 import type { OrganizationAccess } from "../contracts/organization.ts";
-import type { McpAccess } from "../contracts/mcp.ts";
+import { mcpCallerConnection, type McpAccess } from "../contracts/mcp.ts";
 
 /** An MCP client acting for the user who owns its OAuth grant or personal access token. */
-export const mcpCaller = (access: McpAccess, issuer: string): Caller => ({
-  kind: "agent",
-  subject: access.userId,
-  issuer,
-  email: access.email ?? null,
-  organizationId: access.access.organization,
-  channel: "mcp",
-  provenance: {
-    trusted: false,
-    clientId: access.clientId,
-    ...(access.grant.target.kind === "mcp" && access.grant.target.connection !== undefined
-      ? { connectionId: access.grant.target.connection }
-      : {}),
-  },
-});
+export const mcpCaller = (access: McpAccess, issuer: string): Caller => {
+  const connectionId = mcpCallerConnection(access);
+  return {
+    kind: "agent",
+    subject: access.userId,
+    issuer,
+    email: access.email ?? null,
+    organizationId: access.access.organization,
+    channel: "mcp",
+    provenance: {
+      trusted: false,
+      clientId: access.clientId,
+      ...(connectionId === undefined ? {} : { connectionId }),
+    },
+  };
+};
 
 /** An API client: an OAuth API grant or an API key, acting for the user who owns it. */
 export const apiCaller = (

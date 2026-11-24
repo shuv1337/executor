@@ -89,8 +89,8 @@ This sync does not publish, merge the PR or deploy.
 - Self-host E2E warms a real publisher cache, checks loopback MCP access through a pinned PAT,
   narrows the same connection, and verifies a fresh load after recreation under the same ID
   and policy. One unpinned owner key crosses organization URLs with matching app slugs without
-  sharing skill data. The second organization's DELETE is attempted; self-host returns 404
-  because it does not expose that operation, so isolated server teardown owns the remaining data.
+  sharing skill data. Self-host does not expose organization deletion; isolated server
+  teardown owns the second organization.
 - Fork CI now runs the member managed-key checks. Native coverage exercises the upstream stall
   report through the fork's bounded stream cut and three-process teardown.
 - The inherited connection lifecycle test now checks the fork's discovery policy: a
@@ -98,6 +98,16 @@ This sync does not publish, merge the PR or deploy.
   The separate anti-widening scenarios still require scoped operations to fail with 403.
 - Deferred from this round: `runtime.inspect` and `runtime.index` binding, detached skill catalog
   loads, and any change to the PAT or connection key automatic approval default.
+
+## Final review fixes
+
+- Tool calls, resumed tool calls and skill loads share a connection-revision cache namespace.
+  MCP and API derive the revision from the same canonical live policy and row timestamps. The
+  publisher scenario checks cross-route cache reuse and immediate invalidation on narrowing.
+- Ordinary OAuth continues to serve the recorded consent at any MCP address. Host-attached
+  bindings and PAT addresses remain checked, and rejected credentials retain the OAuth challenge.
+- Cloud stamps the connection at every API/MCP origin, including the dashboard host. Forwarded
+  v1 toolkits keep the public MCP address but bind nested calls to the verified stored connection.
 
 Rat-stack references: `ratstack://skills/security-audit` (source-first trust boundary),
 `ratstack://lore/concurrent-work-needs-an-owner` (bounded client scopes), and

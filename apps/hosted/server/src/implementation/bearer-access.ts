@@ -27,7 +27,11 @@ import {
   McpWhoami,
   type GrantTarget,
 } from "@executor-js/mcp-auth";
-import { ConnectionPolicy, connectionGrantPolicy } from "@executor-js/mcp-auth/connections";
+import {
+  ConnectionPolicy,
+  canonicalConnectionPolicy,
+  connectionGrantPolicy,
+} from "@executor-js/mcp-auth/connections";
 import { Clock, Context, Effect, Option, Redacted, Schema } from "effect";
 import { SqlClient } from "effect/sql";
 import { ApiKeyId, ApiKeyMetadata } from "../contracts/api-keys.ts";
@@ -416,31 +420,31 @@ const oauthAccess = (
     yield* recordCaller(organization, row.subject);
     // A connection grant has no authority of its own; it reads the connection on every use.
     const connection = record.connection ?? undefined;
-    const policy =
+    const livePolicy =
       connection === undefined
-        ? yield* Schema.decodeUnknownEffect(Schema.fromJsonString(GrantPolicy))(
-            row.grantPolicy,
-          ).pipe(Effect.mapError(() => unauthorized("unknown")))
+        ? undefined
         : row.connectionId === null || row.connectionRevoked !== false
           ? yield* unauthorized("revoked")
           : row.connectionUser !== row.grantUser || row.connectionResource !== row.grantResource
             ? yield* unauthorized("wrong_resource")
-            : connectionGrantPolicy(
-                yield* Schema.decodeUnknownEffect(Schema.fromJsonString(ConnectionPolicy))(
-                  row.connectionPolicy,
-                ).pipe(Effect.mapError(() => unavailable)),
-              );
+            : yield* Schema.decodeUnknownEffect(Schema.fromJsonString(ConnectionPolicy))(
+                row.connectionPolicy,
+              ).pipe(Effect.mapError(() => unavailable));
+    const policy =
+      livePolicy === undefined
+        ? yield* Schema.decodeUnknownEffect(Schema.fromJsonString(GrantPolicy))(
+            row.grantPolicy,
+          ).pipe(Effect.mapError(() => unauthorized("unknown")))
+        : connectionGrantPolicy(livePolicy);
     const connectionRevision =
-      connection === undefined
+      livePolicy === undefined
         ? undefined
-        : row.connectionCreatedAt === null ||
-            row.connectionUpdatedAt === null ||
-            row.connectionPolicy === null
+        : row.connectionCreatedAt === null || row.connectionUpdatedAt === null
           ? yield* unavailable
           : yield* mcpConnectionRevision(
               row.connectionCreatedAt,
               row.connectionUpdatedAt,
-              row.connectionPolicy,
+              livePolicy,
             ).pipe(Effect.mapError(() => unavailable));
     const requested = yield* requestedOrganization(
       request,
@@ -685,9 +689,14 @@ const ConnectionRow = Schema.Struct({
 });
 
 /** Both the record generation and its stored policy enter the host-only cache identity. */
-export const mcpConnectionRevision = (generation: number, updatedAt: number, policy: string) =>
+export const mcpConnectionRevision = (
+  generation: number,
+  updatedAt: number,
+  policy: ConnectionPolicy,
+) =>
   Effect.tryPromise({
-    try: () => defaultKeyHasher(JSON.stringify([generation, updatedAt, policy])),
+    try: () =>
+      defaultKeyHasher(JSON.stringify([generation, updatedAt, canonicalConnectionPolicy(policy)])),
     catch: () => new AuthenticationUnavailable(),
   });
 
@@ -722,11 +731,7 @@ export const patConnectionPolicy = (
     );
     if (Option.isNone(decoded)) return Option.none();
     const generation = row.value.createdAt;
-    const revision = yield* mcpConnectionRevision(
-      generation,
-      row.value.updatedAt,
-      row.value.policy,
-    );
+    const revision = yield* mcpConnectionRevision(generation, row.value.updatedAt, decoded.value);
     return Option.some({ policy: connectionGrantPolicy(decoded.value), generation, revision });
   });
 

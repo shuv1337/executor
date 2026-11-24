@@ -249,15 +249,16 @@ const grantedAccess = <E>(
         stored.resource !== organization
       )
         return yield* Effect.fail(refuse);
-      policy = connectionGrantPolicy(
-        yield* Schema.decodeUnknownEffect(Schema.fromJsonString(ConnectionPolicy))(stored.policy),
+      const livePolicy = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(ConnectionPolicy))(
+        stored.policy,
       );
-      if (stored.createdAt === null || stored.updatedAt === null || stored.policy === null)
+      policy = connectionGrantPolicy(livePolicy);
+      if (stored.createdAt === null || stored.updatedAt === null)
         return yield* new AuthenticationUnavailable();
       connectionRevision = yield* mcpConnectionRevision(
         stored.createdAt,
         stored.updatedAt,
-        stored.policy,
+        livePolicy,
       );
     }
     const connection = stored?.id;
@@ -265,6 +266,7 @@ const grantedAccess = <E>(
     return McpAccess.make({
       userId: input.user,
       clientId: v1ForwardClient,
+      ...(connection === undefined ? {} : { verifiedConnection: connection }),
       ...(connectionRevision === undefined ? {} : { connectionRevision }),
       grant: {
         id: grantId({ user: input.user, organization, mode: input.mode, connection }),

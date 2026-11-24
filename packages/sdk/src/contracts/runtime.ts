@@ -560,6 +560,8 @@ export interface Runtime<Requirements = never> {
        * declare `callerIdentity`, so the outbound still binds that connection.
        */
       readonly callerConnection?: string;
+      /** Host-only fingerprint of the stored connection and policy. */
+      readonly callerConnectionRevision?: string;
     } & HostContext,
   ) => Effect.Effect<Json, RuntimeLoadError | typeof HostCallError.Type, Requirements>;
   /**

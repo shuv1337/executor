@@ -41,6 +41,7 @@ import {
   type SelectedAccounts,
 } from "../contracts/apps.ts";
 import { AccountNotFound } from "../contracts/account.ts";
+import { CurrentCallerConnectionRevision } from "../contracts/caller-connection.ts";
 import { VersionNotFound } from "../contracts/version.ts";
 import {
   type AppAccountUse,
@@ -309,9 +310,14 @@ export const callerContext = (
  * The verified MCP connection, sent even when {@link callerContext} omits `caller`. The runner
  * seals it into the outbound; the app bundle never sees it.
  */
-export const boundCallerConnection = (caller: Caller | undefined) => {
+export const boundCallerConnection = (caller: Caller | undefined, revision: string | undefined) => {
   const connection = caller?.provenance?.connectionId;
-  return connection === undefined ? {} : { callerConnection: connection };
+  return connection === undefined
+    ? {}
+    : {
+        callerConnection: connection,
+        ...(revision === undefined ? {} : { callerConnectionRevision: revision }),
+      };
 };
 
 /** Background work names no organization itself; the app's organization owner is the one it runs in. */
@@ -1991,6 +1997,7 @@ export const makeTools = (
         // Every failure from here, the app's or Executor's own, passes through `callFailure` once.
         return yield* Effect.gen(function* () {
           const kind = yield* kindOf(state, context, parsed.tool, named);
+          const connectionRevision = yield* CurrentCallerConnectionRevision;
           if (kind !== undefined) (yield* ToolCallKindObserved)?.(kind);
           let toolError = false;
           const execute = (context: InvocationContext) =>
@@ -2008,7 +2015,7 @@ export const makeTools = (
                 ...(kind === undefined ? {} : { kind }),
                 input: args,
                 ...callerContext(state),
-                ...boundCallerConnection(state.caller),
+                ...boundCallerConnection(state.caller, connectionRevision),
                 ...(options?.elicitation === undefined ? {} : { elicitation: options.elicitation }),
               });
             }).pipe(
@@ -2197,6 +2204,7 @@ export const makeTools = (
                     // resumed call that may write reports what it failed with as possibly written.
                     return yield* Effect.gen(function* () {
                       const kind = yield* kindOf(state, context, saved.tool, saved.kind);
+                      const connectionRevision = yield* CurrentCallerConnectionRevision;
                       let toolError = false;
                       const execute = (context: InvocationContext) =>
                         Effect.suspend(() => {
@@ -2216,7 +2224,7 @@ export const makeTools = (
                             input: originalInput,
                             approval: { tool: saved.tool, input: saved.input },
                             ...callerContext(state, approver),
-                            ...boundCallerConnection(state.caller),
+                            ...boundCallerConnection(state.caller, connectionRevision),
                             ...(options?.elicitation === undefined
                               ? {}
                               : { elicitation: options.elicitation }),

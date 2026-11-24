@@ -42,6 +42,7 @@ import {
   Connection,
   ConnectionName,
   ConnectionPolicy,
+  canonicalConnectionPolicy,
   connectionGrantPlaceholder,
   connectionGrantPolicy,
 } from "../contracts/connection.ts";
@@ -71,13 +72,6 @@ const ConnectionRecord = Schema.Struct({
   createdAt: Schema.Date,
   updatedAt: Schema.Date,
 });
-/** JSON with object keys sorted, so equal values compare equal whatever order they were built in. */
-const canonicalJson = (value: unknown): string =>
-  JSON.stringify(value, (_key, item: unknown) =>
-    item !== null && typeof item === "object" && !Array.isArray(item)
-      ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
-      : item,
-  );
 /** Server-only connection calls name the verified user and host resource explicitly. */
 const ConnectionOwner = { userId: Schema.NonEmptyString, resource: Schema.NonEmptyString };
 /** Verified credential identity plus the current persisted grant, independent of host ownership. */
@@ -1443,7 +1437,8 @@ export const grantOAuthPlugins = (settings: GrantOAuthOptions) => {
               // The client chose this ID for one editor, so a retry returns the first result.
               if (existing !== undefined && !existing.revoked)
                 return existing.name === input.name &&
-                  canonicalJson(yield* connectionPolicy(existing)) === canonicalJson(input.policy)
+                  canonicalConnectionPolicy(yield* connectionPolicy(existing)) ===
+                    canonicalConnectionPolicy(input.policy)
                   ? yield* connectionView(existing)
                   : yield* Effect.fail(new APIError("CONFLICT"));
               if (existing !== undefined) return yield* reviveConnection(ctx, existing, input);

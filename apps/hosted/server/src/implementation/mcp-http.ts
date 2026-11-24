@@ -55,6 +55,7 @@ import {
   CurrentMcpSession,
   McpAuthentication,
   McpUnauthorized,
+  mcpCallerConnection,
   type McpAccess,
 } from "../contracts/mcp.ts";
 import { CurrentOrganization, OrganizationReference } from "../contracts/organization.ts";
@@ -72,6 +73,7 @@ import { callerAccounts } from "./app-accounts.ts";
 import { resourceAuthorityForLinks } from "./resource-policy.ts";
 import { BearerHashes } from "./bearer-access.ts";
 import { hostedMcpBackend } from "./mcp.ts";
+import { patGrantOf } from "./mcp-oauth.ts";
 
 // A native MCP server retains its tool handlers. Authority is supplied only while
 // dispatching the HTTP request, never while registering those handlers.
@@ -211,8 +213,8 @@ export const requestedMcpOrganization = (url: URL): OrganizationReference | unde
 };
 
 /**
- * An explicit connection can only be served by credentials bound to that connection. Without
- * an explicit connection, an OAuth grant may still carry its own narrower scope.
+ * Ordinary OAuth serves its recorded consent, not the URL's suggested connection. PATs
+ * take their scope from the address. An attached connection must match verified authority.
  */
 export const mcpAccessRefusal = (
   access: McpAccess,
@@ -221,9 +223,13 @@ export const mcpAccessRefusal = (
 ) => {
   const connection =
     access.grant.target.kind === "mcp" ? access.grant.target.connection : undefined;
-  if (callingConnection !== undefined && connection !== callingConnection)
+  if (callingConnection !== undefined && mcpCallerConnection(access) !== callingConnection)
     return { reason: "calling_connection" } as const;
-  if (address.connection !== undefined && address.connection !== connection)
+  if (
+    address.connection !== undefined &&
+    address.connection !== connection &&
+    Option.isSome(patGrantOf(access.grant.id))
+  )
     return unrecordedRefusal(address);
   return grantRefusal(access.grant);
 };
@@ -241,19 +247,19 @@ const authenticateMcpAddress = (
 ) =>
   Effect.gen(function* () {
     const header = headers.get(callerConnectionHeader);
-    const bound = header ?? undefined;
+    const bound = Schema.decodeUnknownOption(ConnectionId)(header);
+    const connection = Option.getOrUndefined(bound);
     if (
-      bound !== undefined &&
-      (!Schema.is(ConnectionId)(bound) ||
-        (address.connection !== undefined && address.connection !== bound))
+      header !== null &&
+      (connection === undefined ||
+        (address.connection !== undefined && address.connection !== connection))
     )
       return yield* callingConnectionRefused();
-    const connection = Schema.is(ConnectionId)(bound) ? bound : undefined;
     const access = yield* auth
       .authenticate(headers, namedApprovalMode(url), organization, address.connection ?? connection)
       .pipe(
         Effect.mapError((error) =>
-          connection !== undefined && error._tag !== "AuthenticationUnavailable"
+          connection !== undefined && error._tag === "McpForbidden"
             ? callingConnectionRefused()
             : error,
         ),

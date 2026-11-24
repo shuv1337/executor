@@ -106,10 +106,7 @@ export const makeSkills = (
                       hostApi: declarations.hostApi(state.version),
                       sources,
                       ...context,
-                      ...boundCallerConnection(state.caller),
-                      ...(callerConnectionRevision === undefined
-                        ? {}
-                        : { callerConnectionRevision }),
+                      ...boundCallerConnection(state.caller, callerConnectionRevision),
                     })
                     .pipe(
                       // A service's rejection names the selected account, as in tool listing.
