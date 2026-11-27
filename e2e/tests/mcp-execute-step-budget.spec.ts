@@ -17,11 +17,15 @@
  * of the result, so a loop that joins a megabyte string stops in seconds.
  */
 import { expect, layer } from "@effect/vitest";
-import { Deferred, Duration, Effect, Fiber, Schema } from "effect";
+import { Deferred, Duration, Effect, Exit, Fiber, Schema } from "effect";
+import { randomUUID } from "node:crypto";
+import { createServer, type ServerResponse } from "node:http";
 import { scenarios } from "../test-plan.ts";
 import { Actors } from "../support/actors.ts";
 import { Api, body } from "../support/api.ts";
+import { appsManifest } from "../support/apps-release.ts";
 import { HostedLive, withHostedCase } from "../support/case.ts";
+import { App } from "../support/contracts.ts";
 import { Evidence } from "../support/evidence.ts";
 import { McpClient } from "../support/mcp-client.ts";
 
@@ -39,6 +43,130 @@ const Executed = Schema.Struct({
     toolCalls: Schema.Array(Schema.Struct({ name: Schema.String, outcome: Schema.String })),
   }),
 });
+
+const WalkCacheFuzzResult = Schema.Struct({
+  mismatch: Schema.String,
+  accepted: Schema.Number,
+  cyclesRejected: Schema.Number,
+  sortOps: Schema.Number,
+  partialSortOps: Schema.Number,
+  jsonChecks: Schema.Number,
+});
+
+const barrierAppSource = (
+  origin: string,
+) => `import { defineApp, query, object, string, router } from "apps";
+export default defineApp({}, async () => ({ tools: router({
+  checkpoint: query(
+    { input: object({ stage: string() }), description: "Coordinate walk-cache overlap barrier" },
+    async (ctx, { stage }) => {
+      const response = await ctx.fetch(${JSON.stringify(origin)} + "/" + stage, {
+        method: "POST",
+        signal: ctx.signal,
+      });
+      if (!response.ok) throw new Error("Barrier failed: " + response.status);
+      return await response.json();
+    },
+  ),
+}) }));`;
+
+/**
+ * Loopback coordination server that observes the exact server-side interleaving between the
+ * victim program and the noisy program. Holds `/victim-warm` open until `/noise-hit` arrives from
+ * a concurrent execution (or times out after 15 s if executions were serialized).
+ */
+const startWalkBarrier = () =>
+  Effect.acquireRelease(
+    Effect.gen(function* () {
+      const events: Array<string> = [];
+      const victimWarmed = yield* Deferred.make<void>();
+      let victimHeld = false;
+      let victimDone = false;
+      let noiseHitsWhileVictimHeld = 0;
+      let noiseHitsBeforeVictimDone = 0;
+      let releaseVictim: ((timedOut: boolean) => void) | undefined;
+
+      const server = createServer((req, res) => {
+        const sendJson = (target: ServerResponse, status: number, payload: unknown) => {
+          if (target.writableEnded) return;
+          target.writeHead(status, { "content-type": "application/json" });
+          target.end(JSON.stringify(payload));
+        };
+
+        if (req.method === "POST" && req.url === "/victim-warm") {
+          events.push("victim-warm");
+          victimHeld = true;
+          let finished = false;
+          const finish = (timedOut: boolean) => {
+            if (finished) return;
+            finished = true;
+            clearTimeout(timer);
+            victimHeld = false;
+            if (releaseVictim === finish) releaseVictim = undefined;
+            sendJson(res, timedOut ? 504 : 200, { released: !timedOut, timedOut });
+          };
+          const timer = setTimeout(() => finish(true), 15_000);
+          releaseVictim = finish;
+          req.on("close", () => {
+            if (!finished) {
+              clearTimeout(timer);
+              victimHeld = false;
+              if (releaseVictim === finish) releaseVictim = undefined;
+            }
+          });
+          Deferred.doneUnsafe(victimWarmed, Exit.void);
+          return;
+        }
+
+        if (req.method === "POST" && req.url === "/noise-hit") {
+          events.push("noise-hit");
+          const held = victimHeld;
+          if (held) noiseHitsWhileVictimHeld += 1;
+          if (!victimDone) noiseHitsBeforeVictimDone += 1;
+          releaseVictim?.(false);
+          sendJson(res, 200, { ok: true, whileVictimHeld: held });
+          return;
+        }
+
+        if (req.method === "POST" && req.url === "/victim-done") {
+          events.push("victim-done");
+          victimDone = true;
+          sendJson(res, 200, { ok: true });
+          return;
+        }
+
+        sendJson(res, 404, { error: "not found" });
+      });
+
+      const port = yield* Effect.callback<number>((resume) => {
+        server.once("error", (error) => resume(Effect.die(error)));
+        server.listen(0, "127.0.0.1", () => {
+          const address = server.address();
+          if (address === null || typeof address === "string") {
+            resume(Effect.die(new Error("Walk barrier server did not bind a TCP port")));
+            return;
+          }
+          resume(Effect.succeed(address.port));
+        });
+      });
+
+      return {
+        origin: `http://127.0.0.1:${port}`,
+        events,
+        victimWarmed,
+        snapshot: () => ({
+          events: [...events],
+          noiseHitsWhileVictimHeld,
+          noiseHitsBeforeVictimDone,
+        }),
+        close: () => {
+          releaseVictim?.(true);
+          server.close();
+        },
+      };
+    }),
+    (barrier) => Effect.sync(() => barrier.close()),
+  );
 
 type Connected = Effect.Success<ReturnType<Effect.Success<typeof McpClient>["connect"]>>;
 
@@ -242,7 +370,7 @@ return { total, calls: [first, second, third].length };`;
  * module-global epoch, concurrent mutations invalidate `meta` on every yield and exhaust the
  * 5,000,000-step budget.
  */
-const sharedMetaUnderNoiseVictim = `
+const sharedMetaUnderNoiseVictim = (barrierSlug?: string) => `
 const meta = {
   records: Array.from({ length: 1000 }, (_, i) => ({
     id: 'm' + i,
@@ -258,17 +386,29 @@ const meta = {
   })),
 };
 const rows = [];
-for (let i = 0; i < 20000; i++) {
+rows.push({ id: 0, meta });
+${
+  barrierSlug === undefined
+    ? ""
+    : `const gate = await tools[${JSON.stringify(barrierSlug)}].checkpoint({ stage: 'victim-warm' });
+if (!gate.released) throw new Error('Victim barrier did not observe concurrent noise');`
+}
+for (let i = 1; i < 20000; i++) {
   rows.push({ id: i, meta });
   if (i % 2 === 0) await 0;
+}
+${
+  barrierSlug === undefined
+    ? ""
+    : `await tools[${JSON.stringify(barrierSlug)}].checkpoint({ stage: 'victim-done' });`
 }
 return rows.length;`;
 
 /**
- * Repeatedly mutates an object held inside a walked outer object, yielding between steps.
- * Under a shared module-level walk epoch this bumps the global epoch thousands of times per burst.
+ * Repeatedly mutates an object held inside a walked outer object, yielding between steps, and
+ * signals the barrier server after warming and mutating so overlap is observed server-side.
  */
-const walkEpochNoise = `
+const walkEpochNoise = (barrierSlug: string) => `
 const inner = { v: 1 };
 const outer = { inner };
 const init = [];
@@ -278,14 +418,18 @@ for (let i = 0; i < 4000; i++) {
   box.a = inner;
   inner.x = { n: i };
   box.a = null;
+  if (i === 500) await tools[${JSON.stringify(barrierSlug)}].checkpoint({ stage: 'noise-hit' });
   if (i % 2 === 0) await 0;
 }
 return 4000;`;
 
-/** Comparator empties `t` and links `t` into `x`; write-back must reject and leave `t` untouched. */
+/**
+ * Comparator empties `t` and links `t` into `x`. Placing a valid object before `x` proves that a
+ * later item's rejection leaves zero partial write-back (`t.length === 0`).
+ */
 const sortDirectCycle = `
 const x = {};
-const t = [x, {}];
+const t = [{ ok: 1 }, x, 1];
 let err = '';
 try {
   t.sort(() => { t.splice(0); x.t = t; return 0; });
@@ -366,6 +510,7 @@ const keys = ['a', 'b', 'c', 'd'];
 let accepted = 0;
 let cyclesRejected = 0;
 let sortOps = 0;
+let partialSortOps = 0;
 let jsonChecks = 0;
 let mismatch = '';
 
@@ -373,7 +518,7 @@ for (const initialSeed of seeds) {
   let state = initialSeed >>> 0;
   const nextInt = (bound) => {
     state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
-    return state % bound;
+    return (state >>> 16) % bound;
   };
 
   const nodes = [];
@@ -595,6 +740,9 @@ for (const initialSeed of seeds) {
       sortOps++;
       const origItems = shadow[u].slice();
       const mode = nextInt(3);
+      const partialRemoval = origItems.length >= 2 && nextInt(2) === 1;
+      const removeCount = partialRemoval ? 1 + nextInt(origItems.length - 1) : origItems.length;
+      if (partialRemoval) partialSortOps++;
       const targetObj = objIndices[nextInt(objIndices.length)];
       const targetKey = keys[nextInt(keys.length)];
       let mutated = false;
@@ -603,8 +751,8 @@ for (const initialSeed of seeds) {
         nodes[u].sort(() => {
           if (!mutated) {
             mutated = true;
-            nodes[u].splice(0);
-            shadow[u].splice(0);
+            nodes[u].splice(0, removeCount);
+            shadow[u].splice(0, removeCount);
             if (mode === 0) {
               const innerSame = Object.hasOwn(shadow[targetObj], targetKey) && shadow[targetObj][targetKey] === u;
               const innerExpected = innerSame ? false : canReach(u, targetObj);
@@ -660,7 +808,7 @@ for (const initialSeed of seeds) {
   }
 }
 
-return { mismatch, accepted, cyclesRejected, sortOps, jsonChecks };`;
+return { mismatch, accepted, cyclesRejected, sortOps, partialSortOps, jsonChecks };`;
 
 layer(HostedLive, { excludeTestServices: true })("Hosted MCP execute step budget", (it) => {
   it.effect(
@@ -856,7 +1004,25 @@ layer(HostedLive, { excludeTestServices: true })("Hosted MCP execute step budget
       withHostedCase(
         context,
         Effect.gen(function* () {
-          const evidence = yield* Evidence;
+          const api = yield* Api,
+            actors = yield* Actors,
+            evidence = yield* Evidence;
+          const barrier = yield* startWalkBarrier();
+          const barrierApp = yield* body(
+            App,
+            yield* api.request(
+              actors.owner,
+              "POST",
+              `/api/organizations/${actors.organization.id}/apps/deploy`,
+              {
+                name: `Walk barrier ${randomUUID().slice(0, 8)}`,
+                files: [
+                  { path: "index.ts", content: barrierAppSource(barrier.origin) },
+                  appsManifest,
+                ],
+              },
+            ),
+          );
           const victimClient = yield* connectHosted("execute-walk-cache-victim");
           const noiseClient = yield* connectHosted("execute-walk-cache-noise");
 
@@ -864,54 +1030,48 @@ layer(HostedLive, { excludeTestServices: true })("Hosted MCP execute step budget
           const quiet = yield* execute(
             victimClient,
             "shared-meta-quiet-control",
-            sharedMetaUnderNoiseVictim,
+            sharedMetaUnderNoiseVictim(),
           );
           expect(quiet.execution).toMatchObject({ ok: true, value: 20_000 });
 
-          // Run the same victim concurrently alongside a bounded noisy fiber that repeatedly
-          // mutates an object inside a walked outer object.
+          // Run the same victim concurrently alongside a bounded noisy fiber coordinated through
+          // the server-side barrier app: the victim warms `meta` and holds at `/victim-warm` until
+          // a concurrent noisy execution runs nested-store mutations and hits `/noise-hit`.
           const maxNoisyBursts = 20;
           let stopNoisy = false;
           let noisyBursts = 0;
-          let overlapObserved = false;
-          let victimStartedAt = 0;
-          let victimEndedAt = 0;
-          const noiseStarted = yield* Deferred.make<void>();
 
-          const noisyFiber = yield* Effect.forkChild(
-            Effect.gen(function* () {
-              while (!stopNoisy && noisyBursts < maxNoisyBursts) {
-                const burstIndex = noisyBursts;
-                const burstStart = Date.now();
-                if (burstIndex === 0) yield* Deferred.succeed(noiseStarted, undefined);
-                const burst = yield* execute(
-                  noiseClient,
-                  `walk-epoch-noise-${burstIndex}`,
-                  walkEpochNoise,
-                );
-                const burstEnd = Date.now();
-                expect(burst.execution).toMatchObject({ ok: true, value: 4000 });
-                noisyBursts += 1;
-                if (
-                  victimStartedAt > 0 &&
-                  burstStart < (victimEndedAt > 0 ? victimEndedAt : Number.POSITIVE_INFINITY) &&
-                  burstEnd > victimStartedAt
-                ) {
-                  overlapObserved = true;
-                }
-              }
-            }),
-          );
-
-          const underNoise = yield* Effect.gen(function* () {
-            yield* Deferred.await(noiseStarted);
-            victimStartedAt = Date.now();
-            const result = yield* execute(
+          const victimFiber = yield* Effect.forkChild(
+            execute(
               victimClient,
               "shared-meta-under-noise",
-              sharedMetaUnderNoiseVictim,
+              sharedMetaUnderNoiseVictim(barrierApp.slug),
+            ),
+          );
+
+          const noiseProgram = walkEpochNoise(barrierApp.slug);
+          let noisyFiber: Fiber.Fiber<void, unknown> | undefined;
+
+          const underNoise = yield* Effect.gen(function* () {
+            yield* Effect.raceFirst(
+              Deferred.await(barrier.victimWarmed),
+              Fiber.await(victimFiber).pipe(Effect.asVoid),
             );
-            victimEndedAt = Date.now();
+            noisyFiber = yield* Effect.forkChild(
+              Effect.gen(function* () {
+                while (!stopNoisy && noisyBursts < maxNoisyBursts) {
+                  const burstIndex = noisyBursts;
+                  const burst = yield* execute(
+                    noiseClient,
+                    `walk-epoch-noise-${burstIndex}`,
+                    noiseProgram,
+                  );
+                  expect(burst.execution).toMatchObject({ ok: true, value: 4000 });
+                  noisyBursts += 1;
+                }
+              }),
+            );
+            const result = yield* Fiber.join(victimFiber);
             stopNoisy = true;
             yield* Fiber.join(noisyFiber);
             return result;
@@ -919,10 +1079,18 @@ layer(HostedLive, { excludeTestServices: true })("Hosted MCP execute step budget
             Effect.ensuring(
               Effect.suspend(() => {
                 stopNoisy = true;
-                return Fiber.interrupt(noisyFiber);
+                return Effect.all(
+                  [
+                    Fiber.interrupt(victimFiber),
+                    ...(noisyFiber === undefined ? [] : [Fiber.interrupt(noisyFiber)]),
+                  ],
+                  { concurrency: "unbounded" },
+                );
               }),
             ),
           );
+
+          const barrierState = barrier.snapshot();
 
           // M3: comparator Array.prototype.sort write-back validation and controls.
           const direct = yield* execute(victimClient, "sort-direct-cycle", sortDirectCycle);
@@ -952,7 +1120,7 @@ layer(HostedLive, { excludeTestServices: true })("Hosted MCP execute step budget
             underNoiseOk: underNoise.execution.ok,
             underNoiseError: underNoise.execution.error,
             noisyBursts,
-            overlapObserved,
+            barrier: barrierState,
             direct: direct.execution,
             leaf: leaf.execution,
             ancestor: ancestor.execution,
@@ -962,8 +1130,14 @@ layer(HostedLive, { excludeTestServices: true })("Hosted MCP execute step budget
             fuzz: fuzz.execution,
           });
 
+          const firstNoiseIndex = barrierState.events.indexOf("noise-hit");
+          const victimDoneIndex = barrierState.events.lastIndexOf("victim-done");
+          expect(barrierState.events[0]).toBe("victim-warm");
+          expect(firstNoiseIndex).toBeGreaterThan(0);
+          expect(victimDoneIndex).toBeGreaterThan(firstNoiseIndex);
+          expect(barrierState.noiseHitsWhileVictimHeld).toBeGreaterThanOrEqual(1);
+          expect(barrierState.noiseHitsBeforeVictimDone).toBeGreaterThanOrEqual(1);
           expect(noisyBursts).toBeGreaterThanOrEqual(1);
-          expect(overlapObserved).toBe(true);
           expect(underNoise.execution).toMatchObject({ ok: true, value: 20_000 });
 
           expect(direct.execution).toMatchObject({
@@ -991,25 +1165,15 @@ layer(HostedLive, { excludeTestServices: true })("Hosted MCP execute step budget
 
           expect(largeSort.execution).toMatchObject({ ok: true, value: 5000 });
 
-          expect(fuzz.execution).toMatchObject({
-            ok: true,
-            value: {
-              mismatch: "",
-              accepted: expect.any(Number),
-              cyclesRejected: expect.any(Number),
-              sortOps: expect.any(Number),
-              jsonChecks: expect.any(Number),
-            },
-          });
-          const fuzzValue = fuzz.execution.value as {
-            accepted: number;
-            cyclesRejected: number;
-            sortOps: number;
-            jsonChecks: number;
-          };
+          expect(fuzz.execution.ok).toBe(true);
+          const fuzzValue = yield* Schema.decodeUnknownEffect(WalkCacheFuzzResult)(
+            fuzz.execution.value,
+          );
+          expect(fuzzValue.mismatch).toBe("");
           expect(fuzzValue.accepted).toBeGreaterThan(0);
           expect(fuzzValue.cyclesRejected).toBeGreaterThan(0);
           expect(fuzzValue.sortOps).toBeGreaterThan(0);
+          expect(fuzzValue.partialSortOps).toBeGreaterThan(0);
           expect(fuzzValue.jsonChecks).toBeGreaterThan(0);
         }).pipe(Effect.provide(McpClient.layer)),
       ),

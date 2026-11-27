@@ -79,36 +79,36 @@ Operators and patterns that read a whole value are charged too:
   array and `join` them instead, which is charged once.
 - Storing a value walks it to reject cycles: assignment to a property or index, `push`,
   `unshift`, `splice`, `fill`, `Object.assign`, and comparator `Array.prototype.sort` write-back.
-  `switch` walks its discriminant and case
-  values to reject interpreter references. Both walks are charged as they go, one step per 2
-  values visited. The store walk also remembers every object whose whole graph it has checked in a
-  per-execution `WalkCache` (owned by the execution's `Interpreter` and shared with its invoked
-  functions, promises and generators, with no module-level mutable state) and stops there next
-  time, as the container it looks for is never inside one. Concurrent executions keep independent
-  walk caches and epochs so one program's mutations cannot invalidate another's cache or push it
-  over its step budget. An object holding
-  no objects stays remembered until an object is stored into it. Any other object is remembered for
-  the current epoch: storing an object into a remembered object that another remembered object
-  holds starts a new epoch, which forgets every non-leaf object at once, because their graphs may
-  now reach the new value. For comparator `Array.prototype.sort`, before writing sorted items back
-  into the target array, every object item not currently present in the live target array is
+  `switch` walks its discriminant and case values to reject interpreter references. Both walks are
+  charged as they go, one step per 2 values visited. The store walk also remembers every object
+  whose whole graph it has checked in a per-execution `WalkCache` (owned by the execution's
+  `Interpreter` and shared with its invoked functions, promises and generators, with no
+  module-level mutable state) and stops there next time, as the container it looks for is never
+  inside one. Concurrent executions keep independent walk caches and epochs so one program's
+  mutations cannot invalidate another's cache or push it over its step budget. An object holding no
+  objects stays remembered until an object is stored into it. Any other object is remembered for the
+  current epoch: storing an object into a remembered object that another remembered object holds
+  starts a new epoch, which forgets every non-leaf object at once, because their graphs may now
+  reach the new value. For comparator `Array.prototype.sort`, before writing sorted items back into
+  the target array, every object item not currently present in the live target array is
   preflight-checked with `rejectCircularInsertion` (sharing one `seen` set and meter) so comparator
   mutations cannot introduce a cycle, perform a partial write-back, or leave stale leaf/ancestor
-  walk-cache entries; no-comparator sorts and legitimate comparator sorts where all items remain in
-  the target array skip the walk. Every store into existing data runs this walk first, so the walk still
-  finds every cycle; a differential fuzz of 3.9 million stores against a fresh reachability check
-  agreed on all of them, and fails at once when the epoch is not advanced. The one store that
-  skips the walk is a property or index assignment of the value the slot already holds, which
-  cannot change the graph: `g[k] = g[k] || []` followed by `g[k].push(row)` walked the whole group,
-  every row in it, on every row, and grouping 50,000 row objects stopped at the budget in about 2 s.
-  Before this, attaching one shared `meta` of 50,000 columns to each of 20,000 rows walked all the
-  columns on each store, uncharged, and ran for minutes; it now takes 0.3 s. A shared `meta` of
-  1,000 records, each an object, was walked record by record on every store, about 500 steps
-  each and 10 million for 20,000 rows, and stopped at the budget in about 1 s; it is now walked
-  once and the 20,000 stores take 0.25 s in Node. Grouping 50,000 rows into an object with `a = g[k] || []; a.push(v); g[k] = a` walked
-  each group on each store; it now takes 0.7 s. A program that changes the shared value between
-  stores, such as setting `meta.records[i].seen` for each row, still has it walked again on each
-  store, one step per 2 records.
+  walk-cache entries. Every store that can add a new edge into existing data runs this walk first,
+  so the walk still finds every cycle; a differential fuzz of 3.9 million stores against a fresh
+  reachability check agreed on all of them, and fails at once when the epoch is not advanced. Stores
+  that only retain an identical edge or reorder existing edges add no reachability and skip the
+  walk: a property or index assignment of the value the slot already holds, no-comparator sorts, and
+  comparator sort write-back items still present in the live target array. For example,
+  `g[k] = g[k] || []` followed by `g[k].push(row)` used to walk the whole group, every row in it, on
+  every row, and grouping 50,000 row objects stopped at the budget in about 2 s. Before this,
+  attaching one shared `meta` of 50,000 columns to each of 20,000 rows walked all the columns on
+  each store, uncharged, and ran for minutes; it now takes 0.3 s. A shared `meta` of 1,000 records,
+  each an object, was walked record by record on every store, about 500 steps each and 10 million
+  for 20,000 rows, and stopped at the budget in about 1 s; it is now walked once and the 20,000
+  stores take 0.25 s in Node. Grouping 50,000 rows into an object with
+  `a = g[k] || []; a.push(v); g[k] = a` walked each group on each store; it now takes 0.7 s. A
+  program that changes the shared value between stores, such as setting `meta.records[i].seen` for
+  each row, still has it walked again on each store, one step per 2 records.
 - A template interpolating an array or object is charged for copying and joining it.
 - Rest patterns: an object rest is charged for the object, an array rest one step per element it
   takes. `for...in` is charged for its key list.
