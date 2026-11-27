@@ -98,7 +98,9 @@ jobs:
         run: |
           bun run e2e:self-host --test-name 'Self-host MCP (resumes all three|reports a crashed parked)|PAT MCP approvals bind|PAT MCP model-mode resume' --workers 1
       - name: Person-only approval scenarios
-        run: bun run e2e:self-host --test-name 'a tool that requires a person refuses the agent|owner of an automatic-mode grant approves|A plain-URL API key in automatic mode' --workers 1
+        run: |
+          bun run e2e:self-host --test-name 'a tool that requires a person refuses the agent|owner of an automatic-mode grant approves|A plain-URL API key in automatic mode' --workers 1
+          bun run e2e:local --test-name '^Local person-only approval binds' --workers 1
       - name: MCP Skills extension and client bounds
         run: |
           bun run e2e:self-host --test-name 'Skills extension|Self-host MCP (admits|never forgets) a' --workers 1

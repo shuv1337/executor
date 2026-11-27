@@ -203,6 +203,7 @@ export const localMcp = (
             const url = new URL(`/mcp/approve/${address.requestId}`, oauth.origin);
             url.searchParams.set("sessionId", address.sessionId);
             url.searchParams.set("grantId", caller);
+            if (address.mode !== undefined) url.searchParams.set("mode", address.mode);
             return url.toString();
           }),
       },
