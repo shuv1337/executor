@@ -1,5 +1,5 @@
 import type { SqlClient } from "effect/sql";
-import { GrantId, permitsBrowserApproval } from "@executor-js/mcp-auth";
+import { GrantId, grantRefusal, permitsBrowserApproval } from "@executor-js/mcp-auth";
 import { localMcpBackend } from "./mcp.ts";
 import type { LocalMcpOAuth } from "./mcp-oauth.ts";
 import { invocationAccounts, type Executor } from "@executor-js/sdk/core";
@@ -7,6 +7,7 @@ import { invocationAccounts, type Executor } from "@executor-js/sdk/core";
 import {
   BrowserApprovalAddress,
   BrowserApprovalAnswer,
+  BrowserApprovalMode,
   BrowserSessionId,
   type BrowserApprovals,
 } from "@executor-js/mcp/browser";
@@ -14,6 +15,12 @@ import { Effect, Schema } from "effect";
 import { HttpServerRequest, HttpServerResponse } from "effect/http";
 import { localRequest, requestOrigin, sessionCookie, type LocalAuth } from "./auth.ts";
 import type { ServerConfig } from "../contracts/config.ts";
+
+const ApprovalQuery = Schema.Struct({
+  sessionId: BrowserSessionId,
+  grantId: GrantId,
+  mode: Schema.optionalKey(BrowserApprovalMode),
+});
 
 /** Local endpoints share the execution manager with /mcp while retaining separate cookie/Origin checks. */
 export const localMcpApproval = (
@@ -35,13 +42,14 @@ export const localMcpApproval = (
       return HttpServerResponse.empty({ status: 403 });
     if (!(yield* auth.valid(request.cookies[sessionCookie(config)])))
       return HttpServerResponse.empty({ status: 401 });
-    const query = yield* HttpServerRequest.schemaSearchParams(
-      Schema.Struct({ sessionId: BrowserSessionId, grantId: GrantId }),
-    );
     const url = new URL(request.url, "http://localhost");
+    const query = yield* Schema.decodeUnknownEffect(ApprovalQuery)(
+      HttpServerRequest.searchParamsFromURL(url),
+    );
     const address = yield* Schema.decodeUnknownEffect(BrowserApprovalAddress)({
-      ...query,
       requestId: url.pathname.split("/").at(-1),
+      sessionId: query.sessionId,
+      ...(query.mode === undefined ? {} : { mode: query.mode }),
     });
     const headers = new Headers(request.headers);
     headers.set("origin", oauth.origin);
@@ -50,12 +58,25 @@ export const localMcpApproval = (
         ? {
             id: query.grantId,
             policy: { kind: "all" as const },
-            target: { kind: "mcp" as const, mode: "browser" as const },
+            target: { kind: "mcp" as const, mode: address.mode ?? ("browser" as const) },
           }
         : (yield* oauth.browserGrant(headers, query.grantId)).grant;
-    if (!permitsBrowserApproval(grant)) return HttpServerResponse.empty({ status: 403 });
+    // Browser-mode links name an MCP session; person-only caller-mode links name a grant and mode.
+    const permitted =
+      address.mode === undefined
+        ? permitsBrowserApproval(grant)
+        : grant.target.kind === "mcp" &&
+          grant.target.mode === address.mode &&
+          address.sessionId === address.mode &&
+          grantRefusal(grant) === undefined;
+    if (!permitted) return HttpServerResponse.empty({ status: 403 });
     const view = yield* approvals.get(grant.id, address);
     if (view.status === "pending") {
+      if (
+        address.mode !== undefined &&
+        (view.request.status !== "approval-required" || view.request.human !== true)
+      )
+        return HttpServerResponse.empty({ status: 403 });
       const tool =
         view.request.status === "approval-required"
           ? {
@@ -89,7 +110,8 @@ export const localMcpApproval = (
     );
   }).pipe(
     Effect.catchTags({
-      LocalMcpUnauthorized: () => Effect.succeed(HttpServerResponse.empty({ status: 401 })),
+      // Pairing was checked above; an unresolvable grant is forbidden.
+      LocalMcpUnauthorized: () => Effect.succeed(HttpServerResponse.empty({ status: 403 })),
       LocalMcpAuthUnavailable: () => Effect.succeed(HttpServerResponse.empty({ status: 503 })),
       AppNotFound: () => Effect.succeed(HttpServerResponse.jsonUnsafe({ status: "unavailable" })),
       StorageError: () => Effect.succeed(HttpServerResponse.empty({ status: 503 })),

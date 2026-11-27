@@ -11,10 +11,12 @@ import { scenarios } from "../test-plan.ts";
 import { Api, body, type Session } from "../support/api.ts";
 import { Actors } from "../support/actors.ts";
 import { McpClient } from "../support/mcp-client.ts";
-import { HostedLive, withHostedCase } from "../support/case.ts";
+import { HostedLive, TestLive, withCase, withHostedCase } from "../support/case.ts";
 import { App } from "../support/contracts.ts";
 import { appsManifest } from "../support/apps-release.ts";
-import { consentTo, revokeClientGrants } from "../support/mcp-connections.ts";
+import { clientGrantId, consentTo, revokeClientGrants } from "../support/mcp-connections.ts";
+import { pairLocalOperator } from "../support/mcp-consent.ts";
+import { reveal } from "../support/failure-text.ts";
 import { Target } from "../support/platform.ts";
 import { targetHosts } from "../support/role-hosts.ts";
 
@@ -739,6 +741,272 @@ layer(HostedLive, { excludeTestServices: true })("Caller identity", (it) => {
           subject: done.caller.subject,
         });
         expect(JSON.stringify([asked, refused, done])).not.toContain(Redacted.value(token));
+      }).pipe(Effect.provide(McpClient.layer)),
+    ),
+  );
+});
+
+const deployLocalCallerApp = (operator: Session) =>
+  Effect.gen(function* () {
+    const target = yield* Target;
+    const headers = { authorization: `Bearer ${reveal(target.apiKey)}` };
+    const deployed = yield* operator.send(
+      "POST",
+      "/v1/apps/deploy",
+      {
+        owner: "local",
+        name: `Caller identity ${randomUUID().slice(0, 8)}`,
+        files: [{ path: "index.ts", content: source }, appsManifest],
+      },
+      headers,
+    );
+    expect(deployed.status).toBe(200);
+    const { app } = yield* body(Schema.Struct({ app: App }), deployed);
+    yield* Effect.addFinalizer(() =>
+      operator.send("DELETE", `/v1/apps/${app.id}`, undefined, headers).pipe(Effect.orDie),
+    );
+    return app.slug;
+  });
+
+type Runner = ReturnType<typeof mcpRunner>;
+const callerModes = ["model", "automatic"] as const;
+const accept = { response: { action: "accept" } };
+const localApprovalPath = (requestId: string, params: URLSearchParams) =>
+  `/dashboard/api/mcp/approvals/${encodeURIComponent(requestId)}?${params}`;
+
+const startLocalApproval = (runner: Runner, mode: (typeof callerModes)[number] | "browser") =>
+  Effect.gen(function* () {
+    const asked = yield* Schema.decodeUnknownEffect(Pending)(
+      (yield* runner.execute(`${mode} client calls a person-only tool`, "personal", {
+        note: `Review the ${mode} call`,
+      })).structuredContent,
+    );
+    expect(asked.human).toBe(true);
+    if (asked.approvalUrl === undefined) return yield* Effect.die("No approval URL");
+    const page = new URL(asked.approvalUrl);
+    if (mode === "browser") {
+      expect(page.searchParams.get("mode")).toBeNull();
+      expect(page.searchParams.get("sessionId")).toBeTruthy();
+      expect(callerModes).not.toContain(page.searchParams.get("sessionId"));
+    } else {
+      expect(page.searchParams.get("mode"), `${mode} link carries its mode`).toBe(mode);
+      expect(page.searchParams.get("sessionId")).toBe(mode);
+      const refused = yield* Schema.decodeUnknownEffect(Pending)(
+        (yield* runner.resume(`${mode} client tries to approve its own call`, asked.requestId))
+          .structuredContent,
+      );
+      expect(refused).toMatchObject({
+        requestId: asked.requestId,
+        human: true,
+        approvalUrl: asked.approvalUrl,
+      });
+    }
+    return { requestId: asked.requestId, page };
+  });
+
+const checkLocalApproval = (
+  session: Session,
+  requestId: string,
+  params: URLSearchParams,
+  label: string,
+  status: 200 | 400 | 401 | 403,
+  headers?: Record<string, string>,
+) =>
+  Effect.gen(function* () {
+    const api = yield* Api;
+    const path = localApprovalPath(requestId, params);
+    const read = yield* api.request(session, "GET", path, undefined, headers);
+    expect(read.status, `Read: ${label}`).toBe(status);
+    const answer = yield* api.request(session, "POST", path, accept, headers);
+    expect(answer.status, `Answer: ${label}`).toBe(status);
+    if (status === 200) {
+      expect(yield* body(ApprovalView, read)).toEqual({ status: "unavailable" });
+      expect(yield* body(ApprovalAck, answer)).toEqual({ status: "unavailable" });
+    }
+  });
+
+const approveLocalInBrowser = (
+  operator: Session,
+  runner: Runner,
+  approval: Effect.Success<ReturnType<typeof startLocalApproval>>,
+) =>
+  Effect.gen(function* () {
+    const api = yield* Api,
+      browser = yield* Browser;
+    const pending = yield* api.request(
+      operator,
+      "GET",
+      localApprovalPath(approval.requestId, approval.page.searchParams),
+    );
+    expect(pending.status).toBe(200);
+    expect(yield* body(ApprovalView, pending)).toMatchObject({
+      status: "pending",
+      request: { status: "approval-required", invocation: { tool: "personal" } },
+    });
+    yield* browser.use("Open the original approval link as the paired operator", (tab) =>
+      tab.goto(approval.page.toString()),
+    );
+    yield* browser.use("Approve the person-only call", (tab) =>
+      tab.getByRole("button", { name: "Approve", exact: true }).click(),
+    );
+    yield* browser.use("The browser acknowledges the answer", (tab) =>
+      tab.getByText("You can return to your agent.").waitFor(),
+    );
+    const done = yield* runner.completed(
+      Identity,
+      yield* runner.resume("The agent collects the person's answer", approval.requestId),
+    );
+    expect(done.approvedBy).toMatchObject({ kind: "human", method: "browser" });
+  });
+
+layer(TestLive, { excludeTestServices: true })("Local person-only approvals", (it) => {
+  it.effect(scenarios.localPersonApprovalOAuth.title, (context) =>
+    withCase(
+      context,
+      Effect.gen(function* () {
+        const api = yield* Api,
+          target = yield* Target,
+          mcp = yield* McpClient,
+          browser = yield* Browser;
+        const operator = yield* pairLocalOperator;
+        const anonymous = yield* api.session();
+        const slug = yield* deployLocalCallerApp(operator);
+        const clients: string[] = [];
+        yield* revokeClientGrants(operator, () => clients);
+        const connect = (mode: (typeof callerModes)[number] | "browser", label: string) =>
+          Effect.gen(function* () {
+            const consent = yield* consentTo(operator, `${target.metadata.origin}/mcp`, {
+              "x-executor-grant-settings": JSON.stringify({ mode }),
+            });
+            clients.push(consent.clientId);
+            expect(consent.status).toBe(200);
+            const token = yield* consent.tokens;
+            const runner = mcpRunner(yield* mcp.connect(token, label), slug, mode);
+            const grantId = yield* clientGrantId(operator, consent.clientId);
+            return { runner, token, grantId };
+          });
+        const browserFoil = yield* connect("browser", "local-browser-foil");
+        yield* browser.login(operator);
+        for (const mode of callerModes) {
+          const { runner, token, grantId } = yield* connect(mode, `local-${mode}`);
+          const approval = yield* startLocalApproval(runner, mode);
+          const { requestId, page } = approval;
+          const own = page.searchParams;
+          expect(own.get("grantId")).toBe(grantId);
+          if (mode === "model") {
+            const ordinary = yield* Schema.decodeUnknownEffect(Pending)(
+              (yield* runner.execute("model client asks for ordinary approval", "reviewed", {
+                note: "Agent approval is enough",
+              })).structuredContent,
+            );
+            expect(ordinary.human).toBeUndefined();
+            yield* checkLocalApproval(operator, ordinary.requestId, own, "not person-only", 403);
+            const done = yield* runner.completed(
+              Identity,
+              yield* runner.resume("The model approves the ordinary request", ordinary.requestId),
+            );
+            expect(done.approvedBy).toMatchObject({ kind: "agent", method: "model" });
+          }
+          const other = mode === "model" ? "automatic" : "model";
+          const wrongMode = withMode(own, other);
+          wrongMode.set("sessionId", other);
+          const wrongMarker = new URLSearchParams(own);
+          wrongMarker.set("sessionId", other);
+          const wrongGrant = new URLSearchParams(own);
+          wrongGrant.set("grantId", browserFoil.grantId);
+          for (const [label, params] of [
+            ["a different mode and its marker", wrongMode],
+            ["an omitted mode", withMode(own, null)],
+            ["a wrong session marker", wrongMarker],
+            ["a browser-mode grant", wrongGrant],
+          ] as const) {
+            yield* checkLocalApproval(operator, requestId, params, label, 403);
+          }
+          yield* checkLocalApproval(anonymous, requestId, own, "no pairing cookie", 401);
+          yield* checkLocalApproval(operator, requestId, own, "a bearer header", 403, {
+            authorization: `Bearer ${reveal(token)}`,
+          });
+          expect(
+            (yield* api.request(operator, "POST", localApprovalPath(requestId, own), accept, {
+              origin: "https://wrong-origin.example.test",
+            })).status,
+            "Answer: a cross-origin request",
+          ).toBe(403);
+          yield* checkLocalApproval(
+            operator,
+            requestId,
+            withMode(own, "browser"),
+            "malformed mode",
+            400,
+          );
+          const repeated = new URLSearchParams(own);
+          repeated.append("mode", mode);
+          yield* checkLocalApproval(operator, requestId, repeated, "repeated mode", 400);
+          yield* browser.use("Open a link that repeats its mode", (tab) =>
+            tab.goto(`${page.pathname}?${repeated}`),
+          );
+          yield* browser.use("The browser refuses the ambiguous link", (tab) =>
+            tab.getByRole("heading", { name: "This approval link is invalid." }).waitFor(),
+          );
+
+          const second = yield* connect(mode, `local-${mode}-second`);
+          const secondGrant = new URLSearchParams(own);
+          expect(second.grantId).not.toBe(grantId);
+          secondGrant.set("grantId", second.grantId);
+          yield* checkLocalApproval(
+            operator,
+            requestId,
+            secondGrant,
+            "another same-mode grant",
+            200,
+          );
+          expect(
+            (yield* api.request(operator, "POST", "/api/auth/mcp/grants/revoke", {
+              id: second.grantId,
+            })).status,
+          ).toBe(200);
+          yield* checkLocalApproval(operator, requestId, secondGrant, "a revoked grant", 403);
+          yield* approveLocalInBrowser(operator, runner, approval);
+          yield* checkLocalApproval(operator, requestId, own, "a consumed request", 200);
+        }
+      }).pipe(Effect.provide(McpClient.layer)),
+    ),
+  );
+
+  it.effect(scenarios.localPersonApprovalAdministrator.title, (context) =>
+    withCase(
+      context,
+      Effect.gen(function* () {
+        const target = yield* Target,
+          mcp = yield* McpClient,
+          browser = yield* Browser;
+        const operator = yield* pairLocalOperator;
+        const slug = yield* deployLocalCallerApp(operator);
+        yield* browser.login(operator);
+        for (const mode of [...callerModes, "browser"] as const) {
+          const runner = mcpRunner(
+            yield* mcp.connect(target.apiKey, `local-admin-${mode}`, { mode }),
+            slug,
+            mode,
+          );
+          const approval = yield* startLocalApproval(runner, mode);
+          const { requestId, page } = approval;
+          expect(page.searchParams.get("grantId")).toBe("local-administrator");
+          if (mode !== "browser") {
+            const other = mode === "model" ? "automatic" : "model";
+            const wrongMode = withMode(page.searchParams, other);
+            yield* checkLocalApproval(
+              operator,
+              requestId,
+              wrongMode,
+              "other mode, same marker",
+              403,
+            );
+            wrongMode.set("sessionId", other);
+            yield* checkLocalApproval(operator, requestId, wrongMode, "other mode and marker", 200);
+          }
+          yield* approveLocalInBrowser(operator, runner, approval);
+        }
       }).pipe(Effect.provide(McpClient.layer)),
     ),
   );

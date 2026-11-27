@@ -11,13 +11,18 @@ const approvals = browserApprovalAtoms(BrowserAtoms);
 function Review() {
   const location = useLocation();
   const page = usePageUrl();
-  const address = Schema.decodeUnknownOption(
-    Schema.Struct({ ...BrowserApprovalAddress.fields, grantId: GrantId }),
-  )({
-    requestId: location.pathname.split("/").at(-1),
-    grantId: new URLSearchParams(page.search).get("grantId"),
-    sessionId: new URLSearchParams(page.search).get("sessionId"),
-  });
+  const query = new URLSearchParams(page.search);
+  const mode = query.get("mode");
+  const address = ["grantId", "sessionId", "mode"].some((key) => query.getAll(key).length > 1)
+    ? Option.none()
+    : Schema.decodeUnknownOption(
+        Schema.Struct({ ...BrowserApprovalAddress.fields, grantId: GrantId }),
+      )({
+        requestId: location.pathname.split("/").at(-1),
+        grantId: query.get("grantId"),
+        sessionId: query.get("sessionId"),
+        ...(mode === null ? {} : { mode }),
+      });
   if (Option.isNone(address))
     return (
       <main className="p-8">
@@ -26,10 +31,15 @@ function Review() {
         </h1>
       </main>
     );
+  const params = new URLSearchParams({
+    sessionId: address.value.sessionId,
+    grantId: address.value.grantId,
+    ...(address.value.mode === undefined ? {} : { mode: address.value.mode }),
+  });
   return (
     <BrowserApprovalPage
       atoms={approvals(
-        `/dashboard/api/mcp/approvals/${encodeURIComponent(address.value.requestId)}?${new URLSearchParams({ sessionId: address.value.sessionId, grantId: address.value.grantId })}`,
+        `/dashboard/api/mcp/approvals/${encodeURIComponent(address.value.requestId)}?${params}`,
       )}
     />
   );

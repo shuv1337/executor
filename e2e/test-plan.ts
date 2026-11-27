@@ -10912,6 +10912,24 @@ export const scenarios = plan({
       local: na("This scenario uses hosted memberships and personal API keys."),
     },
   },
+  localPersonApprovalOAuth: {
+    file: "caller-identity.spec.ts",
+    title: "Local person-only approval binds model and automatic OAuth grants to their own links",
+    targets: {
+      local: scheduled,
+      "self-host": na("This scenario exercises Local pairing and grant routing."),
+      cloud: na("This scenario exercises Local pairing and grant routing."),
+    },
+  },
+  localPersonApprovalAdministrator: {
+    file: "caller-identity.spec.ts",
+    title: "Local person-only approval binds the administrator key to its MCP mode",
+    targets: {
+      local: scheduled,
+      "self-host": na("The Local administrator key has no hosted equivalent."),
+      cloud: na("The Local administrator key has no hosted equivalent."),
+    },
+  },
   sharedRuntime: {
     fixtures: "actors",
     file: "shared-runtime.spec.ts",
