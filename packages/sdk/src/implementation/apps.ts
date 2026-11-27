@@ -36,6 +36,7 @@ import {
   RuntimeProtocolUnsupported,
   type Runtime,
 } from "../contracts/runtime.ts";
+import { safeRegistryBuildFailure } from "../contracts/registry-build-failure.ts";
 import {
   AppCodeId,
   AppId,
@@ -98,10 +99,7 @@ const versionBuildFailed = (owner: OwnerId, name: string, error: RuntimeBuildFai
     reason: hint ?? error.declaration?.message ?? "App build failed",
     stage,
     ...(location === undefined ? {} : { location }),
-    package: error.package,
-    version: error.version,
-    registry: error.registry,
-    status: error.status,
+    ...safeRegistryBuildFailure(error),
     message: `App build failed at the ${stage} stage${where}${detail === undefined ? "." : `: ${detail}`}`,
   });
 };

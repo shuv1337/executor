@@ -7,6 +7,7 @@ import {
   RuntimeBuildFailed,
 } from "../contracts/runtime.ts";
 import type { CodeFiles } from "../contracts/source.ts";
+import { safeRegistryBuildFailure } from "../contracts/registry-build-failure.ts";
 import { prepareUiBuild } from "./ui-build.ts";
 import { Effect, Option, Path, Schema } from "effect";
 import type { Plugin } from "esbuild";
@@ -92,12 +93,7 @@ const shownCompileErrors = 5;
 
 /** Keep the compiler's own errors and the first failing location for the deployer. */
 const compileFailure = (cause: unknown, dependency: RuntimeBuildFailed | undefined) => {
-  const diagnostics = {
-    package: dependency?.package,
-    version: dependency?.version,
-    registry: dependency?.registry,
-    status: dependency?.status,
-  };
+  const diagnostics = safeRegistryBuildFailure(dependency);
   return Option.match(Schema.decodeUnknownOption(EsbuildFailure)(cause), {
     onNone: () =>
       new RuntimeBuildFailed({

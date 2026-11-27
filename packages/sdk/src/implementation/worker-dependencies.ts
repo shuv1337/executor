@@ -5,12 +5,7 @@ import { Effect, Schema, Semaphore } from "effect";
 import type { WorkerHost } from "./worker-build.ts";
 import type { Plugin } from "esbuild";
 import { boundBuildMessage, describeBuildCause, RuntimeBuildFailed } from "../contracts/runtime.ts";
-import {
-  safeExactSemver,
-  safeHttpStatus,
-  safeNpmPackageName,
-  safeRegistryOrigin,
-} from "../contracts/registry-build-failure.ts";
+import { safeRegistryBuildFailure } from "../contracts/registry-build-failure.ts";
 import tailwind from "tailwindcss/package.json" with { type: "json" };
 import { withoutUrlSecrets } from "@executor-js/utils/url-policy";
 
@@ -86,10 +81,7 @@ export const workerDependencies = (filesystem: InMemoryFileSystem, host: WorkerH
             return yield* new RuntimeBuildFailed({
               stage: "dependencies",
               dependency: name,
-              package: safeNpmPackageName(result.failure?.package),
-              version: safeExactSemver(result.failure?.version),
-              registry: safeRegistryOrigin(result.failure?.registry),
-              status: safeHttpStatus(result.failure?.status),
+              ...safeRegistryBuildFailure(result.failure),
               message: boundBuildMessage(
                 withoutUrlSecrets(
                   result.warnings.length > 0

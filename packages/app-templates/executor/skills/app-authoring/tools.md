@@ -400,9 +400,11 @@ serving the old value; the loader can `read(key, schema)` the old value to confi
 it cheaply. Errors are not cached. `invalidate(key)` also fences pending loaders.
 
 On hosted scoped MCP connections, the host partitions `ctx.cache` namespaces by
-caller connection and policy revision. Writes and `ctx.cache.invalidate` from
-unscoped contexts (schedules, webhooks, and full-access callers) affect only the
-shared unscoped slot. Scoped entries can still be served until they expire.
+caller connection and policy revision. A new revision starts with an empty
+slot, and a scoped caller can invalidate only its own slot. Writes and
+`ctx.cache.invalidate` from unscoped contexts (schedules, webhooks, and
+full-access callers) affect only the shared unscoped slot. Scoped entries can
+still be served until they expire.
 
 The cache keeps an entry at most 7 days. A longer `freshFor` plus `staleFor`,
 or a longer `write` retention, is shortened to 7 days, taking `staleFor` first.
