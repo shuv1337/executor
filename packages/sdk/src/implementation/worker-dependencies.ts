@@ -5,6 +5,12 @@ import { Effect, Schema, Semaphore } from "effect";
 import type { WorkerHost } from "./worker-build.ts";
 import type { Plugin } from "esbuild";
 import { boundBuildMessage, describeBuildCause, RuntimeBuildFailed } from "../contracts/runtime.ts";
+import {
+  safeExactSemver,
+  safeHttpStatus,
+  safeNpmPackageName,
+  safeRegistryOrigin,
+} from "../contracts/registry-build-failure.ts";
 import tailwind from "tailwindcss/package.json" with { type: "json" };
 import { withoutUrlSecrets } from "@executor-js/utils/url-policy";
 
@@ -80,6 +86,10 @@ export const workerDependencies = (filesystem: InMemoryFileSystem, host: WorkerH
             return yield* new RuntimeBuildFailed({
               stage: "dependencies",
               dependency: name,
+              package: safeNpmPackageName(result.failure?.package),
+              version: safeExactSemver(result.failure?.version),
+              registry: safeRegistryOrigin(result.failure?.registry),
+              status: safeHttpStatus(result.failure?.status),
               message: boundBuildMessage(
                 withoutUrlSecrets(
                   result.warnings.length > 0
@@ -93,6 +103,17 @@ export const workerDependencies = (filesystem: InMemoryFileSystem, host: WorkerH
           });
         }).pipe(Effect.withSpan("runtime.cloud.dependencies")),
       );
+    let importFailure: RuntimeBuildFailed | undefined;
+    const installImport = (name: string, version: string, transitive?: boolean) =>
+      Effect.runPromiseWith(context)(
+        install(name, version, transitive).pipe(
+          Effect.tapError((error) =>
+            Effect.sync(() => {
+              importFailure ??= error;
+            }),
+          ),
+        ),
+      );
     const plugin: Plugin = {
       name: "executor-imported-dependencies",
       setup(build) {
@@ -102,7 +123,7 @@ export const workerDependencies = (filesystem: InMemoryFileSystem, host: WorkerH
             args.kind === "import-rule" &&
             (args.path === "tailwindcss" || args.path.startsWith("tailwindcss/"))
           ) {
-            await Effect.runPromiseWith(context)(install("tailwindcss", tailwind.version, false));
+            await installImport("tailwindcss", tailwind.version, false);
             return undefined;
           }
           const parts = args.path.split("/");
@@ -110,7 +131,7 @@ export const workerDependencies = (filesystem: InMemoryFileSystem, host: WorkerH
           if (name === undefined || !Object.hasOwn(dependencies, name)) return undefined;
           const version = dependencies[name];
           if (version === undefined) return undefined;
-          await Effect.runPromiseWith(context)(install(name, version));
+          await installImport(name, version);
           // Let the existing resolver apply package exports, conditions, and asset handling.
           return undefined;
         });
@@ -118,6 +139,7 @@ export const workerDependencies = (filesystem: InMemoryFileSystem, host: WorkerH
     };
     return {
       plugin,
+      failure: () => importFailure,
       framework:
         dependencies.apps === undefined
           ? Effect.succeed(false)

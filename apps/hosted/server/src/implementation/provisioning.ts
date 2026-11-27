@@ -1,5 +1,13 @@
 /** Host-owned lifecycle jobs. No browser session, secrets, or live request enters the queue. */
-import { BuildStage, StorageError } from "@executor-js/sdk/core";
+import {
+  BuildStage,
+  RegistryBuildFailureFields,
+  safeExactSemver,
+  safeHttpStatus,
+  safeNpmPackageName,
+  safeRegistryOrigin,
+  StorageError,
+} from "@executor-js/sdk/core";
 import { Effect, Exit, Schedule, Schema } from "effect";
 import { SqlClient } from "effect/sql";
 import { traceFailure } from "@executor-js/telemetry/failed-span";
@@ -33,26 +41,9 @@ const FailureCause = Schema.Struct({
   tag: Schema.String,
   /** The build step a failed build names, such as `dependencies`; a closed set, never text. */
   stage: Schema.optional(BuildStage),
-  package: Schema.optional(Schema.String),
-  version: Schema.optional(Schema.String),
-  registry: Schema.optional(Schema.String),
-  status: Schema.optional(Schema.Int),
+  ...RegistryBuildFailureFields,
 });
 type FailureCause = typeof FailureCause.Type;
-/** A log line keeps one record: no control character may enter it from a field. */
-const hasControlCharacter = (value: string) =>
-  [...value].some((character) => {
-    const code = character.codePointAt(0) ?? 0;
-    return code < 0x20 || code === 0x7f;
-  });
-/** A bounded name an error states as its own field, never text quoted from a response. */
-const causeName = (value: unknown) =>
-  typeof value === "string" &&
-  value.length > 0 &&
-  value.length <= 200 &&
-  !hasControlCharacter(value)
-    ? value
-    : undefined;
 /** Only a tag an error class names, so a response cannot choose the text logged. */
 const causeTag = (value: unknown) =>
   typeof value === "object" &&
@@ -62,14 +53,6 @@ const causeTag = (value: unknown) =>
   /^[A-Za-z][A-Za-z0-9]{0,63}$/u.test(value._tag)
     ? value._tag
     : undefined;
-const causeOrigin = (value: unknown) => {
-  if (typeof value !== "string" || value.length === 0) return undefined;
-  try {
-    return new URL(value).origin;
-  } catch {
-    return undefined;
-  }
-};
 /**
  * Project a failure onto the fields that may reach a background log: its tagged name and, when an
  * error or its cause chain states them as typed fields, the build stage, package, version, registry
@@ -86,17 +69,11 @@ const failureCause = (error: unknown): FailureCause => {
   for (let depth = 0; depth < 4 && typeof current === "object" && current !== null; depth += 1) {
     const value = current as Record<string, unknown>;
     tag = tag === "Unknown" ? (causeTag(value) ?? tag) : tag;
-    packageName ??= causeName(value.dependency) ?? causeName(value.package);
-    version ??= causeName(value.version);
-    registry ??= causeOrigin(value.registry);
+    packageName ??= safeNpmPackageName(value.package) ?? safeNpmPackageName(value.dependency);
+    version ??= safeExactSemver(value.version);
+    registry ??= safeRegistryOrigin(value.registry);
     stage ??= Schema.is(BuildStage)(value.stage) ? value.stage : undefined;
-    status ??=
-      typeof value.status === "number" &&
-      Number.isInteger(value.status) &&
-      value.status >= 100 &&
-      value.status <= 599
-        ? value.status
-        : undefined;
+    status ??= safeHttpStatus(value.status);
     current = value.cause;
   }
   return {

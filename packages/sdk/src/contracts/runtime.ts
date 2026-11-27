@@ -19,6 +19,7 @@ import {
 import { DatabaseFieldReserved } from "@executor-js/app-data/contracts";
 import { RecordedMessage } from "@executor-js/utils/recorded-message";
 import { BuildStage, SourceLocation, type BuildMemoryExceeded } from "./version.ts";
+import { RegistryBuildFailureFields } from "./registry-build-failure.ts";
 import type { CodeFiles } from "./source.ts";
 import { BuildId, Json } from "./shared.ts";
 import type { BlobKey, BlobRange, BlobStoreError } from "./blobs.ts";
@@ -276,6 +277,7 @@ export class RuntimeBuildFailed extends Schema.TaggedError<RuntimeBuildFailed>()
   {
     stage: BuildStage,
     dependency: Schema.optional(Schema.String),
+    ...RegistryBuildFailureFields,
     /** A named declaration problem the author can fix, reported with the failed deploy. */
     declaration: Schema.optional(DatabaseFieldReserved),
     message: Schema.optional(BuildMessage),

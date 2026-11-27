@@ -98,6 +98,10 @@ const versionBuildFailed = (owner: OwnerId, name: string, error: RuntimeBuildFai
     reason: hint ?? error.declaration?.message ?? "App build failed",
     stage,
     ...(location === undefined ? {} : { location }),
+    package: error.package,
+    version: error.version,
+    registry: error.registry,
+    status: error.status,
     message: `App build failed at the ${stage} stage${where}${detail === undefined ? "." : `: ${detail}`}`,
   });
 };

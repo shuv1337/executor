@@ -91,9 +91,20 @@ const EsbuildFailure = Schema.Struct({
 const shownCompileErrors = 5;
 
 /** Keep the compiler's own errors and the first failing location for the deployer. */
-const compileFailure = (cause: unknown) =>
-  Option.match(Schema.decodeUnknownOption(EsbuildFailure)(cause), {
-    onNone: () => new RuntimeBuildFailed({ stage: "compile", message: describeBuildCause(cause) }),
+const compileFailure = (cause: unknown, dependency: RuntimeBuildFailed | undefined) => {
+  const diagnostics = {
+    package: dependency?.package,
+    version: dependency?.version,
+    registry: dependency?.registry,
+    status: dependency?.status,
+  };
+  return Option.match(Schema.decodeUnknownOption(EsbuildFailure)(cause), {
+    onNone: () =>
+      new RuntimeBuildFailed({
+        stage: "compile",
+        message: describeBuildCause(cause),
+        ...diagnostics,
+      }),
     onSome: (failure) => {
       const errors = failure.errors.map(({ text, location }) => ({
         text,
@@ -110,6 +121,7 @@ const compileFailure = (cause: unknown) =>
       const more = errors.length - lines.length;
       return new RuntimeBuildFailed({
         stage: "compile",
+        ...diagnostics,
         message: boundBuildMessage(
           [...lines, ...(more > 0 ? [`(${more} more errors)`] : [])].join("\n") ||
             describeBuildCause(cause),
@@ -118,6 +130,7 @@ const compileFailure = (cause: unknown) =>
       });
     },
   });
+};
 
 const selectedFramework = (filesystem: InMemoryFileSystem) =>
   Effect.gen(function* () {
@@ -209,7 +222,8 @@ export const compileWorkerApp = (
             sizes.plugin,
           ],
         }),
-      catch: (cause) => sizes.failure() ?? json.failure() ?? compileFailure(cause),
+      catch: (cause) =>
+        sizes.failure() ?? json.failure() ?? compileFailure(cause, dependencies.failure()),
     });
     const map = sourceMap.map();
     if (map === undefined)

@@ -18,6 +18,10 @@ const BuildFailed = Schema.Struct({
   _tag: Schema.Literal("VersionBuildFailed"),
   stage: Schema.String,
   message: Schema.String,
+  package: Schema.String,
+  version: Schema.String,
+  registry: Schema.String,
+  status: Schema.Int,
 });
 
 /** A package the suite's registry does not serve, so installing it fails with the registry's 404. */
@@ -63,6 +67,10 @@ export default defineApp({}, { tools: router({
             );
           // The installer's failure reaches the deployer through the bundler's import resolution.
           expect(failed.stage).toBe("compile");
+          expect(failed.package).toBe(missingPackage);
+          expect(failed.version).toBe("1.0.0");
+          expect(failed.registry).toBe(new URL(registry.url).origin);
+          expect(failed.status).toBe(404);
           // Still useful: it names the package and the registry's host and path.
           expect(failed.message).toContain(`Installing ${missingPackage}@1.0.0 failed`);
           expect(failed.message).toContain(registry.location);
