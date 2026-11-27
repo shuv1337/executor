@@ -763,7 +763,10 @@ const deployLocalCallerApp = (operator: Session) =>
     expect(deployed.status).toBe(200);
     const { app } = yield* body(Schema.Struct({ app: App }), deployed);
     yield* Effect.addFinalizer(() =>
-      operator.send("DELETE", `/v1/apps/${app.id}`, undefined, headers).pipe(Effect.orDie),
+      operator.send("DELETE", `/v1/apps/${app.id}`, undefined, headers).pipe(
+        Effect.map((removed) => expect(removed.status).toBe(200)),
+        Effect.orDie,
+      ),
     );
     return app.slug;
   });
@@ -823,6 +826,22 @@ const checkLocalApproval = (
       expect(yield* body(ApprovalView, read)).toEqual({ status: "unavailable" });
       expect(yield* body(ApprovalAck, answer)).toEqual({ status: "unavailable" });
     }
+  });
+
+const refuseOrdinaryLocalApproval = (operator: Session, runner: Runner, params: URLSearchParams) =>
+  Effect.gen(function* () {
+    const ordinary = yield* Schema.decodeUnknownEffect(Pending)(
+      (yield* runner.execute("model client asks for ordinary approval", "reviewed", {
+        note: "Agent approval is enough",
+      })).structuredContent,
+    );
+    expect(ordinary.human).toBeUndefined();
+    yield* checkLocalApproval(operator, ordinary.requestId, params, "not person-only", 403);
+    const done = yield* runner.completed(
+      Identity,
+      yield* runner.resume("The model approves the ordinary request", ordinary.requestId),
+    );
+    expect(done.approvedBy).toMatchObject({ kind: "agent", method: "model" });
   });
 
 const approveLocalInBrowser = (
@@ -886,6 +905,7 @@ layer(TestLive, { excludeTestServices: true })("Local person-only approvals", (i
             return { runner, token, grantId };
           });
         const browserFoil = yield* connect("browser", "local-browser-foil");
+        yield* browser.omitNetworkTrace;
         yield* browser.login(operator);
         for (const mode of callerModes) {
           const { runner, token, grantId } = yield* connect(mode, `local-${mode}`);
@@ -893,20 +913,7 @@ layer(TestLive, { excludeTestServices: true })("Local person-only approvals", (i
           const { requestId, page } = approval;
           const own = page.searchParams;
           expect(own.get("grantId")).toBe(grantId);
-          if (mode === "model") {
-            const ordinary = yield* Schema.decodeUnknownEffect(Pending)(
-              (yield* runner.execute("model client asks for ordinary approval", "reviewed", {
-                note: "Agent approval is enough",
-              })).structuredContent,
-            );
-            expect(ordinary.human).toBeUndefined();
-            yield* checkLocalApproval(operator, ordinary.requestId, own, "not person-only", 403);
-            const done = yield* runner.completed(
-              Identity,
-              yield* runner.resume("The model approves the ordinary request", ordinary.requestId),
-            );
-            expect(done.approvedBy).toMatchObject({ kind: "agent", method: "model" });
-          }
+          if (mode === "model") yield* refuseOrdinaryLocalApproval(operator, runner, own);
           const other = mode === "model" ? "automatic" : "model";
           const wrongMode = withMode(own, other);
           wrongMode.set("sessionId", other);
@@ -931,6 +938,10 @@ layer(TestLive, { excludeTestServices: true })("Local person-only approvals", (i
               origin: "https://wrong-origin.example.test",
             })).status,
             "Answer: a cross-origin request",
+          ).toBe(403);
+          expect(
+            (yield* operator.send("POST", localApprovalPath(requestId, own), accept)).status,
+            "Answer: no Origin header",
           ).toBe(403);
           yield* checkLocalApproval(
             operator,
@@ -982,6 +993,7 @@ layer(TestLive, { excludeTestServices: true })("Local person-only approvals", (i
           browser = yield* Browser;
         const operator = yield* pairLocalOperator;
         const slug = yield* deployLocalCallerApp(operator);
+        yield* browser.omitNetworkTrace;
         yield* browser.login(operator);
         for (const mode of [...callerModes, "browser"] as const) {
           const runner = mcpRunner(
@@ -992,6 +1004,27 @@ layer(TestLive, { excludeTestServices: true })("Local person-only approvals", (i
           const approval = yield* startLocalApproval(runner, mode);
           const { requestId, page } = approval;
           expect(page.searchParams.get("grantId")).toBe("local-administrator");
+          if (mode === "model") {
+            yield* checkLocalApproval(
+              operator,
+              requestId,
+              withMode(page.searchParams, null),
+              "a model request in the browser partition",
+              200,
+            );
+            yield* refuseOrdinaryLocalApproval(operator, runner, page.searchParams);
+          }
+          if (mode === "browser") {
+            const model = withMode(page.searchParams, "model");
+            model.set("sessionId", "model");
+            yield* checkLocalApproval(
+              operator,
+              requestId,
+              model,
+              "a browser request in the model partition",
+              200,
+            );
+          }
           if (mode !== "browser") {
             const other = mode === "model" ? "automatic" : "model";
             const wrongMode = withMode(page.searchParams, other);
