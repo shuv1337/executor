@@ -21,7 +21,7 @@ index fa559109c179700e47dd94029abea7d76a00fb50..aa562a81a15e168b321e063ce668d85f
    list(prefix?: string): string[];
    flush(): Promise<void>;
 diff --git a/dist/index.d.ts b/dist/index.d.ts
-index 53dd55f4cd0292a11050505c4824afe0cac15d33..6ccabb03b2982011b5ad2635f2f302a87d8c164f 100644
+index 53dd55f4cd0292a11050505c4824afe0cac15d33..59a61ecae3bd0f291169e4ee1009eebfc8c5330d 100644
 --- a/dist/index.d.ts
 +++ b/dist/index.d.ts
 @@ -331,6 +331,8 @@ declare function handleAssetRequest(
@@ -33,7 +33,20 @@ index 53dd55f4cd0292a11050505c4824afe0cac15d33..6ccabb03b2982011b5ad2635f2f302a8
    /**
     * Input files — keys are paths relative to project root, values are file contents.
     * Accepts a plain object (which is wrapped in an InMemoryFileSystem automatically)
-@@ -499,6 +501,16 @@ interface InstallResult {
+@@ -495,10 +497,29 @@ interface InstallResult {
+    * Warnings encountered during installation
+    */
+   warnings: string[];
++  /** The first package installation failure. */
++  failure?: {
++    package?: string;
++    /** The resolved version, or the declared range if resolution failed. */
++    version?: string;
++    registry?: string;
++    /** HTTP status from the configured registry for a direct dependency. */
++    status?: number;
++  };
+ }
  //#endregion
  //#region src/installer.d.ts
  interface InstallOptions {
@@ -125,10 +138,10 @@ index 9ddcbac086bbd60fece6571299c86f92d33412a6..2f2667088015a158ebd9f1d324137199
  		installWarnings.push(...installResult.warnings);
  	}
 diff --git a/dist/installer-DDvaMqav.js b/dist/installer-DDvaMqav.js
-index 5ed55da1726ab87d1c11932262f972cf39c3dd45..c50d0cf085a7dffd44af6558f56c5a627bc8e2ec 100644
+index 5ed55da1726ab87d1c11932262f972cf39c3dd45..5b1f8d0bc35f62009f0c687c1fd897644edf21b8 100644
 --- a/dist/installer-DDvaMqav.js
 +++ b/dist/installer-DDvaMqav.js
-@@ -49,21 +49,63 @@ function isTextFile(path) {
+@@ -49,21 +49,72 @@ function isTextFile(path) {
  * Fetch with a timeout.
  * Throws an error if the request takes longer than the specified timeout.
  */
@@ -156,7 +169,12 @@ index 5ed55da1726ab87d1c11932262f972cf39c3dd45..c50d0cf085a7dffd44af6558f56c5a62
 +* chose and repeats nothing a server or an archive sent; any other error is
 +* reported as unexpected.
 +*/
-+var InstallFailure = class extends Error {};
++var InstallFailure = class extends Error {
++	constructor(message, registryStatus) {
++		super(message);
++		this.registryStatus = registryStatus;
++	}
++};
 +/**
 +* Why a request failed to send. A fetch hook rejects with an error named
 +* `NetworkRefused` for a destination its network policy refuses. workerd
@@ -179,13 +197,17 @@ index 5ed55da1726ab87d1c11932262f972cf39c3dd45..c50d0cf085a7dffd44af6558f56c5a62
 +async function fetchFrom(url, options, timeoutMs, network) {
 +	let current = url;
 +	for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
-+		const send = URL.parse(current)?.origin === network.registryOrigin ? fetch : network.elsewhere;
++		const onRegistry = URL.parse(current)?.origin === network.registryOrigin;
++		const send = onRegistry ? fetch : network.elsewhere;
 +		const response = await fetchWithTimeout(current, {
 +			...options,
 +			redirect: "manual"
 +		}, timeoutMs, send);
 +		const location = REDIRECT_STATUSES.has(response.status) ? response.headers.get("location") : null;
-+		if (location === null) return response;
++		if (location === null) return {
++			response,
++			registryStatus: onRegistry && network.registryOrigin !== void 0 ? response.status : void 0
++		};
 +		response.body?.cancel().catch(() => {});
 +		const next = URL.parse(location, current);
 +		if (next === null || next.protocol !== "https:" && next.protocol !== "http:") throw new InstallFailure("a redirect named an invalid URL");
@@ -196,7 +218,7 @@ index 5ed55da1726ab87d1c11932262f972cf39c3dd45..c50d0cf085a7dffd44af6558f56c5a62
  //#endregion
  //#region src/installer-python.ts
  const PYODIDE_VERSION = "v0.27.5";
-@@ -381,7 +423,11 @@ const NPM_REGISTRY = "https://registry.npmjs.org";
+@@ -381,7 +432,11 @@ const NPM_REGISTRY = "https://registry.npmjs.org";
  * @returns Metadata about the installation
  */
  async function installDependencies(fileSystem, options = {}) {
@@ -209,7 +231,7 @@ index 5ed55da1726ab87d1c11932262f972cf39c3dd45..c50d0cf085a7dffd44af6558f56c5a62
  	const result = {
  		installed: [],
  		warnings: []
-@@ -407,14 +453,19 @@ async function installDependencies(fileSystem, options = {}) {
+@@ -407,14 +462,19 @@ async function installDependencies(fileSystem, options = {}) {
  		if (Object.keys(depsToInstall).length === 0) return result;
  		const installedPackages = /* @__PURE__ */ new Set();
  		const inProgress = /* @__PURE__ */ new Map();
@@ -231,12 +253,13 @@ index 5ed55da1726ab87d1c11932262f972cf39c3dd45..c50d0cf085a7dffd44af6558f56c5a62
  	if (installedPackages.has(name)) return;
  	if (fileSystem.read(`node_modules/${name}/package.json`) !== null) {
  		installedPackages.add(name);
-@@ -422,28 +473,43 @@ async function installPackage(name, versionRange, result, fileSystem, installedP
+@@ -422,28 +482,55 @@ async function installPackage(name, versionRange, result, fileSystem, installedP
  	}
  	const existing = inProgress.get(name);
  	if (existing) return existing;
 +	const installDependency = (depName, depVersion) => installPackage(depName, depVersion, result, fileSystem, installedPackages, inProgress, registry, transitive, extract, network, root ?? name);
  	const installPromise = (async () => {
++		let failedVersion;
  		try {
 -			const metadata = await fetchPackageMetadata(name, registry);
 -			const version = resolveVersion(versionRange, metadata);
@@ -260,9 +283,11 @@ index 5ed55da1726ab87d1c11932262f972cf39c3dd45..c50d0cf085a7dffd44af6558f56c5a62
 +				if (transitive) await Promise.all(Object.entries(deps).map(([depName, depVersion]) => installDependency(depName, depVersion)));
  				return;
  			}
++			failedVersion = versionRange;
 +			const metadata = await fetchPackageMetadata(name, registry, network);
 +			const version = resolveVersion(versionRange, metadata);
 +			if (!version) throw new InstallFailure("no version in the registry matches its declared range");
++			failedVersion = version;
  			const versionMetadata = metadata.versions[version];
 -			if (!versionMetadata) {
 -				result.warnings.push(`Version ${version} not found for ${name}`);
@@ -285,10 +310,19 @@ index 5ed55da1726ab87d1c11932262f972cf39c3dd45..c50d0cf085a7dffd44af6558f56c5a62
 +			// the declared package is named.
 +			const reason = error instanceof InstallFailure ? error.message : "it failed unexpectedly";
 +			result.warnings.push(root === void 0 ? `Failed to install ${name}: ${reason}` : `Failed to install a dependency of ${root}: ${reason}`);
++			if (result.failure === void 0) {
++				const configured = URL.parse(registry);
++				result.failure = {
++					package: root ?? name,
++					...(root === void 0 && typeof failedVersion === "string" ? { version: failedVersion } : {}),
++					...(configured?.protocol === "https:" || configured?.protocol === "http:" ? { registry: configured.origin } : {}),
++					...(root === void 0 && error instanceof InstallFailure && error.registryStatus !== void 0 ? { status: error.registryStatus } : {})
++				};
++			}
  		}
  	})();
  	inProgress.set(name, installPromise);
-@@ -453,104 +519,128 @@ async function installPackage(name, versionRange, result, fileSystem, installedP
+@@ -453,104 +540,128 @@ async function installPackage(name, versionRange, result, fileSystem, installedP
  		inProgress.delete(name);
  	}
  }
@@ -308,9 +342,9 @@ index 5ed55da1726ab87d1c11932262f972cf39c3dd45..c50d0cf085a7dffd44af6558f56c5a62
 -	if (!response.ok) {
 -		const hint = response.status === 404 ? " (package not found — check the name in package.json or set the `registry` option if it lives on a private registry)" : "";
 -		throw new Error(`Registry returned ${response.status} ${response.statusText} for "${name}" at ${url}${hint}`);
-+	const response = await fetchFrom(url, { headers: { Accept: "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8" } }, DEFAULT_TIMEOUT_MS, network);
-+	if (response.status === 404) throw new InstallFailure(`the registry at ${registry} has no such package (HTTP 404)`);
-+	if (!response.ok) throw new InstallFailure(`the registry at ${registry} answered HTTP ${response.status}`);
++	const { response, registryStatus } = await fetchFrom(url, { headers: { Accept: "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8" } }, DEFAULT_TIMEOUT_MS, network);
++	if (response.status === 404) throw new InstallFailure(`the registry at ${registry} has no such package (HTTP 404)`, registryStatus);
++	if (!response.ok) throw new InstallFailure(`the registry at ${registry} answered HTTP ${response.status}`, registryStatus);
 +	let metadata;
 +	try {
 +		metadata = await response.json();
@@ -367,11 +401,11 @@ index 5ed55da1726ab87d1c11932262f972cf39c3dd45..c50d0cf085a7dffd44af6558f56c5a62
 -	const buffer = await response.arrayBuffer();
 -	return extractTarball(new Uint8Array(buffer));
 +	if (typeof tarballUrl !== "string") throw new InstallFailure("the registry's metadata names no tarball");
-+	const response = await fetchFrom(tarballUrl, {}, DEFAULT_TIMEOUT_MS * 2, options.network ?? {
++	const { response, registryStatus } = await fetchFrom(tarballUrl, {}, DEFAULT_TIMEOUT_MS * 2, options.network ?? {
 +		registryOrigin: void 0,
 +		elsewhere: fetch
 +	});
-+	if (!response.ok) throw new InstallFailure(`the tarball download answered HTTP ${response.status}`);
++	if (!response.ok) throw new InstallFailure(`the tarball download answered HTTP ${response.status}`, registryStatus);
 +	if (response.body === null) throw new InstallFailure("the tarball download has no body");
 +	try {
 +		return await extractTarball(response.body, options.buildInputsOnly === true ? isBuildInput : isTextFile);
@@ -487,7 +521,7 @@ index 5ed55da1726ab87d1c11932262f972cf39c3dd45..c50d0cf085a7dffd44af6558f56c5a62
  	}
  	const archiveRoot = findSharedTarRootDirectory(regularFilePaths);
  	const files = {};
-@@ -560,6 +650,70 @@ function parseTar(data) {
+@@ -560,6 +671,70 @@ function parseTar(data) {
  	}
  	return files;
  }

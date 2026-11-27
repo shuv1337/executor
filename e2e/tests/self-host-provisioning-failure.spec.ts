@@ -1,13 +1,14 @@
 /**
  * A self-host whose npm registry cannot serve the `apps` package keeps failing its default app
- * installation. The provisioning log names the failed step by its tagged cause, and never quotes
- * the registry's credentials, path or the packages it was asked for.
+ * installation. The provisioning log names the failed step and package without quoting the
+ * registry's credentials, path, query or response.
  */
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { expect, layer } from "@effect/vitest";
 import { Effect, FileSystem, Layer, Option, Schedule, Schema } from "effect";
 import { Api, SessionClients } from "../support/api.ts";
+import { appsVersion } from "../support/apps-release.ts";
 import { TestLive, withCase } from "../support/case.ts";
 import { startLoggedSelfHost } from "../support/managed-server.ts";
 import { Target } from "../support/platform.ts";
@@ -29,7 +30,7 @@ const records = (text: string, message: string) =>
     const record = Schema.decodeUnknownOption(LogRecord)(line.slice(at));
     if (Option.isNone(record)) return [];
     const logged = record.value.message;
-    return Array.isArray(logged) && logged[0] === message ? [{ line, fields: logged[1] }] : [];
+    return Array.isArray(logged) && logged[0] === message ? [{ fields: logged[1] }] : [];
   });
 
 /** An npm registry answering every request with 404, reached through a credentialed URL. */
@@ -37,13 +38,17 @@ const refusingRegistry = Effect.gen(function* () {
   const user = `synthetic-user-${randomUUID().slice(0, 8)}`;
   const password = `synthetic-password-${randomUUID().slice(0, 8)}`;
   const token = `synthetic-token-${randomUUID().slice(0, 8)}`;
+  const responseMarker = `synthetic-registry-response-${randomUUID()}`;
   const paths: string[] = [];
   const server = yield* Effect.acquireRelease(
     Effect.callback<ReturnType<typeof createServer>>((resume) => {
       const server = createServer((request, response) => {
         paths.push(request.url ?? "/");
-        response.writeHead(404, { "content-type": "application/json" });
-        response.end(JSON.stringify({ error: "not found" }));
+        response.writeHead(404, {
+          "content-type": "application/json",
+          "x-registry-response": responseMarker,
+        });
+        response.end(JSON.stringify({ error: responseMarker }));
       });
       server.listen(0, "127.0.0.1", () => resume(Effect.succeed(server)));
     }),
@@ -58,7 +63,7 @@ const refusingRegistry = Effect.gen(function* () {
   return {
     url: `http://${user}:${password}@127.0.0.1:${address.port}/mirror?token=${token}`,
     paths,
-    secrets: [user, password, token, "mirror"],
+    secrets: [user, password, token, "/mirror", "?token=", responseMarker],
   };
 });
 
@@ -95,8 +100,9 @@ layer(TestLive, { excludeTestServices: true })("Self-host provisioning failure",
           // The default app pins the `apps` package this host ships; its build asks the registry
           // for it, and the refusal fails the team's installation.
           const fs = yield* FileSystem.FileSystem;
-          const { step, attempt } = yield* fs.readFileString(server.log).pipe(
+          const { text, step, attempt } = yield* fs.readFileString(server.log).pipe(
             Effect.map((text) => ({
+              text,
               step: records(text, "Provisioning step failed"),
               attempt: records(text, "Provisioning attempt failed"),
             })),
@@ -116,24 +122,23 @@ layer(TestLive, { excludeTestServices: true })("Self-host provisioning failure",
           if (failed === undefined || retried === undefined)
             return yield* Effect.die("Provisioning failure lines missing");
           expect(failed.fields["reason"]).toBe("dependency");
-          // The failed build's stage is a closed name, so the log can say which step broke.
-          expect(failed.fields["cause"]).toMatchObject({
+          const cause = {
             tag: "VersionBuildFailed",
             stage: "dependencies",
-          });
+            package: "apps",
+            version: appsVersion,
+            registry: new URL(registry.url).origin,
+            status: 404,
+          };
+          expect(failed.fields["cause"]).toEqual(cause);
           expect(retried.fields["attempts"]).toBeGreaterThanOrEqual(1);
           expect(retried.fields["outcome"]).toBe("requeued");
-          expect(retried.fields["cause"]).toMatchObject({
-            tag: "VersionBuildFailed",
-            stage: "dependencies",
-          });
+          expect(retried.fields["cause"]).toEqual(cause);
 
-          // The registry's credentials, path and query stay out of both lines.
-          for (const { line } of [...step, ...attempt])
+          // The registry's credentials, path, query and response stay out of the server log.
+          for (const line of text.split("\n"))
             for (const secret of registry.secrets)
-              expect(line, "the failure omits the registry's credentials and path").not.toContain(
-                secret,
-              );
+              expect(line, "the failure omits private registry details").not.toContain(secret);
         }),
       ),
     120_000,

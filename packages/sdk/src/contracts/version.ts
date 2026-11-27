@@ -5,6 +5,7 @@ import { RecordedMessage } from "@executor-js/utils/recorded-message";
 import { UserFacingError } from "@executor-js/utils/user-facing-error";
 import { AppCodeId, AppId, BuildId, VersionId, OwnerId } from "./shared.ts";
 import { SourceCommit, SourceFiles } from "./source.ts";
+import { RegistryBuildFailureFields } from "./registry-build-failure.ts";
 
 export { SourceFiles, SourceFile, SourceFilePath } from "./source.ts";
 
@@ -109,6 +110,7 @@ export class VersionBuildFailed extends Schema.TaggedError<VersionBuildFailed>()
     reason: Schema.String,
     /** The build step that failed, when the runtime reported it. */
     stage: Schema.optional(BuildStage),
+    ...RegistryBuildFailureFields,
     /** The first failing source location, when known. */
     location: Schema.optional(SourceLocation),
     /** The stage, location and underlying failure, such as the compiler's own errors. */

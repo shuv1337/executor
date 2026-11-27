@@ -1,5 +1,12 @@
 /** Public Effect-native SDK. The caller owns platform layers and resource lifetimes. */
 export * from "./contracts/index.ts";
+export {
+  RegistryBuildFailureFields,
+  safeExactSemver,
+  safeHttpStatus,
+  safeNpmPackageName,
+  safeRegistryOrigin,
+} from "./contracts/registry-build-failure.ts";
 export { createExecutor, createRemoteExecutor } from "./implementation/create.ts";
 export { httpEventSender } from "./implementation/event-sender.ts";
 export { makeDeclarationCache } from "./implementation/declarations.ts";

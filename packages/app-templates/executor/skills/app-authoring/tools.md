@@ -393,11 +393,18 @@ Use `ctx.cache.get({ key, schema, freshFor, staleFor, load })` for shared JSON.
 Put every result dependency in the key. Use `ctx.cache.forAccount(account)` for
 private results; the host also scopes entries to current credentials. Use
 `ctx.cache.forCaller()` for anything computed from who is calling: the shared
-scope serves every caller of the app. Use the
+scope is not caller-specific. Use the
 loader's `fetch`, `signal`, and `cache` so stale refreshes can finish after the
 request. Pass `stale: "revalidate"` to await the load past `freshFor` instead of
 serving the old value; the loader can `read(key, schema)` the old value to confirm
 it cheaply. Errors are not cached. `invalidate(key)` also fences pending loaders.
+
+On hosted scoped MCP connections, the host partitions `ctx.cache` namespaces by
+caller connection and policy revision. A new revision starts with an empty
+slot, and a scoped caller can invalidate only its own slot. Writes and
+`ctx.cache.invalidate` from unscoped contexts (schedules, webhooks, and
+full-access callers) affect only the shared unscoped slot. Scoped entries can
+still be served until they expire.
 
 The cache keeps an entry at most 7 days. A longer `freshFor` plus `staleFor`,
 or a longer `write` retention, is shortened to 7 days, taking `staleFor` first.
