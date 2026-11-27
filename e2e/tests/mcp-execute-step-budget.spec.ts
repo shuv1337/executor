@@ -17,7 +17,7 @@
  * of the result, so a loop that joins a megabyte string stops in seconds.
  */
 import { expect, layer } from "@effect/vitest";
-import { Duration, Effect, Fiber, Schema } from "effect";
+import { Deferred, Duration, Effect, Fiber, Schema } from "effect";
 import { scenarios } from "../test-plan.ts";
 import { Actors } from "../support/actors.ts";
 import { Api, body } from "../support/api.ts";
@@ -236,6 +236,432 @@ const second = await tools.search({ query: 'github', limit: 1 });
 const third = await tools.search({ query: 'slack', limit: 1 });
 return { total, calls: [first, second, third].length };`;
 
+/**
+ * Attaches a 1,000-record shared `meta` to 20,000 rows while yielding periodically. With a
+ * per-execution WalkCache, `meta` is walked once regardless of concurrent executions; with a
+ * module-global epoch, concurrent mutations invalidate `meta` on every yield and exhaust the
+ * 5,000,000-step budget.
+ */
+const sharedMetaUnderNoiseVictim = `
+const meta = {
+  records: Array.from({ length: 1000 }, (_, i) => ({
+    id: 'm' + i,
+    label: 'L' + i,
+    w: i,
+    a: i + 1,
+    b: i + 2,
+    c: i + 3,
+    d: i + 4,
+    e: i + 5,
+    f: i + 6,
+    g: i + 7,
+  })),
+};
+const rows = [];
+for (let i = 0; i < 20000; i++) {
+  rows.push({ id: i, meta });
+  if (i % 2 === 0) await 0;
+}
+return rows.length;`;
+
+/**
+ * Repeatedly mutates an object held inside a walked outer object, yielding between steps.
+ * Under a shared module-level walk epoch this bumps the global epoch thousands of times per burst.
+ */
+const walkEpochNoise = `
+const inner = { v: 1 };
+const outer = { inner };
+const init = [];
+init.push(outer);
+const box = {};
+for (let i = 0; i < 4000; i++) {
+  box.a = inner;
+  inner.x = { n: i };
+  box.a = null;
+  if (i % 2 === 0) await 0;
+}
+return 4000;`;
+
+/** Comparator empties `t` and links `t` into `x`; write-back must reject and leave `t` untouched. */
+const sortDirectCycle = `
+const x = {};
+const t = [x, {}];
+let err = '';
+try {
+  t.sort(() => { t.splice(0); x.t = t; return 0; });
+} catch (e) {
+  err = String(e);
+}
+return { err, len: t.length };`;
+
+/** Comparator empties `t` and caches `t` as a leaf; write-back must invalidate `t`'s leaf cache. */
+const sortLeafCacheCycle = `
+const x = {};
+const keep = [];
+const t = [x, {}];
+t.sort(() => { t.splice(0); keep.push(t); return 0; });
+let err = '';
+try {
+  x.k = { t };
+} catch (e) {
+  err = String(e);
+}
+return err;`;
+
+/** Comparator empties `t` and caches `outer = { t }`; write-back must advance the walk epoch. */
+const sortAncestorCacheCycle = `
+const x = {};
+const keep = [];
+const t = [x, {}];
+const outer = { t };
+t.sort(() => { t.splice(0); keep.push(outer); return 0; });
+let err = '';
+try {
+  x.o = outer;
+} catch (e) {
+  err = String(e);
+}
+return err;`;
+
+/** Control: comparator sort preserves explicit `undefined` vs. trailing sparse holes. */
+const sortSparseControl = `
+const a = [{ k: 2 }, undefined, , { k: 1 }];
+a.sort((l, r) => l.k - r.k);
+return [
+  a.length,
+  a[0].k,
+  a[1].k,
+  Object.hasOwn(a, 2),
+  a[2] === undefined,
+  Object.hasOwn(a, 3),
+].join(',');`;
+
+/** Control: sorting 5,000 10-key objects with a comparator stays well within the step budget. */
+const sortLargeObjectsControl = `
+const items = Array.from({ length: 5000 }, (_, i) => ({
+  id: (i * 7919) % 5000,
+  k0: i,
+  k1: i + 1,
+  k2: i + 2,
+  k3: i + 3,
+  k4: i + 4,
+  k5: i + 5,
+  k6: i + 6,
+  k7: i + 7,
+  k8: i + 8,
+}));
+items.sort((l, r) => l.id - r.id);
+for (let i = 1; i < items.length; i++) {
+  if (items[i - 1].id > items[i].id) return -1;
+}
+return items.length;`;
+
+/**
+ * Deterministic differential fuzz of WalkCache and every mutating graph operation against an
+ * independent BFS reachability oracle on a shadow adjacency list.
+ */
+const walkCacheSeededFuzz = `
+const seeds = [101, 202, 303, 404, 505];
+const keys = ['a', 'b', 'c', 'd'];
+let accepted = 0;
+let cyclesRejected = 0;
+let sortOps = 0;
+let jsonChecks = 0;
+let mismatch = '';
+
+for (const initialSeed of seeds) {
+  let state = initialSeed >>> 0;
+  const nextInt = (bound) => {
+    state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+    return state % bound;
+  };
+
+  const nodes = [];
+  const shadow = [];
+  const keep = [];
+  for (let i = 0; i < 10; i++) {
+    if (i % 2 === 0) {
+      nodes.push({});
+      shadow.push({});
+    } else {
+      nodes.push([]);
+      shadow.push([]);
+    }
+  }
+  const objIndices = [0, 2, 4, 6, 8];
+  const arrIndices = [1, 3, 5, 7, 9];
+
+  const canReach = (start, target) => {
+    if (start === target) return true;
+    const visited = new Set([start]);
+    const queue = [start];
+    for (let head = 0; head < queue.length; head++) {
+      const cur = queue[head];
+      const edges = shadow[cur];
+      if (Array.isArray(edges)) {
+        for (let i = 0; i < edges.length; i++) {
+          if (!Object.hasOwn(edges, i)) continue;
+          const nxt = edges[i];
+          if (nxt === target) return true;
+          if (nxt >= 0 && !visited.has(nxt)) {
+            visited.add(nxt);
+            queue.push(nxt);
+          }
+        }
+      } else {
+        for (const k of Object.keys(edges)) {
+          const nxt = edges[k];
+          if (nxt === target) return true;
+          if (nxt >= 0 && !visited.has(nxt)) {
+            visited.add(nxt);
+            queue.push(nxt);
+          }
+        }
+      }
+    }
+    return false;
+  };
+
+  for (let step = 0; step < 420 && mismatch === ''; step++) {
+    const op = nextInt(9);
+    if (op === 0) {
+      const u = objIndices[nextInt(objIndices.length)];
+      const k = keys[nextInt(keys.length)];
+      const v = nextInt(10);
+      const same = Object.hasOwn(shadow[u], k) && shadow[u][k] === v;
+      const expected = same ? false : canReach(v, u);
+      let threw = false;
+      try {
+        nodes[u][k] = nodes[v];
+      } catch (e) {
+        threw = String(e).includes('contains a circular value');
+        if (!threw) mismatch = 'unexpected error on obj assign: ' + String(e);
+      }
+      if (mismatch === '' && threw !== expected) {
+        mismatch = 'seed ' + initialSeed + ' step ' + step + ' obj assign expected=' + expected + ' threw=' + threw;
+      }
+      if (threw) cyclesRejected++;
+      else {
+        shadow[u][k] = v;
+        accepted++;
+      }
+    } else if (op === 1) {
+      const u = objIndices[nextInt(objIndices.length)];
+      const k = keys[nextInt(keys.length)];
+      delete nodes[u][k];
+      delete shadow[u][k];
+      accepted++;
+    } else if (op === 2) {
+      const u = arrIndices[nextInt(arrIndices.length)];
+      const idx = nextInt(Math.min(shadow[u].length + 1, 5));
+      const v = nextInt(10);
+      const same = Object.hasOwn(shadow[u], idx) && shadow[u][idx] === v;
+      const expected = same ? false : canReach(v, u);
+      let threw = false;
+      try {
+        nodes[u][idx] = nodes[v];
+      } catch (e) {
+        threw = String(e).includes('contains a circular value');
+        if (!threw) mismatch = 'unexpected error on arr assign: ' + String(e);
+      }
+      if (mismatch === '' && threw !== expected) {
+        mismatch = 'seed ' + initialSeed + ' step ' + step + ' arr assign expected=' + expected + ' threw=' + threw;
+      }
+      if (threw) cyclesRejected++;
+      else {
+        shadow[u][idx] = v;
+        accepted++;
+      }
+    } else if (op === 3) {
+      const u = arrIndices[nextInt(arrIndices.length)];
+      if (shadow[u].length >= 5) {
+        nodes[u].splice(0, 2);
+        shadow[u].splice(0, 2);
+      }
+      const count = 1 + nextInt(2);
+      const vals = [];
+      for (let c = 0; c < count; c++) vals.push(nextInt(10));
+      const expected = vals.some((v) => canReach(v, u));
+      let threw = false;
+      try {
+        nodes[u].push(...vals.map((v) => nodes[v]));
+      } catch (e) {
+        threw = String(e).includes('contains a circular value');
+        if (!threw) mismatch = 'unexpected error on push: ' + String(e);
+      }
+      if (mismatch === '' && threw !== expected) {
+        mismatch = 'seed ' + initialSeed + ' step ' + step + ' push expected=' + expected + ' threw=' + threw;
+      }
+      if (threw) cyclesRejected++;
+      else {
+        shadow[u].push(...vals);
+        accepted++;
+      }
+    } else if (op === 4) {
+      const u = arrIndices[nextInt(arrIndices.length)];
+      if (shadow[u].length >= 5) {
+        nodes[u].pop();
+        shadow[u].pop();
+      }
+      const v = nextInt(10);
+      const expected = canReach(v, u);
+      let threw = false;
+      try {
+        nodes[u].unshift(nodes[v]);
+      } catch (e) {
+        threw = String(e).includes('contains a circular value');
+        if (!threw) mismatch = 'unexpected error on unshift: ' + String(e);
+      }
+      if (mismatch === '' && threw !== expected) {
+        mismatch = 'seed ' + initialSeed + ' step ' + step + ' unshift expected=' + expected + ' threw=' + threw;
+      }
+      if (threw) cyclesRejected++;
+      else {
+        shadow[u].unshift(v);
+        accepted++;
+      }
+    } else if (op === 5) {
+      const u = arrIndices[nextInt(arrIndices.length)];
+      const start = nextInt(shadow[u].length + 1);
+      const del = nextInt(3);
+      const insert = nextInt(2) === 0 ? [] : [nextInt(10)];
+      const expected = insert.some((v) => canReach(v, u));
+      let threw = false;
+      try {
+        nodes[u].splice(start, del, ...insert.map((v) => nodes[v]));
+      } catch (e) {
+        threw = String(e).includes('contains a circular value');
+        if (!threw) mismatch = 'unexpected error on splice: ' + String(e);
+      }
+      if (mismatch === '' && threw !== expected) {
+        mismatch = 'seed ' + initialSeed + ' step ' + step + ' splice expected=' + expected + ' threw=' + threw;
+      }
+      if (threw) cyclesRejected++;
+      else {
+        shadow[u].splice(start, del, ...insert);
+        accepted++;
+      }
+    } else if (op === 6) {
+      const u = arrIndices[nextInt(arrIndices.length)];
+      if (shadow[u].length === 0) continue;
+      const v = nextInt(10);
+      const end = Math.min(2, shadow[u].length);
+      const expected = canReach(v, u);
+      let threw = false;
+      try {
+        nodes[u].fill(nodes[v], 0, end);
+      } catch (e) {
+        threw = String(e).includes('contains a circular value');
+        if (!threw) mismatch = 'unexpected error on fill: ' + String(e);
+      }
+      if (mismatch === '' && threw !== expected) {
+        mismatch = 'seed ' + initialSeed + ' step ' + step + ' fill expected=' + expected + ' threw=' + threw;
+      }
+      if (threw) cyclesRejected++;
+      else {
+        shadow[u].fill(v, 0, end);
+        accepted++;
+      }
+    } else if (op === 7) {
+      const u = objIndices[nextInt(objIndices.length)];
+      const s = objIndices[nextInt(objIndices.length)];
+      if (u === s) continue;
+      const committed = [];
+      let expected = false;
+      for (const k of Object.keys(shadow[s])) {
+        const v = shadow[s][k];
+        if (canReach(v, u)) {
+          expected = true;
+          break;
+        }
+        committed.push([k, v]);
+      }
+      let threw = false;
+      try {
+        Object.assign(nodes[u], nodes[s]);
+      } catch (e) {
+        threw = String(e).includes('contains a circular value');
+        if (!threw) mismatch = 'unexpected error on Object.assign: ' + String(e);
+      }
+      if (mismatch === '' && threw !== expected) {
+        mismatch = 'seed ' + initialSeed + ' step ' + step + ' assign expected=' + expected + ' threw=' + threw;
+      }
+      for (const [k, v] of committed) shadow[u][k] = v;
+      if (threw) cyclesRejected++;
+      else accepted++;
+    } else {
+      const u = arrIndices[nextInt(arrIndices.length)];
+      if (shadow[u].length < 2) continue;
+      sortOps++;
+      const origItems = shadow[u].slice();
+      const mode = nextInt(3);
+      const targetObj = objIndices[nextInt(objIndices.length)];
+      const targetKey = keys[nextInt(keys.length)];
+      let mutated = false;
+      let threw = false;
+      try {
+        nodes[u].sort(() => {
+          if (!mutated) {
+            mutated = true;
+            nodes[u].splice(0);
+            shadow[u].splice(0);
+            if (mode === 0) {
+              const innerSame = Object.hasOwn(shadow[targetObj], targetKey) && shadow[targetObj][targetKey] === u;
+              const innerExpected = innerSame ? false : canReach(u, targetObj);
+              let innerThrew = false;
+              try {
+                nodes[targetObj][targetKey] = nodes[u];
+              } catch (e) {
+                innerThrew = String(e).includes('contains a circular value');
+                if (!innerThrew) mismatch = 'unexpected inner sort error: ' + String(e);
+              }
+              if (mismatch === '' && innerThrew !== innerExpected) {
+                mismatch = 'seed ' + initialSeed + ' step ' + step + ' sort inner expected=' + innerExpected + ' threw=' + innerThrew;
+              }
+              if (!innerThrew) shadow[targetObj][targetKey] = u;
+            } else if (mode === 1) {
+              keep.push(nodes[u]);
+            } else {
+              keep.push({ u: nodes[u] });
+              keep.push(nodes[targetObj]);
+            }
+          }
+          return 0;
+        });
+      } catch (e) {
+        threw = String(e).includes('contains a circular value');
+        if (!threw) mismatch = 'unexpected error on sort: ' + String(e);
+      }
+      const expected = origItems.some((v) => v >= 0 && canReach(v, u));
+      if (mismatch === '' && threw !== expected) {
+        mismatch = 'seed ' + initialSeed + ' step ' + step + ' sort write-back expected=' + expected + ' threw=' + threw;
+      }
+      if (threw) {
+        cyclesRejected++;
+        if (mismatch === '' && nodes[u].length !== shadow[u].length) {
+          mismatch = 'seed ' + initialSeed + ' step ' + step + ' sort partial write-back len=' + nodes[u].length;
+        }
+      } else {
+        origItems.forEach((v, idx) => {
+          shadow[u][idx] = v;
+        });
+        accepted++;
+      }
+    }
+
+    if (mismatch === '' && step % 50 === 49) {
+      JSON.stringify(nodes);
+      jsonChecks++;
+    }
+  }
+  if (mismatch === '') {
+    JSON.stringify(nodes);
+    jsonChecks++;
+  }
+}
+
+return { mismatch, accepted, cyclesRejected, sortOps, jsonChecks };`;
+
 layer(HostedLive, { excludeTestServices: true })("Hosted MCP execute step budget", (it) => {
   it.effect(
     scenarios.mcpExecuteStepBudget.title,
@@ -419,6 +845,172 @@ layer(HostedLive, { excludeTestServices: true })("Hosted MCP execute step budget
           yield* evidence.measure("group-rows-or-push-ms", groupedRows.ms);
           yield* evidence.measure("group-rows-reduce-ms", reducedRows.ms);
           yield* evidence.measure("template-runaway-ms", template.ms);
+        }).pipe(Effect.provide(McpClient.layer)),
+      ),
+    { timeout: 180_000 },
+  );
+
+  it.effect(
+    scenarios.mcpExecuteWalkCache.title,
+    (context) =>
+      withHostedCase(
+        context,
+        Effect.gen(function* () {
+          const evidence = yield* Evidence;
+          const victimClient = yield* connectHosted("execute-walk-cache-victim");
+          const noiseClient = yield* connectHosted("execute-walk-cache-noise");
+
+          // M2: quiet control establishes that the 1,000-record shared-meta victim fits easily.
+          const quiet = yield* execute(
+            victimClient,
+            "shared-meta-quiet-control",
+            sharedMetaUnderNoiseVictim,
+          );
+          expect(quiet.execution).toMatchObject({ ok: true, value: 20_000 });
+
+          // Run the same victim concurrently alongside a bounded noisy fiber that repeatedly
+          // mutates an object inside a walked outer object.
+          const maxNoisyBursts = 20;
+          let stopNoisy = false;
+          let noisyBursts = 0;
+          let overlapObserved = false;
+          let victimStartedAt = 0;
+          let victimEndedAt = 0;
+          const noiseStarted = yield* Deferred.make<void>();
+
+          const noisyFiber = yield* Effect.forkChild(
+            Effect.gen(function* () {
+              while (!stopNoisy && noisyBursts < maxNoisyBursts) {
+                const burstIndex = noisyBursts;
+                const burstStart = Date.now();
+                if (burstIndex === 0) yield* Deferred.succeed(noiseStarted, undefined);
+                const burst = yield* execute(
+                  noiseClient,
+                  `walk-epoch-noise-${burstIndex}`,
+                  walkEpochNoise,
+                );
+                const burstEnd = Date.now();
+                expect(burst.execution).toMatchObject({ ok: true, value: 4000 });
+                noisyBursts += 1;
+                if (
+                  victimStartedAt > 0 &&
+                  burstStart < (victimEndedAt > 0 ? victimEndedAt : Number.POSITIVE_INFINITY) &&
+                  burstEnd > victimStartedAt
+                ) {
+                  overlapObserved = true;
+                }
+              }
+            }),
+          );
+
+          const underNoise = yield* Effect.gen(function* () {
+            yield* Deferred.await(noiseStarted);
+            victimStartedAt = Date.now();
+            const result = yield* execute(
+              victimClient,
+              "shared-meta-under-noise",
+              sharedMetaUnderNoiseVictim,
+            );
+            victimEndedAt = Date.now();
+            stopNoisy = true;
+            yield* Fiber.join(noisyFiber);
+            return result;
+          }).pipe(
+            Effect.ensuring(
+              Effect.suspend(() => {
+                stopNoisy = true;
+                return Fiber.interrupt(noisyFiber);
+              }),
+            ),
+          );
+
+          // M3: comparator Array.prototype.sort write-back validation and controls.
+          const direct = yield* execute(victimClient, "sort-direct-cycle", sortDirectCycle);
+          const leaf = yield* execute(victimClient, "sort-leaf-cache-cycle", sortLeafCacheCycle);
+          const ancestor = yield* execute(
+            victimClient,
+            "sort-ancestor-cache-cycle",
+            sortAncestorCacheCycle,
+          );
+          const sparse = yield* execute(victimClient, "sort-sparse-control", sortSparseControl);
+          const largeSort = yield* execute(
+            victimClient,
+            "sort-large-objects-control",
+            sortLargeObjectsControl,
+          );
+
+          // N4: deterministic seeded differential graph-mutation fuzz against BFS oracle.
+          const fuzz = yield* execute(victimClient, "walk-cache-seeded-fuzz", walkCacheSeededFuzz);
+
+          yield* evidence.measure("shared-meta-quiet-ms", quiet.ms);
+          yield* evidence.measure("shared-meta-under-noise-ms", underNoise.ms);
+          yield* evidence.measure("sort-large-objects-ms", largeSort.ms);
+          yield* evidence.measure("walk-cache-fuzz-ms", fuzz.ms);
+          yield* evidence.json("walk-cache-summary.json", {
+            quietMs: quiet.ms,
+            underNoiseMs: underNoise.ms,
+            underNoiseOk: underNoise.execution.ok,
+            underNoiseError: underNoise.execution.error,
+            noisyBursts,
+            overlapObserved,
+            direct: direct.execution,
+            leaf: leaf.execution,
+            ancestor: ancestor.execution,
+            sparse: sparse.execution,
+            largeSortMs: largeSort.ms,
+            largeSort: largeSort.execution,
+            fuzz: fuzz.execution,
+          });
+
+          expect(noisyBursts).toBeGreaterThanOrEqual(1);
+          expect(overlapObserved).toBe(true);
+          expect(underNoise.execution).toMatchObject({ ok: true, value: 20_000 });
+
+          expect(direct.execution).toMatchObject({
+            ok: true,
+            value: {
+              err: expect.stringContaining("contains a circular value"),
+              len: 0,
+            },
+          });
+
+          expect(leaf.execution).toMatchObject({
+            ok: true,
+            value: expect.stringContaining("contains a circular value"),
+          });
+
+          expect(ancestor.execution).toMatchObject({
+            ok: true,
+            value: expect.stringContaining("contains a circular value"),
+          });
+
+          expect(sparse.execution).toMatchObject({
+            ok: true,
+            value: "4,1,2,true,true,false",
+          });
+
+          expect(largeSort.execution).toMatchObject({ ok: true, value: 5000 });
+
+          expect(fuzz.execution).toMatchObject({
+            ok: true,
+            value: {
+              mismatch: "",
+              accepted: expect.any(Number),
+              cyclesRejected: expect.any(Number),
+              sortOps: expect.any(Number),
+              jsonChecks: expect.any(Number),
+            },
+          });
+          const fuzzValue = fuzz.execution.value as {
+            accepted: number;
+            cyclesRejected: number;
+            sortOps: number;
+            jsonChecks: number;
+          };
+          expect(fuzzValue.accepted).toBeGreaterThan(0);
+          expect(fuzzValue.cyclesRejected).toBeGreaterThan(0);
+          expect(fuzzValue.sortOps).toBeGreaterThan(0);
+          expect(fuzzValue.jsonChecks).toBeGreaterThan(0);
         }).pipe(Effect.provide(McpClient.layer)),
       ),
     { timeout: 180_000 },

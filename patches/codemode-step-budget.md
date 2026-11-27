@@ -78,14 +78,24 @@ Operators and patterns that read a whole value are charged too:
   million steps, and about 18,000 lines (2.2 MB) spend the default budget. Collect lines in an
   array and `join` them instead, which is charged once.
 - Storing a value walks it to reject cycles: assignment to a property or index, `push`,
-  `unshift`, `splice`, `fill` and `Object.assign`. `switch` walks its discriminant and case
+  `unshift`, `splice`, `fill`, `Object.assign`, and comparator `Array.prototype.sort` write-back.
+  `switch` walks its discriminant and case
   values to reject interpreter references. Both walks are charged as they go, one step per 2
-  values visited. The store walk also remembers every object whose whole graph it has checked
-  and stops there next time, as the container it looks for is never inside one. An object holding
+  values visited. The store walk also remembers every object whose whole graph it has checked in a
+  per-execution `WalkCache` (owned by the execution's `Interpreter` and shared with its invoked
+  functions, promises and generators, with no module-level mutable state) and stops there next
+  time, as the container it looks for is never inside one. Concurrent executions keep independent
+  walk caches and epochs so one program's mutations cannot invalidate another's cache or push it
+  over its step budget. An object holding
   no objects stays remembered until an object is stored into it. Any other object is remembered for
   the current epoch: storing an object into a remembered object that another remembered object
   holds starts a new epoch, which forgets every non-leaf object at once, because their graphs may
-  now reach the new value. Every store into existing data runs this walk first, so the walk still
+  now reach the new value. For comparator `Array.prototype.sort`, before writing sorted items back
+  into the target array, every object item not currently present in the live target array is
+  preflight-checked with `rejectCircularInsertion` (sharing one `seen` set and meter) so comparator
+  mutations cannot introduce a cycle, perform a partial write-back, or leave stale leaf/ancestor
+  walk-cache entries; no-comparator sorts and legitimate comparator sorts where all items remain in
+  the target array skip the walk. Every store into existing data runs this walk first, so the walk still
   finds every cycle; a differential fuzz of 3.9 million stores against a fresh reachability check
   agreed on all of them, and fails at once when the epoch is not advanced. The one store that
   skips the walk is a property or index assignment of the value the slot already holds, which
@@ -130,9 +140,6 @@ These still run work the budget does not see, and are left for a follow-up:
   A loop of each of these with a million-element array runs to its 30 s wall time.
   `console.table` and `Object.is` walk too, but are already stopped by the charge for their
   arguments.
-- A shared value made of many small records is walked in full on every store, because only
-  objects holding no objects are remembered: attaching a 1,000-record `meta` to each of 20,000
-  rows stops at the budget in about 2 s.
 - Not a hole, but worth knowing: grouping with `g[k] = (g[k] || []).concat([v])` copies the group
   on every row and is charged for it, so 50,000 rows in 10 groups stop at the budget in under a
   second. `push` into the group instead.

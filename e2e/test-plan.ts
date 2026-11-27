@@ -1405,6 +1405,17 @@ export const scenarios = plan({
       local: na("Shared execute path and CodeMode patch; covered on self-host"),
     },
   },
+  mcpExecuteWalkCache: {
+    fixtures: "actors",
+    file: "mcp-execute-step-budget.spec.ts",
+    title:
+      "Hosted MCP execute isolates walk budgets, validates comparator sort write-back, and agrees with a seeded graph model",
+    targets: {
+      "self-host": scheduled,
+      cloud: na("Shared execute path and CodeMode patch; covered on self-host"),
+      local: na("Shared execute path and CodeMode patch; covered on self-host"),
+    },
+  },
   mcpExecuteReach: {
     fixtures: "actors",
     file: "mcp-execute-reach.spec.ts",
